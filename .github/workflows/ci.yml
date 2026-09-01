@@ -157,6 +157,11 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - run: cargo test -p chronixd --features otlp
       - run: cargo check -p chronixd --features all-connectors --all-targets
+      # Each connector alone, not only the pair: `all-connectors` compiles both
+      # at once, so an item that one gates and the other imports builds there
+      # and nowhere else.
+      - run: cargo check -p chronixd --features kafka --all-targets
+      - run: cargo check -p chronixd --features mqtt --all-targets
       - run: cargo test -p chronix-engine --features field-encryption
       - run: cargo check -p chronix-engine --features object-store --all-targets
       - run: cargo test -p chronix-engine --features object-store objstore

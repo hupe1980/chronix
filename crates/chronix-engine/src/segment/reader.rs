@@ -42,6 +42,10 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+// The only bare `Arc` in this file is the key provider, which is gated; every
+// other use is written out as `std::sync::Arc`. Without the same gate the
+// import is unused under `--no-default-features`.
+#[cfg(feature = "field-encryption")]
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
