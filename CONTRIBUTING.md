@@ -116,9 +116,25 @@ git push origin v0.1.0
 ```
 
 `.github/workflows/release.yml` does the rest: it checks the tag against the
-manifest, runs the release gate, builds `chronixd` for six targets, publishes
+manifest, waits for CI's verdict on that commit, builds `chronixd`, publishes
 the library crates to crates.io, then attaches the archives to the GitHub
-release. Publishing runs last because it cannot be undone.
+release.
+
+It does not re-run the test suite. CI has already run every check on that
+commit and runs *more* than a release-time re-run would — the aarch64 targets,
+the feature matrix, miri, the MSRV floor, `cargo deny` and the site build are
+all CI jobs — so the release waits for that verdict instead of re-deriving a
+weaker one. **Tag a commit that is on `main` and has passed CI**; a tag on a
+commit CI never saw fails rather than publishing on trust.
+
+Publishing waits for that verdict because it cannot be undone. It does not
+wait for the binaries, which are a separate artifact — `chronixd` is not
+published to crates.io at all.
+
+Binaries are built for four targets: `x86_64` and `aarch64` Linux (gnu),
+`aarch64` Linux musl for static deployment on a gateway, and `aarch64` macOS.
+Each is exercised by a CI job, and the `verify` job fails the release if that
+stops being true. Adding a target means adding it to CI in the same commit.
 
 Crates go up in dependency order, which `scripts/publish-order.sh` derives
 from the manifests. The workflow needs a crates.io API token with publish

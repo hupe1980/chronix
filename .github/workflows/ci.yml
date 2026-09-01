@@ -299,7 +299,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-protoc
-      - run: cargo doc --no-deps
+      # docs.rs builds with `all-features = true`, so a link that resolves only
+      # under the default set is a broken docs.rs page. This is the check that
+      # found nine unresolved intra-doc links, one of them in a published
+      # crate; the default-feature build saw none of them.
+      - run: cargo doc --no-deps --workspace --all-features
       # Doc examples are compiled and run. `doctest = false` in every manifest
       # keeps them out of the ordinary test run for build time, which meant
       # nothing ever compiled them: 15 of them did not, because they imported

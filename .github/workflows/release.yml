@@ -47,31 +47,87 @@ jobs:
             exit 1
           }
 
+      # A binary for a target no CI job builds is a promise nobody checks —
+      # the matrix shipped two such targets before anyone noticed. Cheap
+      # enough to assert here rather than to remember.
+      - name: Every shipped target is exercised by CI
+        run: |
+          python3 - <<'EOF'
+          import sys, yaml
+          ci = yaml.safe_load(open(".github/workflows/ci.yml"))
+          rel = yaml.safe_load(open(".github/workflows/release.yml"))
+          native = {
+              "ubuntu-latest": "x86_64-unknown-linux-gnu",
+              "ubuntu-24.04": "x86_64-unknown-linux-gnu",
+              "ubuntu-24.04-arm": "aarch64-unknown-linux-gnu",
+              "macos-latest": "aarch64-apple-darwin",
+          }
+          covered = set()
+          for job in ci["jobs"].values():
+              m = job.get("strategy", {}).get("matrix", {})
+              covered.update(m.get("target", []))
+              runs = m.get("os") or ([job["runs-on"]] if isinstance(job.get("runs-on"), str) else [])
+              covered.update(native.get(label, label) for label in runs)
+          shipped = [e["target"] for e in rel["jobs"]["binaries"]["strategy"]["matrix"]["include"]]
+          missing = [t for t in shipped if t not in covered]
+          for t in missing:
+              print(f"::error::{t} is shipped but no CI job builds it")
+          print(f"shipped: {len(shipped)}, uncovered: {len(missing)}")
+          sys.exit(1 if missing else 0)
+          EOF
+
   # A tag push does not run the CI workflow, so the gate runs here too. These
   # are the checks a published version cannot be taken back from.
-  gate:
-    name: Release gate
+  # CI already ran every check on this commit, and runs *more* of them than a
+  # release-time re-run would: the aarch64 targets, the feature matrix, miri,
+  # the MSRV floor, `cargo deny` and the site build are all CI jobs. Repeating
+  # a subset here would take half an hour to prove less. So this waits for
+  # CI's verdict on this exact SHA instead of re-deriving it.
+  #
+  # A tag on a commit CI never saw has no verdict, and fails here rather than
+  # publishing on trust.
+  ci-passed:
+    name: CI passed for this commit
     needs: verify
     runs-on: ubuntu-latest
-    env:
-      RUSTFLAGS: "-D warnings"
+    permissions:
+      contents: read
+      actions: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: rustfmt, clippy }
-      - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/setup-protoc
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo test --doc --workspace
-      # docs.rs builds with all features, so a link that resolves only under
-      # the default set is a broken docs.rs page for a version already public.
-      - run: cargo doc --no-deps --workspace --all-features
+      - name: Wait for CI to conclude, then require success
         env:
-          RUSTDOCFLAGS: "-D warnings"
-      - run: ./scripts/check-docs.sh
-      - run: ./scripts/check-references.sh
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="${{ github.sha }}"
+          deadline=$(( SECONDS + 45 * 60 ))
+          echo "waiting for CI on $sha"
+          while :; do
+            runs=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${sha}&per_page=100" \
+              --jq '.workflow_runs')
+            success=$(printf '%s' "$runs" | jq '[.[] | select(.conclusion == "success")] | length')
+            failed=$(printf '%s' "$runs" | jq '[.[] | select(.conclusion != null and .conclusion != "success")] | length')
+            total=$(printf '%s' "$runs" | jq 'length')
+
+            if [ "$success" -gt 0 ]; then
+              echo "CI passed for $sha"
+              exit 0
+            fi
+            if [ "$failed" -gt 0 ]; then
+              echo "::error::CI concluded unsuccessfully for $sha — fix it and re-tag" >&2
+              exit 1
+            fi
+            if [ "$total" -eq 0 ] && [ "$SECONDS" -gt 300 ]; then
+              echo "::error::no CI run exists for $sha. Push the commit to main and let CI run before tagging." >&2
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::timed out waiting for CI on $sha" >&2
+              exit 1
+            fi
+            sleep 30
+          done
 
   binaries:
     name: chronixd (${{ matrix.target }})
@@ -84,14 +140,20 @@ jobs:
           # Every target builds on a runner of its own architecture, so the C
           # that `aws-lc-rs` compiles is native and no cross toolchain is
           # involved. Only musl adds anything, and only a libc.
+          #
+          # Each of these four is exercised by CI: x86_64 gnu and arm64 macOS
+          # by the `test` job's matrix, both aarch64 Linux targets by the
+          # `aarch64` job. `x86_64-unknown-linux-musl` and
+          # `x86_64-apple-darwin` were dropped because nothing tested them —
+          # a shipped binary for a target no job builds is a promise nobody
+          # checks. Alpine on x86_64 and Intel Macs build from source; adding
+          # either back means adding it to CI in the same commit.
           - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04,     target: x86_64-unknown-linux-musl }
-          # The design partner's target. musl is the one that matters for a
-          # gateway: a static binary with no libc version to match.
+          # ARM servers (Graviton, Ampere) and, with musl, the design
+          # partner's gateway: a static binary with no libc version to match.
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest,     target: aarch64-apple-darwin }
-          - { os: macos-latest,     target: x86_64-apple-darwin }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -104,8 +166,6 @@ jobs:
 
       - name: Build
         env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --locked -p chronixd --target ${{ matrix.target }}
@@ -131,7 +191,11 @@ jobs:
   # a version for every packaged dependency, optional ones included.
   crates-io:
     name: Publish to crates.io
-    needs: [gate, binaries]
+    # Only the gate. `chronixd` is `publish = false`, so nothing this job
+    # uploads comes out of the `binaries` matrix — waiting for four release
+    # builds bought no safety for the crates and put them on the critical
+    # path. The gate is what must pass before an irreversible publish.
+    needs: [ci-passed]
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
