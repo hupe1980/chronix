@@ -1,0 +1,31 @@
+name: Free disk space
+description: >
+  Delete preinstalled toolchains this repository never uses, to make room for
+  the build.
+
+  A GitHub Linux runner has ~14 GB free, and a debug build of this workspace
+  does not fit: `chronix-engine` alone produces 2.3 GB of artifacts, and the
+  `test` and `examples` jobs additionally build every integration test, every
+  example and the dev-dependency graph. Running out shows up as
+  `ld terminated with signal 7 [Bus error]` — the linker's mapped output
+  cannot grow — with the real cause, `No space left on device`, thousands of
+  lines away in the log.
+
+  Docker images are deliberately left alone: `testcontainers` pulls its own.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        echo "before:"; df -h / | tail -1
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /usr/local/lib/android \
+          /opt/ghc \
+          /usr/local/share/boost \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/local/share/powershell \
+          /usr/share/swift || true
+        echo "after:"; df -h / | tail -1
