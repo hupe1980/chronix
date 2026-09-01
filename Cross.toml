@@ -1,0 +1,9 @@
+# `cross` runs the build inside a per-target container, so tools installed on
+# the runner are not present: `chronixd`'s build script shells out to `protoc`
+# and dies with "Could not find `protoc`" without this. Both the CI
+# cross-compile job and the release binaries go through `cross`, so installing
+# it here covers both.
+[build]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes protobuf-compiler",
+]

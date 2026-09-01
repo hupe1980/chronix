@@ -110,6 +110,13 @@ jobs:
     # must keep compiling.
     name: Frozen cluster tier (compile check)
     runs-on: ubuntu-latest
+    # The one place the workspace-wide `-D warnings` must not apply. The
+    # frozen tier is compile-checked, not lint-clean, and carries known clippy
+    # debt by policy; denying warnings here fails the job on exactly the debt
+    # already accepted. Deny-level lints still fail, which is the point of the
+    # clippy step below.
+    env:
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -249,20 +256,18 @@ jobs:
           cd sdks/python && CHRONIX_URL=http://127.0.0.1:4242 python tests/smoke_live.py
 
   deny:
+    # The single advisory gate. `cargo audit` used to run beside this and was
+    # removed: it reads `Cargo.lock` with no feature resolution, so it reported
+    # `rkyv` — which no build graph reaches, even under `--all-features` — and
+    # it cannot see the justifications in `deny.toml`. Two advisory lists means
+    # two places to record an accepted risk, and only one of them was read.
     name: Dependency Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
-
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          arguments: --all-features
 
   doc:
     name: Documentation

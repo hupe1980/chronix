@@ -94,8 +94,15 @@ corresponding Cargo feature flag is enabled.
 | Feature | Crate | Description |
 |---------|-------|-------------|
 | `kafka` | `krafka` 0.21 | Kafka consumer — pure async Rust, no C toolchain |
-| `mqtt`  | `rumqttc` 0.24 | MQTT subscriber with async client |
+| `mqtt`  | `rumqttc` 0.25 | MQTT subscriber with async client. Plaintext only — see below |
 | `all-connectors` | — | Enables both `kafka` and `mqtt` |
+
+`rumqttc` is taken with `default-features = false`. Its `use-rustls` feature
+is not a TLS option the subscriber offers — it never builds a `Transport` — so
+enabling it only added `rustls-webpki` 0.102 (two advisories, and `rumqttc`'s
+own `^0.102.8` caps it below the fixed 0.103.10), the unmaintained
+`rustls-pemfile`, and a second crypto provider. MQTT connections are plaintext;
+TLS returns when `rumqttc` moves to a provider-agnostic rustls.
 
 Without the feature flag, the connector struct is still available (for
 configuration parsing and testing), but `start()` logs a notice and
