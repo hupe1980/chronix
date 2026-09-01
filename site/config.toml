@@ -1,0 +1,63 @@
+# Zola configuration for the Chronix documentation site.
+#
+# Replaces an mdBook setup whose chapters were stubs `{{#include}}`-ing the
+# repository's Markdown, so the site and the repo could not drift apart. Zola
+# gives per-page metadata — titles, descriptions, canonical URLs, structured
+# data — which is what a documentation site needs to be findable, and mdBook
+# has no place to put.
+
+base_url = "https://hupe1980.github.io/chronix"
+title = "Chronix"
+description = "Chronix is an embedded-first time-series database in pure Rust, with forecasting and anomaly detection inside the engine. Run it as a Cargo dependency or as a server behind Grafana."
+default_language = "en"
+compile_sass = true
+minify_html = true
+build_search_index = true
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+author = "hupe1980"
+
+taxonomies = [
+  { name = "tags", feed = true, paginate_by = 20 },
+]
+
+[markdown]
+render_emoji = false
+external_links_target_blank = true
+smart_punctuation = false
+bottom_footnotes = true
+# Heading anchors are what makes deep links into long reference pages work,
+# and what lets search engines surface a specific section rather than a page.
+insert_anchor_links = "heading"
+
+[markdown.highlighting]
+# Two themes, switched by the `prefers-color-scheme` CSS the theme emits, so
+# code blocks stay readable in both without a JavaScript toggle.
+style = "class"
+light_theme = "ayu-light"
+dark_theme = "ayu-dark"
+
+[search]
+# The javascript format defines `window.searchIndex`, so it loads with a
+# plain <script src> and needs no fetch, no CORS story and no async gap.
+index_format = "elasticlunr_javascript"
+include_title = true
+include_description = true
+include_path = true
+
+[link_checker]
+# Anchors inside generated pages are checked at build time.
+internal_level = "error"
+external_level = "warn"
+
+[extra]
+# Appended to the site name in the <title> of the home and 404 pages.
+tagline = "embedded time-series database for Rust"
+repo_url = "https://github.com/hupe1980/chronix"
+crates_url = "https://crates.io/crates/chronix"
+docsrs_url = "https://docs.rs/chronix"
+# Shown in the footer and used for the JSON-LD `softwareVersion`.
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+# Default social preview; pages may override with `extra.image`.
+og_image = "/og-image.svg"

@@ -1,0 +1,274 @@
+//! `chronixd` — the Chronix time-series database server.
+//!
+//! ```text
+//! chronixd --data-dir /var/lib/chronix --bind 0.0.0.0:8086
+//! chronixd --mode meta --node-id 1 --raft-bind 0.0.0.0:9100 --cluster-peers 10.0.0.2:9100,10.0.0.3:9100
+//! chronixd --mode data --node-id 10 --meta-addrs 10.0.0.1:9100,10.0.0.2:9100,10.0.0.3:9100
+//! ```
+
+use std::path::PathBuf;
+
+use clap::{Parser, ValueEnum};
+use tracing::info;
+
+use chronixd::config::ServerConfig;
+
+/// Node operating mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NodeMode {
+    /// Standalone single-node server (default — no cluster).
+    Standalone,
+    /// MetaNode — Raft consensus cluster for metadata management.
+    Meta,
+    /// DataNode — hosts region data, registers with MetaNodes.
+    Data,
+}
+
+/// Chronix time-series database server.
+#[derive(Parser, Debug)]
+#[command(
+    name = "chronixd",
+    version,
+    about = "Chronix time-series database server"
+)]
+struct Cli {
+    /// Path to TOML configuration file.
+    #[arg(long, short = 'c', env = "CHRONIXD_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Node operating mode.
+    #[arg(long, env = "CHRONIXD_MODE", value_enum, default_value = "standalone")]
+    mode: NodeMode,
+
+    /// Unique node identifier (required for meta/data modes).
+    #[arg(long, env = "CHRONIXD_NODE_ID")]
+    node_id: Option<u64>,
+
+    /// Raft/admin gRPC bind address (meta mode).
+    #[arg(long, env = "CHRONIXD_RAFT_BIND")]
+    raft_bind: Option<String>,
+
+    /// Comma-separated MetaNode peer addresses for cluster bootstrap (meta mode).
+    #[arg(long, env = "CHRONIXD_CLUSTER_PEERS", value_delimiter = ',')]
+    cluster_peers: Vec<String>,
+
+    /// Comma-separated MetaNode addresses for registration (data mode).
+    #[arg(long, env = "CHRONIXD_META_ADDRS", value_delimiter = ',')]
+    meta_addrs: Vec<String>,
+
+    /// Data directory (overrides config file).
+    #[arg(long, env = "CHRONIXD_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
+    /// HTTP bind address (overrides config file).
+    #[arg(long, env = "CHRONIXD_BIND")]
+    bind: Option<String>,
+
+    /// gRPC bind address (overrides config file).
+    #[arg(long, env = "CHRONIXD_GRPC_BIND")]
+    grpc_bind: Option<String>,
+
+    /// Flight SQL bind address (overrides config file).
+    #[arg(long, env = "CHRONIXD_FLIGHT_BIND")]
+    flight_bind: Option<String>,
+
+    /// TLS certificate file.
+    #[arg(long, env = "CHRONIXD_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    /// TLS private key file.
+    #[arg(long, env = "CHRONIXD_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+
+    /// TLS client CA certificate for mutual TLS (optional).
+    /// When set, clients must present a certificate signed by this CA.
+    #[arg(long, env = "CHRONIXD_TLS_CLIENT_CA")]
+    tls_client_ca: Option<PathBuf>,
+
+    /// TLS certificate/key hot-reload interval in seconds (0 = disabled).
+    /// When set, the server watches cert/key files and atomically reloads
+    /// the TLS configuration on change for zero-downtime certificate rotation.
+    #[arg(long, env = "CHRONIXD_TLS_RELOAD_INTERVAL", default_value = "0")]
+    tls_reload_interval_secs: u64,
+
+    /// Log format: "text" or "json".
+    #[arg(long, env = "CHRONIXD_LOG_FORMAT", default_value = "text")]
+    log_format: String,
+
+    /// Log level filter.
+    #[arg(long, env = "CHRONIXD_LOG_LEVEL", default_value = "info")]
+    log_level: String,
+
+    /// Export bundled Grafana dashboards to the given directory and exit.
+    #[arg(long)]
+    export_dashboards: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    // Load config from file or use defaults
+    let mut config = if let Some(ref path) = cli.config {
+        ServerConfig::from_toml(path)?
+    } else {
+        ServerConfig::default()
+    };
+
+    // CLI overrides
+    if let Some(ref data_dir) = cli.data_dir {
+        config.database.data_dir = data_dir.clone();
+    }
+    if let Some(ref bind) = cli.bind {
+        config.http_addr = bind
+            .parse()
+            .map_err(|e| format!("invalid HTTP bind address '{bind}': {e}"))?;
+    }
+    if let Some(ref grpc_bind) = cli.grpc_bind {
+        config.grpc_addr = grpc_bind
+            .parse()
+            .map_err(|e| format!("invalid gRPC bind address '{grpc_bind}': {e}"))?;
+    }
+    if let Some(ref flight_bind) = cli.flight_bind {
+        config.flight_addr = flight_bind
+            .parse()
+            .map_err(|e| format!("invalid Flight SQL bind address '{flight_bind}': {e}"))?;
+    }
+    if let Some(ref cert) = cli.tls_cert {
+        let key = cli
+            .tls_key
+            .clone()
+            .ok_or("TLS certificate provided but no key (--tls-key)")?;
+        config.tls = Some(chronixd::config::TlsConfig {
+            cert: cert.clone(),
+            key,
+            client_ca: cli.tls_client_ca.clone(),
+            reload_interval_secs: cli.tls_reload_interval_secs,
+        });
+    }
+    config.log_format = cli.log_format;
+    config.log_level = cli.log_level;
+
+    // Cluster mode configuration
+    match cli.mode {
+        NodeMode::Meta => {
+            let node_id = cli.node_id.ok_or("--node-id is required for meta mode")?;
+            let raft_bind = cli
+                .raft_bind
+                .ok_or("--raft-bind is required for meta mode")?;
+            config.cluster = Some(chronixd::config::ClusterConfig {
+                mode: chronixd::config::ClusterMode::Meta,
+                node_id,
+                raft_bind_addr: raft_bind,
+                cluster_peers: cli.cluster_peers,
+                meta_addrs: Vec::new(),
+                tls: None,
+            });
+        }
+        NodeMode::Data => {
+            let node_id = cli.node_id.ok_or("--node-id is required for data mode")?;
+            if cli.meta_addrs.is_empty() {
+                return Err("--meta-addrs is required for data mode".into());
+            }
+            config.cluster = Some(chronixd::config::ClusterConfig {
+                mode: chronixd::config::ClusterMode::Data,
+                node_id,
+                raft_bind_addr: String::new(),
+                cluster_peers: Vec::new(),
+                meta_addrs: cli.meta_addrs,
+                tls: None,
+            });
+        }
+        NodeMode::Standalone => {}
+    }
+
+    // Validate port configuration
+    config.validate_ports()?;
+    // Validate CORS configuration
+    config.validate_cors()?;
+
+    // Setup logging
+    setup_logging(&config);
+
+    // Handle --export-dashboards early exit
+    if let Some(ref out_dir) = cli.export_dashboards {
+        export_dashboards(out_dir)?;
+        return Ok(());
+    }
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        mode = ?cli.mode,
+        "starting chronixd"
+    );
+
+    // Run the server
+    chronixd::server::run(config).await?;
+
+    Ok(())
+}
+
+/// Initialize tracing-subscriber with the configured format and level.
+///
+/// # Trace Filtering & Sampling
+///
+/// Log verbosity is controlled by the `RUST_LOG` environment variable (takes
+/// precedence) or the `--log-level` / `log_level` config field.  Examples:
+///
+/// ```text
+/// RUST_LOG=chronix=debug,info          # debug for chronix crates, info elsewhere
+/// RUST_LOG=chronix_wal=trace,warn      # trace WAL internals, warn for the rest
+/// ```
+///
+/// For distributed **trace sampling** (OTLP), use the `otel` module's
+/// [`TracingConfig`](chronixd::otel::TracingConfig) with an
+/// [`OtlpConfig`](chronixd::otel::OtlpConfig) that exposes
+/// `SamplingStrategy::Ratio(f64)` (e.g. 0.01 = 1 %).  This function only
+/// sets up local logging; OTLP export with head-based sampling is handled
+/// separately via `chronixd::otel::init_tracing`.
+fn setup_logging(config: &ServerConfig) {
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::EnvFilter;
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+
+    match config.log_format.as_str() {
+        "json" => {
+            fmt::fmt().with_env_filter(filter).json().init();
+        }
+        _ => {
+            fmt::fmt().with_env_filter(filter).init();
+        }
+    }
+}
+
+/// Export bundled Grafana dashboard JSON files from the `dashboards/` directory.
+fn export_dashboards(out_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("dashboards"))
+        .ok_or("cannot resolve dashboards directory")?;
+
+    if !src_dir.exists() {
+        return Err(format!("dashboards directory not found at {}", src_dir.display()).into());
+    }
+
+    std::fs::create_dir_all(out_dir)?;
+
+    let mut count = 0u32;
+    for entry in std::fs::read_dir(&src_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            let dest = out_dir.join(entry.file_name());
+            std::fs::copy(&path, &dest)?;
+            println!("exported: {}", dest.display());
+            count += 1;
+        }
+    }
+
+    println!("{count} dashboard(s) exported to {}", out_dir.display());
+    Ok(())
+}

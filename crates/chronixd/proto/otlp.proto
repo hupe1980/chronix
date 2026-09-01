@@ -1,0 +1,144 @@
+// OpenTelemetry OTLP metrics types — consolidated single-package proto.
+//
+// Derived from the OpenTelemetry proto specification at:
+// https://github.com/open-telemetry/opentelemetry-proto
+// Simplified to a single package to avoid prost cross-package reference issues.
+
+syntax = "proto3";
+
+package otlp;
+
+// ── Common types ───────────────────────────────────────────────────────
+
+message AnyValue {
+  oneof value {
+    string string_value = 1;
+    bool   bool_value   = 2;
+    int64  int_value    = 3;
+    double double_value = 4;
+    ArrayValue array_value = 5;
+    KeyValueList kvlist_value = 6;
+    bytes  bytes_value  = 7;
+  }
+}
+
+message ArrayValue {
+  repeated AnyValue values = 1;
+}
+
+message KeyValueList {
+  repeated KeyValue values = 1;
+}
+
+message KeyValue {
+  string   key   = 1;
+  AnyValue value = 2;
+}
+
+message InstrumentationScope {
+  string name    = 1;
+  string version = 2;
+  repeated KeyValue attributes = 3;
+}
+
+// ── Resource ───────────────────────────────────────────────────────────
+
+message Resource {
+  repeated KeyValue attributes = 1;
+  uint32 dropped_attributes_count = 2;
+}
+
+// ── Metrics ────────────────────────────────────────────────────────────
+
+message ResourceMetrics {
+  Resource resource = 1;
+  repeated ScopeMetrics scope_metrics = 2;
+}
+
+message ScopeMetrics {
+  InstrumentationScope scope = 1;
+  repeated Metric metrics = 2;
+}
+
+message Metric {
+  string name        = 1;
+  string description = 2;
+  string unit        = 3;
+
+  oneof data {
+    Gauge     gauge      = 5;
+    Sum       sum        = 7;
+    Histogram histogram  = 9;
+    Summary   summary    = 11;
+  }
+}
+
+message Gauge {
+  repeated NumberDataPoint data_points = 1;
+}
+
+message Sum {
+  repeated NumberDataPoint data_points = 1;
+  AggregationTemporality aggregation_temporality = 2;
+  bool is_monotonic = 3;
+}
+
+enum AggregationTemporality {
+  AGGREGATION_TEMPORALITY_UNSPECIFIED = 0;
+  AGGREGATION_TEMPORALITY_DELTA = 1;
+  AGGREGATION_TEMPORALITY_CUMULATIVE = 2;
+}
+
+message Histogram {
+  repeated HistogramDataPoint data_points = 1;
+  AggregationTemporality aggregation_temporality = 2;
+}
+
+message Summary {
+  repeated SummaryDataPoint data_points = 1;
+}
+
+message NumberDataPoint {
+  repeated KeyValue attributes = 7;
+  fixed64 start_time_unix_nano = 2;
+  fixed64 time_unix_nano = 3;
+
+  oneof value {
+    double as_double = 4;
+    sfixed64 as_int = 6;
+  }
+}
+
+message HistogramDataPoint {
+  repeated KeyValue attributes = 9;
+  fixed64 start_time_unix_nano = 2;
+  fixed64 time_unix_nano = 3;
+  fixed64 count = 4;
+  double  sum   = 5;
+  repeated fixed64 bucket_counts    = 6;
+  repeated double  explicit_bounds  = 7;
+}
+
+message SummaryDataPoint {
+  repeated KeyValue attributes = 7;
+  fixed64 start_time_unix_nano = 2;
+  fixed64 time_unix_nano = 3;
+  fixed64 count = 4;
+  double  sum   = 5;
+  repeated ValueAtQuantile quantile_values = 6;
+
+  message ValueAtQuantile {
+    double quantile = 1;
+    double value    = 2;
+  }
+}
+
+// ── Collector ──────────────────────────────────────────────────────────
+
+message ExportMetricsServiceRequest {
+  repeated ResourceMetrics resource_metrics = 1;
+}
+
+message ExportMetricsServiceResponse {
+  // Deliberately empty.
+}

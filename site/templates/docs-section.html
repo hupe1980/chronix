@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="wrap layout">
+  <aside class="sidebar" aria-label="Section navigation">
+    <p class="sidebar-title">{{ section.title }}</p>
+    <nav>
+      <ul>
+      {% for p in section.pages %}
+        <li><a href="{{ p.permalink }}">{{ p.title }}</a></li>
+      {% endfor %}
+      </ul>
+    </nav>
+  </aside>
+
+  <article class="doc">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') }}">Chronix</a>
+      <span aria-hidden="true">/</span>
+      <span>{{ section.title }}</span>
+    </nav>
+
+    <h1>{{ section.title }}</h1>
+    <div class="prose">{{ section.content | safe }}</div>
+
+    <ul class="index-list">
+      {% for p in section.pages %}
+      <li>
+        <a href="{{ p.permalink }}"><strong>{{ p.title }}</strong></a>
+        {% if p.description %}<span>{{ p.description }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </article>
+</div>
+{% endblock %}

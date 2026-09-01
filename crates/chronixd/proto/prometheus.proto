@@ -1,0 +1,81 @@
+// Prometheus remote write/read wire protocol types.
+// Based on https://github.com/prometheus/prometheus/blob/main/prompb/types.proto
+// and https://github.com/prometheus/prometheus/blob/main/prompb/remote.proto
+
+syntax = "proto3";
+
+package prometheus;
+
+// ── Types ──────────────────────────────────────────────────────────────
+
+message Label {
+  string name  = 1;
+  string value = 2;
+}
+
+message Sample {
+  double value    = 1;
+  // Timestamp in milliseconds since epoch.
+  int64  timestamp = 2;
+}
+
+enum MetricType {
+  UNKNOWN        = 0;
+  COUNTER        = 1;
+  GAUGE          = 2;
+  SUMMARY        = 3;
+  HISTOGRAM      = 4;
+  GAUGE_HISTOGRAM = 5;
+  INFO           = 6;
+  STATESET       = 7;
+}
+
+message Exemplar {
+  repeated Label labels    = 1;
+  double         value     = 2;
+  int64          timestamp = 3;
+}
+
+message TimeSeries {
+  repeated Label    labels   = 1;
+  repeated Sample   samples  = 2;
+  repeated Exemplar exemplars = 3;
+}
+
+// ── Remote Write ───────────────────────────────────────────────────────
+
+message WriteRequest {
+  repeated TimeSeries timeseries = 1;
+}
+
+// ── Remote Read ────────────────────────────────────────────────────────
+
+message ReadRequest {
+  repeated Query queries = 1;
+}
+
+message ReadResponse {
+  repeated QueryResult results = 1;
+}
+
+message Query {
+  int64 start_timestamp_ms = 1;
+  int64 end_timestamp_ms   = 2;
+  repeated LabelMatcher matchers = 3;
+}
+
+message LabelMatcher {
+  enum Type {
+    EQ  = 0;
+    NEQ = 1;
+    RE  = 2;
+    NRE = 3;
+  }
+  Type   type  = 1;
+  string name  = 2;
+  string value = 3;
+}
+
+message QueryResult {
+  repeated TimeSeries timeseries = 1;
+}

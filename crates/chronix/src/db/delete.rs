@@ -1,0 +1,491 @@
+//! Delete-path methods for [`Chronix`] — drop, tombstone, hard-delete.
+
+use std::collections::BTreeMap;
+
+use metrics::counter;
+use tracing::{info, warn};
+
+use arrow::array::Array;
+use chronix_core::{wal_encode, SeriesKey, Tombstone, WalEntry};
+use chronix_engine::index::SegmentCatalogEntry;
+use chronix_engine::segment::reader::SegmentReader;
+use chronix_streaming::cdc::CdcEvent;
+
+use crate::delete::{DeleteBuilder, DeleteOutcome, DeleteRequest};
+use crate::error::{DbError, Result};
+
+impl super::Chronix {
+    /// Drop an entire measurement and all its data.
+    ///
+    /// This removes:
+    /// * All on-disk segments for the measurement
+    /// * The measurement schema from the catalog and registry
+    /// * Bloom filters for the dropped segments
+    /// * Time-index entries for the dropped segments
+    ///
+    /// In-flight memtable data is flushed first so that all data is in
+    /// segments before removal.  The cardinality tracker (`known_series`)
+    /// is cleared to reflect the reduced series universe — it will be
+    /// lazily rebuilt by subsequent inserts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is closed, flush fails, or
+    /// segment deletion encounters an I/O error.
+    pub fn drop_measurement(&self, measurement: &str) -> Result<()> {
+        self.check_open()?;
+
+        // When soft_delete_ttl is configured, mark the measurement
+        // as pending deletion instead of immediately removing data.
+        // The background GC pass will hard-delete it after the TTL elapses.
+        if let Some(ttl) = self.config.soft_delete_ttl {
+            let now_ms = super::chrono_timestamp_ms();
+            let deadline_ms = now_ms + ttl.as_millis() as u64;
+            {
+                let mut pending = self.pending_measurement_drops.write();
+                pending.insert(measurement.to_string(), deadline_ms);
+            }
+            info!(
+                measurement,
+                deadline_ms,
+                ttl_secs = ttl.as_secs(),
+                "Measurement marked for soft-delete; will be hard-deleted after TTL"
+            );
+
+            // Emit CDC event so subscribers know about the pending drop.
+            self.cdc_bus.publish(CdcEvent::MeasurementDropped {
+                measurement: measurement.to_string(),
+                seq: 0,
+            });
+
+            return Ok(());
+        }
+
+        // Original hard-delete path (soft_delete_ttl = None).
+        self.hard_delete_measurement(measurement)
+    }
+
+    /// Internal hard-delete implementation for a measurement.
+    ///
+    /// Flushes memtables, removes all segment files, cleans up catalog,
+    /// schema, indexes, and caches. Used by the immediate `drop_measurement`
+    pub(super) fn hard_delete_measurement(&self, measurement: &str) -> Result<()> {
+        // 1. Flush all shards so memtable data lands in segments
+        self.flush()?;
+
+        // 2. Collect segment IDs for this measurement
+        let entries: Vec<SegmentCatalogEntry> = {
+            let catalog = self.catalog.read();
+            catalog
+                .segments_for_measurement(measurement)
+                .into_iter()
+                .cloned()
+                .collect()
+        };
+
+        // 3. Delete segment files and remove from catalog
+        {
+            let mut catalog = self.catalog.write();
+            for entry in &entries {
+                // Remove segment file from disk (best-effort)
+                if let Err(e) = std::fs::remove_file(&entry.path) {
+                    warn!(
+                        path = %entry.path.display(),
+                        error = %e,
+                        "Failed to delete segment file"
+                    );
+                }
+                // Remove bloom sidecar file (best-effort)
+                let bloom_path = entry.path.with_extension("bloom");
+                if let Err(e) = std::fs::remove_file(&bloom_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!(path = %bloom_path.display(), error = %e, "failed to remove bloom sidecar");
+                    }
+                }
+                // Remove from catalog manifest
+                catalog.remove_segment(entry.segment_id)?;
+            }
+
+            // 4. Remove schema from catalog
+            catalog.remove_schema(measurement)?;
+        }
+
+        // 5. Remove schema from in-memory registry
+        let _ = self.schema.remove(measurement);
+
+        // 6. Clean up time-index and bloom entries for removed segments
+        {
+            let mut time_idx = self.time_index.write();
+            let mut blooms = self.blooms.write();
+            for entry in &entries {
+                if let Some(idx) = time_idx.get_mut(&entry.shard_id) {
+                    if !idx.remove_segment(entry.segment_id) {
+                        warn!(segment_id = ?entry.segment_id, "drop: time-index entry not found");
+                    }
+                }
+                blooms.remove(&entry.segment_id.0);
+            }
+        }
+
+        // 7. Reset cardinality tracker.
+        //
+        // Selectively remove only series belonging to the dropped measurement.
+        // Canonical forms are prefixed with `measurement\0`, so `starts_with`
+        // is unambiguous (NUL cannot appear in measurement or tag names).
+        {
+            let prefix = format!("{measurement}\0");
+            self.known_series
+                .retain(|canonical| !canonical.starts_with(&prefix));
+        }
+
+        // 8. Evict measurement from caches and inverted index
+        self.lvc.evict_measurement(measurement);
+        for entry in &entries {
+            self.tag_index.remove_segment(entry.segment_id);
+            self.metadata_cache.remove(entry.segment_id);
+            self.segment_cache.invalidate_segment(entry.segment_id);
+        }
+
+        info!(measurement, segments = entries.len(), "Measurement dropped");
+
+        // Emit CDC event for subscribers (seq auto-assigned by publish)
+        self.cdc_bus.publish(CdcEvent::MeasurementDropped {
+            measurement: measurement.to_string(),
+            seq: 0,
+        });
+
+        Ok(())
+    }
+
+    /// Delete every stored point of one series.
+    ///
+    /// "Every stored point" is meant literally, and the distinction matters:
+    /// the tombstone's upper bound is resolved to the newest timestamp the
+    /// series actually has, so a point written *afterwards* re-creates the
+    /// series rather than disappearing into a standing delete. Re-provisioning
+    /// a device under an identifier that had once been deleted is the ordinary
+    /// case here, and it used to discard everything the device sent.
+    ///
+    /// This delegates to [`execute_delete`](Self::execute_delete) rather than
+    /// repeating it. The two paths had drifted apart — one flushed first and
+    /// the other did not, and only one of them evicted the last-value cache —
+    /// which is the failure mode a shared implementation removes rather than
+    /// documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is closed or the delete fails.
+    pub fn delete_series(&self, measurement: &str, tags: &BTreeMap<String, String>) -> Result<()> {
+        let key = SeriesKey::new(measurement.to_string(), tags.clone())
+            .map_err(|e| DbError::Internal(format!("Invalid series key: {e}")))?;
+
+        let req = DeleteRequest {
+            measurement: measurement.to_string(),
+            tag_filters: tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            time_start: None,
+            time_end: None,
+        };
+        self.execute_delete(&req)?;
+
+        self.cdc_bus.publish(CdcEvent::SeriesDeleted {
+            measurement: measurement.to_string(),
+            tags: tags.clone(),
+            series_hash: key.hash_fnv(),
+            seq: 0,
+        });
+
+        Ok(())
+    }
+
+    /// Reclaim tombstones that can no longer mask anything.
+    ///
+    /// A tombstone records the segments it was issued against. A segment
+    /// leaves the catalog only by being rewritten — compaction applies
+    /// tombstones as it merges — or by being deleted outright, so once none of
+    /// a tombstone's segments remains, no stored row can still match it and
+    /// the tombstone is provably dead.
+    ///
+    /// See D44. Two rules used to sit here instead, and both resurrected data.
+    /// The first dropped a tombstone once its series had left `known_series`,
+    /// which the delete itself had just arranged — so it fired after the *next*
+    /// compaction pass regardless of whether that pass had touched the
+    /// segments holding the deleted rows. The second dropped a tombstone once
+    /// its measurement had no active segments, which is sound but never true
+    /// for a measurement that is still being written to. Neither asked the
+    /// question that matters: has the delete been materialised?
+    ///
+    /// Returns the number of tombstones reclaimed.
+    pub fn gc_tombstones(&self) -> usize {
+        let removed = {
+            let mut catalog = self.catalog.write();
+            match catalog.reclaim_tombstones() {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(error = %e, "failed to reclaim tombstones from the catalog");
+                    return 0;
+                }
+            }
+        };
+
+        if removed > 0 {
+            // Re-read rather than mirror the removals: the catalog is the
+            // authority on which tombstones exist, and keeping one copy in
+            // step with another by replaying edits is what let the two drift.
+            let refreshed = self.catalog.read().tombstones().clone();
+            *self.tombstones.write() = refreshed;
+
+            counter!("chronix_tombstone_gc_total").increment(removed as u64);
+            info!(reclaimed = removed, "GC: reclaimed materialised tombstones");
+        }
+        removed
+    }
+
+    // ── Predicate Delete ────────────────────────────────────────────
+
+    /// Create a new delete request builder.
+    ///
+    /// Returns a [`DeleteBuilder`] for ergonomic construction of
+    /// predicate-based delete requests.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// db.delete_builder()
+    ///     .measurement("cpu")
+    ///     .tag("host", "server-01")
+    ///     .before(cutoff_ts)
+    ///     .build()?;
+    /// ```
+    pub fn delete_builder(&self) -> DeleteBuilder {
+        DeleteBuilder::new()
+    }
+
+    /// Execute a predicate-based delete request.
+    ///
+    /// Every series matching the measurement and tag filters is tombstoned
+    /// over the request's time range. When the request names no range, the
+    /// upper bound is resolved **per series** to the newest timestamp that
+    /// series actually has, so the delete covers exactly the data that exists
+    /// and a later write re-creates the series.
+    ///
+    /// The delete is durable before this returns: the resolved tombstones are
+    /// appended to the catalog manifest and fsynced. They are logged to the
+    /// data WAL as well, so a point-in-time restore replays them, but the
+    /// catalog is what makes the delete survive a restart — the data WAL is
+    /// truncated once the memtable it covers has been flushed, and it used to
+    /// take every delete older than that flush with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is closed, or if the tombstones
+    /// cannot be persisted.
+    #[must_use = "delete errors must be handled"]
+    pub fn execute_delete(&self, req: &DeleteRequest) -> Result<DeleteOutcome> {
+        self.check_open()?;
+
+        // Flush all memtables so series not yet on disk are included in the scan.
+        let _ = self.flush()?;
+
+        let measurement = &req.measurement;
+        let (start, end) = req.effective_range();
+
+        // Find active segments for measurement in the time range
+        let entries: Vec<SegmentCatalogEntry> = {
+            let catalog = self.catalog.read();
+            catalog
+                .active_segments_for_measurement(measurement)
+                .into_iter()
+                .filter(|e| e.min_timestamp <= end && e.max_timestamp >= start)
+                .cloned()
+                .collect()
+        };
+
+        // Per matched series: the newest timestamp seen inside the requested
+        // window. That is the resolved upper bound for an unranged delete.
+        let mut matched: BTreeMap<String, (SeriesKey, i64)> = BTreeMap::new();
+
+        // Every segment scanned, including those that matched nothing: the
+        // tombstone is reclaimable only once all of them have been rewritten,
+        // and a segment that was skipped must keep it alive.
+        let mut scanned_segments: Vec<u64> = Vec::new();
+
+        // A segment that cannot be read is *not* deleted from. Count
+        // those so the caller can tell a complete delete from a partial one
+        // instead of receiving a plain success.
+        let mut segments_skipped: u64 = 0;
+
+        for entry in &entries {
+            scanned_segments.push(entry.segment_id.0);
+
+            let reader = match SegmentReader::open(&entry.path) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(segment = %entry.path.display(), error = %e, "Skipping unreadable segment in delete");
+                    segments_skipped += 1;
+                    continue;
+                }
+            };
+
+            let batch = match reader.read_all() {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(segment = %entry.path.display(), error = %e, "Failed to read segment in delete");
+                    segments_skipped += 1;
+                    continue;
+                }
+            };
+
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Build tag filter refs
+            let tag_refs: Vec<(&str, &str)> = req
+                .tag_filters
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+
+            let filtered = chronix_query::filter::filter_batch(&batch, start, end, &tag_refs)?;
+
+            if filtered.num_rows() == 0 {
+                continue;
+            }
+
+            // Tombstone all matching series hashes — use schema registry
+            // to identify actual tag columns (not just Utf8 fields).
+            let tags_col_names: Vec<String> = self
+                .schema(measurement)
+                .map(|ms| ms.tag_names().into_iter().map(String::from).collect())
+                .unwrap_or_else(|| {
+                    // Fallback: infer from Utf8 columns if schema is missing
+                    filtered
+                        .schema()
+                        .fields()
+                        .iter()
+                        .filter(|f| {
+                            f.name() != "timestamp"
+                                && f.data_type() == &arrow::datatypes::DataType::Utf8
+                        })
+                        .map(|f| f.name().clone())
+                        .collect()
+                });
+
+            // The newest timestamp per series is what resolves an unranged
+            // delete's upper bound, so the row loop cannot stop at the first
+            // row of a series the way it used to.
+            let ts_col = filtered
+                .column_by_name("timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
+                .ok_or_else(|| DbError::Internal("segment has no timestamp column".into()))?;
+
+            for row in 0..filtered.num_rows() {
+                let mut tags = BTreeMap::new();
+                for col_name in &tags_col_names {
+                    if let Some(col) = filtered.column_by_name(col_name) {
+                        if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>()
+                        {
+                            if arr.is_valid(row) {
+                                tags.insert(col_name.clone(), arr.value(row).to_string());
+                            }
+                        }
+                    }
+                }
+                let Ok(key) = SeriesKey::new(measurement.clone(), tags) else {
+                    continue;
+                };
+                let ts = ts_col.value(row);
+                matched
+                    .entry(key.canonical_form().to_string())
+                    .and_modify(|(_, max_ts)| *max_ts = (*max_ts).max(ts))
+                    .or_insert((key, ts));
+            }
+        }
+
+        // Resolve each match into a tombstone.
+        //
+        // The upper bound is the request's when it named one, and otherwise
+        // the newest timestamp that series actually has. Resolving it is what
+        // separates "delete what is stored" from "mask this series forever":
+        // the unranged form used to produce an open-ended tombstone, so every
+        // later write to the same series was accepted, logged, and then
+        // filtered out of every read.
+        let tombstones: Vec<Tombstone> = matched
+            .iter()
+            .map(|(canonical, (_, max_ts))| {
+                let upper = req.time_end.unwrap_or(*max_ts);
+                Tombstone::ranged(canonical.clone(), start, upper)
+                    .with_segments(scanned_segments.iter().copied())
+            })
+            .collect();
+
+        let tombstoned_count = tombstones.len() as u64;
+
+        if !tombstones.is_empty() {
+            // Persist before touching in-memory state, so a crash in the
+            // middle leaves a database that has either applied the delete or
+            // not seen it — never one that shows it and forgets it on restart.
+            //
+            // The catalog append is the durable record; the WAL entry exists
+            // so that a point-in-time restore from a base backup replays the
+            // delete rather than silently resurrecting the rows.
+            let payload = wal_encode(&WalEntry::Delete {
+                tombstones: tombstones.clone(),
+            })
+            .map_err(|e| DbError::Internal(format!("Failed to serialize WAL entry: {e}")))?;
+            self.wal.append_durable(&payload)?;
+
+            self.catalog
+                .write()
+                .record_tombstones(&tombstones)
+                .map_err(|e| DbError::Internal(format!("Failed to persist tombstones: {e}")))?;
+
+            {
+                let mut live = self.tombstones.write();
+                for tombstone in &tombstones {
+                    live.insert(tombstone.clone());
+                }
+            }
+
+            // `known_series` is the cardinality budget, and a series is
+            // released from it only by a delete that covered all of that
+            // series — which is exactly an unbounded request. A ranged delete
+            // leaves the series alive, and releasing it there under-counts the
+            // budget.
+            //
+            // Note the bound that is *not* usable here: the per-series maximum
+            // collected above is the maximum inside the scanned window, so
+            // comparing it against `time_end` is vacuous — it can never exceed
+            // it. A `[.., X]` delete on a series holding data after `X` has to
+            // read as partial, and only an absent bound proves it is not.
+            let covers_whole_series = req.time_start.is_none() && req.time_end.is_none();
+            for (canonical, (key, _)) in &matched {
+                if covers_whole_series {
+                    self.known_series.remove(canonical.as_str());
+                }
+                self.lvc.evict_by_key(key);
+            }
+        }
+
+        if segments_skipped > 0 {
+            warn!(
+                measurement,
+                segments_skipped,
+                "Predicate delete was PARTIAL — some segments could not be scanned"
+            );
+            metrics::counter!("chronix_delete_segments_skipped_total").increment(segments_skipped);
+        }
+
+        info!(
+            measurement,
+            tombstoned = tombstoned_count,
+            segments_scanned = entries.len(),
+            segments_skipped,
+            "Predicate delete complete (durable in the catalog manifest)"
+        );
+        Ok(DeleteOutcome {
+            series_tombstoned: tombstoned_count,
+            segments_skipped,
+        })
+    }
+}

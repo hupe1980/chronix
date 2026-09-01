@@ -1,0 +1,92 @@
+[package]
+name = "chronix-analytics"
+description = "Analytics engine for Chronix — preprocessing, forecasting, anomaly detection, multivariate analysis, model lifecycle, and streaming analytics on a SIMD/rayon CPU compute core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["forecasting", "anomaly", "timeseries", "analytics", "arima"]
+categories = ["science", "algorithms"]
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+# docs.rs builds with default features unless told otherwise, which would
+# publish documentation with the feature-gated surface missing entirely — the
+# cold tier, the security modules and Flight are all off by default.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+doctest = false
+
+[features]
+default = []
+## Delegate LU/QR to system BLAS/LAPACK for optimised large-matrix performance.
+
+[dependencies]
+chronix-core.workspace = true
+chronix-streaming.workspace = true
+
+# Numerics
+rand.workspace = true
+rayon.workspace = true
+
+# Arrow interop (zero-copy preprocessing adapters)
+arrow.workspace = true
+
+# Model persistence
+postcard.workspace = true
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Concurrency
+dashmap.workspace = true
+parking_lot.workspace = true
+
+# Observability
+metrics.workspace = true
+tracing.workspace = true
+
+# Hashing (registry plugin allowlist)
+sha2.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# LAPACK (feature-gated)
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+serde_json.workspace = true
+
+[[bench]]
+name = "compute_bench"
+harness = false
+
+[[bench]]
+name = "preprocess_bench"
+harness = false
+
+[[bench]]
+name = "forecast_bench"
+harness = false
+
+[[bench]]
+name = "anomaly_bench"
+harness = false
+
+[[bench]]
+name = "multivariate_bench"
+harness = false
+
+[lints]
+workspace = true

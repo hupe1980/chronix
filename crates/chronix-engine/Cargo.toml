@@ -1,0 +1,104 @@
+[package]
+name = "chronix-engine"
+description = "Storage engine for Chronix — WAL, memtable, columnar segments, indexes, compaction, and caches"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["timeseries", "database", "lsm", "storage", "tsdb"]
+categories = ["database-implementations"]
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+# docs.rs builds with default features unless told otherwise, which would
+# publish documentation with the feature-gated surface missing entirely — the
+# cold tier, the security modules and Flight are all off by default.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+doctest = false
+
+[features]
+default = ["field-encryption"]
+## AES-256-GCM encryption support in the segment layer.
+field-encryption = ["dep:aes-gcm"]
+## S3/GCS/Azure object storage backend for cold-data tiering.
+object-store = ["dep:object_store", "dep:url", "dep:parquet", "dep:tempfile"]
+
+[dependencies]
+chronix-core.workspace = true
+chronix-encoding.workspace = true
+chronix-security.workspace = true
+
+# Columnar interop
+arrow.workspace = true
+# Parquet is the cold-tier format (D6); only pulled in with `object-store`.
+parquet = { workspace = true, optional = true }
+
+# Compression & integrity
+crc32c.workspace = true
+lz4_flex.workspace = true
+zstd.workspace = true
+
+# Memory-mapped I/O
+memmap2.workspace = true
+
+# Concurrency
+crossbeam-epoch.workspace = true
+crossbeam-skiplist.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+futures.workspace = true
+
+# Serialization
+postcard.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+# Hashing & misc
+bytes.workspace = true
+fnv.workspace = true
+rand.workspace = true
+
+# Observability
+metrics.workspace = true
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Encryption (feature-gated)
+aes-gcm = { workspace = true, optional = true }
+
+# Object storage (feature-gated)
+object_store = { workspace = true, optional = true }
+# Scratch space for the cold-tier re-encode (the segment reader mmaps).
+tempfile = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+
+[[bench]]
+name = "wal_bench"
+harness = false
+
+[[bench]]
+name = "segment_bench"
+harness = false
+
+[[bench]]
+name = "memtable_bench"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,259 @@
+//! Compact binary codec for WAL entries.
+//!
+//! All records use the binary v1 format (version-prefixed + `postcard`
+//! serialisation of the variant fields). Legacy JSON is **not** supported.
+//!
+//! ## Wire format (v1)
+//!
+//! ```text
+//! [1 byte  version = 0x01]
+//! [1 byte  variant discriminant]
+//! [N bytes postcard-encoded variant fields]
+//! ```
+//!
+//! Discriminants:
+//! - `0x00` → `WalEntry::Write { point }`
+//! - `0x01` → `WalEntry::Delete { tombstones }`
+//! - `0x02` → `WalEntry::SchemaChange { actions }`
+
+use crate::types::{Point, WalEntry};
+use std::fmt;
+
+/// Binary version prefix.
+const WAL_BINARY_V1: u8 = 0x01;
+
+// Variant discriminants.
+const DISC_WRITE: u8 = 0x00;
+const DISC_DELETE: u8 = 0x01;
+const DISC_SCHEMA_CHANGE: u8 = 0x02;
+
+/// Errors produced by the WAL codec.
+#[derive(Debug)]
+pub enum CodecError {
+    /// The payload is empty or too short to contain a valid record.
+    Truncated,
+    /// The version prefix is not recognised (e.g. legacy JSON or corrupt data).
+    UnknownVersion(u8),
+    /// The binary discriminant byte is not recognised.
+    UnknownDiscriminant(u8),
+    /// `postcard` serialisation/deserialisation failed.
+    Postcard(postcard::Error),
+}
+
+impl fmt::Display for CodecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "WAL record truncated"),
+            Self::UnknownVersion(v) => write!(f, "unknown WAL version prefix: 0x{v:02x}"),
+            Self::UnknownDiscriminant(d) => write!(f, "unknown WAL binary discriminant: 0x{d:02x}"),
+            Self::Postcard(e) => write!(f, "WAL postcard error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Postcard(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<postcard::Error> for CodecError {
+    fn from(e: postcard::Error) -> Self {
+        Self::Postcard(e)
+    }
+}
+
+/// Encode a [`WalEntry`] into the compact binary v1 format.
+///
+/// The returned `Vec<u8>` can be passed directly to the WAL writer.
+/// The encoding is ~5–10× smaller and faster than the previous JSON format.
+/// # Errors
+///
+/// Returns [`CodecError::Postcard`] when postcard serialization fails.
+pub fn encode(entry: &WalEntry) -> Result<Vec<u8>, CodecError> {
+    // Pre-allocate a reasonable buffer (version byte + discriminant + payload).
+    let mut buf = Vec::with_capacity(256);
+    buf.push(WAL_BINARY_V1);
+
+    match entry {
+        WalEntry::Write { point } => {
+            buf.push(DISC_WRITE);
+            let data = postcard::to_stdvec(point)?;
+            buf.extend_from_slice(&data);
+        }
+        WalEntry::Delete { tombstones } => {
+            buf.push(DISC_DELETE);
+            let data = postcard::to_stdvec(tombstones)?;
+            buf.extend_from_slice(&data);
+        }
+        WalEntry::SchemaChange { actions } => {
+            buf.push(DISC_SCHEMA_CHANGE);
+            let data = postcard::to_stdvec(actions)?;
+            buf.extend_from_slice(&data);
+        }
+    }
+
+    Ok(buf)
+}
+
+/// Encode a single write-point directly without constructing a [`WalEntry`].
+///
+/// This avoids the `Point::clone()` that would otherwise be needed to build
+/// a `WalEntry::Write { point }` variant.  On the hot write path — especially
+/// batch inserts — this eliminates one `String` + `Vec` heap allocation per
+/// point.
+/// # Errors
+///
+/// Returns [`CodecError::Postcard`] when postcard serialization fails.
+pub fn encode_write_point(point: &Point) -> Result<Vec<u8>, CodecError> {
+    let mut buf = Vec::with_capacity(256);
+    buf.push(WAL_BINARY_V1);
+    buf.push(DISC_WRITE);
+    let data = postcard::to_stdvec(point)?;
+    buf.extend_from_slice(&data);
+    Ok(buf)
+}
+
+/// Decode a WAL payload into a [`WalEntry`].
+///
+/// Only binary v1 records (starting with `0x01`) are accepted.
+/// Legacy JSON records are rejected with [`CodecError::UnknownVersion`].
+/// # Errors
+///
+/// Returns [`CodecError::Truncated`] on short input,
+/// [`CodecError::UnknownVersion`] / [`CodecError::UnknownDiscriminant`] on
+/// unrecognised bytes, and a deserialization error on corrupt payloads.
+#[allow(clippy::indexing_slicing)] // all accesses guarded by explicit length checks above them
+pub fn decode(data: &[u8]) -> Result<WalEntry, CodecError> {
+    if data.is_empty() {
+        return Err(CodecError::Truncated);
+    }
+
+    if data[0] != WAL_BINARY_V1 {
+        return Err(CodecError::UnknownVersion(data[0]));
+    }
+
+    if data.len() < 2 {
+        return Err(CodecError::Truncated);
+    }
+
+    let payload = &data[2..];
+    match data[1] {
+        DISC_WRITE => {
+            let point: Point = postcard::from_bytes(payload)?;
+            Ok(WalEntry::Write { point })
+        }
+        DISC_DELETE => {
+            let tombstones: Vec<crate::types::Tombstone> = postcard::from_bytes(payload)?;
+            Ok(WalEntry::Delete { tombstones })
+        }
+        DISC_SCHEMA_CHANGE => {
+            let actions: Vec<crate::schema::SchemaAction> = postcard::from_bytes(payload)?;
+            Ok(WalEntry::SchemaChange { actions })
+        }
+        d => Err(CodecError::UnknownDiscriminant(d)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FieldValue, SeriesKey, Tombstone};
+    use std::collections::BTreeMap;
+
+    fn sample_point() -> Point {
+        let key = SeriesKey::new("cpu", BTreeMap::from([("host".into(), "srv-1".into())])).unwrap();
+        let fields = BTreeMap::from([("value".to_string(), FieldValue::F64(42.5))]);
+        Point::new(key, fields, 1_000_000_000).unwrap()
+    }
+
+    #[test]
+    fn write_roundtrip() {
+        let entry = WalEntry::Write {
+            point: sample_point(),
+        };
+        let encoded = encode(&entry).unwrap();
+        assert_eq!(encoded[0], WAL_BINARY_V1);
+        assert_eq!(encoded[1], DISC_WRITE);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn delete_roundtrip_preserves_the_time_range() {
+        // The range is the point: the previous encoding stored the *request*
+        // and rebuilt unranged tombstones on replay, so a one-hour delete
+        // became a whole-series delete after a restart.
+        let entry = WalEntry::Delete {
+            tombstones: vec![
+                Tombstone::ranged("cpu\0host=srv-1", 100, 200),
+                Tombstone::ranged("cpu\0host=srv-2", i64::MIN, 5_000).with_segments([1, 2, 3]),
+            ],
+        };
+        let encoded = encode(&entry).unwrap();
+        assert_eq!(encoded[1], DISC_DELETE);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn decode_json_rejected_with_unknown_version() {
+        // JSON starts with `{` (0x7B) — must be rejected, not silently decoded.
+        let json = b"{\"Write\":{}}";
+        let err = decode(json).unwrap_err();
+        assert!(
+            matches!(err, CodecError::UnknownVersion(0x7B)),
+            "expected UnknownVersion(0x7B), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_empty_payload_returns_error() {
+        assert!(decode(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_truncated_binary_returns_error() {
+        assert!(decode(&[WAL_BINARY_V1]).is_err());
+    }
+
+    #[test]
+    fn decode_unknown_discriminant_returns_error() {
+        assert!(decode(&[WAL_BINARY_V1, 0xFF, 0x00]).is_err());
+    }
+
+    #[test]
+    fn schema_change_roundtrip() {
+        use crate::schema::{ColumnDef, ColumnRole, ColumnType, MeasurementSchema, SchemaAction};
+
+        let actions = vec![
+            SchemaAction::CreateMeasurement(MeasurementSchema::new("cpu")),
+            SchemaAction::AddColumn {
+                measurement: "cpu".to_string(),
+                column: ColumnDef {
+                    name: "host".to_string(),
+                    column_type: ColumnType::String,
+                    role: ColumnRole::Tag,
+                },
+            },
+            SchemaAction::AddColumn {
+                measurement: "cpu".to_string(),
+                column: ColumnDef {
+                    name: "value".to_string(),
+                    column_type: ColumnType::F64,
+                    role: ColumnRole::Field,
+                },
+            },
+        ];
+
+        let entry = WalEntry::SchemaChange { actions };
+        let encoded = encode(&entry).unwrap();
+        assert_eq!(encoded[0], WAL_BINARY_V1);
+        assert_eq!(encoded[1], DISC_SCHEMA_CHANGE);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(entry, decoded);
+    }
+}

@@ -1,0 +1,197 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping Chronix metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Object Store Put Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_objstore_put_duration_seconds_bucket[5m]))",
+          "legendFormat": "Put p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_objstore_put_duration_seconds_bucket[5m]))",
+          "legendFormat": "Put p99"
+        }
+      ]
+    },
+    {
+      "title": "Object Store Get Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_objstore_get_duration_seconds_bucket[5m]))",
+          "legendFormat": "Get p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_objstore_get_duration_seconds_bucket[5m]))",
+          "legendFormat": "Get p99"
+        }
+      ]
+    },
+    {
+      "title": "Cache Hit Ratio",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(chronix_objstore_cache_hits_total[5m]) / (rate(chronix_objstore_cache_hits_total[5m]) + rate(chronix_objstore_cache_misses_total[5m]))",
+          "legendFormat": "Hit Ratio"
+        }
+      ]
+    },
+    {
+      "title": "Cache Hits & Misses (rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      },
+      "targets": [
+        {
+          "expr": "rate(chronix_objstore_cache_hits_total[5m])",
+          "legendFormat": "Hits/s"
+        },
+        {
+          "expr": "rate(chronix_objstore_cache_misses_total[5m])",
+          "legendFormat": "Misses/s"
+        }
+      ]
+    },
+    {
+      "title": "WAL Segment Write Duration",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_wal_write_duration_seconds_bucket[5m]))",
+          "legendFormat": "WAL Write p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_wal_write_duration_seconds_bucket[5m]))",
+          "legendFormat": "WAL Write p99"
+        }
+      ]
+    },
+    {
+      "title": "Segment Compaction Duration",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_compaction_duration_seconds_bucket[5m]))",
+          "legendFormat": "Compaction p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_compaction_duration_seconds_bucket[5m]))",
+          "legendFormat": "Compaction p99"
+        }
+      ]
+    },
+    {
+      "title": "Tiering Operations (rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "rate(chronix_objstore_tiering_operations_total[5m])",
+          "legendFormat": "Tiering ops/s"
+        }
+      ]
+    },
+    {
+      "title": "Local Disk Usage",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50000000000 },
+              { "color": "red", "value": 90000000000 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "chronix_storage_disk_usage_bytes",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["chronix", "storage", "tiering"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Chronix — Storage & Tiering",
+  "uid": "chronix-storage",
+  "version": 1
+}

@@ -1,0 +1,39 @@
+[package]
+name = "chronix-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+keywords = ["timeseries", "query", "database", "arrow", "sql"]
+categories = ["database-implementations"]
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Query engine for the Chronix time-series database"
+
+# docs.rs builds with default features unless told otherwise, which would
+# publish documentation with the feature-gated surface missing entirely — the
+# cold tier, the security modules and Flight are all off by default.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+doctest = false
+
+[dependencies]
+chronix-core.workspace = true
+chronix-encoding.workspace = true
+chronix-engine.workspace = true
+arrow.workspace = true
+fnv.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

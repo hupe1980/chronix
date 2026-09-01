@@ -1,0 +1,71 @@
+[package]
+name = "chronix-streaming"
+description = "Reactive layer for Chronix — CDC event streaming, subscriptions, continuous aggregations, and programmable signals"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["timeseries", "cdc", "streaming", "triggers", "database"]
+categories = ["database-implementations"]
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+# docs.rs builds with default features unless told otherwise, which would
+# publish documentation with the feature-gated surface missing entirely — the
+# cold tier, the security modules and Flight are all off by default.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+doctest = false
+
+[features]
+default = []
+## Enable Arrow Flight CDC export (adds arrow, arrow-flight, tonic, prost deps).
+flight = ["dep:arrow", "dep:arrow-flight", "dep:tonic", "dep:prost"]
+
+[dependencies]
+chronix-core.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async
+tokio = { workspace = true }
+tokio-stream.workspace = true
+
+# Concurrency
+dashmap.workspace = true
+parking_lot.workspace = true
+
+# Signal delivery
+fnv.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+uuid.workspace = true
+
+# Observability
+metrics.workspace = true
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Optional deps for the `flight` feature
+arrow = { workspace = true, optional = true }
+arrow-flight = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

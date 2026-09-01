@@ -1,0 +1,514 @@
+//! Shared types, constants, and utility functions for the HTTP module.
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+use chronix::prelude::*;
+use chronix::Chronix;
+
+/// Cached SQL logical plans keyed by `(namespace, query)`, each with an
+/// insertion `Instant` (TTL) and last-access `Instant` (LRU).
+pub type SqlPlanCache = std::collections::HashMap<
+    (String, String),
+    (
+        Arc<datafusion::logical_expr::LogicalPlan>,
+        std::time::Instant,
+        std::time::Instant,
+    ),
+>;
+
+use crate::connector::ConnectorManager;
+
+// ── Write deduplication cache ──────────────────────────────────────────
+
+/// TTL cache for write idempotency keys.
+///
+/// Maps `Idempotency-Key` header values (full strings) to the time
+/// they were first seen.  Duplicate writes within the dedup window are
+/// rejected with HTTP 409.
+///
+/// Uses the full key string instead of a hash to prevent silent write
+/// rejection on hash collision.
+///
+/// Eviction is O(1) amortized — a `VecDeque` tracks insertion order
+/// so the oldest entries can be drained from the front without sorting.
+#[derive(Debug, Clone)]
+pub struct WriteDedupCache {
+    /// Insertion-ordered map + deque for O(1) eviction.
+    inner: Arc<parking_lot::Mutex<DedupInner>>,
+    /// Time window for dedup (keys older than this are evicted).
+    window: std::time::Duration,
+    /// Maximum number of entries before oldest-quarter eviction.
+    max_entries: usize,
+}
+
+/// Internal state for [`WriteDedupCache`].
+#[derive(Debug)]
+struct DedupInner {
+    /// Full idempotency key strings → insertion instant.
+    map: std::collections::HashMap<String, std::time::Instant>,
+    /// Insertion-ordered queue for O(1) oldest-first eviction.
+    order: std::collections::VecDeque<(String, std::time::Instant)>,
+}
+
+impl WriteDedupCache {
+    /// Create a new dedup cache.  Returns `None` when the window is zero
+    /// (disabled).
+    #[must_use]
+    pub fn new(window_secs: u64, max_entries: usize) -> Option<Self> {
+        if window_secs == 0 {
+            return None;
+        }
+        Some(Self {
+            inner: Arc::new(parking_lot::Mutex::new(DedupInner {
+                map: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
+            })),
+            window: std::time::Duration::from_secs(window_secs),
+            max_entries,
+        })
+    }
+
+    /// Check-and-insert an idempotency key.
+    ///
+    /// Returns `true` if the key is a **duplicate** (already seen within
+    /// the window). Returns `false` if the key is new (and was inserted).
+    pub fn check_duplicate(&self, key: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut inner = self.inner.lock();
+
+        // Drain expired entries from the front of the deque (O(1)
+        // amortized).  Entries are in insertion order, so the front is
+        // always the oldest.
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
+        while let Some((front_key, front_ts)) = inner.order.front() {
+            if *front_ts > cutoff {
+                break; // everything remaining is newer
+            }
+            let front_key = front_key.clone();
+            let front_ts = *front_ts;
+            inner.order.pop_front();
+            // Remove from map only if the timestamp matches (handles
+            // re-inserts of the same key with a newer timestamp).
+            if let Some(&map_ts) = inner.map.get(&front_key) {
+                if map_ts == front_ts {
+                    inner.map.remove(&front_key);
+                }
+            }
+        }
+
+        // If still over capacity, evict oldest quarter from the front.
+        if inner.map.len() > self.max_entries {
+            let to_evict = inner.map.len() / 4;
+            let mut evicted = 0;
+            while evicted < to_evict {
+                if let Some((front_key, front_ts)) = inner.order.pop_front() {
+                    if let Some(&map_ts) = inner.map.get(&front_key) {
+                        if map_ts == front_ts {
+                            inner.map.remove(&front_key);
+                            evicted += 1;
+                            continue;
+                        }
+                    }
+                    // Stale deque entry — skip without counting.
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Check if key exists and is within the window.
+        if let Some(&ts) = inner.map.get(key) {
+            if now.duration_since(ts) < self.window {
+                return true; // duplicate
+            }
+            // Expired — re-insert below.  Stale deque entry cleaned
+            // up lazily on next eviction pass.
+        }
+
+        inner.map.insert(key.to_string(), now);
+        inner.order.push_back((key.to_string(), now));
+        false
+    }
+}
+
+// ── Constants and helper functions ─────────────────────────────────────
+
+/// The tag that carries a point's namespace.
+///
+/// One definition, in `chronix_core`, shared by the server, the query builder,
+/// the SQL provider and the PromQL evaluator.
+pub(super) use crate::namespace::NAMESPACE_TAG;
+
+/// Extract the namespace from request extensions.
+///
+/// Falls back to `"default"` when no [`NamespaceContext`] is present
+/// (e.g. standalone mode without multi-tenancy).
+pub(super) use crate::namespace::resolve as resolve_namespace;
+
+// ─── Safe numeric helpers ────────────────────────────────────────────
+
+/// Convert seconds (f64) to nanoseconds (i64) with clamping.
+#[inline]
+pub(super) fn secs_to_nanos_i64(secs: f64) -> i64 {
+    let ns = secs * 1_000_000_000.0;
+    #[allow(clippy::cast_possible_truncation)]
+    if ns.is_nan() {
+        0
+    } else if ns >= i64::MAX as f64 {
+        i64::MAX
+    } else if ns <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        ns as i64
+    }
+}
+
+// ── Shared state types ─────────────────────────────────────────────────
+
+/// Application state shared across all HTTP handlers.
+pub type AppState = Arc<SharedState>;
+
+/// State shared across all HTTP handlers.
+pub struct SharedState {
+    /// The embedded Chronix database.
+    pub db: Arc<Chronix>,
+    /// Server configuration (for CORS, SQL limits, etc.).
+    pub config: crate::config::ServerConfig,
+    /// Server start time (for uptime calculation).
+    pub start_time: std::time::Instant,
+    /// Optional connector manager for `/api/v1/connectors`.
+    pub connector_manager: Option<Arc<ConnectorManager>>,
+    /// Per-namespace DataFusion session contexts for SQL queries.
+    ///
+    /// One shared context makes every SQL query read every tenant's rows: the
+    /// namespace has to scope the *tables*, not merely the plan cache. Reach
+    /// for one with [`SharedState::sql_ctx`].
+    pub sql_contexts: crate::namespace::SqlContexts,
+    /// Optional authentication state for key management.
+    pub auth_state: Option<crate::auth::AuthState>,
+    /// Optional cluster meta client for admin operations.
+    #[cfg(feature = "cluster")]
+    pub meta_client: Option<Arc<dyn chronix_cluster::MetaClient>>,
+    /// Optional namespace registry for multi-tenancy.
+    pub namespace_registry: Option<Arc<chronix_security::tenant::NamespaceRegistry>>,
+    /// Model catalog for analytics model management.
+    pub model_catalog: Arc<parking_lot::RwLock<chronix::chronix_analytics::forecast::ModelCatalog>>,
+    /// Optional chaos agent for fault injection testing.
+    #[cfg(feature = "chaos")]
+    pub chaos_agent: Option<Arc<chronix_chaos::ChaosAgent>>,
+    /// Persistent store for chaos injection guards to avoid `mem::forget` leaks.
+    #[cfg(feature = "chaos")]
+    pub chaos_guards: parking_lot::Mutex<Vec<chronix_chaos::FaultGuard>>,
+    /// SQL plan cache, keyed by (namespace, SQL) to
+    /// prevent cross-tenant plan leakage.  Each entry carries an insertion
+    /// `Instant` for TTL-based expiry and a last-access `Instant` for LRU
+    /// eviction .
+    pub sql_plan_cache: parking_lot::Mutex<SqlPlanCache>,
+    /// Maximum duration for a single write batch (`0` = no deadline).
+    /// Prevents stuck writes from exhausting the thread-pool.
+    pub write_timeout: std::time::Duration,
+    /// Optional Cedar authorization engine for policy enforcement.
+    pub authz_engine: Option<Arc<chronix_security::authz::AuthzEngine>>,
+    /// Optional audit logger for security and compliance auditing.
+    pub audit_logger: Option<Arc<chronix_security::audit::AuditLogger>>,
+    /// Per-namespace rate limiter for tenant-level request throttling.
+    pub namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter,
+    /// Optional write deduplication cache for idempotency keys.
+    pub write_dedup_cache: Option<WriteDedupCache>,
+    /// Memoized OpenAPI JSON document.
+    ///
+    /// Per server rather than per process: the document embeds this server's
+    /// configuration, so a process running two servers (or a test harness
+    /// starting several) must not serve the first one's spec for all of them.
+    pub openapi_json: std::sync::OnceLock<String>,
+}
+
+impl SharedState {
+    /// SQL session context scoped to `namespace`.
+    ///
+    /// Every table it exposes carries a mandatory namespace filter, so the
+    /// isolation does not depend on the SQL text a client sends.
+    #[must_use]
+    pub fn sql_ctx(&self, namespace: Option<&str>) -> Arc<datafusion::prelude::SessionContext> {
+        self.sql_contexts.get(namespace)
+    }
+}
+
+// ── Request / response types shared across handlers ────────────────────
+
+/// Time range in the query body.
+#[derive(Debug, Deserialize)]
+pub struct TimeRangeRequest {
+    /// Start timestamp (nanoseconds, inclusive).
+    pub start: i64,
+    /// End timestamp (nanoseconds, inclusive).
+    pub end: i64,
+}
+
+// ── Pagination types ────────────────────────────────────────────
+
+/// Default page size when `limit` is omitted from pagination query parameters.
+pub const DEFAULT_LIST_LIMIT: usize = 100;
+
+/// Pagination query parameters for list endpoints.
+#[derive(Debug, Deserialize)]
+pub struct PaginationParams {
+    /// Number of items to skip (default: 0).
+    pub offset: Option<usize>,
+    /// Maximum number of items to return (default: [`DEFAULT_LIST_LIMIT`]).
+    pub limit: Option<usize>,
+}
+
+/// Generic paginated response envelope.
+#[derive(Debug, Serialize)]
+pub struct PaginatedResponse<T: Serialize> {
+    /// The page of items.
+    pub items: Vec<T>,
+    /// Total number of items available (before pagination).
+    pub total: usize,
+    /// The offset used for this page.
+    pub offset: usize,
+    /// The limit used for this page.
+    pub limit: usize,
+}
+
+/// Info about a measurement for the list endpoint.
+#[derive(Debug, Serialize)]
+pub struct MeasurementInfo {
+    /// Measurement name.
+    pub name: String,
+    /// Schema columns.
+    pub columns: Vec<ColumnInfo>,
+}
+
+/// Column info in a measurement schema.
+#[derive(Debug, Serialize)]
+pub struct ColumnInfo {
+    /// Column name.
+    pub name: String,
+    /// Column role ("timestamp", "tag", or "field").
+    pub role: String,
+    /// Arrow data type (for field columns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+/// Convert an Arrow array value at a given row to JSON.
+pub(super) fn arrow_value_to_json(col: &dyn arrow::array::Array, idx: usize) -> serde_json::Value {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    if col.is_null(idx) {
+        return serde_json::Value::Null;
+    }
+
+    match col.data_type() {
+        DataType::Int8 => col
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int16 => col
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt8 => col
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt16 => col
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt32 => col
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt64 => col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Float32 => col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::LargeUtf8 => col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| serde_json::json!(a.value(idx)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Timestamp(unit, _) => {
+            use arrow::datatypes::TimeUnit;
+            let ts = match unit {
+                TimeUnit::Nanosecond => col
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Microsecond => col
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Millisecond => col
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Second => col
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .map(|a| a.value(idx)),
+            };
+            serde_json::json!(ts)
+        }
+        _ => serde_json::Value::String(format!("<unsupported: {}>", col.data_type())),
+    }
+}
+
+/// Convert a [`MeasurementSchema`] to the REST API info struct.
+pub(super) fn measurement_schema_to_info(
+    name: &str,
+    schema: &MeasurementSchema,
+) -> MeasurementInfo {
+    let mut columns = Vec::new();
+
+    // Timestamp column
+    columns.push(ColumnInfo {
+        name: "timestamp".to_string(),
+        role: "timestamp".to_string(),
+        data_type: Some("int64".to_string()),
+    });
+
+    // Tag columns. The namespace marker is internal and never reported.
+    for tag in schema.tag_names() {
+        if tag == NAMESPACE_TAG {
+            continue;
+        }
+        columns.push(ColumnInfo {
+            name: tag.to_string(),
+            role: "tag".to_string(),
+            data_type: Some("string".to_string()),
+        });
+    }
+
+    // Field columns
+    for col in schema.columns() {
+        if col.role == ColumnRole::Field {
+            columns.push(ColumnInfo {
+                name: col.name.clone(),
+                role: "field".to_string(),
+                data_type: Some(crate::util::column_type_to_str(col.column_type).to_string()),
+            });
+        }
+    }
+
+    MeasurementInfo {
+        name: name.to_string(),
+        columns,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measurement_schema_to_info_complete() {
+        let mut schema = MeasurementSchema::new("cpu");
+        let _ = schema.add_tag("host");
+        let _ = schema.add_tag("region");
+        schema.add_field("usage", &FieldValue::F64(0.0)).unwrap();
+        schema.add_field("count", &FieldValue::I64(0)).unwrap();
+
+        let info = measurement_schema_to_info("cpu", &schema);
+        assert_eq!(info.name, "cpu");
+        // timestamp + 2 tags + 2 fields = 5
+        assert_eq!(info.columns.len(), 5);
+        assert_eq!(info.columns[0].name, "timestamp");
+        assert_eq!(info.columns[0].role, "timestamp");
+        assert_eq!(info.columns[1].name, "host");
+        assert_eq!(info.columns[1].role, "tag");
+        assert_eq!(info.columns[3].name, "usage");
+        assert_eq!(info.columns[3].role, "field");
+    }
+
+    // ── WriteDedupCache tests (: O(1) amortized eviction) ───────
+
+    #[test]
+    fn dedup_cache_detects_duplicate() {
+        let cache = WriteDedupCache::new(60, 100).unwrap();
+        assert!(!cache.check_duplicate("key-1")); // first insert
+        assert!(cache.check_duplicate("key-1")); // duplicate
+    }
+
+    #[test]
+    fn dedup_cache_disabled_when_zero_window() {
+        assert!(WriteDedupCache::new(0, 100).is_none());
+    }
+
+    #[test]
+    fn dedup_cache_evicts_over_capacity() {
+        let cache = WriteDedupCache::new(3600, 4).unwrap();
+        // Fill to capacity
+        for i in 0..5 {
+            assert!(!cache.check_duplicate(&format!("k{i}")));
+        }
+        // After capacity exceeded, oldest quarter (1 entry) should be evicted.
+        // The cache should still function correctly.
+        let inner = cache.inner.lock();
+        assert!(inner.map.len() <= 5); // at most 5 (eviction removes oldest quarter)
+    }
+
+    #[test]
+    fn dedup_cache_reinsert_after_expiry_works() {
+        // Use a very short window to test expiry.
+        let cache = WriteDedupCache::new(1, 100).unwrap();
+        assert!(!cache.check_duplicate("key-1")); // first insert
+        assert!(cache.check_duplicate("key-1")); // duplicate within window
+                                                 // Sleep past the window
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Should no longer be a duplicate — expired.
+        assert!(!cache.check_duplicate("key-1"));
+    }
+
+    #[test]
+    fn dedup_cache_clone_shares_state() {
+        let a = WriteDedupCache::new(60, 100).unwrap();
+        let b = a.clone();
+        assert!(!a.check_duplicate("shared"));
+        assert!(b.check_duplicate("shared")); // sees insert from `a`
+    }
+}

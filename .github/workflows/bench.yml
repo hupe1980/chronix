@@ -1,0 +1,106 @@
+name: Benchmarks
+
+# A performance regression used to be found by somebody running Criterion on
+# purpose. This job runs it instead.
+#
+# The comparison is against the pull request's **merge base**, measured on the
+# same runner in the same job. That matters: GitHub's shared runners vary by
+# well over 20% between jobs, so a gate that compares against a number committed
+# to the repository measures the runner, not the change. Measuring both sides
+# back to back cancels most of that out.
+#
+# It is deliberately *not* part of the required CI set. A benchmark gate that
+# blocks merges on a noisy signal trains people to re-run it, which is how a
+# test stops being read (QUALITY.md §3).
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Regression threshold, percent"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  compare:
+    name: Criterion vs merge base
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install critcmp
+        run: cargo install critcmp --locked
+
+      # The subset is the hot paths with a claim attached to them
+      # (concepts/QUALITY.md §2): the codecs, the WAL and memtable write path,
+      # and the end-to-end engine benches. The analytics and server benches are
+      # slower and are left to the scheduled full run.
+      - name: Benchmark the pull request
+        run: |
+          set -euo pipefail
+          cargo bench -p chronix-encoding -p chronix-engine -p chronix --benches -- \
+            --warm-up-time 1 --measurement-time 5 --save-baseline pr
+
+      - name: Check out the merge base
+        run: |
+          set -euo pipefail
+          BASE=$(git merge-base HEAD "origin/${{ github.base_ref || 'main' }}")
+          echo "merge base: $BASE"
+          git checkout --detach "$BASE"
+
+      - name: Benchmark the merge base
+        run: |
+          set -euo pipefail
+          cargo bench -p chronix-encoding -p chronix-engine -p chronix --benches -- \
+            --warm-up-time 1 --measurement-time 5 --save-baseline base
+
+      - name: Compare
+        id: compare
+        run: |
+          set -euo pipefail
+          THRESHOLD="${{ github.event.inputs.threshold || '20' }}"
+          critcmp base pr | tee /tmp/critcmp.txt
+          # critcmp exits 0 regardless, so the threshold is applied here.
+          # Column 2 is the base ratio, column 5 the pr ratio; a ratio of 1.00
+          # marks the faster side, so a regression shows as pr > 1 + threshold.
+          python3 - "$THRESHOLD" <<'PY'
+          import re, sys
+          threshold = float(sys.argv[1]) / 100.0
+          regressions = []
+          for line in open('/tmp/critcmp.txt'):
+              m = re.match(r'^(\S+)\s+(\d+\.\d+)\s.*?\s(\d+\.\d+)\s', line)
+              if not m:
+                  continue
+              name, base_ratio, pr_ratio = m.group(1), float(m.group(2)), float(m.group(3))
+              if pr_ratio > 1.0 + threshold:
+                  regressions.append((name, pr_ratio))
+          if regressions:
+              print(f"::error::{len(regressions)} benchmark(s) regressed by more than {threshold:.0%}")
+              for name, ratio in regressions:
+                  print(f"::error::{name} is {ratio:.2f}x the merge base")
+              sys.exit(1)
+          print(f"No benchmark regressed by more than {threshold:.0%}")
+          PY
+
+      - name: Upload comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-comparison
+          path: /tmp/critcmp.txt

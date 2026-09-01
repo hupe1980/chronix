@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="wrap band">
+  <p class="eyebrow">404</p>
+  <h1>That page moved or never existed.</h1>
+  <p class="lede">
+    The documentation was reorganised: one 3,400-line architecture page became
+    a page per subsystem, and the guide, internals and reference are now
+    separate sections. An old deep link is the most likely cause.
+  </p>
+  <div class="cards compact" style="margin-top:2rem">
+    <a class="card link" href="{{ get_url(path='@/docs/_index.md') }}">
+      <h3>Guide</h3><p>Install, API, operations, security.</p></a>
+    <a class="card link" href="{{ get_url(path='@/internals/_index.md') }}">
+      <h3>Internals</h3><p>How the engine works, and why.</p></a>
+    <a class="card link" href="{{ get_url(path='@/reference/_index.md') }}">
+      <h3>Reference</h3><p>The implementation, subsystem by subsystem.</p></a>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,90 @@
+syntax = "proto3";
+package chronix.data.v1;
+
+/// A single field value in a data point.
+message FieldValue {
+    oneof kind {
+        double f64_value = 1;
+        int64 i64_value = 2;
+        uint64 u64_value = 3;
+        bool bool_value = 4;
+        string string_value = 5;
+    }
+}
+
+/// A named field with its value.
+message FieldEntry {
+    string name = 1;
+    FieldValue value = 2;
+}
+
+/// A single time-series data point for inter-node transfer.
+message DataPoint {
+    string measurement = 1;
+    map<string, string> tags = 2;
+    repeated FieldEntry fields = 3;
+    int64 timestamp_ns = 4;
+}
+
+/// Write a batch of points to a region.
+message WriteRegionRequest {
+    uint64 region_id = 1;
+    repeated DataPoint points = 2;
+}
+
+/// Result of a region write.
+message WriteRegionResponse {
+    uint64 written = 1;
+}
+
+/// A tag-based equality filter.
+message TagFilter {
+    string key = 1;
+    string value = 2;
+}
+
+/// Query a region's local data.
+message QueryRegionRequest {
+    uint64 region_id = 1;
+    string measurement = 2;
+    int64 start_ns = 3;
+    int64 end_ns = 4;
+    repeated TagFilter tag_filters = 5;
+    repeated string field_columns = 6;
+    uint64 limit = 7;
+    /// RAFT-05: When true, the server verifies Raft leadership via
+    /// ReadIndex before serving the read, ensuring linearizability.
+    bool require_linearizable = 8;
+}
+
+/// Result of a region query.
+message QueryRegionResponse {
+    repeated DataPoint points = 1;
+}
+
+/// A WAL entry for replication.
+message WalReplicationEntry {
+    uint64 sequence = 1;
+    bytes data = 2;
+}
+
+/// Replicate WAL entries to a follower region.
+message ReplicateRequest {
+    uint64 region_id = 1;
+    repeated WalReplicationEntry entries = 2;
+}
+
+/// Result of a WAL replication.
+message ReplicateResponse {
+    uint64 applied = 1;
+}
+
+/// DataNode gRPC service — region-level read/write/replicate operations.
+service DataService {
+    /// Write a batch of points to a region's local storage.
+    rpc WriteRegion(WriteRegionRequest) returns (WriteRegionResponse);
+    /// Query a region's local data store.
+    rpc QueryRegion(QueryRegionRequest) returns (QueryRegionResponse);
+    /// Replicate WAL entries from the region leader to a follower.
+    rpc ReplicateWal(ReplicateRequest) returns (ReplicateResponse);
+}

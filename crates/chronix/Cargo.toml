@@ -1,0 +1,110 @@
+[package]
+name = "chronix"
+description = "Chronix — an embedded, analytics-optimised time-series database."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["timeseries", "database", "tsdb", "embedded", "analytics"]
+categories = ["database-implementations", "database", "embedded"]
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+# docs.rs builds with default features unless told otherwise, which would
+# publish documentation with the feature-gated surface missing entirely — the
+# cold tier, the security modules and Flight are all off by default.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+doctest = false
+
+[features]
+default = []
+## Parquet cold tier on S3/GCS/Azure, queryable through SQL (D6).
+object-store = ["chronix-engine/object-store", "dep:object_store", "dep:url"]
+
+[dependencies]
+chronix-core.workspace = true
+chronix-encoding.workspace = true
+chronix-query.workspace = true
+chronix-engine.workspace = true
+chronix-streaming.workspace = true
+chronix-analytics.workspace = true
+chronix-security.workspace = true
+arrow.workspace = true
+dashmap.workspace = true
+datafusion.workspace = true
+fs2.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+parking_lot.workspace = true
+parquet.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+uuid.workspace = true
+rayon.workspace = true
+regex.workspace = true
+chrono-tz.workspace = true
+
+# Cold tier (feature-gated)
+object_store = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+criterion = { workspace = true }
+chronix-chaos.workspace = true
+
+[[bench]]
+name = "chronix_bench"
+harness = false
+
+# Examples are auto-discovered from `examples/`; only the feature-gated one
+# needs a declaration. They used to live at the workspace root and be wired up
+# with 27 `path = "../../examples/..."` entries — which `cargo package` cannot
+# include, so the published crate declared 27 example targets whose sources
+# were absent and the verification build failed.
+[[example]]
+name = "cold_tier"
+required-features = ["object-store"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[lints]
+workspace = true

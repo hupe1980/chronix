@@ -1,0 +1,44 @@
+[package]
+name = "chronix-dsim"
+description = "Deterministic simulation testing for Chronix distributed systems"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Frozen tier / dev tooling — not part of the release (D8).
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+# Internal crates
+chronix-chaos = { workspace = true }
+chronix-meta = { workspace = true }
+
+# Deterministic randomness
+rand = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Data structures
+parking_lot = { workspace = true }
+
+# Consensus
+openraft = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

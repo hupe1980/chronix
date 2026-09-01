@@ -1,0 +1,46 @@
+[package]
+name = "chronix-meta"
+description = "Raft-replicated metadata store for Chronix cluster coordination"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Frozen tier / dev tooling — not part of the release (D8).
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+chronix-core.workspace = true
+
+openraft.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+redb.workspace = true
+futures.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build = "0.14"
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

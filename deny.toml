@@ -1,0 +1,71 @@
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# Each entry states why it is accepted and what would clear it. An `ignore`
+# without a reason is how an advisory list stops being read.
+ignore = [
+  # rustls-pemfile — unmaintained; its functionality moved into
+  # rustls-pki-types 1.9+. Chronix's own use is migrated (see
+  # chronixd::tls), but `axum-server` still depends on it transitively, so
+  # the crate stays in the graph until that upstream moves. No vulnerability.
+  "RUSTSEC-2025-0134",
+
+  # quick-xml < 0.41 — two denial-of-service parsing bugs, pulled in only by
+  # `object_store`, which pins `^0.39`. Reachable only when parsing an XML
+  # response from an S3/Azure endpoint, i.e. from the object store the
+  # operator configured, and only with the optional `object-store` feature
+  # enabled. Clears when object_store relaxes its quick-xml requirement;
+  # re-check on every object_store bump.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
+
+[licenses]
+# Chronix is MIT OR Apache-2.0. Everything below is a permissive licence that
+# imposes no obligation beyond attribution, grouped by why it appears.
+allow = [
+  # The ecosystem baseline.
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  # Unicode data tables (icu, unicode-ident).
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  # Apache-2.0 with the LLVM linking exception — strictly more permissive than
+  # plain Apache-2.0 (ar_archive_writer, and the Rust toolchain's own crates).
+  "Apache-2.0 WITH LLVM-exception",
+  # zlib-rs and foldhash. Permissive, attribution-only.
+  "Zlib",
+  # tiny-keccak. A public-domain dedication; no obligations at all.
+  "CC0-1.0",
+  # webpki-roots — the Mozilla CA bundle ships under the Community Data
+  # Licence Agreement, which is a data licence rather than a code licence.
+  "CDLA-Permissive-2.0",
+  # libbz2-rs-sys. The bzip2 licence is BSD-style.
+  "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+
+# aws-lc-sys declares "ISC AND (Apache-2.0 OR ISC) AND OpenSSL". The OpenSSL
+# clause covers vendored BoringSSL-derived C, and is an advertising-clause-free
+# permissive licence; it is accepted for this crate only rather than allowed
+# globally, because a blanket `OpenSSL` allow would also permit the far more
+# awkward OpenSSL 1.x combination elsewhere. It reaches the graph through
+# rustls feature unification (bollard/hyper-rustls enable the aws-lc-rs
+# backend), not through a chronix dependency.
+[[licenses.exceptions]]
+name = "aws-lc-sys"
+allow = ["OpenSSL"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

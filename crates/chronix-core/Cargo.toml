@@ -1,0 +1,42 @@
+[package]
+name = "chronix-core"
+description = "Core data model, types, errors, and configuration for the Chronix time-series database"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["timeseries", "database", "tsdb", "metrics"]
+categories = ["database-implementations", "data-structures"]
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+# docs.rs builds with default features unless told otherwise, which would
+# publish documentation with the feature-gated surface missing entirely — the
+# cold tier, the security modules and Flight are all off by default.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+doctest = false
+
+[dependencies]
+postcard = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+fnv = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

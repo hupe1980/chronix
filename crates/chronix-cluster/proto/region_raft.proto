@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package chronix.region_raft.v1;
+
+// ── Region Raft inter-node transport ────────────────────────────────────
+//
+// Multi-Raft overlay: each request carries a `region_id` so the server
+// can demux to the correct per-region Raft group.  Payloads are
+// bincode-serialised OpenRaft messages (same approach as Meta Raft).
+
+/// Region-scoped Raft RPC request.
+message RegionRaftRequest {
+    /// Target region Raft group.
+    uint64 region_id = 1;
+    /// Bincode-encoded OpenRaft request body.
+    bytes data = 2;
+}
+
+/// Region-scoped Raft RPC response.
+message RegionRaftResponse {
+    /// Bincode-encoded OpenRaft response body.
+    bytes data = 1;
+}
+
+/// Region Raft service — one instance per DataNode, demuxes by region_id.
+service RegionRaftService {
+    /// Append log entries to a region's Raft group.
+    rpc AppendEntries(RegionRaftRequest) returns (RegionRaftResponse);
+    /// Request a vote from a region's Raft group.
+    rpc Vote(RegionRaftRequest) returns (RegionRaftResponse);
+    /// Install a snapshot on a region's Raft group.
+    rpc InstallSnapshot(RegionRaftRequest) returns (RegionRaftResponse);
+}

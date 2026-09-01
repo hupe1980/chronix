@@ -1,0 +1,7 @@
+# Chronix clippy configuration
+too-many-arguments-threshold = 8
+# Production code stays strict; test code may unwrap/index freely.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true

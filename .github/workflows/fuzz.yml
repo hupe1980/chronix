@@ -1,0 +1,55 @@
+name: Fuzz
+
+# Nightly, plus on demand. The three targets are the adversarial half of the
+# decoder-robustness story: `crates/chronix-encoding/tests/decoder_robustness.rs`
+# is the deterministic few seconds that runs on every commit, and this is the
+# coverage-guided run that finds what a proptest generator never will.
+#
+# It exists because that test file said it did. A comment claiming a scheduled
+# fuzz job, with no such job in the tree, is the same defect class as a fuzz
+# target whose comment claimed 21 encodings while it reached 12 (R3).
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: "Seconds to run each target"
+        required: false
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_column_decoder
+          - fuzz_segment_reader
+          - fuzz_wal_reader
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-fuzz needs nightly for the sanitizer instrumentation.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ github.event.inputs.duration_secs || 300 }} \
+            -rss_limit_mb=2048
+      # A crash is the finding; keep the input so it can be replayed and
+      # turned into a regression test.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

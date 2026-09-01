@@ -1,0 +1,171 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping Chronix metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "GPU Compute Duration by Operation",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_gpu_compute_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50 {{op}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_gpu_compute_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99 {{op}}"
+        }
+      ]
+    },
+    {
+      "title": "GPU Memory Budget",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      },
+      "targets": [
+        {
+          "expr": "chronix_gpu_memory_budget_bytes",
+          "legendFormat": "Budget"
+        }
+      ]
+    },
+    {
+      "title": "GPU Buffer Pool",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      },
+      "targets": [
+        {
+          "expr": "chronix_gpu_pool_allocated_bytes",
+          "legendFormat": "Allocated"
+        }
+      ]
+    },
+    {
+      "title": "GPU Pool Cached Buffers",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "chronix_gpu_pool_cached_buffers",
+          "legendFormat": "Cached"
+        }
+      ]
+    },
+    {
+      "title": "GPU Sub-batches (rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        {
+          "expr": "rate(chronix_gpu_sub_batches_total[5m])",
+          "legendFormat": "{{op}}"
+        }
+      ]
+    },
+    {
+      "title": "Compute Engine Dispatch Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      },
+      "targets": [
+        {
+          "expr": "rate(chronix_gpu_compute_duration_seconds_count[5m])",
+          "legendFormat": "GPU {{op}}"
+        }
+      ]
+    },
+    {
+      "title": "Forecast Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_forecast_fit_duration_seconds_bucket[5m]))",
+          "legendFormat": "Fit p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_forecast_fit_duration_seconds_bucket[5m]))",
+          "legendFormat": "Fit p99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_forecast_predict_duration_seconds_bucket[5m]))",
+          "legendFormat": "Predict p50"
+        }
+      ]
+    },
+    {
+      "title": "Anomaly Detection Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_anomaly_detect_duration_seconds_bucket[5m]))",
+          "legendFormat": "Detect p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_anomaly_detect_duration_seconds_bucket[5m]))",
+          "legendFormat": "Detect p99"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["chronix", "analytics", "gpu"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Chronix — Analytics & GPU",
+  "uid": "chronix-analytics",
+  "version": 1
+}

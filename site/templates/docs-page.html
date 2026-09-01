@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block og_type %}article{% endblock %}
+
+{% block structured_data %}
+{{ super() }}
+<script type="application/ld+json">
+{{ {
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": page.title,
+  "description": page.description,
+  "url": page.permalink,
+  "inLanguage": "en",
+  "isPartOf": {"@type": "WebSite", "name": config.title, "url": config.base_url},
+  "author": {"@type": "Person", "name": config.extra.author | default(value="hupe1980")}
+} | json_encode() | safe }}
+</script>
+{#- Breadcrumbs are what turns a URL into a readable path in a search result.
+    `section` is not bound on a page template, so the parent is looked up. -#}
+{%- set parent = get_section(path=page.ancestors | last) -%}
+<script type="application/ld+json">
+{{ {
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  "itemListElement": [
+    {"@type": "ListItem", "position": 1, "name": "Chronix", "item": config.base_url},
+    {"@type": "ListItem", "position": 2, "name": parent.title, "item": parent.permalink},
+    {"@type": "ListItem", "position": 3, "name": page.title, "item": page.permalink}
+  ]
+} | json_encode() | safe }}
+</script>
+{% endblock %}
+
+{% block content %}
+<div class="wrap layout">
+  {% set sect = get_section(path=page.ancestors | last) %}
+
+  <aside class="sidebar" aria-label="Section navigation">
+    <p class="sidebar-title">{{ sect.title }}</p>
+    <nav>
+      <ul>
+      {% for p in sect.pages %}
+        <li><a href="{{ p.permalink }}"{% if p.permalink == page.permalink %} aria-current="page"{% endif %}>{{ p.title }}</a></li>
+      {% endfor %}
+      </ul>
+    </nav>
+  </aside>
+
+  <article class="doc">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') }}">Chronix</a>
+      <span aria-hidden="true">/</span>
+      <a href="{{ sect.permalink }}">{{ sect.title }}</a>
+    </nav>
+
+    <h1>{{ page.title }}</h1>
+    {% if page.description %}<p class="doc-lede">{{ page.description }}</p>{% endif %}
+
+    {% if page.toc | length > 1 %}
+    <details class="toc" open>
+      <summary>On this page</summary>
+      <ul>
+      {% for h in page.toc %}
+        <li><a href="{{ h.permalink | safe }}">{{ h.title }}</a>
+        {% if h.children | length > 0 %}
+          <ul>{% for c in h.children %}<li><a href="{{ c.permalink | safe }}">{{ c.title }}</a></li>{% endfor %}</ul>
+        {% endif %}
+        </li>
+      {% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+
+    <div class="prose">
+      {{ page.content | safe }}
+    </div>
+
+    <nav class="pager" aria-label="Pagination">
+      {% if page.lower %}<a class="prev" href="{{ page.lower.permalink }}"><span>Previous</span>{{ page.lower.title }}</a>{% endif %}
+      {% if page.higher %}<a class="next" href="{{ page.higher.permalink }}"><span>Next</span>{{ page.higher.title }}</a>{% endif %}
+    </nav>
+
+    <p class="edit">
+      <a href="{{ config.extra.repo_url }}/edit/main/{{ page.extra.source | default(value='site/content/' ~ page.relative_path) }}" rel="noopener">Improve this page on GitHub</a>
+    </p>
+  </article>
+</div>
+{% endblock %}

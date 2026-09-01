@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package chronix.raft.v1;
+
+// ── Raft inter-node transport ──────────────────────────────────────────
+//
+// Carries serialised OpenRaft messages between MetaNode peers.
+// Payloads are serde-JSON encoded so the proto layer stays thin and
+// forward-compatible with OpenRaft type changes.
+
+/// Generic Raft RPC request — wraps a JSON-serialised OpenRaft message.
+message RaftRequest {
+  /// JSON-encoded request body (AppendEntriesRequest, VoteRequest, etc.)
+  bytes data = 1;
+}
+
+/// Generic Raft RPC response — wraps a JSON-serialised OpenRaft response.
+message RaftResponse {
+  /// JSON-encoded response body.
+  bytes data = 1;
+}
+
+/// Snapshot chunk for streaming snapshot installation.
+message SnapshotChunk {
+  /// JSON-encoded Vote.
+  bytes vote = 1;
+  /// Serialised snapshot data (bincode).
+  bytes data = 2;
+  /// Offset within the snapshot stream.
+  uint64 offset = 3;
+  /// True if this is the final chunk.
+  bool done = 4;
+}
+
+/// Raft inter-node service for MetaNode cluster communication.
+service RaftService {
+  /// Replicate log entries from leader to follower.
+  rpc AppendEntries(RaftRequest) returns (RaftResponse);
+
+  /// Request votes during leader election.
+  rpc Vote(RaftRequest) returns (RaftResponse);
+
+  /// Install a full state-machine snapshot on a follower.
+  rpc InstallSnapshot(RaftRequest) returns (RaftResponse);
+}

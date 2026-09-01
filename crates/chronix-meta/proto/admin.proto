@@ -1,0 +1,165 @@
+syntax = "proto3";
+
+package chronix.admin.v1;
+
+// ── MetaNode Admin API ─────────────────────────────────────────────────
+//
+// Cluster administration service exposed by MetaNode leaders.
+// DataNodes, QueryNodes, and admin tools use this API to register nodes,
+// send heartbeats, manage regions, and query cluster metadata.
+
+/// A data node descriptor sent during registration.
+message NodeInfo {
+  uint64 node_id = 1;
+  string grpc_addr = 2;
+  /// "data" | "query" | "meta"
+  string mode = 3;
+  uint64 disk_capacity_bytes = 4;
+  uint64 memory_bytes = 5;
+  uint32 cpu_cores = 6;
+}
+
+/// Heartbeat sent periodically by DataNodes.
+message HeartbeatRequest {
+  uint64 node_id = 1;
+  uint64 generation = 2;
+  /// UNIX timestamp (seconds) on the sending node.
+  uint64 timestamp_secs = 3;
+}
+
+/// Region descriptor for creation.
+message RegionSpec {
+  uint64 region_id = 1;
+  string measurement = 2;
+  uint64 leader_node_id = 3;
+  repeated uint64 replica_node_ids = 4;
+  uint32 replication_factor = 5;
+}
+
+/// Replica address entry (node_id + address).
+message ReplicaAddr {
+  uint64 node_id = 1;
+  string addr = 2;
+}
+
+/// Routing entry returned in routing table queries.
+message RouteEntryProto {
+  uint64 region_id = 1;
+  string measurement = 2;
+  uint64 leader_node_id = 3;
+  string leader_addr = 4;
+  repeated ReplicaAddr replica_addrs = 5;
+}
+
+/// Group of route entries for one measurement.
+message RouteEntryGroup {
+  string measurement = 1;
+  repeated RouteEntryProto entries = 2;
+}
+
+/// Full routing table snapshot.
+message RoutingTableResponse {
+  uint64 version = 1;
+  repeated RouteEntryGroup groups = 2;
+}
+
+/// Cluster config values.
+message ClusterConfigProto {
+  string cluster_name = 1;
+  uint32 default_replication_factor = 2;
+  uint32 default_region_count = 3;
+  uint32 heartbeat_interval_secs = 4;
+  uint32 suspect_threshold = 5;
+  uint32 dead_threshold = 6;
+  uint32 max_concurrent_rereplications = 7;
+}
+
+/// Generic metadata command (JSON-serialised MetaCommand).
+message ProposeRequest {
+  /// JSON-encoded MetaCommand.
+  bytes command = 1;
+}
+
+/// Generic metadata response (JSON-serialised MetaResponse).
+message ProposeResponse {
+  /// JSON-encoded MetaResponse.
+  bytes response = 1;
+}
+
+/// Membership change: add a voter/learner node to the Raft group.
+message AddNodeRequest {
+  uint64 node_id = 1;
+  string grpc_addr = 2;
+  /// If true, add as a learner first (non-voting).
+  bool as_learner = 3;
+}
+
+/// Membership change: remove a node from the Raft group.
+message RemoveNodeRequest {
+  uint64 node_id = 1;
+}
+
+/// Empty response for simple acknowledgments.
+message Ack {}
+
+/// Cluster node list response.
+message NodeListResponse {
+  repeated NodeInfo nodes = 1;
+  /// The current Raft leader node ID (0 if unknown).
+  uint64 leader_id = 2;
+}
+
+/// Request to get cluster info (empty).
+message ClusterInfoRequest {}
+
+/// Cluster info response.
+message ClusterInfoResponse {
+  uint64 leader_id = 1;
+  repeated uint64 voter_ids = 2;
+  repeated uint64 learner_ids = 3;
+  ClusterConfigProto config = 4;
+  uint64 committed_log_index = 5;
+}
+
+/// MetaNode admin service — cluster management operations.
+service MetaAdminService {
+  // ── Node lifecycle ──
+
+  /// Register a DataNode or QueryNode with the cluster.
+  rpc RegisterNode(NodeInfo) returns (Ack);
+
+  /// Deregister a node from the cluster.
+  rpc DeregisterNode(RemoveNodeRequest) returns (Ack);
+
+  /// DataNode heartbeat — must be called periodically.
+  rpc Heartbeat(HeartbeatRequest) returns (Ack);
+
+  // ── Region management ──
+
+  /// Create a new data region.
+  rpc CreateRegion(RegionSpec) returns (Ack);
+
+  /// Get the current routing table snapshot.
+  rpc GetRoutingTable(Ack) returns (RoutingTableResponse);
+
+  // ── Generic Raft proposal ──
+
+  /// Propose an arbitrary MetaCommand through Raft consensus.
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+
+  // ── Raft membership ──
+
+  /// Add a node to the Raft voter/learner set.
+  rpc AddRaftNode(AddNodeRequest) returns (Ack);
+
+  /// Remove a node from the Raft group.
+  rpc RemoveRaftNode(RemoveNodeRequest) returns (Ack);
+
+  // ── Cluster info ──
+
+  /// List registered data/query nodes.
+  rpc ListNodes(Ack) returns (NodeListResponse);
+
+  /// Get cluster health and membership info.
+  rpc GetClusterInfo(ClusterInfoRequest) returns (ClusterInfoResponse);
+}

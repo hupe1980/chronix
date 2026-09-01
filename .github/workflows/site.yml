@@ -1,0 +1,67 @@
+name: Deploy site
+
+# Publishes the documentation site to GitHub Pages from `main`.
+#
+# Kept separate from CI because it needs `pages: write` and an environment,
+# and because a docs deploy failing should not read as the test suite failing.
+# CI still *builds* the site on every pull request — this workflow only adds
+# publication.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; a queued run supersedes an older one rather than
+# racing it, but an in-flight deploy is allowed to finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zola
+        run: |
+          set -euo pipefail
+          VERSION=v0.21.0
+          curl -sSL "https://github.com/getzola/zola/releases/download/${VERSION}/zola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+          zola --version
+
+      - uses: actions/configure-pages@v5
+        id: pages
+
+      # `base_url` must match where the site is actually served, or every
+      # absolute URL — canonical tags, Open Graph, the sitemap — points at a
+      # host that does not serve it.
+      - name: Build
+        working-directory: site
+        run: zola build --base-url "${{ steps.pages.outputs.base_url }}"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

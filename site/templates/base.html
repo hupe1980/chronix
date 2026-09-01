@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="{{ lang | default(value=config.default_language) }}"{% block htmlclass %}{% endblock %}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Title and description drive both the browser tab and the search snippet.
+    Zola binds `page` on page templates and `section` on section templates and
+    neither on others, so each is resolved explicitly rather than assumed. -#}
+{%- if page is defined -%}
+  {%- set page_title = page.title -%}
+  {%- set page_desc = page.description | default(value=config.description) -%}
+{%- elif section is defined -%}
+  {%- set page_title = section.title -%}
+  {%- set page_desc = section.description | default(value=config.description) -%}
+{%- else -%}
+  {%- set page_title = config.title -%}
+  {%- set page_desc = config.description -%}
+{%- endif -%}
+{#- The 404 page renders with neither `page` nor `section` bound, so the
+    fallbacks are applied unconditionally rather than relying on the branch
+    above having run. `default` protects a bare name; it does not protect a
+    field access on an undefined one, which is why the branch exists at all. -#}
+{%- set page_title = page_title | default(value=config.title) -%}
+{%- set page_desc = page_desc | default(value=config.description) -%}
+{%- set bare_title = false -%}
+{%- if page is defined -%}{%- set bare_title = page.extra.bare_title | default(value=false) -%}
+{%- elif section is defined -%}{%- set bare_title = section.extra.bare_title | default(value=false) -%}{%- endif -%}
+{%- set canonical = current_url | default(value=config.base_url) -%}
+
+{#- Search results truncate a title around 60 characters, so the site name is
+    appended only when it is not already in the page title. -#}
+<title>{% if page_title == config.title %}{{ config.title }} — {{ config.extra.tagline }}{% elif bare_title %}{{ page_title }}{% else %}{{ page_title }} · {{ config.title }}{% endif %}</title>
+<meta name="description" content="{{ page_desc }}">
+<link rel="canonical" href="{{ canonical }}">
+
+{#- Open Graph / Twitter: what link previews in Slack, GitHub and search use. -#}
+<meta property="og:type" content="{% block og_type %}website{% endblock %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ page_title }}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ canonical }}">
+<meta property="og:image" content="{{ get_url(path=config.extra.og_image, trailing_slash=false) }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ page_title }}">
+<meta name="twitter:description" content="{{ page_desc }}">
+<meta name="twitter:image" content="{{ get_url(path=config.extra.og_image, trailing_slash=false) }}">
+
+<meta name="theme-color" content="#0b0f14" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="color-scheme" content="light dark">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg', trailing_slash=false) }}" type="image/svg+xml">
+<link rel="alternate" type="application/atom+xml" title="{{ config.title }}" href="{{ get_url(path='atom.xml', trailing_slash=false) }}">
+<link rel="stylesheet" href="{{ get_url(path='main.css', trailing_slash=false) | safe }}">
+{#- Class-based syntax highlighting: every token carries both a `.z-l-*` (light)
+    and a `.z-d-*` (dark) class, so the dark sheet is loaded behind a media
+    query and simply does not apply in light mode. No JavaScript, no flash. -#}
+<link rel="stylesheet" href="{{ get_url(path='giallo-light.css', trailing_slash=false) | safe }}">
+<link rel="stylesheet" href="{{ get_url(path='giallo-dark.css', trailing_slash=false) | safe }}" media="(prefers-color-scheme: dark)">
+
+{% block structured_data %}
+<script type="application/ld+json">
+{{ {
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "Chronix",
+  "description": config.description,
+  "url": config.base_url,
+  "codeRepository": config.extra.repo_url,
+  "programmingLanguage": "Rust",
+  "license": "https://spdx.org/licenses/MIT.html",
+  "author": {"@type": "Person", "name": config.extra.author | default(value="hupe1980")}
+} | json_encode() | safe }}
+</script>
+{% endblock %}
+
+{% block head %}{% endblock %}
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="{{ get_url(path='@/_index.md') }}">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Chronix</span>
+    </a>
+    <nav class="topnav" aria-label="Main">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Guide</a>
+      <a href="{{ get_url(path='@/internals/_index.md') }}">Internals</a>
+      <a href="{{ get_url(path='@/reference/_index.md') }}">Reference</a>
+      <a href="{{ config.extra.docsrs_url }}" rel="noopener">API&nbsp;docs</a>
+      <a class="ghlink" href="{{ config.extra.repo_url }}" rel="noopener">GitHub</a>
+    </nav>
+    <div class="search" id="search-box" hidden>
+      <label class="visually-hidden" for="search-input">Search the documentation</label>
+      <input id="search-input" type="search" placeholder="Search docs…" autocomplete="off" spellcheck="false">
+      <div id="search-results" role="listbox" aria-label="Search results"></div>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+{% block content %}{% endblock %}
+</main>
+
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>Chronix</strong> {{ config.extra.version }} — {{ config.extra.license }}.
+      Built in Rust.
+    </p>
+    <nav aria-label="Footer">
+      <a href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a href="{{ config.extra.crates_url }}" rel="noopener">crates.io</a>
+      <a href="{{ config.extra.docsrs_url }}" rel="noopener">docs.rs</a>
+      <a href="{{ config.extra.repo_url }}" rel="noopener">Source</a>
+    </nav>
+  </div>
+</footer>
+
+<script src="{{ get_url(path='elasticlunr.min.js', trailing_slash=false) | safe }}" defer></script>
+<script src="{{ get_url(path='search_index.en.js', trailing_slash=false) | safe }}" defer></script>
+<script src="{{ get_url(path='search.js', trailing_slash=false) | safe }}" defer></script>
+</body>
+</html>

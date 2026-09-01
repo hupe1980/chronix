@@ -1,0 +1,292 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Default members = the product (engine, analytics, streaming,
+      # security, facade, server). The frozen cluster tier has its own job.
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  cross-aarch64:
+    # The first deployment target is an aarch64 Linux gateway
+    # (512 MB–1 GB RAM, eMMC/SD). Keep the embedded build compiling for it.
+    #
+    # musl is checked alongside gnu because it is the target that *proves* the
+    # no-C-toolchain claim: a dependency with a build script that shells out to
+    # cmake compiles on the gnu host and falls over here. Nothing in the
+    # release graph builds C any more (D38, D41), and this is what keeps that
+    # true rather than asserted. The design partner asked for both.
+    name: Cross-compile (aarch64 Linux, ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p chronix -p chronixd --target ${{ matrix.target }}
+      # The connectors are the features most likely to reintroduce a C
+      # dependency, so they are cross-checked rather than assumed.
+      - run: cargo check -p chronixd --features all-connectors --target ${{ matrix.target }}
+
+  frozen-tier:
+    # The distributed cluster tier is frozen (no active development) but
+    # must keep compiling — see concepts/CLUSTER.md.
+    name: Frozen cluster tier (compile check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p chronix-meta -p chronix-cluster -p chronix-dsim
+      # `cargo check` is a weaker floor than it reads as: the frozen tier once
+      # stopped *clippy-compiling* while this job stayed green (R14). Lints are
+      # not denied here — the frozen tier is compile-checked, not lint-clean —
+      # but a deny-level lint must not go unnoticed.
+      - run: cargo clippy -p chronix-meta -p chronix-cluster -p chronix-dsim --all-targets
+      - run: cargo check -p chronixd --features cluster,chaos
+
+  features:
+    # Optional features are not covered by the default build, so nothing
+    # compiled them and `otlp` silently stopped building. Every feature flag
+    # gets built and tested here.
+    name: Optional features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p chronixd --features otlp
+      - run: cargo check -p chronixd --features all-connectors --all-targets
+      - run: cargo test -p chronix-engine --features field-encryption
+      - run: cargo check -p chronix-engine --features object-store --all-targets
+      - run: cargo test -p chronix-engine --features object-store objstore
+      - run: cargo test -p chronix --features object-store --lib cold_tier
+      # The archive is the only operation that removes data from the hot tier,
+      # so its ordering — verify, drop the catalog entry, delete the file — is
+      # covered by an integration test rather than by the unit tests above.
+      - run: cargo test -p chronix --features object-store --test cold_archive
+      - run: cargo check -p chronix-streaming --features flight --all-targets
+      - run: cargo check -p chronix-security --no-default-features --all-targets
+      - run: cargo check -p chronix-engine --no-default-features --all-targets
+
+  examples:
+    # Nothing ran the examples, so `storage_lifecycle` silently rotted: it
+    # seeded a hardcoded 2023 epoch and then deleted its own data once the
+    # wall clock passed the retention window.
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run every example
+        # `object-store` is enabled for the whole loop because `cold_tier`
+        # declares it as a required feature; without it `cargo run` refuses that
+        # target and the loop would skip the one example that exercises the
+        # archive path. It is the only feature `chronix` has, so enabling it
+        # costs the other examples nothing but build time.
+        run: |
+          set -euo pipefail
+          for f in crates/chronix/examples/*.rs; do
+            name=$(basename "$f" .rs)
+            echo "── $name"
+            cargo run -q -p chronix --features object-store --example "$name"
+          done
+
+  site:
+    # The documentation site is content, so it can rot silently. `zola build`
+    # fails on a broken internal link or a bad anchor, which is the class of
+    # defect that made the previous docs cite ports the server does not listen
+    # on and crates that no longer exist.
+    name: Documentation site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zola
+        run: |
+          set -euo pipefail
+          VERSION=v0.21.0
+          curl -sSL "https://github.com/getzola/zola/releases/download/${VERSION}/zola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin zola
+          zola --version
+      - name: Build
+        working-directory: site
+        run: zola build
+      - name: Check links and anchors
+        working-directory: site
+        run: zola check
+
+      # `zola check` proves the links resolve. This proves the prose is about
+      # this tree: crate names, default ports, example paths and removed
+      # subsystems, none of which a link checker can see.
+      - name: Check documentation against the code
+        run: ./scripts/check-docs.sh
+
+  python-sdk:
+    # The SDK shipped with a test suite and no job that ran it, which is the
+    # same shape as the `otlp` feature that did not compile (D29, R6). It cost
+    # exactly what that costs: `delete()` sent its tag filters under a field
+    # name the server does not read, and the server's delete body ignores
+    # unknown fields — so every delete issued through this client dropped its
+    # filters and applied to the whole measurement. The tests passed, because
+    # they mocked the endpoint and asserted only the response.
+    name: Python SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - name: Unit tests
+        run: python -m pytest -q
+
+      # The unit tests mock the server, and a mock asserts the contract its
+      # author imagined — which is precisely how every request body in this
+      # client came to disagree with the server. This step drives the real one.
+      - name: Build chronixd
+        working-directory: .
+        run: cargo build -p chronixd
+
+      - name: Live smoke test against chronixd
+        working-directory: .
+        run: |
+          set -euo pipefail
+          ./target/debug/chronixd --data-dir "$(mktemp -d)" --bind 127.0.0.1:4242 &
+          server=$!
+          trap 'kill $server' EXIT
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:4242/health >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:4242/health
+          cd sdks/python && CHRONIX_URL=http://127.0.0.1:4242 python tests/smoke_live.py
+
+  references:
+    # `concepts/README.md` promises that D and R numbers are stable identifiers
+    # cited from code comments — "renumbering one breaks a reference nothing
+    # checks". This is that check. The tree carried 130 comments citing round
+    # numbers from a defunct audit scheme, which read as citations of risks
+    # that do not exist.
+    name: Reference integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-references.sh
+
+  deny:
+    name: Dependency Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+      # Doc examples are compiled and run. `doctest = false` in every manifest
+      # keeps them out of the ordinary test run for build time, which meant
+      # nothing ever compiled them: 15 of them did not, because they imported
+      # through `crate::`, which is not how an external caller reaches the
+      # crate — and a doc example is the first code a user copies from
+      # docs.rs. `--doc` overrides the manifest flag.
+      - run: cargo test --doc --workspace
+
+  bench:
+    name: Benchmarks (compile check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p chronix-engine --bench wal_bench --no-run
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri test -p chronix-core -- --skip proptests --skip config_toml_roundtrip
+
+  msrv:
+    name: MSRV (1.94)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets

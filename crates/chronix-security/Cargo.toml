@@ -1,0 +1,77 @@
+[package]
+name = "chronix-security"
+description = "Security layer for Chronix — authentication, Cedar authorization, audit trail, and multi-tenancy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["authorization", "cedar", "audit", "timeseries", "rbac"]
+categories = ["authentication", "cryptography"]
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+# docs.rs builds with default features unless told otherwise, which would
+# publish documentation with the feature-gated surface missing entirely — the
+# cold tier, the security modules and Flight are all off by default.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+doctest = false
+
+[features]
+default = ["webhook"]
+webhook = ["dep:ureq"]
+
+[dependencies]
+chronix-core.workspace = true
+
+# Hashing & crypto
+aes-gcm.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+
+# Authorization
+cedar-policy.workspace = true
+
+# JWT / OIDC
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+
+# Identifiers & encoding
+base64.workspace = true
+percent-encoding.workspace = true
+uuid.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Concurrency
+dashmap.workspace = true
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+# Observability
+metrics.workspace = true
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Audit webhook sink (feature-gated)
+ureq = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,229 @@
+syntax = "proto3";
+
+package chronix.v1;
+
+option java_package = "io.chronix.v1";
+option go_package = "github.com/hupe1980/chronix/proto/v1";
+
+// ── Common types ───────────────────────────────────────────────────────
+
+/// A tag key-value pair.
+message Tag {
+  string key = 1;
+  string value = 2;
+}
+
+/// A field value — one of several typed scalars.
+message FieldValue {
+  oneof value {
+    double float64 = 1;
+    int64  int64   = 2;
+    uint64 uint64  = 3;
+    bool   boolean = 4;
+    string string  = 5;
+  }
+}
+
+/// A single field key + value pair.
+message Field {
+  string key = 1;
+  FieldValue value = 2;
+}
+
+/// A single time-series data point.
+message Point {
+  string measurement = 1;
+  repeated Tag tags = 2;
+  repeated Field fields = 3;
+  /// Timestamp in nanoseconds since Unix epoch.
+  int64 timestamp = 4;
+}
+
+/// A half-open time range [start, end).
+message TimeRange {
+  int64 start = 1;
+  int64 end   = 2;
+}
+
+// ── Write ──────────────────────────────────────────────────────────────
+
+message WriteRequest {
+  repeated Point points = 1;
+}
+
+message WriteResponse {
+  /// Number of points successfully written.
+  uint64 written = 1;
+}
+
+// ── Stream Write ───────────────────────────────────────────────────────
+
+message StreamWriteRequest {
+  repeated Point points = 1;
+  /// Optional deduplication key for exactly-once semantics.
+  string dedup_key = 2;
+}
+
+message StreamWriteResponse {
+  /// Cumulative number of points acknowledged.
+  uint64 total_written = 1;
+  /// Number of points written in this batch.
+  uint64 batch_written = 2;
+}
+
+// ── Query ──────────────────────────────────────────────────────────────
+
+message QueryRequest {
+  string measurement = 1;
+  TimeRange range = 2;
+  /// Tag filters: only points matching ALL tags are returned.
+  repeated Tag tag_filters = 3;
+  /// If non-empty, only return these field columns.
+  repeated string field_columns = 4;
+  /// Maximum number of points to return (0 = unlimited).
+  uint64 limit = 5;
+}
+
+/// A row in the query result — a denormalized point.
+message QueryRow {
+  int64 timestamp = 1;
+  repeated Tag tags = 2;
+  repeated Field fields = 3;
+}
+
+message QueryResponse {
+  repeated QueryRow rows = 1;
+}
+
+// ── Schema ─────────────────────────────────────────────────────────────
+
+message SchemaRequest {
+  string measurement = 1;
+}
+
+/// Column definition within a measurement schema.
+message ColumnSchema {
+  string name = 1;
+  /// "tag", "field", or "timestamp"
+  string role = 2;
+  /// For fields: "float64", "int64", "uint64", "bool", "string"
+  string data_type = 3;
+}
+
+message SchemaResponse {
+  string measurement = 1;
+  repeated ColumnSchema columns = 2;
+}
+
+// ── Measurements ───────────────────────────────────────────────────────
+
+message ListMeasurementsRequest {}
+
+message MeasurementInfo {
+  string name = 1;
+  repeated ColumnSchema columns = 2;
+}
+
+message ListMeasurementsResponse {
+  repeated MeasurementInfo measurements = 1;
+}
+
+// ── Delete ─────────────────────────────────────────────────────────────
+
+message DeleteRequest {
+  string measurement = 1;
+  repeated Tag tag_filters = 2;
+  TimeRange range = 3;
+}
+
+message DeleteResponse {
+  uint64 deleted = 1;
+  // DEL-01: segments that could not be scanned and may still hold matching
+  // data. Non-zero means the delete was only partially applied.
+  uint64 segments_skipped = 2;
+}
+
+// ── Drop Measurement ───────────────────────────────────────────────────
+
+message DropMeasurementRequest {
+  string measurement = 1;
+}
+
+message DropMeasurementResponse {}
+
+// ── Server Metadata ────────────────────────────────────────────────────
+
+message ServerInfoRequest {}
+
+message ServerInfoResponse {
+  string version = 1;
+  uint64 uptime_seconds = 2;
+  uint64 measurement_count = 3;
+}
+
+// ── SQL ────────────────────────────────────────────────────────────────
+
+message SqlRequest {
+  /// The SQL query string.
+  string query = 1;
+}
+
+/// A single cell value in a SQL result row.
+message SqlValue {
+  oneof value {
+    double float64 = 1;
+    int64  int64   = 2;
+    uint64 uint64  = 3;
+    bool   boolean = 4;
+    string string  = 5;
+  }
+  bool is_null = 6;
+}
+
+/// A row in a SQL result set.
+message SqlRow {
+  repeated SqlValue values = 1;
+}
+
+/// Column metadata for SQL results.
+message SqlColumnMeta {
+  string name = 1;
+  string data_type = 2;
+}
+
+message SqlResponse {
+  repeated SqlColumnMeta columns = 1;
+  repeated SqlRow rows = 2;
+  uint64 row_count = 3;
+}
+
+// ── Service ────────────────────────────────────────────────────────────
+
+service ChronixService {
+  /// Write a batch of points.
+  rpc Write(WriteRequest) returns (WriteResponse);
+
+  /// Stream points for continuous high-throughput ingestion.
+  rpc StreamWrite(stream StreamWriteRequest) returns (StreamWriteResponse);
+
+  /// Query points — server-streaming response.
+  rpc Query(QueryRequest) returns (stream QueryResponse);
+
+  /// Get measurement schema.
+  rpc GetSchema(SchemaRequest) returns (SchemaResponse);
+
+  /// List all measurements.
+  rpc ListMeasurements(ListMeasurementsRequest) returns (ListMeasurementsResponse);
+
+  /// Delete points matching predicates.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  /// Drop an entire measurement.
+  rpc DropMeasurement(DropMeasurementRequest) returns (DropMeasurementResponse);
+
+  /// Get server information.
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+
+  /// Execute a SQL query.
+  rpc ExecuteSql(SqlRequest) returns (SqlResponse);
+}

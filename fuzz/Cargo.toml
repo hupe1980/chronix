@@ -1,0 +1,30 @@
+[package]
+name = "chronix-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+chronix-encoding = { path = "../crates/chronix-encoding" }
+chronix-engine = { path = "../crates/chronix-engine" }
+chronix-core = { path = "../crates/chronix-core" }
+tempfile = "3"
+
+[[bin]]
+name = "fuzz_column_decoder"
+path = "fuzz_targets/fuzz_column_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_segment_reader"
+path = "fuzz_targets/fuzz_segment_reader.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wal_reader"
+path = "fuzz_targets/fuzz_wal_reader.rs"
+doc = false
