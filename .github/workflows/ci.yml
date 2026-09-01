@@ -62,27 +62,38 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - run: cargo test
 
-  cross-aarch64:
+  aarch64:
     # The first deployment target is an aarch64 Linux gateway
     # (512 MB–1 GB RAM, eMMC/SD). Keep the embedded build compiling for it.
     #
-    # Both targets go through `cross`, which supplies a C toolchain per target
-    # in a container. A bare runner cannot do this: `aws-lc-rs` compiles C for
-    # the *target*, so `cargo clippy --target aarch64-…` dies in `cc-rs` with
-    # `failed to find tool "aarch64-linux-gnu-gcc"`. `release.yml` builds the
-    # shipped binaries the same way, so CI and the release use one mechanism.
+    # This runs on a native arm64 runner rather than cross-compiling. The
+    # alternative was `cross`, and it cost three failures to reject: a bare
+    # runner has no `aarch64-linux-gnu-gcc`, which `aws-lc-rs` needs because it
+    # compiles C for the target; `cross` supplies one but builds in a container
+    # where the runner's `protoc` is invisible; and that container's own apt
+    # `protoc` is 2.6.1, which cannot parse `proto3`. Building natively makes
+    # all three disappear — the C compiler, `protoc` and the linker are simply
+    # the host's.
+    #
+    # `clippy`, not `check`: architecture-gated code is only linted for the
+    # architecture being compiled, so the NEON paths in `chronix-analytics` are
+    # invisible to the x86_64 Clippy job. This is the only job that lints the
+    # target the design partner ships on.
     #
     # musl is checked alongside gnu because it is where a build script that
-    # needs more than a C compiler falls over: one that shells out to cmake
-    # compiles for gnu and fails here. The design partner asked for both.
-    name: Cross-compile (aarch64 Linux, ${{ matrix.target }})
-    runs-on: ubuntu-latest
+    # needs more than a C compiler falls over. The design partner asked for
+    # both. Only musl needs anything extra, and only a libc.
+    name: aarch64 Linux (${{ matrix.target }})
+    runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
         target:
           - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
+    env:
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,19 +102,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-protoc
-      # `clippy`, not `check`: architecture-gated code is only linted for the
-      # architecture being compiled, so the NEON paths in `chronix-analytics`
-      # are invisible to the x86_64 Clippy job — and the x86 paths are
-      # invisible to anyone developing on an aarch64 machine. This is the only
-      # job that lints the target the design partner actually ships on.
-      # `cross` mounts the host rustup toolchain, so the `clippy` component and
-      # the target installed above are the ones used inside the container.
-      - name: Install cross
-        run: cargo install cross --locked --version 0.2.5
-      - run: cross clippy -p chronix -p chronixd --target ${{ matrix.target }} -- -D warnings
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
+      - run: cargo clippy -p chronix -p chronixd --target ${{ matrix.target }} -- -D warnings
       # The connectors are the features most likely to reintroduce a C
       # dependency, so they are cross-checked rather than assumed.
-      - run: cross clippy -p chronixd --features all-connectors --target ${{ matrix.target }} -- -D warnings
+      - run: cargo clippy -p chronixd --features all-connectors --target ${{ matrix.target }} -- -D warnings
 
   frozen-tier:
     # The distributed cluster tier is frozen (no active development) but

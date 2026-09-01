@@ -266,12 +266,15 @@ per-request timeouts and row/batch limits, SSE annotations and bundled
 Grafana dashboards in [`dashboards/`](dashboards/).
 
 Both connectors are **pure Rust** — `krafka` and `rumqttc` — so turning them
-on does not pull in a C toolchain. Neither does anything else: the release
-dependency graph of every crate here, `chronixd` included, contains no C build
-step, which is what makes the cross-compiled aarch64 target the embedded case
-is built for a plain `cargo build`. That holds because rustls is pinned to a
-single crypto provider (`ring`) rather than inheriting each dependency's
-default — see D41, which is also why the server's TLS starts at all.
+on adds no C build step. One dependency does compile C: `aws-lc-rs`, the
+single rustls crypto provider the whole workspace shares rather than
+inheriting each dependency's default. Nothing is shipped precompiled — crates
+carry source — but `aws-lc-sys` ships a *pregenerated build configuration* for
+`linux_aarch64` among others, so it drives `cc` directly instead of invoking
+CMake. A C compiler for the target architecture is therefore the whole
+requirement: no cmake, no Fortran, no system libraries. That is why CI builds
+the embedded target on a native arm64 runner rather than cross-compiling —
+`cargo build` there needs nothing a stock runner lacks.
 
 ## Building
 

@@ -191,7 +191,7 @@ series, which is hundreds of microseconds at 10K points.
 ### Cardinality Enforcement
 
 Chronix tracks distinct canonical series keys in a `DashSet<String>` — exactly,
-with no sketch beside it (D34). Before
+with no sketch beside it. Before
 every `insert()` or `insert_batch()`, the new series key is checked against the
 configured `max_series_cardinality` limit (default: 1,000,000). If the limit
 would be exceeded, the write is rejected with `CardinalityExceeded`.

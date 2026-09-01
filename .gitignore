@@ -35,3 +35,6 @@ target
 
 # Zola build output for the documentation site.
 site/public/
+
+# Staged by .github/actions/setup-cross so the cross container can see it.
+.protoc/

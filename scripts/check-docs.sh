@@ -87,6 +87,14 @@ fi
 if grep -rnE '\b[DR][0-9]{1,3}\b' --include='*.rs' crates 2>/dev/null; then
   note "a doc comment cites a D/R identifier, which resolves only in concepts/"
 fi
+# The same citation in prose is the same defect: `concepts/` is not published,
+# so "see D41" sends a reader nowhere. Scanned separately because the cluster
+# pages legitimately draw R1/R2/R3 as *region* names in ASCII diagrams, which
+# a bare identifier scan cannot tell apart from a citation.
+if grep -rnE '\((D[0-9]{1,3}(, ?[DR][0-9]{1,3})*)\)|\bsee [DR][0-9]{1,3}\b' \
+     README.md CONTRIBUTING.md site/content 2>/dev/null; then
+  note "a published document cites a D/R identifier, which resolves only in concepts/"
+fi
 
 # ── 5. Deleted subsystems must stay deleted in prose ────────────────────
 # The GPU backend, the WASM plugin runtime and the in-house dashboards were
