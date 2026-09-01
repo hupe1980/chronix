@@ -159,7 +159,8 @@ db.close().unwrap();
   can only ever keep a segment it could have dropped, never the reverse — the
   series bloom holds complete series keys, so it is consulted only when the
   query's tag filters cover every tag, and skipped otherwise
-- Caches: sub-10 µs last-value cache, TinyLFU segment cache, metadata cache
+- Caches: last-value cache (opt-in per measurement; ~400 ns on a hit),
+  TinyLFU segment cache, metadata cache
 - Deletes are **ranged tombstones persisted in the catalog manifest**: a
   delete names an interval (resolved to the series' newest stored timestamp
   when you do not name one), survives a flush and a restart, and is reclaimed
@@ -377,15 +378,15 @@ API documentation for the published crates is on
 ## Project Status
 
 Pre-release, under active development. The engine is extensively hardened —
-3,030 tests in the workspace (2,602 in the default build), property tests
+3,035 tests in the workspace (2,607 in the default build), property tests
 on every codec, three fuzz targets run nightly, crash-recovery integration
-tests, and 32 deep audit passes — but the on-disk format and public API are **not yet
+tests, and 33 deep audit passes — but the on-disk format and public API are **not yet
 stable**. The first tagged release will declare both.
 
 The tree tracks the current ecosystem: **Arrow 59, DataFusion 55, parquet 59,
-arrow-flight 59, tonic 0.14**. What remains before a first release is release
-engineering — crates.io metadata, a semver policy, an API audit of the facade,
-and a benchmark regression gate.
+arrow-flight 59, tonic 0.14**. The release procedure and version policy are in
+[CONTRIBUTING.md](CONTRIBUTING.md); what remains before a first release is a
+Grafana walkthrough and TSBS results.
 
 `cargo clippy --all-targets` is clean on the default build at the configured
 lint level. The frozen cluster crates (`chronix-meta`, `chronix-cluster`,

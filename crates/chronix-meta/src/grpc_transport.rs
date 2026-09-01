@@ -1,7 +1,7 @@
 //! gRPC-based Raft network transport for multi-process `MetaNode` clusters.
 //!
 //! Provides both the server-side handler ([`RaftGrpcServer`]) and a
-//! client-side [`RaftNetworkFactory`] implementation ([`GrpcNetworkFactory`])
+//! client-side `RaftNetworkFactory` implementation ([`GrpcNetworkFactory`])
 //! that routes Raft RPCs over tonic gRPC connections.
 //!
 //! All OpenRaft request/response types are serialised as **postcard** inside

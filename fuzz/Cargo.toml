@@ -11,7 +11,6 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 chronix-encoding = { path = "../crates/chronix-encoding" }
 chronix-engine = { path = "../crates/chronix-engine" }
-chronix-core = { path = "../crates/chronix-core" }
 tempfile = "3"
 
 [[bin]]

@@ -1,4 +1,4 @@
-//! Performance validation tests for CDC streaming (Story 5.1).
+//! Performance validation tests for CDC streaming.
 //!
 //! Validates:
 //! - CDC event delivery < 5 ms from publish to subscriber

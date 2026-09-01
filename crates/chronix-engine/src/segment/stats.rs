@@ -106,9 +106,8 @@ impl ColumnStats {
 
     /// Update statistics with a new `u64` value.
     ///
-    /// Tracks full-precision u64 min/max in dedicated fields, avoiding
-    /// the lossy i64::MAX clamp that previously broke predicate pushdown
-    /// for values above 2^63.
+    /// Tracks full-precision u64 min/max in dedicated fields. Clamping to
+    /// `i64::MAX` instead breaks predicate pushdown above 2^63.
     pub fn update_u64(&mut self, value: u64) {
         self.min_value_u64 = self.min_value_u64.min(value);
         self.max_value_u64 = self.max_value_u64.max(value);

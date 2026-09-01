@@ -1,7 +1,7 @@
 //! Registering the Parquet cold tier with DataFusion.
 //!
 //! The tiering engine re-encodes segments to Parquet on the way to object
-//! storage ([`chronix_engine::objstore::parquet_tier`], D6). This module is the
+//! storage ([`chronix_engine::objstore::parquet_tier`]). This module is the
 //! other half of that decision: it makes the archive queryable *from chronix*
 //! as well as from DuckDB, by pointing DataFusion at the same bucket.
 //!
@@ -73,7 +73,7 @@ pub async fn register_cold_tier(ctx: &SessionContext, url: &str, table_name: &st
     // Those are Hive-style partition directories, which DataFusion's listing
     // treats as partitions rather than as subdirectories — so this finds the
     // objects with `listing_table_ignore_subdirectory` left at its default,
-    // instead of mutating the shared session to relax it (D25).
+    // instead of mutating the shared session to relax it.
     //
     // Filtering on the extension also keeps `.csx` objects left by an earlier
     // `ColdFormat::Csx` policy out of the table, rather than failing the whole

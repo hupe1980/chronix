@@ -173,6 +173,36 @@ impl WebhookConfig {
 /// The webhook channel serializes the `SignalEvent` to JSON and posts it
 /// to the configured URL. If a signing secret is configured, an
 /// `X-Chronix-Signature` header with the HMAC-SHA256 hex digest is included.
+/// The TLS configuration for this crate's outbound HTTPS requests.
+///
+/// **This is a library, so it does not install a process-global provider.**
+/// `CryptoProvider::install_default` sets process-wide state and silently
+/// loses to whoever called it first: a crate that installs `ring` on its first
+/// webhook would make a later `install_default(aws_lc_rs)` in the embedding
+/// application fail, and the application would get a provider it did not
+/// choose with no error to read. `chronix` is published for other people to
+/// embed, so that is not a theoretical objection.
+///
+/// Instead the provider the application installed is *used* if there is one,
+/// and `ring` is the fallback only when nobody has chosen. `chronixd`
+/// installs one at startup, so under the server this resolves to the server's
+/// choice.
+///
+/// Trust anchors come from the platform verifier, matching what `reqwest`
+/// would have built on its own.
+fn tls_config() -> std::result::Result<rustls::ClientConfig, rustls::Error> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_platform_verifier()?
+        .with_no_client_auth())
+}
+
 ///
 /// Uses the async `reqwest::Client` internally. When called from a
 /// synchronous context (the `DeliveryChannel` trait), it bridges via
@@ -217,7 +247,12 @@ impl WebhookChannel {
         // Enter the runtime context so reqwest binds its IO driver to
         // *this* runtime rather than requiring an ambient one.
         let _guard = runtime.enter();
-        let client = reqwest::Client::builder().timeout(config.timeout).build()?;
+        let client = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .use_preconfigured_tls(tls_config().map_err(|e| {
+                SignalError::InvalidConfig(format!("failed to build TLS configuration: {e}"))
+            })?)
+            .build()?;
         drop(_guard);
 
         let url = config.url.clone();
@@ -273,7 +308,7 @@ impl WebhookChannel {
     /// Compute HMAC-SHA256 signature for a payload.
     #[must_use]
     pub fn compute_signature(secret: &str, payload: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         let mut mac =

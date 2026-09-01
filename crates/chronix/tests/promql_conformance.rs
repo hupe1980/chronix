@@ -531,7 +531,7 @@ fn histogram_quantile_refuses_an_unbounded_histogram() {
 /// *full-range* scans, so a Grafana panel with 200 steps over six hours read
 /// six hours of data two hundred times. The comment above the field claimed
 /// "O(steps) to O(1)" for several releases while the code had no cache at all
-/// (R3) — so the claim is asserted here rather than described there.
+/// — so the claim is asserted here rather than described there.
 #[test]
 fn a_range_query_reads_its_window_once() {
     let key = SeriesKey::new("cpu", tags! { "host" => "a" }).unwrap();

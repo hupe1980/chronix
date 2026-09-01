@@ -1,4 +1,4 @@
-//! Performance validation tests for Cedar authorization (Story 5.2).
+//! Performance validation tests for Cedar authorization.
 //!
 //! Validates:
 //! - Authorization decision latency scales well with policy count

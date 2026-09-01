@@ -193,7 +193,7 @@ mod tests {
         // idle machine. Kept out of the default run (thermal throttling and
         // parallel test load produce false failures); run explicitly with
         // `cargo test -- --ignored`. Migrating perf assertions to Criterion
-        // is tracked in concepts/ROADMAP.md.
+        // is in the backlog.
         let engine = AlertEngine::new();
 
         // Register 50 alert configs on the same measurement

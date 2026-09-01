@@ -104,6 +104,10 @@ async fn server_with_data() -> (String, TempDir) {
 /// The query is appended verbatim rather than built by a serializer: `match[]`
 /// is a repeated key, and a serializer cannot produce one.
 async fn data(base: &str, path_and_query: &str) -> Value {
+    // Explicit rather than relying on another test in this binary having
+    // installed it first: `reqwest` panics when the process-level rustls
+    // provider is missing, so the suite would pass or fail on test order.
+    chronixd::tls::ensure_crypto_provider();
     let resp = reqwest::get(format!("{base}{path_and_query}"))
         .await
         .unwrap();
@@ -226,6 +230,7 @@ async fn name_values_and_metadata_list_the_measurements() {
 #[tokio::test]
 async fn a_malformed_matcher_is_a_bad_request() {
     let (base, _tmp) = server_with_data().await;
+    chronixd::tls::ensure_crypto_provider();
     let resp = reqwest::get(format!("{base}/api/v1/prom/series?match[]=%7Bhost%3D%22"))
         .await
         .unwrap();

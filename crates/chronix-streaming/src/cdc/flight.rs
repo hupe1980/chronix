@@ -1,7 +1,7 @@
 //! Arrow Flight CDC export — bridge CDC events to Flight `DoExchange` streams.
 //!
 //! This module converts [`CdcEvent`]s into Arrow [`RecordBatch`]es and
-//! provides a [`CdcFlightService`] that implements the Arrow Flight
+//! provides a [`CdcFlightExporter`] that implements the Arrow Flight
 //! `DoExchange` RPC for real-time CDC streaming to external consumers.
 //!
 //! ## Schema

@@ -164,13 +164,11 @@ impl super::Chronix {
     /// series actually has, so a point written *afterwards* re-creates the
     /// series rather than disappearing into a standing delete. Re-provisioning
     /// a device under an identifier that had once been deleted is the ordinary
-    /// case here, and it used to discard everything the device sent.
+    /// case here.
     ///
     /// This delegates to [`execute_delete`](Self::execute_delete) rather than
-    /// repeating it. The two paths had drifted apart — one flushed first and
-    /// the other did not, and only one of them evicted the last-value cache —
-    /// which is the failure mode a shared implementation removes rather than
-    /// documents.
+    /// repeating it, so both paths flush first and both evict the last-value
+    /// cache.
     ///
     /// # Errors
     ///
@@ -205,7 +203,7 @@ impl super::Chronix {
     /// a tombstone's segments remains, no stored row can still match it and
     /// the tombstone is provably dead.
     ///
-    /// See D44. Two rules used to sit here instead, and both resurrected data.
+    /// Two weaker rules sat here before, and both resurrected data.
     /// The first dropped a tombstone once its series had left `known_series`,
     /// which the delete itself had just arranged — so it fired after the *next*
     /// compaction pass regardless of whether that pass had touched the
@@ -373,7 +371,7 @@ impl super::Chronix {
 
             // The newest timestamp per series is what resolves an unranged
             // delete's upper bound, so the row loop cannot stop at the first
-            // row of a series the way it used to.
+            // row of a series.
             let ts_col = filtered
                 .column_by_name("timestamp")
                 .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())

@@ -42,7 +42,7 @@ impl PearsonCorrelation {
     ///
     /// `NaN` pairs are deleted pairwise. When either series has **zero
     /// variance** the correlation is undefined and the result is `NaN`, not
-    /// `0.0` — the convention D26 fixed for `RollingCorrelation` and
+    /// `0.0` — the convention `RollingCorrelation` and
     /// `rolling_corr`, applied here for the same reason: `0.0` asserts "these
     /// series are uncorrelated" where the truth is "there is nothing to
     /// correlate", and a caller acts on the first.
@@ -403,7 +403,7 @@ impl LagCorrelation {
     /// series, or either window has zero variance — yields `NaN`, not `0.0`.
     /// `0.0` is the worse answer of the two because it conflates "uncorrelated"
     /// with "there is not enough information to say", and it is *actionable*
-    /// where a `NaN` is visibly absent (D26, the same convention
+    /// where a `NaN` is visibly absent (the same convention
     /// [`RollingCorrelation`] follows).
     ///
     /// Cost is O(n) per lag, so O(n·|lags|) overall — ask for the lags wanted
@@ -595,7 +595,7 @@ mod tests {
         assert!((results[1].1 - 1.0).abs() < 1e-3);
     }
 
-    /// D26: an undefined lag correlation is `NaN`, never `0.0`. `0.0` asserts
+    /// An undefined lag correlation is `NaN`, never `0.0`. `0.0` asserts
     /// "these series are uncorrelated" where the truth is "there is not enough
     /// information to say", and a caller acts on the first and ignores the
     /// second.

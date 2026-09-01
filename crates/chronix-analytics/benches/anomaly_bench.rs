@@ -1,11 +1,12 @@
 #![allow(clippy::unwrap_used)] // benches may unwrap
-//! Benchmarks for anomaly detectors (Epic 10, Story 10.2).
+//! Benchmarks for anomaly detectors.
 
 use chronix_analytics::anomaly::{
     AnomalyDetector, DynamicThresholdDetector, IqrDetector, ModifiedZScoreDetector,
     MovingAverageResidualDetector, ZScoreDetector,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 fn gen_data(n: usize) -> (Vec<i64>, Vec<f64>) {
     let ts: Vec<i64> = (0..n as i64).map(|i| i * 1_000_000_000).collect();

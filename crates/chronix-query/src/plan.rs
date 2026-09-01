@@ -343,7 +343,7 @@ impl QueryBuilder {
     /// API, where points carry no namespace tag and a filter on one would
     /// match nothing. Call sites use this rather than branching, so that
     /// scoping a read is one uniform call instead of an `if` each of them can
-    /// forget (R1).
+    /// forget.
     #[must_use]
     pub fn namespace_scope(self, ns: Option<&str>) -> Self {
         match ns {

@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// A virtual clock for deterministic simulation.
 ///
-/// Time advances only via [`advance`](Self::advance) or
-/// [`advance_ms`](Self::advance_ms). All nodes in a simulation share
+/// Time advances only via `advance` or `advance_ms`. All nodes in a simulation share
 /// a single `VirtualClock`, but per-node skew can be applied via
 /// [`skew_for_node`](Self::skew_for_node).
 #[derive(Debug)]

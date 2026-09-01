@@ -1,7 +1,7 @@
 //! Region migration — move regions between `DataNode`s with zero downtime.
 //!
 //! The [`RegionMigrator`] coordinates the migration lifecycle using a
-//! **two-phase Raft protocol** (D2 hardening):
+//! **two-phase Raft protocol**:
 //!
 //! 1. **`BeginMigration`** — adds the destination as a learner replica and
 //!    transitions the region to `Migrating` state via Raft. This prevents
@@ -261,7 +261,7 @@ impl RegionMigrator {
 
     /// Execute a region migration according to the plan.
     ///
-    /// Uses a **two-phase protocol** for safety (D2 hardening):
+    /// Uses a **two-phase protocol** for safety:
     ///
     /// 1. **`BeginMigration`** — adds dest as learner, marks `Migrating`.
     /// 2. **Snapshot:** Read all data from the source region.
@@ -983,7 +983,7 @@ mod tests {
         let plan = MigrationPlan::new(10, "cpu", 1, 1);
         let err = migrator.migrate(&plan).await.unwrap_err();
 
-        // No meta client — migration must fail with an internal error (D2 hardening).
+        // No meta client — migration must fail with an internal error.
         let msg = err.to_string();
         assert!(
             msg.contains("meta client required"),

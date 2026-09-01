@@ -1,6 +1,6 @@
 //! DataNode gRPC service — region-level write, query, and replication.
 //!
-//! The [`DataGrpcServer`] serves [`DataService`](proto::data_service_server::DataService)
+//! The [`DataGrpcServer`] serves the `DataService` gRPC interface
 //! RPCs, delegating storage operations to an [`RegionStorage`] implementation.
 //! This decouples the gRPC transport from the underlying storage engine so
 //! that the same proto contract works against both a real Chronix instance

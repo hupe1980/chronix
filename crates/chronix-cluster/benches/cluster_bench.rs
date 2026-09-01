@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
 
 use async_trait::async_trait;
 use chronix_core::{FieldValue, Point, SeriesKey};

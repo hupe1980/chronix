@@ -387,7 +387,7 @@ pub async fn get_namespace_usage_handler(
 /// Re-exported from `chronix_core` so the server, the query builder, the SQL
 /// provider and the PromQL evaluator all name the same constant. They used to
 /// spell the string out separately, and the copies drifted: two of five write
-/// paths stamped it and one of seven read paths filtered on it (R1).
+/// paths stamped it and one of seven read paths filtered on it.
 pub use chronix_core::NAMESPACE_TAG;
 
 /// Namespace for a request, from its resolved [`NamespaceContext`].
@@ -404,7 +404,7 @@ pub fn resolve(ns_ctx: Option<&NamespaceContext>) -> &str {
 /// Tenancy is a deployment switch rather than always-on because a point
 /// written before it was enabled carries no tag, and a scoped read cannot see
 /// it — so the trade is stated once in the config instead of made silently
-/// (D46).
+///.
 #[must_use]
 pub fn scope<'a>(
     state: &crate::http::AppState,
@@ -450,7 +450,7 @@ pub const METADATA_KEY: &str = "x-namespace";
 /// Stamp `namespace` onto every point, overriding anything the client sent.
 ///
 /// Overriding rather than defaulting is the point: a namespace a client can
-/// choose is not an isolation boundary (D47).
+/// choose is not an isolation boundary.
 ///
 /// # Errors
 ///
@@ -475,7 +475,7 @@ pub fn scope_points(
 ///
 /// A context's tables are scoped by the table provider, so isolation does not
 /// depend on the SQL text: `SELECT * FROM power` through a `tenant-a` context
-/// cannot be phrased to read anything else (D45).
+/// cannot be phrased to read anything else.
 pub struct SqlContexts {
     db: std::sync::Arc<chronix::Chronix>,
     contexts: parking_lot::Mutex<

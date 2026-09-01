@@ -380,9 +380,8 @@ same statistic and follow the same conventions, which match pandas
 
 `NaN` — not `0.0` — is the correct value for an undefined correlation: `0.0`
 asserts "these series are uncorrelated" when the truth is "there is not enough
-information to say". `RollingCorrelation` previously reported values computed
-from *partial* windows and `0.0` for zero variance, so the two functions gave
-different answers for the same input. A test pins them to the same output.
+information to say". `RollingCorrelation` and the SQL function follow the same
+rule, and a test pins them to the same output.
 
 ## Multivariate Analysis
 

@@ -16,7 +16,7 @@ use crate::error::ServerError;
 /// Line Protocol, OTLP, Prometheus remote write, gRPC, Flight SQL `DoPut`,
 /// and the Kafka and MQTT connectors — goes through here, which is what makes
 /// the namespace stamp an invariant rather than something each handler has to
-/// remember (D45, R19). The namespace is applied, not merged.
+/// remember. The namespace is applied, not merged.
 ///
 /// Prevents a stuck downstream write from exhausting the tokio thread
 /// pool. A zero timeout disables the deadline and waits indefinitely.
@@ -325,7 +325,7 @@ pub const SKIPPED_SAMPLES_METRIC: &str = "chronix_wire_non_finite_samples_skippe
 /// deliver — it retries it, forever — so the first target to go away stalled
 /// the remote-write queue and stopped ingestion entirely, from a valid
 /// message. A protocol surface has to be judged by what real senders actually
-/// send (D2), and dropping the sample it cannot represent while accepting the
+/// send, and dropping the sample it cannot represent while accepting the
 /// rest is what every other receiver does.
 #[must_use]
 pub fn storable_sample(value: f64) -> Option<f64> {

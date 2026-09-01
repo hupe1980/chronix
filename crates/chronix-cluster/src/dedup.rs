@@ -46,9 +46,9 @@ struct DeduplicationEntry {
 /// Bounded, thread-safe deduplication cache for write request IDs.
 ///
 /// Callers should:
-/// 1. Call [`check`] before processing a write. If it returns `Some(n)`,
+/// 1. Call `check` before processing a write. If it returns `Some(n)`,
 ///    the request was already processed — return `n` without re-writing.
-/// 2. Call [`record`] after successfully processing a write to cache the
+/// 2. Call `record` after successfully processing a write to cache the
 ///    result for future duplicate detection.
 #[derive(Debug)]
 pub struct DeduplicationCache {

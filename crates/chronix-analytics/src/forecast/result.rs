@@ -182,9 +182,9 @@ impl ForecastResult {
     ///
     /// # Errors
     ///
-    /// [`ForecastError::InvalidParams`] when `level` is not in `(0, 1)`, or
-    /// when the result's own `confidence_level` is not, which would make the
-    /// ratio meaningless.
+    /// [`ForecastError::InvalidParams`](crate::forecast::ForecastError::InvalidParams)
+    /// when `level` is not in `(0, 1)`, or when the result's own
+    /// `confidence_level` is not, which would make the ratio meaningless.
     pub fn with_confidence(
         mut self,
         level: f64,

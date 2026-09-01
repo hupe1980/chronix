@@ -214,7 +214,7 @@ impl BatchStream<'_> {
             }
         }
 
-        // Memtable last → highest write order → wins dedup (R1).
+        // Memtable last → highest write order → wins dedup.
         if let Some(mem) = bucket.memtable {
             if mem.num_rows() > 0 {
                 let filtered = chronix_query::filter::filter_batch(
@@ -517,7 +517,7 @@ fn build_buckets(entries: Vec<SegmentCatalogEntry>, memtable: RecordBatch) -> Re
     // bucket, after every segment. Buckets dedup independently, so a memtable
     // point overwriting a flushed one would then be emitted as a second row —
     // out of timestamp order, with the stale value first. That is the
-    // last-write-wins divergence this module exists to prevent (R1), so the
+    // last-write-wins divergence this module exists to prevent, so the
     // broken invariant is reported rather than silently worked around.
     if memtable.num_rows() != ts.len() {
         return Err(DbError::Internal(format!(

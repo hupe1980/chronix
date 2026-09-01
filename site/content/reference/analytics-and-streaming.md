@@ -461,9 +461,8 @@ crashes (not just process crashes). The `compact()` path uses `sync_all()` for
 full metadata durability.
 ## Pipeline Orchestrator (`chronix::pipeline`)
 
-The `Pipeline` struct unifies all Backlog 8 subsystems into a single processing
-layer that dispatches CDC events through signal, analytics, authz, and audit
-engines.
+The `Pipeline` struct dispatches CDC events through the signal, analytics,
+authz and audit engines as a single processing layer.
 
 ```text
 Chronix write path

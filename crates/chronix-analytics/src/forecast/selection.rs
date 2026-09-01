@@ -321,8 +321,9 @@ fn candidates(
 
 /// Choose a forecast model for a series by rolling-origin cross-validation.
 ///
-/// See the [module documentation](self) for what is fitted and why the winner
-/// is chosen by out-of-sample error rather than by an information criterion.
+/// What is fitted, and why the winner is chosen by out-of-sample error rather
+/// than by an information criterion, is described on
+/// [`AutoForecastOptions`] and [`SelectionMetric`].
 ///
 /// # Errors
 ///

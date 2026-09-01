@@ -84,6 +84,47 @@ none of which the server bound.
 4. **Write a clear description** — Explain *what* changed and *why*.
 5. **Be responsive** — Address review feedback promptly.
 
+## Releasing
+
+Nine crates, three destinations:
+
+| Artifact | Where |
+|---|---|
+| `chronix` and its seven library crates | crates.io |
+| `chronixd` | GitHub Releases, as a binary — its `cluster` and `chaos` features depend on `publish = false` crates, and cargo requires a version for every packaged dependency, optional ones included |
+| `chronix-meta`, `chronix-cluster`, `chronix-dsim`, `chronix-chaos` | nowhere; a frozen tier and dev tooling |
+
+**Version policy.** Every crate shares one version and they are bumped
+together — a mixed set has never been tested. Within 0.x a breaking change
+bumps the minor (`0.1.0` → `0.2.0`) and a fix bumps the patch. The on-disk
+`.csx` and WAL formats are not stable before 1.0; a format change is a minor
+bump called out in the release notes, and there is no migration tooling before
+then. Sealing the facade API is a pre-1.0 job, not a pre-0.1 one.
+
+**Cutting a release** is a version bump and a tag:
+
+```bash
+$EDITOR Cargo.toml        # workspace [package] version — one version, one commit
+cargo update --workspace  # refresh Cargo.lock to match
+git commit -am "Release 0.1.0"
+git tag -a v0.1.0 -m "chronix 0.1.0"
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` does the rest: it checks the tag against the
+manifest, runs the release gate, builds `chronixd` for six targets, publishes
+the library crates to crates.io, then attaches the archives to the GitHub
+release. Publishing runs last because it cannot be undone.
+
+Crates go up in dependency order, which `scripts/publish-order.sh` derives
+from the manifests. The workflow needs a crates.io API token with publish
+rights in the `crates-io` environment as `CARGO_REGISTRY_TOKEN`; run the
+workflow manually with `dry_run` to exercise the path without uploading.
+
+Two things still need a person before a release: the Grafana walkthrough
+against a running `chronixd`, and checking that every crate rendered on
+docs.rs — a crate that fails there fails silently.
+
 ## Reporting Issues
 
 - Search existing issues before opening a new one.

@@ -5,7 +5,8 @@
 
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use std::hint::black_box;
 
 use chronix_core::{FsyncPolicy, WalConfig};
 use chronix_engine::wal::WalWriter;

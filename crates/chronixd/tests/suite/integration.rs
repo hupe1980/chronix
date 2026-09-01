@@ -77,7 +77,13 @@ async fn start_test_server() -> (String, TempDir) {
     (base, tmp)
 }
 
+/// A client, with the rustls provider installed.
+///
+/// These suites never call `server::run`, so nothing else installs it — and
+/// `reqwest` panics inside `Client::builder().build()` rather than returning
+/// an error when it is missing.
 fn client() -> reqwest::Client {
+    chronixd::tls::ensure_crypto_provider();
     reqwest::Client::new()
 }
 

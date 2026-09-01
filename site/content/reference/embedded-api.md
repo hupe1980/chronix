@@ -169,19 +169,24 @@ equality filtering, and zone-map field predicate pushdown per segment.
 `db.last_value(measurement, tags)` returns the most recent `Point` for a
 specific series without building a full query plan:
 
-1. **Memtable scan** — scan all shards for the series key, taking the point
-   with the highest timestamp that no tombstone masks *at that timestamp*
-   (newest data lives in memory). A series-level tombstone check used to stand
-   ahead of this and return `None` outright, which made a delete of any single
-   hour of a series hide its newest point forever
-2. **Segment scan** — if the memtable is empty, iterate on-disk segments sorted
-   by `max_timestamp` descending. Each segment's bloom filter is checked first —
-   segments that definitely don't contain the target series key are skipped
-   without reading any data. For matching segments, filter to matching series
-   rows, find the newest unmasked timestamp, reconstruct the `Point`, and
-   return immediately
+1. **Last-value cache** — returned immediately on a hit, after checking the
+   entry against the tombstone set. The cache is opt-in
+   (`enable_last_value_cache`, default `false`); without it this step is
+   skipped and every call pays for the two below
+2. **Memtable scan** — scan all shards for the series key, taking the point
+   with the highest timestamp that no tombstone masks *at that timestamp*.
+   Masking is per timestamp, not per series, so a delete covering one hour of a
+   series leaves its newest surviving point answerable
+3. **Segment scan** — the memtable's newest point is a *candidate*, not the
+   answer: writes are accepted up to ±2 shards out of order, so a late arrival
+   can sit in the memtable behind an already-flushed newer point. Segments are
+   walked newest-first by `max_timestamp` and the walk stops as soon as a
+   segment cannot beat the best so far — when the memtable point really is
+   newest, no segment is opened. Bloom filters skip segments that cannot hold
+   the series without reading any data
 
-This provides O(1)-like latency for hot series that are still in the memtable.
+A cache hit costs ~400 ns. Without the cache the call is a memtable scan of the
+series, which is hundreds of microseconds at 10K points.
 
 ### Cardinality Enforcement
 
@@ -199,9 +204,8 @@ cardinality limit before any are committed.
 
 Both delete entry points resolve to the same implementation:
 `delete_series(measurement, tags)` builds a `DeleteRequest` with the series'
-tags and calls `execute_delete`. They used to be separate, and had drifted —
-one flushed first and the other did not, and only one evicted the last-value
-cache.
+tags and calls `execute_delete`, so both flush first and both evict the
+last-value cache.
 
 **A delete produces tombstones, and a tombstone is `{ series_canonical,
 time_range, segments }`:**

@@ -6,7 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use tempfile::TempDir;
 
 use chronix::prelude::*;
@@ -93,6 +94,12 @@ fn seeded_db(n: usize) -> (Chronix, TempDir) {
 }
 
 // ── Write Benchmarks ──────────────────────────────────────────────────
+//
+// Every routine below returns its `(Chronix, TempDir)` rather than dropping
+// it. Criterion drops a routine's return value outside the timed region, so
+// returning the pair keeps teardown — `Chronix::close`, which flushes and
+// encodes every memtable, plus the temp-dir delete — out of the ingest number.
+// Persist cost is measured separately, by `flush_10K` and `batch_commit`.
 
 fn bench_insert_single(c: &mut Criterion) {
     let point = make_points(1).into_iter().next().unwrap();
@@ -104,8 +111,10 @@ fn bench_insert_single(c: &mut Criterion) {
                 let db = Chronix::open(bench_config(tmp.path())).unwrap();
                 (db, tmp)
             },
-            |(db, _tmp)| {
+            |(db, tmp)| {
                 db.insert(black_box(&point)).unwrap();
+                // Returned, not dropped: see `teardown` note above.
+                (db, tmp)
             },
         );
     });
@@ -115,6 +124,7 @@ fn bench_insert_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_batch");
     for size in [100, 1_000, 10_000] {
         let points = make_points(size);
+        group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &points, |b, pts| {
             b.iter_with_setup(
                 || {
@@ -122,8 +132,9 @@ fn bench_insert_batch(c: &mut Criterion) {
                     let db = Chronix::open(bench_config(tmp.path())).unwrap();
                     (db, tmp)
                 },
-                |(db, _tmp)| {
+                |(db, tmp)| {
                     let _ = db.insert_batch(black_box(pts)).unwrap();
+                    (db, tmp)
                 },
             );
         });
@@ -144,8 +155,9 @@ fn bench_flush(c: &mut Criterion) {
                 let _ = db.insert_batch(&points).unwrap();
                 (db, tmp)
             },
-            |(db, _tmp)| {
+            |(db, tmp)| {
                 black_box(db.flush().unwrap());
+                (db, tmp)
             },
         );
     });
@@ -220,18 +232,42 @@ fn bench_aggregation_query(c: &mut Criterion) {
     });
 }
 
+// The last-value cache is opt-in, so a benchmark built on `bench_config`
+// measures the fallback memtable scan no matter what it is called. Both paths
+// get a number, each named for what it runs.
 fn bench_last_value(c: &mut Criterion) {
-    let (db, _tmp) = seeded_db(10_000);
     let tag_map = tags! { "host" => "host-0", "region" => "us-east" };
 
-    c.bench_function("last_value", |b| {
+    // Cache hit: what `enable_last_value_cache(true)` buys.
+    let tmp_cached = TempDir::new().unwrap();
+    let cached_db = Chronix::open(
+        ChronixConfig::builder()
+            .data_dir(tmp_cached.path())
+            .memtable_flush_threshold(64 * 1024 * 1024)
+            .enable_last_value_cache(true)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    let _ = cached_db.insert_batch(&make_points(10_000)).unwrap();
+    cached_db.flush().unwrap();
+    c.bench_function("last_value_cached", |b| {
+        b.iter(|| {
+            black_box(cached_db.last_value("cpu", black_box(&tag_map)).unwrap());
+        });
+    });
+
+    // Cache miss: the default configuration, which scans the memtable and
+    // then walks segments newest-first.
+    let (db, _tmp) = seeded_db(10_000);
+    c.bench_function("last_value_uncached", |b| {
         b.iter(|| {
             black_box(db.last_value("cpu", black_box(&tag_map)).unwrap());
         });
     });
 }
 
-// ── Multi-field insert benchmark (BACKLOG3 Story 5.1) ──────────────
+// ── Multi-field insert benchmark ───────────────────────────────────
 
 fn bench_multi_field_insert(c: &mut Criterion) {
     let points = make_multi_field_points(10_000);
@@ -243,14 +279,15 @@ fn bench_multi_field_insert(c: &mut Criterion) {
                 let db = Chronix::open(bench_config(tmp.path())).unwrap();
                 (db, tmp)
             },
-            |(db, _tmp)| {
+            |(db, tmp)| {
                 let _ = db.insert_batch(black_box(&points)).unwrap();
+                (db, tmp)
             },
         );
     });
 }
 
-// ── Batch commit (< 10ms target) benchmark (BACKLOG3 Story 4.3) ───
+// ── Batch commit (< 10ms target) benchmark ────────────────────────
 
 fn bench_batch_commit(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_commit");
@@ -263,9 +300,10 @@ fn bench_batch_commit(c: &mut Criterion) {
                     let db = Chronix::open(bench_config(tmp.path())).unwrap();
                     (db, tmp)
                 },
-                |(db, _tmp)| {
+                |(db, tmp)| {
                     let _ = db.insert_batch(black_box(pts)).unwrap();
                     black_box(db.flush().unwrap());
+                    (db, tmp)
                 },
             );
         });
@@ -296,15 +334,16 @@ fn bench_execute_stream(c: &mut Criterion) {
     });
 }
 
-// ── Epic 9 - Performance Validation ────────────────────────────────
+// ── Performance Validation ─────────────────────────────────────────
 
-/// Story 9.1: Sustained 1M+ points/sec ingestion.
+/// Sustained ingestion: 1M points in 100 batches, one writer.
 ///
 /// Inserts 10K batches of 100 points (1M total) including WAL append,
 /// memtable insert, and LVC update.
 fn bench_sustained_ingestion_1m(c: &mut Criterion) {
     let mut group = c.benchmark_group("sustained_ingestion");
     group.sample_size(10); // fewer samples — this is a heavy benchmark
+    group.throughput(Throughput::Elements(1_000_000));
 
     // Pre-generate 100 batches of 10K points (1M total)
     let batches: Vec<Vec<Point>> = (0..100)
@@ -346,17 +385,95 @@ fn bench_sustained_ingestion_1m(c: &mut Criterion) {
                 let db = Chronix::open(bench_config(tmp.path())).unwrap();
                 (db, tmp)
             },
-            |(db, _tmp)| {
+            |(db, tmp)| {
                 for batch in &batches {
                     let _ = db.insert_batch(black_box(batch)).unwrap();
                 }
+                (db, tmp)
             },
         );
     });
     group.finish();
 }
 
-/// Story 9.2: Compression ratio benchmark.
+/// Sustained ingestion from several writer threads at once.
+///
+/// The single-writer number above is bounded by one thread's WAL encode and
+/// memtable insert; it is not the engine's ceiling. The memtable is a
+/// lock-free skip list behind a shard router and the WAL coalesces concurrent
+/// appends into one group sync, so the interesting question — the one a
+/// "points/sec" figure in a document is usually taken to answer — is what
+/// several writers reach together. Nothing measured it, so no answer was
+/// grounded in anything.
+fn bench_concurrent_ingestion(c: &mut Criterion) {
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent_ingestion");
+    group.sample_size(10);
+
+    const PER_WRITER: usize = 100_000;
+
+    for writers in [2usize, 4, 8] {
+        group.throughput(Throughput::Elements((writers * PER_WRITER) as u64));
+        // Each writer owns a disjoint slice of the series space, which is how
+        // a real multi-source ingest looks and keeps writers off each other's
+        // skip-list nodes.
+        let per_writer: Vec<Vec<Point>> = (0..writers)
+            .map(|w| {
+                (0..PER_WRITER)
+                    .map(|i| {
+                        let tags: BTreeMap<String, String> = [
+                            ("host".to_string(), format!("host-{}", w * 100 + i % 100)),
+                            ("region".to_string(), format!("region-{}", i % 5)),
+                        ]
+                        .into_iter()
+                        .collect();
+                        let key = SeriesKey::new("cpu", tags).unwrap();
+                        let fields: BTreeMap<String, FieldValue> = [(
+                            "usage_idle".to_string(),
+                            FieldValue::F64(42.0 + (i as f64) * 0.001),
+                        )]
+                        .into_iter()
+                        .collect();
+                        let ts = 1_700_000_000_000_000_000_i64 + (i as i64) * 1_000_000_000;
+                        Point::new(key, fields, ts).unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        let per_writer = Arc::new(per_writer);
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(writers),
+            &per_writer,
+            |b, batches| {
+                b.iter_with_setup(
+                    || {
+                        let tmp = TempDir::new().unwrap();
+                        let db = Arc::new(Chronix::open(bench_config(tmp.path())).unwrap());
+                        (db, tmp)
+                    },
+                    |(db, tmp)| {
+                        thread::scope(|scope| {
+                            for chunk in batches.iter() {
+                                let db = Arc::clone(&db);
+                                scope.spawn(move || {
+                                    for batch in chunk.chunks(10_000) {
+                                        let _ = db.insert_batch(black_box(batch)).unwrap();
+                                    }
+                                });
+                            }
+                        });
+                        (db, tmp)
+                    },
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Compression ratio benchmark.
 ///
 /// Writes known data patterns and measures segment size vs raw data size.
 fn bench_compression_ratio(c: &mut Criterion) {
@@ -395,7 +512,7 @@ fn bench_compression_ratio(c: &mut Criterion) {
     group.finish();
 }
 
-/// Story 9.3: Sub-millisecond query latency.
+/// Query latency, against 100K points across 1K series.
 ///
 /// Preloads a database with data across many series and measures
 /// single-series and multi-series query latency.
@@ -405,6 +522,10 @@ fn bench_query_latency(c: &mut Criterion) {
     let config = ChronixConfig::builder()
         .data_dir(tmp.path())
         .memtable_flush_threshold(128 * 1024 * 1024)
+        // `lvc_lookup` below is where the last-value-cache figure is read
+        // from. The cache is opt-in, so without this the benchmark measures
+        // the fallback scan instead.
+        .enable_last_value_cache(true)
         .build()
         .unwrap();
     let db = Chronix::open(config).unwrap();
@@ -539,9 +660,9 @@ fn bench_compaction(c: &mut Criterion) {
     group.finish();
 }
 
-// ── SQL Analytics Benchmarks (Story 10.3) ──────────────────────────
+// ── SQL Analytics Benchmarks ───────────────────────────────────────
 
-/// Story 10.3 — SQL forecast on single series: target < 50ms.
+/// SQL forecast on a single series: target < 50ms.
 fn bench_sql_forecast(c: &mut Criterion) {
     let mut group = c.benchmark_group("sql_forecast");
     group.sample_size(10);
@@ -595,7 +716,7 @@ fn bench_sql_forecast(c: &mut Criterion) {
     group.finish();
 }
 
-/// Story 10.3 — SQL anomaly_score on single series: target < 100ms.
+/// SQL anomaly_score on a single series: target < 100ms.
 fn bench_sql_anomaly(c: &mut Criterion) {
     let mut group = c.benchmark_group("sql_anomaly");
     group.sample_size(10);
@@ -649,7 +770,7 @@ fn bench_sql_anomaly(c: &mut Criterion) {
     group.finish();
 }
 
-/// Story 10.3 — 10 concurrent FORECAST queries in parallel: target < 200ms total.
+/// 10 concurrent FORECAST queries in parallel: target < 200ms total.
 fn bench_sql_parallel_forecast(c: &mut Criterion) {
     let mut group = c.benchmark_group("sql_parallel_forecast");
     group.sample_size(10);
@@ -728,6 +849,7 @@ criterion_group!(
     bench_batch_commit,
     bench_execute_stream,
     bench_sustained_ingestion_1m,
+    bench_concurrent_ingestion,
     bench_compression_ratio,
     bench_query_latency,
     bench_compaction,
@@ -743,7 +865,7 @@ criterion_group!(
 );
 criterion_main!(benches);
 
-// ── SQL Query Engine Benchmarks (Epic 5, Story 5.1) ────────────────
+// ── SQL Query Engine Benchmarks ────────────────────────────────────
 
 use chronix::promql::eval::QueryParams;
 use chronix::promql::{parse, PromQLEvaluator};
@@ -765,7 +887,7 @@ fn seeded_sql_env(n: usize) -> (Arc<Chronix>, tokio::runtime::Runtime, TempDir) 
     (db, rt, tmp)
 }
 
-/// Story 5.1 — Simple SELECT with time range: target < 5ms p99.
+/// Simple SELECT with a time range: target < 5ms p99.
 fn bench_sql_select_with_time_range(c: &mut Criterion) {
     let (db, rt, _tmp) = seeded_sql_env(100_000);
     let ctx = create_session_context(db);
@@ -784,7 +906,7 @@ fn bench_sql_select_with_time_range(c: &mut Criterion) {
     });
 }
 
-/// Story 5.1 — GROUP BY time_bucket with aggregation: target < 50ms p99 on 1M rows.
+/// GROUP BY time_bucket with aggregation: target < 50ms p99 on 1M rows.
 fn bench_sql_group_by_time_bucket(c: &mut Criterion) {
     let (db, rt, _tmp) = seeded_sql_env(100_000);
     let ctx = create_session_context(db);
@@ -806,7 +928,7 @@ fn bench_sql_group_by_time_bucket(c: &mut Criterion) {
     });
 }
 
-/// Story 5.1 — ORDER BY _time DESC LIMIT 100: target < 2ms p99.
+/// ORDER BY _time DESC LIMIT 100: target < 2ms p99.
 fn bench_sql_order_limit(c: &mut Criterion) {
     let (db, rt, _tmp) = seeded_sql_env(100_000);
     let ctx = create_session_context(db);
@@ -824,7 +946,7 @@ fn bench_sql_order_limit(c: &mut Criterion) {
     });
 }
 
-// ── PromQL Query Engine Benchmarks (Epic 5, Story 5.2) ──────────────
+// ── PromQL Query Engine Benchmarks ──────────────────────────────────
 
 /// Seed a DB with points that look like Prometheus metrics
 /// (measurement = metric name, tags = labels).
@@ -867,7 +989,7 @@ fn seeded_promql_env(
     (Arc::new(db), tmp)
 }
 
-/// Story 5.2 — Instant query (`rate(metric[5m])`): target < 10ms p99.
+/// Instant query (`rate(metric[5m])`): target < 10ms p99.
 fn bench_promql_instant_rate(c: &mut Criterion) {
     let (db, _tmp) = seeded_promql_env("http_requests_total", 100, 100);
     let evaluator = PromQLEvaluator::new(db);
@@ -889,7 +1011,7 @@ fn bench_promql_instant_rate(c: &mut Criterion) {
     });
 }
 
-/// Story 5.2 — Range query (1h range, 15s step): target < 100ms p99.
+/// Range query (1h range, 15s step): target < 100ms p99.
 fn bench_promql_range_query(c: &mut Criterion) {
     let (db, _tmp) = seeded_promql_env("node_cpu_seconds", 10, 240);
     let evaluator = PromQLEvaluator::new(db);
@@ -919,7 +1041,7 @@ fn bench_promql_range_query(c: &mut Criterion) {
     group.finish();
 }
 
-/// Story 5.2 — Aggregation (`sum by (host) (rate(metric[5m]))`): target < 50ms p99.
+/// Aggregation (`sum by (host) (rate(metric[5m]))`): target < 50ms p99.
 fn bench_promql_aggregation(c: &mut Criterion) {
     let (db, _tmp) = seeded_promql_env("app_requests_total", 100, 100);
     let evaluator = PromQLEvaluator::new(db);

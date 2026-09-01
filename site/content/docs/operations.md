@@ -81,7 +81,7 @@ zstd_level = 3
 | `zstd_dict_training` | `false` | Train a per-segment Zstd dictionary from the first row group. Helps where blocks are small and repetitive; costs a training pass per segment |
 | `float_encoding` | `chimp` | `chimp`, `gorilla`, or `plain` |
 | `segment_cache_size` | `512MB` | Decoded-segment cache |
-| `enable_last_value_cache` | `false` | Sub-10 µs last-value reads |
+| `enable_last_value_cache` | `false` | Sub-µs last-value reads (~400 ns; otherwise a memtable scan) |
 | `compaction_concurrency` | — | Parallel compaction tasks |
 | `max_series_cardinality` | — | Cardinality budget |
 

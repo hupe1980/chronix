@@ -126,7 +126,7 @@ pub struct SegmentCatalog {
     segments: BTreeMap<ShardId, Vec<SegmentCatalogEntry>>,
     /// Measurement schemas.
     schemas: HashMap<String, MeasurementSchema>,
-    /// Tombstones recorded by deletes (D43).
+    /// Tombstones recorded by deletes.
     ///
     /// These live in the catalog rather than in the data WAL, and that is the
     /// fix for a delete that did not survive a restart. The data WAL is

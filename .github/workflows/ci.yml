@@ -30,9 +30,24 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
       # Default members = the product (engine, analytics, streaming,
       # security, facade, server). The frozen cluster tier has its own job.
       - run: cargo clippy --all-targets -- -D warnings
+      # `release.yml` publishes in the order this prints. Nothing else runs it,
+      # so without this step a broken derivation surfaces mid-release, with
+      # some crates already uploaded and no way to take them back.
+      - name: Publish order resolves
+        run: |
+          set -euo pipefail
+          order=$(./scripts/publish-order.sh)
+          echo "$order"
+          [ "$(printf '%s\n' "$order" | wc -l)" -eq 8 ] || {
+            echo "::error::expected 8 publishable crates" >&2; exit 1; }
+          [ "$(printf '%s\n' "$order" | head -1)" = "chronix-core" ] || {
+            echo "::error::chronix-core must publish first" >&2; exit 1; }
+          [ "$(printf '%s\n' "$order" | tail -1)" = "chronix" ] || {
+            echo "::error::chronix must publish last" >&2; exit 1; }
 
   test:
     name: Test
@@ -44,17 +59,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
       - run: cargo test
 
   cross-aarch64:
     # The first deployment target is an aarch64 Linux gateway
     # (512 MB–1 GB RAM, eMMC/SD). Keep the embedded build compiling for it.
     #
-    # musl is checked alongside gnu because it is the target that *proves* the
-    # no-C-toolchain claim: a dependency with a build script that shells out to
-    # cmake compiles on the gnu host and falls over here. Nothing in the
-    # release graph builds C any more (D38, D41), and this is what keeps that
-    # true rather than asserted. The design partner asked for both.
+    # musl is checked alongside gnu because it is where a build script that
+    # needs more than a C compiler falls over: one that shells out to cmake
+    # compiles on the gnu host and fails here. The claim being kept true is
+    # "nothing needs a toolchain beyond `cc`" — not "nothing builds C", which
+    # was never accurate: `ring` compiles 17 C files and 90 assembly files.
+    # The design partner asked for both targets.
     name: Cross-compile (aarch64 Linux, ${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
@@ -68,21 +85,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p chronix -p chronixd --target ${{ matrix.target }}
+      - uses: ./.github/actions/setup-protoc
+      # `clippy`, not `check`: architecture-gated code is only linted for the
+      # architecture being compiled, so the NEON paths in `chronix-analytics`
+      # are invisible to the x86_64 Clippy job — and the x86 paths are
+      # invisible to anyone developing on an aarch64 machine. This is the only
+      # job that lints the target the design partner actually ships on.
+      - run: cargo clippy -p chronix -p chronixd --target ${{ matrix.target }} -- -D warnings
       # The connectors are the features most likely to reintroduce a C
       # dependency, so they are cross-checked rather than assumed.
-      - run: cargo check -p chronixd --features all-connectors --target ${{ matrix.target }}
+      - run: cargo clippy -p chronixd --features all-connectors --target ${{ matrix.target }} -- -D warnings
 
   frozen-tier:
     # The distributed cluster tier is frozen (no active development) but
-    # must keep compiling — see concepts/CLUSTER.md.
+    # must keep compiling.
     name: Frozen cluster tier (compile check)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
       - run: cargo check -p chronix-meta -p chronix-cluster -p chronix-dsim
       # `cargo check` is a weaker floor than it reads as: the frozen tier once
       # stopped *clippy-compiling* while this job stayed green (R14). Lints are
@@ -101,6 +126,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
       - run: cargo test -p chronixd --features otlp
       - run: cargo check -p chronixd --features all-connectors --all-targets
       - run: cargo test -p chronix-engine --features field-encryption
@@ -188,6 +214,7 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
       - name: Install
         run: python -m pip install --upgrade pip && pip install -e ".[dev]"
       - name: Unit tests
@@ -214,18 +241,6 @@ jobs:
           curl -sf http://127.0.0.1:4242/health
           cd sdks/python && CHRONIX_URL=http://127.0.0.1:4242 python tests/smoke_live.py
 
-  references:
-    # `concepts/README.md` promises that D and R numbers are stable identifiers
-    # cited from code comments — "renumbering one breaks a reference nothing
-    # checks". This is that check. The tree carried 130 comments citing round
-    # numbers from a defunct audit scheme, which read as citations of risks
-    # that do not exist.
-    name: Reference integrity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: ./scripts/check-references.sh
-
   deny:
     name: Dependency Check
     runs-on: ubuntu-latest
@@ -251,6 +266,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
       - run: cargo doc --no-deps
       # Doc examples are compiled and run. `doctest = false` in every manifest
       # keeps them out of the ordinary test run for build time, which meant
@@ -278,7 +294,10 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly miri test -p chronix-core -- --skip proptests --skip config_toml_roundtrip
+      # No `--skip` list: the tests Miri cannot run carry
+      # `#[cfg_attr(miri, ignore)]` themselves, so adding one cannot silently
+      # break this job.
+      - run: cargo +nightly miri test -p chronix-core
 
   msrv:
     name: MSRV (1.94)
@@ -289,4 +308,5 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
       - run: cargo check --all-targets

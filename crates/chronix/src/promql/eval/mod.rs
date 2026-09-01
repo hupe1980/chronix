@@ -166,7 +166,7 @@ const SCAN_CACHE_CAPACITY: usize = 8;
 /// How much storage work one evaluator actually did.
 ///
 /// Exposed because the claim "a range query reads its window once" is a claim
-/// about behaviour, and a claim in a comment is a claim to be tested (R3). The
+/// about behaviour, and a claim in a comment is a claim to be tested. The
 /// comment was there for several releases while the code did the opposite.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanStats {

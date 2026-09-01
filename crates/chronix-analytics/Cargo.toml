@@ -29,7 +29,6 @@ default = []
 
 [dependencies]
 chronix-core.workspace = true
-chronix-streaming.workspace = true
 
 # Numerics
 rand.workspace = true

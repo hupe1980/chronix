@@ -202,7 +202,7 @@ pub struct ServerConfig {
     /// dimensions separately, and their product is not a bound anybody would
     /// choose: 11 000 points × 10 000 series × 16 bytes is ~1.8 GB. The
     /// evaluator has always checked this budget — it was simply never set by
-    /// any caller, so it read `0` and meant "unlimited" (R3).
+    /// any caller, so it read `0` and meant "unlimited".
     #[serde(default = "default_prom_max_result_bytes")]
     pub prom_max_result_bytes: usize,
 

@@ -59,7 +59,7 @@ fn a_namespaced_scan_sees_flushed_data() {
 
     db.flush().unwrap();
 
-    // Both read paths, because they have disagreed before (R1).
+    // Both read paths, because they have disagreed before.
     let via_execute = db.execute(&plan).unwrap().num_rows();
     let via_iter = count(&db, &plan);
     assert_eq!(

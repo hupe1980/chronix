@@ -4,7 +4,7 @@
 //! A memory budget that holds for `execute()` and not for `execute_stream()`
 //! is not a memory budget — and `execute_stream` is the path that matters,
 //! because SQL, HTTP `/query`, gRPC, PromQL, Prometheus remote read and Flight
-//! SQL all go through it (R1: two implementations of one semantic diverge
+//! SQL all go through it (two implementations of one semantic diverge
 //! silently, and the wrong one is always the one users get).
 //!
 //! The streaming `Aggregate(Scan)` branch folds each batch into a

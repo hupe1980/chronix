@@ -88,9 +88,8 @@ class ChronixClient:
     async def server_info(self) -> ServerInfo:
         """Get server metadata (version, uptime, measurement count).
 
-        Assembled from ``/health`` and the measurement listing's ``total``.
-        There is no ``/api/v1/server_info`` route — this method used to call
-        one, and got a 404 on every invocation.
+        Assembled from ``/health`` and the measurement listing's ``total``;
+        there is no ``/api/v1/server_info`` route.
         """
         health = await self._get("/health")
         listing = await self._get("/api/v1/measurements", params={"limit": 1})
@@ -127,9 +126,9 @@ class ChronixClient:
             headers["Idempotency-Key"] = idempotency_key
 
         body = [p.to_dict() for p in points]
-        # `POST /api/v1/write` answers **204 No Content**. Parsing a JSON body
-        # from it — which this method used to do, reading a `written` field
-        # that no response has ever carried — raises on every successful write.
+        # `POST /api/v1/write` answers **204 No Content** — no body to parse,
+        # so the count returned here is the caller's own.
+
         await self._post_no_content("/api/v1/write", json=body, extra_headers=headers)
         return len(points)
 
@@ -241,9 +240,8 @@ class ChronixClient:
         # The SQL endpoint answers column-oriented metadata plus **positional**
         # rows — `{"columns": [{"name", "data_type"}], "rows": [[...]],
         # "row_count": n}`. `QueryResult` holds row dicts, so the two are
-        # zipped here; handing the raw arrays through, as this used to, gave
-        # callers rows with no column names and a `to_dataframe()` with
-        # integer headers.
+        # zipped here; handing the raw arrays through would give callers rows
+        # with no column names and a `to_dataframe()` with integer headers.
         data = await self._post("/api/v1/sql", json={"query": query})
         names = [c["name"] for c in data.get("columns", [])]
         rows = [dict(zip(names, row)) for row in data.get("rows", [])]
@@ -314,11 +312,6 @@ class ChronixClient:
         Returns a :class:`DeleteResult`. Check
         :attr:`~DeleteResult.complete` before treating the delete as done: the
         server skips segments it cannot read rather than failing the request.
-
-        The tag filters used to be sent as ``tag_filters``, a field the server
-        does not read — and its delete body ignores unknown fields, so every
-        delete issued through this client silently dropped its filters and
-        applied to the **whole measurement**.
         """
         body: dict[str, Any] = {"measurement": measurement}
         if time_range is not None:

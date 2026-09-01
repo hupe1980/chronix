@@ -10,7 +10,7 @@
 //! These tests drive the public API (`drop_measurement`, `delete_series`,
 //! `statistics`) rather than the internal counters, because the internal
 //! counters are what got this wrong: two structures tracked the same fact and
-//! only one of them was maintained on the delete path (R1 — two
+//! only one of them was maintained on the delete path (two
 //! implementations of one semantic diverge silently).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may unwrap

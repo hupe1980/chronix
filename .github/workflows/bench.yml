@@ -48,7 +48,7 @@ jobs:
         run: cargo install critcmp --locked
 
       # The subset is the hot paths with a claim attached to them
-      # (concepts/QUALITY.md §2): the codecs, the WAL and memtable write path,
+      # the codecs, the WAL and memtable write path,
       # and the end-to-end engine benches. The analytics and server benches are
       # slower and are left to the scheduled full run.
       - name: Benchmark the pull request

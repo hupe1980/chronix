@@ -1,0 +1,197 @@
+name: Release
+
+# Tag-driven. `git push origin v0.1.0` publishes the eight library crates to
+# crates.io, builds the `chronixd` binaries and attaches them to the GitHub
+# release.
+#
+# Publishing is irreversible per version, so it runs last: the tag is checked
+# against the manifest, the release gate runs, and every binary target builds
+# before a single crate is uploaded. `workflow_dispatch` exercises the whole
+# path with `--dry-run` publishes.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build"
+        required: true
+      dry_run:
+        description: "Publish with --dry-run"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag says one version; the manifest says another. Catch that before
+  # producing artefacts named after the wrong one.
+  verify:
+    name: Verify the tag matches the manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          manifest=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=$tag manifest=$manifest"
+          [ "$tag" = "v$manifest" ] || {
+            echo "::error::tag $tag does not match workspace version $manifest" >&2
+            exit 1
+          }
+
+  # A tag push does not run the CI workflow, so the gate runs here too. These
+  # are the checks a published version cannot be taken back from.
+  gate:
+    name: Release gate
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test --doc --workspace
+      # docs.rs builds with all features, so a link that resolves only under
+      # the default set is a broken docs.rs page for a version already public.
+      - run: cargo doc --no-deps --workspace --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - run: ./scripts/check-docs.sh
+      - run: ./scripts/check-references.sh
+
+  binaries:
+    name: chronixd (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl }
+          # The design partner's target. musl is the one that matters for a
+          # gateway: a static binary with no libc version to match.
+          - { os: ubuntu-latest,  target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-latest,  target: aarch64-unknown-linux-musl }
+          - { os: macos-latest,   target: aarch64-apple-darwin }
+          - { os: macos-latest,   target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: ./.github/actions/setup-protoc
+
+      # aws-lc-rs compiles C for the *target*, so a cross build needs a cross
+      # C compiler — `cross` supplies one per target rather than this workflow
+      # growing a matrix of apt packages.
+      - name: Install cross
+        if: runner.os == 'Linux'
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cross build --release --locked -p chronixd --target ${{ matrix.target }}
+          else
+            cargo build --release --locked -p chronixd --target ${{ matrix.target }}
+          fi
+
+      - name: Archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="chronixd-${{ github.event.inputs.tag || github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/chronixd" "dist/$name/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  # Last, because it cannot be undone. `chronixd` is not here: its `cluster`
+  # and `chaos` features depend on `publish = false` crates, and cargo requires
+  # a version for every packaged dependency, optional ones included.
+  crates-io:
+    name: Publish to crates.io
+    needs: [gate, binaries]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          [ -n "${CARGO_REGISTRY_TOKEN:-}" ] || {
+            echo "::error::CARGO_REGISTRY_TOKEN is not set" >&2
+            exit 1
+          }
+          args=(--locked)
+          # `--dry-run` on a crate whose dependencies are not yet on crates.io
+          # fails with "no matching package named …", so a dry run is only
+          # meaningful once a first release exists.
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+
+          # Dependency order, derived from the manifests rather than pinned
+          # here, so a dependency change cannot leave it stale.
+          for crate in $(./scripts/publish-order.sh); do
+            echo "── $crate"
+            # `cargo publish` blocks until the new version appears in the
+            # index, so the next crate in the order can resolve it.
+            set +e
+            out=$(cargo publish -p "$crate" "${args[@]}" 2>&1)
+            rc=$?
+            set -e
+            printf '%s\n' "$out"
+            if [ "$rc" -ne 0 ]; then
+              # Re-running a partly-completed release must not fail on the
+              # crates already uploaded at this version.
+              if printf '%s' "$out" | grep -qiE "already (exists|uploaded)"; then
+                echo "$crate is already published at this version — skipping"
+                continue
+              fi
+              exit "$rc"
+            fi
+          done
+
+  github-release:
+    name: Attach binaries to the release
+    needs: [binaries, crates-io]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

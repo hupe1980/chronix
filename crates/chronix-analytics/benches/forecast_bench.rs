@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)] // benches may unwrap
 //! Performance benchmarks for forecast models.
 //!
-//! Targets from BACKLOG7:
+//! Targets:
 //! - SES fit (10K) < 5ms, predict (1K) < 100µs
 //! - Holt-Winters fit (10K, period=24) < 20ms
 //! - ARIMA(1,1,1) fit (10K) < 100ms
@@ -12,7 +12,8 @@
 use chronix_analytics::forecast::{
     ArimaModel, ForecastModel, HoltLinearModel, HoltWintersModel, LinearRegressionModel, SesModel,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 fn gen_data(n: usize) -> (Vec<i64>, Vec<f64>) {
     let ts: Vec<i64> = (0..n as i64).map(|i| i * 1_000_000_000).collect();

@@ -155,7 +155,7 @@ impl PatasDecoder {
             // which panics in debug and silently masks to a wrong value in
             // release. Gorilla and Chimp both derive their shift through a
             // `checked_sub` chain that cannot exceed 63; Patas was the sibling
-            // that validated nothing (R4, D33).
+            // that validated nothing.
             if tz_bytes + sig_bytes > 8 {
                 return Err(EncodingError::CorruptData {
                     detail: format!(

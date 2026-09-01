@@ -51,13 +51,18 @@ use crate::config::{ClusterTlsConfig, TlsConfig};
 /// `rustls/aws-lc-rs` while this workspace asks for `ring`, so every TLS
 /// deployment of `chronixd` aborted with "Could not automatically determine
 /// the process-level CryptoProvider". The features are now unambiguous
-/// (D41), and this call is the belt to that pair of braces: a future
+///, and this call is the belt to that pair of braces: a future
 /// dependency that re-enables a second provider cannot silently bring the
 /// panic back. Installing is idempotent and losing the race is not an error.
-fn ensure_crypto_provider() {
+///
+/// Called at process start rather than only from the TLS path: `reqwest` is
+/// built with `rustls-no-provider` and resolves the process-level provider
+/// when a `Client` is constructed, so an outbound HTTPS request panics
+/// without one even on a server that serves plaintext.
+pub fn ensure_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 
@@ -263,7 +268,7 @@ impl ResolvesServerCert for ReloadableCertResolver {
 pub fn load_certified_key(config: &TlsConfig) -> Result<Arc<CertifiedKey>, TlsError> {
     let certs = load_certs(&config.cert)?;
     let key = load_private_key(&config.key)?;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
         .map_err(|e| TlsError::Config(format!("unsupported private key type: {e}")))?;
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
 }

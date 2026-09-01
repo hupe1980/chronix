@@ -14,8 +14,8 @@
 //! `krafka` rather than `rdkafka`: `rdkafka` compiles librdkafka from C
 //! through cmake, so enabling Kafka ingestion imposed a C toolchain on every
 //! build — including the aarch64 cross-compile the embedded wedge depends on
-//! (R11) — and put an unaudited FFI surface inside a tree whose policy is
-//! `deny(unsafe_code)`. `krafka` is pure Rust with the same policy (D35).
+//! — and put an unaudited FFI surface inside a tree whose policy is
+//! `deny(unsafe_code)`. `krafka` is pure Rust with the same policy.
 //!
 //! # Configuration
 //!

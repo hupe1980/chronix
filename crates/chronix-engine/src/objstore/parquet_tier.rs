@@ -9,7 +9,7 @@
 //! chronix can read it: Spark, DuckDB, Polars and pandas all read Parquet and
 //! none of them will ever read `.csx`.
 //!
-//! So the tiering engine **re-encodes** on the way out (D6). A cold object is
+//! So the tiering engine **re-encodes** on the way out. A cold object is
 //! an ordinary Parquet file with an ordinary Arrow schema — `SELECT * FROM
 //! read_parquet('s3://…')` in DuckDB works with no chronix in the picture.
 //!
@@ -31,7 +31,7 @@
 //! Series blooms and the skip index do not survive: Parquet has no place to
 //! put them. Cold reads therefore prune on row-group statistics alone, which
 //! is weaker than the five-level pruning the hot tier gets
-//! (`concepts/QUERY.md`). That is the price of the archive being readable, and
+//! than a `.csx` read. That is the price of the archive being readable, and
 //! it is charged on the data that is queried least.
 
 use std::path::Path;
@@ -69,7 +69,7 @@ const COLD_ROW_GROUP_ROWS: usize = 65_536;
 pub enum ColdFormat {
     /// Verbatim `.csx`. Smallest, and readable only by chronix.
     Csx,
-    /// Re-encoded Parquet. Readable by any Arrow-ecosystem tool (D6).
+    /// Re-encoded Parquet. Readable by any Arrow-ecosystem tool.
     #[default]
     Parquet,
 }
@@ -340,7 +340,7 @@ mod tests {
         assert_eq!(
             ColdFormat::default(),
             ColdFormat::Parquet,
-            "the archive should be readable by default (D6)"
+            "the archive should be readable by default"
         );
     }
 }

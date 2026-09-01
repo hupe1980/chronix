@@ -305,7 +305,7 @@ impl AuditEvent {
         self.prev_hash = prev_hash.map(String::from);
 
         let hash = if let Some(key) = hmac_key {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             type HmacSha256 = Hmac<Sha256>;
             let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
             if let Some(ph) = &self.prev_hash {
@@ -356,7 +356,7 @@ pub fn verify_hash_chain_with_key(
 
         // Recompute the hash
         let expected_hash = if let Some(key) = hmac_key {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             type HmacSha256 = Hmac<Sha256>;
             let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
             if let Some(ph) = &event.prev_hash {

@@ -60,18 +60,24 @@
 <link rel="stylesheet" href="{{ get_url(path='giallo-dark.css', trailing_slash=false) | safe }}" media="(prefers-color-scheme: dark)">
 
 {% block structured_data %}
+{#- Tera has array literals but not map literals, so the object is written out
+    and each *value* is passed through `json_encode`, which quotes and escapes
+    a string into exactly what a JSON value position needs. -#}
 <script type="application/ld+json">
-{{ {
+{
   "@context": "https://schema.org",
   "@type": "SoftwareSourceCode",
   "name": "Chronix",
-  "description": config.description,
-  "url": config.base_url,
-  "codeRepository": config.extra.repo_url,
+  "description": {{ config.description | json_encode() | safe }},
+  "url": {{ config.base_url | json_encode() | safe }},
+  "codeRepository": {{ config.extra.repo_url | json_encode() | safe }},
   "programmingLanguage": "Rust",
   "license": "https://spdx.org/licenses/MIT.html",
-  "author": {"@type": "Person", "name": config.extra.author | default(value="hupe1980")}
-} | json_encode() | safe }}
+  "author": {
+    "@type": "Person",
+    "name": {{ config.extra.author | default(value="hupe1980") | json_encode() | safe }}
+  }
+}
 </script>
 {% endblock %}
 

@@ -5,12 +5,6 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Each entry states why it is accepted and what would clear it. An `ignore`
 # without a reason is how an advisory list stops being read.
 ignore = [
-  # rustls-pemfile — unmaintained; its functionality moved into
-  # rustls-pki-types 1.9+. Chronix's own use is migrated (see
-  # chronixd::tls), but `axum-server` still depends on it transitively, so
-  # the crate stays in the graph until that upstream moves. No vulnerability.
-  "RUSTSEC-2025-0134",
-
   # quick-xml < 0.41 — two denial-of-service parsing bugs, pulled in only by
   # `object_store`, which pins `^0.39`. Reachable only when parsing an XML
   # response from an S3/Azure endpoint, i.e. from the object store the
@@ -33,7 +27,6 @@ allow = [
   "ISC",
   # Unicode data tables (icu, unicode-ident).
   "Unicode-3.0",
-  "Unicode-DFS-2016",
   # Apache-2.0 with the LLVM linking exception — strictly more permissive than
   # plain Apache-2.0 (ar_archive_writer, and the Rust toolchain's own crates).
   "Apache-2.0 WITH LLVM-exception",
@@ -50,12 +43,13 @@ allow = [
 confidence-threshold = 0.8
 
 # aws-lc-sys declares "ISC AND (Apache-2.0 OR ISC) AND OpenSSL". The OpenSSL
-# clause covers vendored BoringSSL-derived C, and is an advertising-clause-free
-# permissive licence; it is accepted for this crate only rather than allowed
-# globally, because a blanket `OpenSSL` allow would also permit the far more
-# awkward OpenSSL 1.x combination elsewhere. It reaches the graph through
-# rustls feature unification (bollard/hyper-rustls enable the aws-lc-rs
-# backend), not through a chronix dependency.
+# clause covers the vendored BoringSSL-derived C and is an
+# advertising-clause-free permissive licence. It is accepted for this crate
+# only rather than allowed globally, because a blanket `OpenSSL` allow would
+# also permit the far more awkward OpenSSL 1.x combination elsewhere.
+#
+# It is a deliberate first-party dependency: `aws-lc-rs` is the workspace's
+# single rustls crypto provider (D41, D59).
 [[licenses.exceptions]]
 name = "aws-lc-sys"
 allow = ["OpenSSL"]

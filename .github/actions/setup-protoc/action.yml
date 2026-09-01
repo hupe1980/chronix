@@ -1,0 +1,29 @@
+name: Set up protoc
+description: >
+  Install the protobuf compiler, which `chronixd`'s build script needs to
+  generate the gRPC service, the Prometheus remote-write types and the OTLP
+  metric types from `crates/chronixd/proto`.
+
+  One definition, referenced by every job that builds `chronixd`. Inlining the
+  install in each job is the shape that produced the failure this replaces: no
+  job had it, several needed it, and the one that reached the build script
+  first was the only one that said so.
+
+runs:
+  using: composite
+  steps:
+    - name: Install protoc
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v protoc >/dev/null; then
+          protoc --version
+          exit 0
+        fi
+        case "$RUNNER_OS" in
+          Linux)   sudo apt-get update -qq && sudo apt-get install -y protobuf-compiler ;;
+          macOS)   brew install protobuf ;;
+          Windows) choco install protoc --no-progress ;;
+          *)       echo "unsupported runner: $RUNNER_OS" >&2; exit 1 ;;
+        esac
+        protoc --version

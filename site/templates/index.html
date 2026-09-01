@@ -5,18 +5,18 @@
 {#- A landing page benefits from a second, product-shaped entity: it is what
     populates a rich result rather than a plain blue link. -#}
 <script type="application/ld+json">
-{{ {
+{
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "Chronix",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux, macOS, Windows",
-  "description": config.description,
-  "url": config.base_url,
-  "softwareVersion": config.extra.version,
+  "description": {{ config.description | json_encode() | safe }},
+  "url": {{ config.base_url | json_encode() | safe }},
+  "softwareVersion": {{ config.extra.version | json_encode() | safe }},
   "license": "https://spdx.org/licenses/MIT.html",
   "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
-} | json_encode() | safe }}
+}
 </script>
 {% endblock %}
 

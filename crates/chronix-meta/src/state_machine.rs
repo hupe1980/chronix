@@ -138,7 +138,7 @@ impl Default for MetaState {
 /// heartbeat store is initially empty — it re-populates as data nodes
 /// send their next heartbeats.
 ///
-/// **Mitigation:** The [`ClusterCoordinator`] implements a configurable
+/// **Mitigation:** the cluster coordinator implements a configurable
 /// **grace period** (see `record_leader_change` / `in_leader_grace_period`)
 /// during which health checks are suppressed after leader failover. This
 /// prevents spurious suspect/dead declarations while heartbeats propagate

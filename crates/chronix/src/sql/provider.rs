@@ -114,8 +114,7 @@ impl ChronixTableProvider {
 /// field happened to be written first, so it (a) made a measurement's SQL
 /// column order a function of its write history and (b) disagreed with the
 /// storage batch order whenever fields were registered non-alphabetically,
-/// which previously caused projected queries to return the wrong column's
-/// data.
+/// which makes projected queries return the wrong column's data.
 #[must_use]
 pub fn measurement_schema_to_arrow(ms: &MeasurementSchema) -> SchemaRef {
     // The namespace tag is an internal marker, not user data: it must not

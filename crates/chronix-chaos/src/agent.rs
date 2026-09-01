@@ -132,7 +132,7 @@ impl ChaosAgent {
             }
         }
 
-        // Validate all fault parameters (D2 hardening — comprehensive
+        // Validate all fault parameters (comprehensive
         // config validation in a single place).
         config.validate().map_err(ChaosError::InvalidConfig)?;
 

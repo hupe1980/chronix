@@ -2,7 +2,7 @@
 //! and PCA reconstruction error.
 
 use crate::compute::simd_dot_product;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::multivariate::context::MultiSeriesContext;
 use crate::multivariate::error::MultivariateError;

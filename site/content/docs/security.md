@@ -873,7 +873,7 @@ Rejected: DDL, DML, `COPY`, `Statement` plans (`SET`, `PREPARE`, `BEGIN`),
 three are side-effect-free but disclose internal plan shape, catalog layout and
 statistics.
 
-Two properties make this sound, and both were previously missing:
+Two properties make this sound:
 
 1. **Verification happens before execution.** `SessionContext::sql()` is
    `sql_with_options(sql, SQLOptions::new())` with everything permitted — it

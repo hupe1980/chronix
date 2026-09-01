@@ -546,11 +546,11 @@ impl Hash for SeriesKey {
 ///
 /// Multi-tenancy is enforced by this one tag: every ingestion surface stamps
 /// it, every read surface scopes to it. It is *internal* — overwritten if a
-/// client supplies it, and absent from every result and schema (D45, D47).
+/// client supplies it, and absent from every result and schema.
 ///
 /// Defined here because the server, the query builder and the PromQL
-/// evaluator must all name the same key; they used to spell it out
-/// separately, and the copies drifted (R1).
+/// evaluator must all name the same key. Spelling it out separately lets the
+/// copies drift.
 pub const NAMESPACE_TAG: &str = "__namespace__";
 
 /// Separator between `(key, value)` pairs in a [`SeriesKey`] canonical form.
@@ -576,10 +576,10 @@ pub const KV_SEPARATOR: char = '\x01';
 /// order-sensitive, and [`SeriesKey`] keeps its tags sorted.
 ///
 /// Query and dedup paths reconstruct the canonical form from Arrow columns
-/// rather than from a [`SeriesKey`], and each used to inline the format. When
-/// the separators changed, tombstone matching broke silently because those
-/// copies still emitted the old layout. Everything that needs a canonical form
-/// goes through this function so the format has exactly one definition.
+/// rather than from a [`SeriesKey`]. Everything that needs a canonical form
+/// goes through this function so the format has exactly one definition — an
+/// inlined copy goes on emitting the old layout when the separators change,
+/// and tombstone matching breaks silently.
 pub fn push_canonical<'a, I>(out: &mut String, measurement: &str, tags: I)
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -843,7 +843,7 @@ impl fmt::Display for SeriesKey {
 /// Two fields, and each of them is load-bearing for a defect this type used to
 /// have.
 ///
-/// **Every tombstone carries a time range** (D42). There is no "delete the
+/// **Every tombstone carries a time range**. There is no "delete the
 /// series forever" variant, because a time-series delete is a statement about data
 /// that exists, not a standing order against data that does not exist yet.
 /// The unranged form used to mask every future write to the same series as
@@ -854,7 +854,7 @@ impl fmt::Display for SeriesKey {
 /// delete names an interval, and re-ingesting *into* a deleted interval stays
 /// masked until compaction materialises the delete.
 ///
-/// **`segments` records the segments the delete was issued against** (D44) — every
+/// **`segments` records the segments the delete was issued against** — every
 /// active segment that could hold a matching row at that moment. It is not
 /// consulted on the read path; it exists so that reclaiming a tombstone is a
 /// provable step rather than a guess. A tombstone may be dropped exactly when
@@ -1621,7 +1621,10 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+/// Not built under Miri: a property test is hundreds of interpreted cases per
+/// run, and Miri is three orders of magnitude slower than native. The unit
+/// tests above are what Miri is there to check for undefined behaviour.
+#[cfg(all(test, not(miri)))]
 mod proptests {
     use super::*;
     use proptest::prelude::*;

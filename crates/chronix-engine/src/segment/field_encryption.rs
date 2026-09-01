@@ -61,11 +61,23 @@
 
 use crate::segment::error::{Result, SegmentError};
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
 
 /// AES-256-GCM nonce size (96 bits).
 pub(crate) const NONCE_SIZE: usize = 12;
+
+/// Fill `dest` from the operating system's random source.
+///
+/// A GCM nonce must never repeat under one key, so there is no fallback worth
+/// having: if the kernel has no entropy source this panics rather than
+/// producing a nonce that could collide.
+fn fill_random(dest: &mut [u8]) {
+    use rand::TryRng;
+    rand::rngs::SysRng
+        .try_fill_bytes(dest)
+        .expect("the operating system random source must be available");
+}
 
 /// AES-256-GCM authentication tag size (128 bits).
 pub(crate) const TAG_SIZE: usize = 16;
@@ -186,7 +198,13 @@ pub(crate) fn encrypt_block(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>>
         detail: format!("invalid encryption key: {e}"),
     })?;
 
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    // `aead` no longer re-exports an OS generator, and `generate_nonce` went
+    // with it; the 96 bits come from the same source either way.
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    fill_random(&mut nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| SegmentError::CorruptFile {
+        detail: "nonce must be 12 bytes".into(),
+    })?;
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|e| SegmentError::CorruptFile {
@@ -217,11 +235,14 @@ pub(crate) fn decrypt_block(encrypted: &[u8], key: &[u8; 32]) -> Result<Vec<u8>>
         detail: format!("invalid decryption key: {e}"),
     })?;
 
-    let nonce = Nonce::from_slice(&encrypted[..NONCE_SIZE]);
+    let nonce =
+        Nonce::try_from(&encrypted[..NONCE_SIZE]).map_err(|_| SegmentError::CorruptFile {
+            detail: "nonce must be 12 bytes".into(),
+        })?;
     let ciphertext = &encrypted[NONCE_SIZE..];
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| SegmentError::CorruptFile {
             detail: format!("field decryption failed (wrong key or tampered data): {e}"),
         })

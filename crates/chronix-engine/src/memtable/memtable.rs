@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use chronix_core::types::{Point, SeriesKey, Timestamp};
@@ -49,8 +50,14 @@ pub struct Memtable {
     /// global `RwLock<HashMap>` to eliminate write-lock contention on the
     /// hot insert path.
     measurement_index: DashMap<Arc<str>, HashSet<u64>>,
-    /// Estimated total memory usage in bytes.
+    /// Estimated total memory usage in bytes, excluding `measurement_index`.
     estimated_size: AtomicUsize,
+    /// Estimated `measurement_index` footprint in bytes.
+    ///
+    /// Accumulated at the two sites that write the index, not recomputed on
+    /// read: the flush controller's capacity check calls `estimated_size()`
+    /// once per point, and walking the `DashMap` there locks every shard.
+    index_size: AtomicUsize,
     /// Minimum WAL sequence number covered by this memtable.
     min_wal_seq: AtomicU64,
     /// Maximum WAL sequence number covered by this memtable.
@@ -84,6 +91,7 @@ impl Memtable {
             interner: StringInterner::new(),
             measurement_index: DashMap::new(),
             estimated_size: AtomicUsize::new(0),
+            index_size: AtomicUsize::new(0),
             min_wal_seq: AtomicU64::new(u64::MAX),
             max_wal_seq: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
@@ -157,10 +165,10 @@ impl Memtable {
         // DashMap entry API — only per-shard lock, no global contention.
         {
             let hash = point.series_key().hash_fnv();
-            self.measurement_index
-                .entry(measurement_for_index)
-                .or_default()
-                .insert(hash);
+            let delta = self.index_insert(measurement_for_index, hash);
+            if delta > 0 {
+                self.index_size.fetch_add(delta, Ordering::Relaxed);
+            }
         }
 
         Ok(())
@@ -272,11 +280,12 @@ impl Memtable {
         }
 
         // DashMap entry API — per-shard locking, no global contention.
+        let mut index_delta = 0usize;
         for (measurement, hash) in new_index_entries {
-            self.measurement_index
-                .entry(measurement)
-                .or_default()
-                .insert(hash);
+            index_delta += self.index_insert(measurement, hash);
+        }
+        if index_delta > 0 {
+            self.index_size.fetch_add(index_delta, Ordering::Relaxed);
         }
 
         // Emit memtable memory usage gauge after batch insert.
@@ -439,16 +448,34 @@ impl Memtable {
     /// Includes the `measurement_index` DashMap overhead.
     #[must_use]
     pub fn estimated_size(&self) -> usize {
-        let base = self.estimated_size.load(Ordering::Relaxed);
-        // Approximate measurement_index memory: for each entry, count the
-        // Arc<str> key (pointer + str bytes) + HashSet<u64> (capacity × 8 + overhead).
-        let mut index_bytes: usize = 0;
-        for entry in self.measurement_index.iter() {
-            let key_bytes = std::mem::size_of::<usize>() * 2 + entry.key().len();
-            let set_bytes = entry.value().capacity() * std::mem::size_of::<u64>() + 56;
-            index_bytes += key_bytes + set_bytes;
+        self.estimated_size.load(Ordering::Relaxed) + self.index_size.load(Ordering::Relaxed)
+    }
+
+    /// Add `hash` to the index under `measurement`, returning the bytes the
+    /// index grew by.
+    ///
+    /// The accounting matches what a full walk of the map would produce: an
+    /// `Arc<str>` key (pointer pair + string bytes) plus the `HashSet`'s
+    /// allocation (capacity × 8) and its own overhead. Growth is charged as
+    /// the set's capacity actually changes, so an amortised rehash is
+    /// accounted for on the insert that triggers it.
+    fn index_insert(&self, measurement: Arc<str>, hash: u64) -> usize {
+        const SET_OVERHEAD: usize = 56;
+        match self.measurement_index.entry(measurement) {
+            Entry::Occupied(mut occupied) => {
+                let before = occupied.get().capacity();
+                occupied.get_mut().insert(hash);
+                (occupied.get().capacity() - before) * std::mem::size_of::<u64>()
+            }
+            Entry::Vacant(vacant) => {
+                let key_bytes = std::mem::size_of::<usize>() * 2 + vacant.key().len();
+                let mut set = HashSet::new();
+                set.insert(hash);
+                let set_bytes = set.capacity() * std::mem::size_of::<u64>() + SET_OVERHEAD;
+                vacant.insert(set);
+                key_bytes + set_bytes
+            }
         }
-        base + index_bytes
     }
 
     /// Returns the minimum WAL sequence number tracked.
@@ -654,6 +681,48 @@ mod tests {
         let key = SeriesKey::new("cpu".to_string(), BTreeMap::new()).unwrap();
         let points = mt.scan(&key, 0, 1000);
         assert!(points.is_empty());
+    }
+
+    /// `estimated_size` tracks the index incrementally; this pins it to the
+    /// full walk it replaced, so the two cannot drift apart silently.
+    #[test]
+    fn index_accounting_matches_a_full_walk() {
+        let mt = Memtable::new();
+        for i in 0..500u64 {
+            let measurement = format!("m{}", i % 7);
+            let series = format!("s{}", i % 53);
+            mt.insert(&make_point(&measurement, &series, i as i64, 1.0))
+                .unwrap();
+        }
+
+        // The batch path has its own index-write site; cover it too.
+        let batch: Vec<_> = (500..800u64)
+            .map(|i| {
+                make_point(
+                    &format!("m{}", i % 11),
+                    &format!("s{}", i % 97),
+                    i as i64,
+                    2.0,
+                )
+            })
+            .collect();
+        mt.insert_batch(&batch).unwrap();
+
+        let walked: usize = mt
+            .measurement_index
+            .iter()
+            .map(|entry| {
+                let key_bytes = std::mem::size_of::<usize>() * 2 + entry.key().len();
+                let set_bytes = entry.value().capacity() * std::mem::size_of::<u64>() + 56;
+                key_bytes + set_bytes
+            })
+            .sum();
+
+        assert_eq!(
+            mt.index_size.load(Ordering::Relaxed),
+            walked,
+            "incremental index accounting drifted from a full walk"
+        );
     }
 
     #[test]

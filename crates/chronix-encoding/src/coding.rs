@@ -78,7 +78,7 @@ pub(crate) const MAX_BLOCK_VALUES: usize = MAX_DECODED_BYTES / MAX_ELEMENT_BYTES
 /// at most `chronix_engine::segment::DEFAULT_ROW_GROUP_SIZE` (65 536) rows, so
 /// the widest column block is that many values; the constant is repeated here
 /// rather than imported because `chronix-encoding` is standalone on purpose
-/// (D3). Checked at compile time, so lowering `MAX_DECODED_BYTES` far enough
+///. Checked at compile time, so lowering `MAX_DECODED_BYTES` far enough
 /// to break the format fails the build rather than a test run.
 const _: () = assert!(
     MAX_BLOCK_VALUES >= 65_536 * 16,
@@ -95,7 +95,7 @@ const _: () = assert!(
 /// ALP block declaring `u32::MAX` values decoded to a 34 GiB `Vec<f64>` before
 /// this guard existed, which on the flash-constrained gateway that is the
 /// design partner is a killed process rather than a decode error, and reaching
-/// it needs a single flipped bit rather than an attacker (R4).
+/// it needs a single flipped bit rather than an attacker.
 #[inline]
 pub(crate) fn checked_decode_count(count: usize, codec: &'static str) -> Result<usize> {
     if count > MAX_BLOCK_VALUES {

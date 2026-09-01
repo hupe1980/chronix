@@ -1,23 +1,48 @@
 #!/usr/bin/env bash
-# Every `D<n>` and `R<n>` cited in the tree must resolve.
+# Every `D<n>` and `R<n>` cited inside the architecture notes must resolve.
 #
-# `concepts/README.md` states that these are stable identifiers cited from code
-# comments, and that "renumbering one breaks a reference nothing checks". This
-# is that check. It exists because the tree carried 130 comments citing `R26`,
-# `R29`, `R31`, `R32` and `R34` — round numbers from a superseded audit scheme,
-# which read to anyone following them as citations of risks that do not exist.
+# `D` and `R` are the identifiers of DECISIONS.md and RISKS.md. Those notes are
+# internal and are not published with the crates, so nothing outside
+# `concepts/` may cite one — a `(D41)` in a doc comment renders on docs.rs as a
+# reference to a document the reader cannot open, which is the same defect as
+# the audit-scheme numbers that used to litter the tree. That direction is
+# checked by `check-docs.sh`, which runs in CI; this script checks the other
+# one, and can only run where the notes are present.
 #
-# In Markdown, an identifier inside backticks is being *discussed* rather than
-# cited — that is how the documents explain the retired numbers — so code spans
-# are stripped before scanning. A real citation is written bare: `(D25)`, `R7`.
+# Identifiers must also be unique — a number reused by a second decision
+# resolves fine and means two different things.
+#
+# In Markdown an identifier inside backticks is being *discussed* rather than
+# cited, so code spans are stripped before scanning. A real citation is written
+# bare: `(D25)`, `R7`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-defined=$(
+if [ ! -d concepts ]; then
+  echo "concepts/ is not present — nothing to check"
+  exit 0
+fi
+
+raw=$(
   { grep -oE '^\| (D[0-9]+) \|' concepts/DECISIONS.md
     grep -oE '^\| (R[0-9]+) \|' concepts/RISKS.md
-  } | tr -d '| ' | sort -u
+  } | tr -d '| '
 )
+defined=$(echo "$raw" | sort -u)
+
+# A duplicate identifier is worse than a dangling one: every citation still
+# resolves, so a "cited but not defined" check passes while two different
+# decisions answer to the same number.
+duplicated=$(echo "$raw" | sort | uniq -d)
+if [ -n "$duplicated" ]; then
+  echo "error: these identifiers are defined more than once:" >&2
+  echo "$duplicated" | sed 's/^/  /' >&2
+  for id in $duplicated; do
+    echo "── $id" >&2
+    grep -nE "^\| $id \|" concepts/DECISIONS.md concepts/RISKS.md 2>/dev/null | cut -c1-100 >&2
+  done
+  exit 1
+fi
 
 scan_markdown() {
   # Drop fenced code blocks, then inline code spans.
@@ -25,30 +50,22 @@ scan_markdown() {
 }
 
 cited=$(
-  { find crates -name '*.rs' -print0 | xargs -0 grep -hoE '\b[DR][0-9]{1,3}\b'
-    # The manifests cite decisions too: several dependency pins exist only
-    # because of one, and a pin whose reason has been renumbered away is a pin
-    # nobody will dare touch.
-    grep -hoE '\b[DR][0-9]{1,3}\b' Cargo.toml crates/*/Cargo.toml 2>/dev/null
-    for f in concepts/*.md docs/*.md docs/src/**/*.md README.md; do
-      [ -f "$f" ] && scan_markdown "$f" | grep -oE '\b[DR][0-9]{1,3}\b' || true
-    done
-  } 2>/dev/null | sort -u
+  for f in concepts/*.md; do
+    [ -f "$f" ] && scan_markdown "$f" | grep -oE '\b[DR][0-9]{1,3}\b' || true
+  done | sort -u
 )
 
 missing=$(comm -23 <(echo "$cited") <(echo "$defined") || true)
 
 if [ -n "$missing" ]; then
-  echo "error: these identifiers are cited but not defined in concepts/DECISIONS.md or concepts/RISKS.md:" >&2
+  echo "error: cited in concepts/ but not defined in DECISIONS.md or RISKS.md:" >&2
   echo "$missing" | sed 's/^/  /' >&2
   echo >&2
-  echo "Either define them, or — if they are leftovers from an older numbering" >&2
-  echo "scheme — say what the comment means instead of citing a dead number." >&2
-  echo "To discuss a retired number in prose, put it in backticks." >&2
+  echo "Either define them, or say what the sentence means instead of citing a" >&2
+  echo "number. To discuss a retired number in prose, put it in backticks." >&2
   for id in $missing; do
     echo "── $id" >&2
-    { find crates -name '*.rs' -print0 | xargs -0 grep -nE "\b$id\b" || true; } 2>/dev/null | head -3 >&2
-    { grep -rnE "\b$id\b" concepts/ docs/ README.md || true; } 2>/dev/null | head -3 >&2
+    { grep -rnE "\b$id\b" concepts/ || true; } 2>/dev/null | head -3 >&2
   done
   exit 1
 fi

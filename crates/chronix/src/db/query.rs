@@ -313,7 +313,7 @@ impl super::Chronix {
             .iter()
             .map(|f| (f.key.as_str(), f.value.as_str()))
             .collect();
-        let memtable_batch = if memtable_batch.num_rows() > 0 && !tag_filter_refs.is_empty() {
+        let memtable_batch = if memtable_batch.num_rows() > 0 {
             chronix_query::filter::filter_batch(
                 &memtable_batch,
                 time_range.start,
@@ -380,22 +380,17 @@ impl super::Chronix {
             memory_tracker.as_deref(),
         )?;
 
-        // 5. Tag filters are applied at two levels:
-        //    - memtable: pre-filtered above before collect_batches
-        //    - segments: row-group level zone-map pruning via pushdown
-        // Row-group pruning eliminates groups that cannot match, but
-        // within a matching group individual rows may still carry
-        // non-matching tags. Apply a final row-level filter here.
-        let merged = if !tag_filter_refs.is_empty() {
-            chronix_query::filter::filter_batch(
-                &merged,
-                time_range.start,
-                time_range.end,
-                &tag_filter_refs,
-            )?
-        } else {
-            merged
-        };
+        // 5. Both merge inputs are already trimmed — the memtable above,
+        // segment batches inside `collect_batches` — so this is a backstop
+        // over small data. It is unconditional: running it only when a tag
+        // filter was present let a range-only query return every row of a
+        // straddling row group.
+        let merged = chronix_query::filter::filter_batch(
+            &merged,
+            time_range.start,
+            time_range.end,
+            &tag_filter_refs,
+        )?;
 
         // 5b. Filter out tombstoned series from segment data
         let filtered = {
@@ -580,7 +575,7 @@ impl super::Chronix {
                 // take. Folding batch-by-batch bounds memory in the *row* count
                 // but not in the *group* count, so a group-by on a
                 // high-cardinality tag grew until the process died rather than
-                // until the query failed (R12).
+                // until the query failed.
                 let mem_limit = self.config.per_query_memory_limit;
                 let memory_tracker = if mem_limit > 0 {
                     Some(chronix_query::MemoryTracker::new(mem_limit))
@@ -1346,6 +1341,30 @@ impl super::Chronix {
                         };
                         match batch {
                             Ok(b) if b.num_rows() > 0 => {
+                                // Zone maps prune whole row groups, never
+                                // rows within one. Trimming here rather than
+                                // after the merge keeps the surplus out of the
+                                // k-way merge entirely.
+                                let (start_ns, end_ns) = time_range.unwrap_or((i64::MIN, i64::MAX));
+                                let b = match chronix_query::filter::filter_batch(
+                                    &b,
+                                    start_ns,
+                                    end_ns,
+                                    tag_predicates,
+                                ) {
+                                    Ok(trimmed) => trimmed,
+                                    Err(e) => {
+                                        warn!(
+                                            segment = %entry.path.display(),
+                                            error = %e,
+                                            "Error filtering segment batch"
+                                        );
+                                        return None;
+                                    }
+                                };
+                                if b.num_rows() == 0 {
+                                    return None;
+                                }
                                 // Track memory incrementally.
                                 if budget > 0 {
                                     allocated.fetch_add(

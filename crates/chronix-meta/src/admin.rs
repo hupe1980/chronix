@@ -4,7 +4,7 @@
 //! management operations (node registration, heartbeats, region creation,
 //! routing table queries, Raft membership changes).
 //!
-//! The [`GrpcMetaClient`] provides a remote [`MetaClient`](crate client
+//! The [`GrpcMetaClient`] provides a remote `MetaClient`
 //! trait) implementation that DataNodes and QueryNodes use to talk to the
 //! MetaNode cluster over the network.
 
@@ -386,7 +386,7 @@ impl MetaAdminService for MetaAdminServer {
 /// Remote gRPC client implementing the admin interface.
 ///
 /// Connects to `MetaNode` leader and provides methods matching the
-/// [`MetaClient`] trait operations. Includes automatic leader address
+/// `MetaClient` trait operations. Includes automatic leader address
 /// failover — if the current endpoint returns `UNAVAILABLE`, the client
 /// tries the next known `MetaNode` address.
 ///

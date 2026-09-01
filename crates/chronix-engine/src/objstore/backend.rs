@@ -298,7 +298,7 @@ impl ObjectStoreBackend {
     ///
     /// `namespace=<ns>/shard=<n>/<file>` rather than `ns_<ns>/shard_<n>/<file>`,
     /// because the `key=value` form is what the rest of the ecosystem reads as
-    /// a partitioned dataset (D6, "standard edges"). Three things follow from
+    /// a partitioned dataset with standard edges. Three things follow from
     /// it, and none from the underscore form:
     ///
     /// DuckDB, Spark and Polars expose `namespace` and `shard` as **columns**
@@ -306,7 +306,7 @@ impl ObjectStoreBackend {
     /// DataFusion's listing tables treat a `key=value` segment as a partition
     ///   rather than as a subdirectory, so the cold tier registers without
     ///   having to relax `listing_table_ignore_subdirectory` on the shared
-    ///   session — which is the mutation D25 was written about.
+    ///   session — the mutation the read-only admission check exists to stop.
     /// The archive layout is self-describing to somebody who has only the
     ///   bucket and no chronix.
     fn to_obj_path(path: &SegmentPath) -> ObjPath {

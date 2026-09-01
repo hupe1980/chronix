@@ -21,12 +21,12 @@ use chronixd::server::build_router;
 /// Generate a self-signed cert/key pair for `localhost` / `127.0.0.1`.
 fn generate_self_signed_cert() -> (Vec<u8>, Vec<u8>) {
     // Ensure the ring crypto provider is installed for rustls
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     let cert = generate_simple_self_signed(subject_alt_names).unwrap();
     let cert_pem = cert.cert.pem().as_bytes().to_vec();
-    let key_pem = cert.key_pair.serialize_pem().as_bytes().to_vec();
+    let key_pem = cert.signing_key.serialize_pem().as_bytes().to_vec();
     (cert_pem, key_pem)
 }
 

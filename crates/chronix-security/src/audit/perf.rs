@@ -1,4 +1,4 @@
-//! Performance validation tests for audit logging (Story 8.3).
+//! Performance validation tests for audit logging.
 //!
 //! Validates:
 //! - Audit event emit latency < 1 ms per event

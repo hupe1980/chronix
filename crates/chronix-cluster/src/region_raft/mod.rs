@@ -1,7 +1,7 @@
 //! Multi-Raft per-region replication.
 //!
 //! Each data region gets its own Raft group so that writes are quorum-
-//! replicated across [`DataNode`]s. A [`RegionRaftManager`] holds all
+//! replicated across data nodes. A [`RegionRaftManager`] holds all
 //! region Raft groups on a single node and provides the high-level
 //! [`propose_write`](RegionRaftManager::propose_write) entry point.
 //!
@@ -24,10 +24,10 @@
 //!
 //! | Sub-module          | Contents                                      |
 //! |---------------------|-----------------------------------------------|
-//! | [`log_store`]       | In-memory Raft log storage                    |
-//! | [`state_machine`]   | State-machine store (applies writes)          |
-//! | [`network`]         | In-process router & Raft network transport    |
-//! | [`manager`]         | Raft group lifecycle & write proposals        |
+//! | `log_store`       | In-memory Raft log storage                    |
+//! | `state_machine`   | State-machine store (applies writes)          |
+//! | `network`         | In-process router & Raft network transport    |
+//! | `manager`         | Raft group lifecycle & write proposals        |
 
 /// gRPC-based cross-node Region Raft transport.
 pub mod grpc_transport;
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(manager.group_count(), 1);
         assert!(manager.get_raft(10).is_none());
         assert!(manager.get_raft(20).is_some());
-        // D6: verify router entries are cleaned up on remove_group
+        // Verify router entries are cleaned up on remove_group
         assert_eq!(
             manager.router().entry_count(),
             1,

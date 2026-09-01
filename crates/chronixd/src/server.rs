@@ -41,6 +41,10 @@ enum ClusterState {
 ///
 /// Returns an error if the database fails to open or any server fails to bind.
 pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
+    // Before anything builds a TLS client or server: `reqwest` and
+    // `axum-server` both resolve the *process-level* rustls provider and
+    // panic when none is installed.
+    crate::tls::ensure_crypto_provider();
     let start_time = std::time::Instant::now();
 
     // ── Open database ──────────────────────────────────────────────────

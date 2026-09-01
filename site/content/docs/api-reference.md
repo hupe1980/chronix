@@ -102,17 +102,15 @@ Chronix implements the Line Protocol escape rules in full:
 | Field key | `,` `=` ` ` | |
 | String field value | `"` `\` | |
 
-Two consequences worth calling out, because both differ from the previous
-implementation:
+Two consequences worth calling out:
 
 - **`\\` is a literal backslash.** `path="C:\\"` is a value of `C:\` followed
   by a *real* closing quote. Escape detection counts consecutive backslashes,
-  so an escaped backslash before a delimiter no longer swallows the rest of
+  so an escaped backslash before a delimiter does not swallow the rest of
   the line.
-- **`=` is allowed in tag keys and values** (escaped, per the spec). Chronix
-  previously rejected `=` in tag values to keep its internal series identity
-  unambiguous; identity uses reserved control-character separators
-  instead, so lines InfluxDB accepts are accepted here. See
+- **`=` is allowed in tag keys and values** (escaped, per the spec). Series
+  identity uses reserved control-character separators rather than `=`, so
+  lines InfluxDB accepts are accepted here. See
   [Series Identity](@/reference/crate-layout.md#series-identity-and-the-canonical-form).
 
 `\0` and `\x01` are reserved as identity separators and are rejected in

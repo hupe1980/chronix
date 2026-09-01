@@ -31,6 +31,20 @@ pub mod mtls;
 pub mod oidc;
 pub mod rotation;
 
+/// Fill `dest` from the operating system's random source.
+///
+/// One definition for every secret this crate generates — nonces, data keys,
+/// API keys and password salts. `rand` 0.10 renamed the OS generator to
+/// `SysRng` and made it fallible, and a failure here means the kernel has no
+/// entropy source: there is no safe fallback, so it panics rather than
+/// returning a key nobody should trust.
+pub(crate) fn fill_random(dest: &mut [u8]) {
+    use rand::TryRng;
+    rand::rngs::SysRng
+        .try_fill_bytes(dest)
+        .expect("the operating system random source must be available");
+}
+
 pub use api_key::ApiKeyStore;
 pub use encryption::{EncryptionService, KeyProvider, SecretKey};
 pub use error::AuthError;

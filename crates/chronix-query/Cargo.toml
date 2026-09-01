@@ -24,11 +24,9 @@ doctest = false
 
 [dependencies]
 chronix-core.workspace = true
-chronix-encoding.workspace = true
 chronix-engine.workspace = true
 arrow.workspace = true
 fnv.workspace = true
-parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

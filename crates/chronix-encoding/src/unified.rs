@@ -82,9 +82,9 @@ pub enum EncodingType {
     VarintU64 = 15,
     /// Chimp128 ring-buffer XOR for floats.
     Chimp128 = 16,
-    /// Frame-of-Reference for narrow-range integers (RFC-0001 EPIC 2).
+    /// Frame-of-Reference for narrow-range integers.
     ForI64 = 17,
-    /// Frame-of-Reference for narrow-range unsigned integers (RFC-0001 EPIC 2).
+    /// Frame-of-Reference for narrow-range unsigned integers.
     ForU64 = 18,
     /// Patas byte-aligned XOR for floats (VLDB 2023).
     Patas = 19,

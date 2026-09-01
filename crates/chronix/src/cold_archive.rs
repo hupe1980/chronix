@@ -4,7 +4,7 @@
 //! re-encoded to Parquet, uploaded, verified, and then **dropped from the hot
 //! database**. The read half is [`crate::sql::cold_tier::register_cold_tier`],
 //! which exposes the archive as its own SQL table — and DuckDB, Polars and
-//! Spark read the same objects directly (D6, D32).
+//! Spark read the same objects directly.
 //!
 //! # Why archiving removes the segment
 //!
@@ -13,7 +13,7 @@
 //! range crosses the boundary quietly changes cost class, with nothing in the
 //! plan saying so — so the boundary is explicit: after archiving, the segment
 //! lives in the archive table and nowhere else. This is retention with a copy
-//! kept (D49).
+//! kept.
 //!
 //! ```no_run
 //! # use std::time::Duration;

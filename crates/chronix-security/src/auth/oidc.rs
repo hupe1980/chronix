@@ -66,6 +66,58 @@ struct OidcDiscoveryDocument {
     issuer: String,
 }
 
+/// The TLS configuration for this crate's outbound HTTPS requests.
+///
+/// **This is a library, so it does not install a process-global provider.**
+/// `CryptoProvider::install_default` sets process-wide state and silently
+/// loses to whoever called it first: a crate that installs `ring` on its first
+/// webhook would make a later `install_default(aws_lc_rs)` in the embedding
+/// application fail, and the application would get a provider it did not
+/// choose with no error to read. `chronix` is published for other people to
+/// embed, so that is not a theoretical objection.
+///
+/// Instead the provider the application installed is *used* if there is one,
+/// and `ring` is the fallback only when nobody has chosen. `chronixd`
+/// installs one at startup, so under the server this resolves to the server's
+/// choice.
+///
+/// Trust anchors come from the platform verifier, matching what `reqwest`
+/// would have built on its own.
+fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_platform_verifier()?
+        .with_no_client_auth())
+}
+
+/// Build the HTTP client used for OIDC discovery and JWKS fetching.
+///
+/// **Trust anchors come from the operating system.** `reqwest` 0.13 removed
+/// its bundled-roots feature and verifies with `rustls-platform-verifier`, so
+/// the host's CA store decides which identity providers are reachable. For
+/// this client that is the better default — a corporate IdP behind an internal
+/// CA works without configuration — but it is an environment dependency, and
+/// a container image with no `ca-certificates` package will fail every
+/// discovery and JWKS fetch with a TLS error rather than a configuration one.
+///
+/// This is server-side only: the embedded library authenticates nothing and
+/// never reaches here.
+fn http_client() -> Result<reqwest::Client, AuthError> {
+    let tls = tls_config()
+        .map_err(|e| AuthError::Config(format!("failed to build TLS configuration: {e}")))?;
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| AuthError::Config(format!("failed to build HTTP client: {e}")))
+}
+
 /// Fetch the JWKS URI from an OIDC issuer's discovery endpoint.
 ///
 /// Performs `GET {issuer}/.well-known/openid-configuration` and extracts
@@ -76,10 +128,7 @@ pub async fn discover_jwks_url(issuer: &str) -> Result<String, AuthError> {
         issuer.trim_end_matches('/')
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| AuthError::Config(format!("failed to build HTTP client: {e}")))?;
+    let client = http_client()?;
 
     let resp =
         client.get(&url).send().await.map_err(|e| {
@@ -117,10 +166,7 @@ pub async fn discover_jwks_url(issuer: &str) -> Result<String, AuthError> {
 
 /// Fetch a [`JwkSet`] from a URL.
 pub async fn fetch_jwks(url: &str) -> Result<JwkSet, AuthError> {
-    let client = reqwest::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| AuthError::Config(format!("failed to build HTTP client: {e}")))?;
+    let client = http_client()?;
 
     let resp = client
         .get(url)

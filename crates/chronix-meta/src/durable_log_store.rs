@@ -32,7 +32,7 @@ use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{
     Entry, LogId, RaftLogId, RaftLogReader, RaftTypeConfig, StorageError, StorageIOError,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::debug;
 
 /// redb table for Raft log entries: index → postcard(Entry<C>).

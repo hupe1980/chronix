@@ -4,16 +4,23 @@
 {% block structured_data %}
 {{ super() }}
 <script type="application/ld+json">
-{{ {
+{
   "@context": "https://schema.org",
   "@type": "TechArticle",
-  "headline": page.title,
-  "description": page.description,
-  "url": page.permalink,
+  "headline": {{ page.title | json_encode() | safe }},
+  "description": {{ page.description | default(value=config.description) | json_encode() | safe }},
+  "url": {{ page.permalink | json_encode() | safe }},
   "inLanguage": "en",
-  "isPartOf": {"@type": "WebSite", "name": config.title, "url": config.base_url},
-  "author": {"@type": "Person", "name": config.extra.author | default(value="hupe1980")}
-} | json_encode() | safe }}
+  "isPartOf": {
+    "@type": "WebSite",
+    "name": {{ config.title | json_encode() | safe }},
+    "url": {{ config.base_url | json_encode() | safe }}
+  },
+  "author": {
+    "@type": "Person",
+    "name": {{ config.extra.author | default(value="hupe1980") | json_encode() | safe }}
+  }
+}
 </script>
 {#- Breadcrumbs are what turns a URL into a readable path in a search result.
     `section` is not bound on a page template, so the parent is looked up. -#}

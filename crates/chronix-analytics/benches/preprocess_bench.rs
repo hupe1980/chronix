@@ -5,7 +5,8 @@
 
 use chronix_analytics::preprocess::decomposition::{stl_decompose, StlConfig};
 use chronix_analytics::preprocess::{diff, ewm, pct_change, rolling_std, zscore};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 fn gen_data(n: usize) -> Vec<f64> {
     (0..n)

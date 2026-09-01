@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// A network action applied to the simulated cluster.
 #[derive(Debug, Clone, PartialEq)]

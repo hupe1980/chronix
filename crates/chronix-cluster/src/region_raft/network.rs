@@ -83,7 +83,7 @@ impl std::fmt::Debug for RegionRaftRouter {
 
 // ── In-Memory Network ───────────────────────────────────────────────
 
-/// Factory that creates [`RegionRaftNetwork`] instances for a specific
+/// Factory that creates `RegionRaftNetwork` instances for a specific
 /// Raft group (region). Each created network targets a single peer node.
 #[derive(Clone, Debug)]
 pub struct RegionRaftNetworkFactory {

@@ -366,6 +366,52 @@ chronixd bench query --concurrent 16 --queries queries.sql --duration 60s
 
 ---
 
+## Measured Results
+
+Apple M4 Pro (12 cores, 48 GB), macOS 26.5.1, `rustc` 1.98.0, default
+configuration — which means `FsyncPolicy::PerBatch`, so each `insert_batch`
+call costs one fsync. Your hardware and durability settings will move these;
+reproduce them with `cargo bench -p chronix --bench chronix_bench`.
+
+### Ingestion
+
+| Benchmark | Result |
+|-----------|--------|
+| `sustained_ingestion/1M_points_100_batches` | 1.65 s — 607K points/sec, one writer |
+| `concurrent_ingestion/2` | 1.19M points/sec |
+| `concurrent_ingestion/4` | 2.10M points/sec |
+| `concurrent_ingestion/8` | 2.31M points/sec |
+| `insert_batch/10000` | 16.7 ms — 599K points/sec |
+| `flush_10K` | 62 ms — memtable to segment, encode and fsync |
+
+Ingestion scales with concurrent writers up to the point where the WAL group
+sync dominates, which on this hardware is around four. A single writer divides
+its time roughly 40/37/14 between WAL append, memtable insert and WAL encode.
+
+### Queries
+
+Against 100K points across 1,000 series.
+
+| Benchmark | Result |
+|-----------|--------|
+| `query_latency/single_series_1hr` | 377 µs — one series, 3,600 points |
+| `query_latency/lvc_lookup` | 394 ns — requires `enable_last_value_cache` |
+| `query_latency/wide_query_100_series_24hr` | 3.18 ms |
+| `query_latency/wide_query_all_series` | 5.75 ms |
+
+The last-value cache is **off by default**; enable it per measurement with
+`enable_last_value_cache` (see [Operations](@/docs/operations.md)). Without it,
+`last_value` falls back to a memtable scan and costs hundreds of microseconds.
+
+### Analytics
+
+| Benchmark | Result |
+|-----------|--------|
+| `zscore_detect_1m` | 180 ms — 5.5M points/sec |
+| `iqr_detect_1m` | 217 ms — 4.6M points/sec |
+| `ses_fit_10k` | 587 µs — 17M points/sec |
+| `arima_111_fit_10k` | 573 µs |
+
 ## Benchmark Suites
 
 Chronix includes comprehensive criterion benchmarks across all layers.

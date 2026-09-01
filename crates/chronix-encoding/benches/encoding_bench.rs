@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used)] // benches may unwrap
 //! Benchmarks for the chronix-encoding crate.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 use chronix_core::FloatEncoding;
 use chronix_encoding::{
@@ -193,7 +194,7 @@ fn bench_unified(c: &mut Criterion) {
     });
 }
 
-/// Story 9.2: Compression ratio benchmarks.
+/// Compression ratio benchmarks.
 ///
 /// Measures bytes-in vs bytes-out for Chimp, Gorilla, and delta-of-delta
 /// on realistic time-series data patterns.

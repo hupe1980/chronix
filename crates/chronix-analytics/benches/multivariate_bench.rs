@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used)] // benches may unwrap
-//! Benchmarks for multivariate analysis (Epic 10 / Story 11.8).
+//! Benchmarks for multivariate analysis.
 
 use chronix_analytics::multivariate::{
     AnalyticsResults, ColumnarMatrix, CompositeSignalEngine, CompositeSignalRule,
@@ -7,7 +7,8 @@ use chronix_analytics::multivariate::{
     MultiSeriesContext, MultivariateAnomalyDetector, MultivariateForecastModel, RollingCorrelation,
     VarModel,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 fn make_context(n: usize, k: usize) -> MultiSeriesContext {
     let data: Vec<Vec<f64>> = (0..k)

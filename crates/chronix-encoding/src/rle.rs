@@ -422,8 +422,8 @@ const MIN_RUN_BYTES: usize = 5;
 /// Both counts are validated here rather than by the caller, because RLE was
 /// the one decoder that reached neither guard. `num_values` sized a
 /// `Vec::with_capacity` directly from the header — a 9-byte payload declaring
-/// `u32::MAX` reserved 34 GiB, which is the ALP defect of D33 in the codec
-/// D33 did not cover. `num_runs` was trusted the same way and drove the
+/// `u32::MAX` reserved 34 GiB — the same unbounded-header defect the other
+/// codecs carry a ceiling for. `num_runs` was trusted the same way and drove the
 /// decode loop.
 fn read_header(data: &[u8]) -> Result<(usize, usize, usize)> {
     // 1 byte type + 4 bytes num_values + 4 bytes num_runs = 9
@@ -460,7 +460,7 @@ fn read_header(data: &[u8]) -> Result<(usize, usize, usize)> {
 /// `u32`s, so a block declaring three values and one run of `u32::MAX`
 /// expands to 34 GiB and only then fails `verify_count`. The count check has
 /// to happen before the `extend`, not after it — a post-hoc check on an
-/// allocation that already happened is not a bound (D33).
+/// allocation that already happened is not a bound.
 #[inline]
 fn checked_run(decoded: usize, run_len: usize, num_values: usize) -> Result<()> {
     if decoded + run_len > num_values {
@@ -791,7 +791,7 @@ mod bomb_tests {
 
     /// A nine-byte header must not size an allocation.
     ///
-    /// RLE was the one decoder D33 did not reach: `read_header` fed
+    /// RLE was the last decoder to gain a ceiling: `read_header` fed
     /// `num_values` straight into `Vec::with_capacity`, so a nine-byte
     /// payload declaring `u32::MAX` reserved 34 GiB. This is the ALP finding
     /// in the codec the ALP fix did not cover, and it was reachable from a

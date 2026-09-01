@@ -11,7 +11,7 @@
 //! keep. They therefore share [`fetch_scan`](PromQLEvaluator::fetch_scan) and
 //! [`collect_series`]; two copies of a hundred lines of batch decoding is
 //! exactly the shape of divergence that has produced wrong answers here
-//! before (R1).
+//! before.
 //!
 //! # Window boundaries
 //!

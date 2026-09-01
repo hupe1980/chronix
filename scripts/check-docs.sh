@@ -63,12 +63,29 @@ grep -rhoE 'crates/chronix/examples/[a-z_0-9]+\.rs' site/content 2>/dev/null \
       [ -f "$path" ] || note "docs link to '$path', which does not exist"
     done
 
-# ── 4. Public docs must not cite internal planning notes ────────────────
-# Those live outside the published tree; a link to one is a dead link for
-# every reader who is not the author.
+# ── 4. Published artifacts must not cite internal planning notes ────────
+# The architecture notes are not published with the crates, so a reference to
+# one is a dead end for every reader who is not the author. That includes doc
+# comments, which docs.rs renders verbatim: `(D41)` on docs.rs points at a
+# document nobody outside this checkout can open, and `concepts/QUERY.md` is a
+# path that does not exist in the published source.
+#
+# Both halves are checked, because both have leaked: a path, and a bare `D<n>`
+# or `R<n>` identifier.
+# A document that has gone missing fails silently everywhere else: the grep
+# below simply finds nothing in a file that is not there.
+for f in README.md CONTRIBUTING.md; do
+  [ -f "$f" ] || note "$f is missing"
+done
+
 echo "checking for internal references…"
-if grep -rn 'concepts/' site/content README.md CONTRIBUTING.md RELEASING.md 2>/dev/null; then
-  note "public documentation references internal planning notes"
+if grep -rn 'concepts/' \
+     site/content README.md CONTRIBUTING.md \
+     Cargo.toml crates .github 2>/dev/null; then
+  note "a published artifact references the internal architecture notes"
+fi
+if grep -rnE '\b[DR][0-9]{1,3}\b' --include='*.rs' crates 2>/dev/null; then
+  note "a doc comment cites a D/R identifier, which resolves only in concepts/"
 fi
 
 # ── 5. Deleted subsystems must stay deleted in prose ────────────────────

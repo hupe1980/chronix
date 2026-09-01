@@ -6,7 +6,7 @@
 //! covers it better — it is coverage-guided and will find inputs this file
 //! never will. It also **never runs**: there was no CI job invoking it, so the
 //! "exhaustive fuzz coverage of all 21 encodings" in the notes was a claim
-//! about a target nothing executed (R3 — a comment that asserts a property the
+//! about a target nothing executed (a comment that asserts a property the
 //! build does not have).
 //!
 //! This suite is the cheap half of the fix: a few seconds, deterministic
@@ -14,7 +14,7 @@
 //! The other half is `.github/workflows/fuzz.yml`, which runs all three
 //! targets nightly — a job that did not exist while this comment claimed it
 //! did, which is the same defect class as the fuzz target that claimed 21
-//! encodings and reached 12 (R3).
+//! encodings and reached 12.
 //!
 //! The property is not "decoding succeeds". It is that a decoder handed bytes
 //! it did not write returns `Err` — no panic, no abort, no allocation

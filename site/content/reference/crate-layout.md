@@ -91,11 +91,11 @@ forms — hashed to the same value.
 
 **One definition.** The layout lives in `chronix_core::push_canonical`.
 Query-side tombstone matching and the dedup grouper reconstruct canonical
-forms from Arrow columns rather than from a `SeriesKey`, and each used to
-inline the format; when the separators changed, those copies silently kept
-emitting the old layout and tombstone matching broke. They now call the shared
-helper. The inverted tag index uses the same reserved separator for its
-`key`/`value` index keys, for the same reason.
+forms from Arrow columns rather than from a `SeriesKey`, and both call that
+helper rather than inlining the format — an inlined copy goes on emitting the
+old layout when the separators change, and tombstone matching breaks silently.
+The inverted tag index uses the same reserved separator for its `key`/`value`
+index keys, for the same reason.
 
 ### Schema-on-Write
 

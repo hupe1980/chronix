@@ -4,7 +4,8 @@
 use chronix_analytics::compute::{
     simd_mean, simd_min_max, simd_sum, simd_variance, ComputeEngine, CpuEngine,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 fn bench_simd_sum(c: &mut Criterion) {
     let data: Vec<f64> = (0..1_000_000).map(|i| i as f64 * 0.001).collect();
@@ -73,7 +74,7 @@ fn bench_cpu_z_score(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Story 9.1 — Scale benchmarks (CPU baseline: 10K series × 10K points)
+// Scale benchmarks (CPU baseline: 10K series × 10K points)
 // ---------------------------------------------------------------------------
 
 /// Simulate batch SES over many series (10K series × 10K points each).

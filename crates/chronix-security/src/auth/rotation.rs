@@ -210,11 +210,8 @@ impl std::fmt::Debug for RotatingKeyProvider {
 
 /// Generate a cryptographically random 256-bit key.
 fn generate_random_key() -> Vec<u8> {
-    use aes_gcm::aead::rand_core::RngCore;
-    use aes_gcm::aead::OsRng;
-
     let mut key = vec![0u8; 32];
-    OsRng.fill_bytes(&mut key);
+    super::fill_random(&mut key);
     key
 }
 

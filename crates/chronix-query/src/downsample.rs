@@ -13,7 +13,7 @@
 //! [`StreamingDownsampler`] is the one to use over a chunked scan. Bucket
 //! boundaries do not line up with batch boundaries, so downsampling each
 //! batch independently emits the straddling interval twice — once per side —
-//! which a caller then sums, averages or plots as two points (R1). The
+//! which a caller then sums, averages or plots as two points. The
 //! streaming form keeps one open bucket across batches and closes it only
 //! when a row from a later bucket arrives, so a bucket is emitted exactly
 //! once no matter how the input was chunked. Peak memory is one bucket's

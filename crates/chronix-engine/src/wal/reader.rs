@@ -16,7 +16,7 @@ use crate::wal::{WAL_HEADER_SIZE, WAL_MAGIC, WAL_RECORD_HEADER_SIZE, WAL_VERSION
 /// gateway's RAM, and a single flipped bit in a length field is enough to ask
 /// for it. Bounding an allocation by a constant when the real bound — the
 /// bytes that exist — is one `metadata()` call away is the same mistake the
-/// block decoders made (D33).
+/// block decoders made.
 const MAX_PAYLOAD_SIZE: u32 = 256 * 1024 * 1024;
 
 /// A single WAL record as read from disk.

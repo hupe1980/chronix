@@ -280,7 +280,7 @@ impl WalWriter {
             // its syncs are coalesced onto the background thread. Syncing
             // here made `Periodic` behave exactly like `PerWrite`, so the
             // flash-wear preset bought nothing, and this path disagreed with
-            // `append` about what one policy meant (R1).
+            // `append` about what one policy meant.
             if self.config.fsync_policy == FsyncPolicy::PerWrite {
                 inner.writer.flush()?;
                 self.sync_locked(&mut inner)?;
@@ -1165,7 +1165,7 @@ mod tests {
     /// the fsync rate is the wear rate, so "identical to `PerWrite`" is the
     /// whole cost the setting was chosen to avoid. The single-record `append`
     /// honoured the policy, so the two paths disagreed about what one policy
-    /// meant, and nothing compared them (R1).
+    /// meant, and nothing compared them.
     #[test]
     fn periodic_fsync_does_not_sync_on_every_batch() {
         let dir = tempfile::tempdir().unwrap();

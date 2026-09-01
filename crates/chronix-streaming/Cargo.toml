@@ -47,7 +47,9 @@ parking_lot.workspace = true
 fnv.workspace = true
 hmac.workspace = true
 sha2.workspace = true
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true }
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
 uuid.workspace = true
 
 # Observability
@@ -69,3 +71,8 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# Optional dependencies of the `flight` feature; `cargo machete` does not
+# read the `[features]` table.
+ignored = ["arrow-flight", "tonic", "prost"]

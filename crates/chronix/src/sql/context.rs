@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(total_rows, 5);
     }
 
-    // ── Window function tests (Story 1.4) ───────────────────────────
+    // ── Window function tests ───────────────────────────────────────
 
     /// Helper to insert a series of (value, timestamp) points.
     async fn insert_series(db: &Arc<Chronix>, measurement: &str, tag: &str, values: &[f64]) {

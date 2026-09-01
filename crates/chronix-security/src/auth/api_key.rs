@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use dashmap::DashMap;
@@ -28,6 +27,18 @@ use tracing::debug;
 use zeroize::Zeroize;
 
 use crate::auth::error::AuthError;
+
+/// A fresh 16-byte salt, PHC-encoded.
+///
+/// `SaltString::generate` takes a `rand_core` 0.6 generator, which nothing in
+/// this tree wires up any more; the bytes come from the same OS source as
+/// every other secret here and are encoded to the identical alphabet and
+/// length, so the stored hash format is unchanged.
+fn generate_salt() -> SaltString {
+    let mut bytes = [0u8; 16];
+    super::fill_random(&mut bytes);
+    SaltString::encode_b64(&bytes).expect("16 bytes is a valid salt length")
+}
 
 /// Compute the 8-byte prefix fingerprint of a raw API key.
 ///
@@ -130,10 +141,10 @@ impl ApiKeyStore {
         // Generate 256-bit (32-byte) random key for full
         // cryptographic strength instead of UUID v4 (122 bits).
         let mut key_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut key_bytes);
+        super::fill_random(&mut key_bytes);
         use base64::Engine;
         let raw_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes);
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = generate_salt();
         let argon2 = Argon2::default();
         let hash = argon2
             .hash_password(raw_key.as_bytes(), &salt)
@@ -190,7 +201,7 @@ impl ApiKeyStore {
                 "API key with name '{name}' already exists"
             )));
         }
-        let salt = SaltString::generate(&mut OsRng);
+        let salt = generate_salt();
         let argon2 = Argon2::default();
         let mut hash = argon2
             .hash_password(raw_key.as_bytes(), &salt)

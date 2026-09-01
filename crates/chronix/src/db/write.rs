@@ -480,14 +480,9 @@ impl super::Chronix {
     /// `max_series_cardinality`.
     ///
     /// The count comes from `known_series`, which is the *only* cardinality
-    /// bookkeeping in the engine. It used to be shadowed by a HyperLogLog
-    /// sketch kept "for O(1) counting", and that second structure was wrong in
-    /// both directions: `count()` is a 16 384-register scan under a global
-    /// mutex (not O(1), and slower than the sharded length it replaced), an
-    /// HLL cannot *remove*, so every delete inflated it permanently until the
-    /// limit rejected all writes, and the register index was taken from
-    /// FNV-1a's low bits — the bits FNV avalanches worst — which undercounted
-    /// 1 000 series by 4.3 % against a documented 0.8 % error bound (R1).
+    /// bookkeeping in the engine and is exact. A sketch beside it was
+    /// considered and rejected: an HLL cannot remove, so deletes inflate it
+    /// permanently until the limit rejects every write.
     fn check_cardinality(&self, point: &Point) -> Result<()> {
         let canonical = point.series_key().canonical_form();
         // Fast path — lock-free per-shard read.

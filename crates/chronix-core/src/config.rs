@@ -1090,7 +1090,13 @@ mod tests {
         assert_eq!(config.wal.max_file_size, back.wal.max_file_size);
     }
 
+    /// Miri runs with filesystem isolation, so the three tests that reach the
+    /// filesystem carry their own `ignore` rather than being named in the CI
+    /// command: a `--skip` list has to be edited every time such a test is
+    /// added, and the one nobody remembered to add is the one that breaks the
+    /// job.
     #[test]
+    #[cfg_attr(miri, ignore = "reaches the filesystem")]
     fn config_toml_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1160,12 +1166,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "reaches the filesystem")]
     fn from_toml_nonexistent_file() {
         let err = ChronixConfig::from_toml(std::path::Path::new("/no/such/file.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::Io(_)));
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "reaches the filesystem")]
     fn from_toml_invalid_content() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.toml");

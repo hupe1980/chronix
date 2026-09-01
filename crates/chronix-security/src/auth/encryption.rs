@@ -391,10 +391,11 @@ impl EncryptionService {
 
         // Generate random nonce
         let nonce_bytes = generate_nonce();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..])
+            .map_err(|_| AuthError::Config("nonce must be 12 bytes".into()))?;
 
         let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|e| AuthError::Encryption(e.to_string()))?;
 
         // Prepend nonce to ciphertext
@@ -419,11 +420,12 @@ impl EncryptionService {
         let cipher = Aes256Gcm::new_from_slice(enc_key.as_bytes())
             .map_err(|e| AuthError::Decryption(format!("key error: {e}")))?;
 
-        let nonce = Nonce::from_slice(&data[..NONCE_SIZE]);
+        let nonce = Nonce::try_from(&data[..NONCE_SIZE])
+            .map_err(|_| AuthError::Config("nonce must be 12 bytes".into()))?;
         let ciphertext = &data[NONCE_SIZE..];
 
         cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|e| AuthError::Decryption(e.to_string()))
     }
 
@@ -469,11 +471,8 @@ impl EncryptionService {
 
 /// Generate a random 12-byte nonce.
 fn generate_nonce() -> [u8; NONCE_SIZE] {
-    use aes_gcm::aead::rand_core::RngCore;
-    use aes_gcm::aead::OsRng;
-
     let mut nonce = [0u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut nonce);
+    super::fill_random(&mut nonce);
     nonce
 }
 

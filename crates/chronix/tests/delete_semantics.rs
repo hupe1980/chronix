@@ -20,7 +20,7 @@
 //!    a whole-series delete at the next open.
 //!
 //! These drive the public API, because the defect in each case was that two
-//! code paths implemented one semantic and only one of them was right (R1).
+//! code paths implemented one semantic and only one of them was right.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may unwrap
 

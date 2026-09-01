@@ -46,10 +46,9 @@ WAL payloads are serialized using a **binary v1 codec** (`wal_codec` module in
 
 `wal_encode()` / `wal_decode()` and the `WalCodecError` type are exported from
 `chronix_core`. Only binary v1 records are accepted; legacy JSON is rejected.
-`wal_encode_write_point(&Point)` encodes a write directly from a borrow,
-avoiding the `Point::clone()` previously needed to construct
-`WalEntry::Write { point }`. This eliminates `String` + `Vec` heap allocations
-on the hot write path — especially impactful for batch inserts.
+`wal_encode_write_point(&Point)` encodes a write directly from a borrow rather
+than cloning the `Point` into a `WalEntry::Write`, keeping `String` and `Vec`
+allocations off the hot write path. Batch inserts benefit most.
 
 ### Write Path
 

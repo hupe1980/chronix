@@ -210,7 +210,7 @@ impl AnomalyDetector for DynamicThresholdDetector {
                 // the second point of every series scored `z = inf` and was
                 // reported as an anomaly — on every series, always. The
                 // sibling detector never had this because it scores against a
-                // residual std fixed at fit time (R1). Until the window
+                // residual std fixed at fit time. Until the window
                 // fills, the fitted baseline is the honest estimate.
                 let count = i.min(self.lookback);
                 let (m, var) = if count >= self.lookback {

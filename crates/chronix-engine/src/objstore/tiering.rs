@@ -2,14 +2,14 @@
 //!
 //! Uploads a segment to object storage, re-encoding it to Parquet on the way
 //! so the archive is readable by DuckDB, Polars and Spark rather than only by
-//! chronix (D6).
+//! chronix.
 //!
 //! # This is an archive, not a transparent tier
 //!
 //! A cold object has no series bloom and no skip index — Parquet has nowhere
 //! to put them — so it is queried as its own named SQL table via
 //! `chronix::sql::register_cold_tier`, not unioned into the hot measurement
-//! (D32). Archiving therefore *removes* the segment from the hot database:
+//!. Archiving therefore *removes* the segment from the hot database:
 //! `Chronix::archive_cold_segments` uploads, verifies, and only then drops the
 //! catalog entry and the local file, in that order.
 //!
@@ -46,7 +46,7 @@ pub struct TieringConfig {
     /// Defaults to [`ColdFormat::Parquet`], which is the whole point of the
     /// cold tier: an archive only chronix can read is a walled garden, and
     /// Spark, DuckDB and Polars reading it directly is worth more than the
-    /// encoding win on data nobody queries hot (D6). Set this to
+    /// encoding win on data nobody queries hot. Set this to
     /// [`ColdFormat::Csx`] to upload verbatim instead, which is smaller and
     /// keeps the segment's blooms and skip index.
     #[serde(default)]
@@ -179,7 +179,7 @@ impl TieringEngine {
         // would need one; here they are, so the source path is used directly.
         // The alternative — a second, bytes-based reader path — is a duplicate
         // implementation of segment decoding, the bug class this tree has paid
-        // for most often (R1).
+        // for most often.
         let object_name = match self.config.cold_format {
             ColdFormat::Csx => candidate.segment_name.clone(),
             ColdFormat::Parquet => parquet_object_name(&candidate.segment_name),
@@ -478,7 +478,7 @@ mod parquet_cold_tier_tests {
 
     /// A tiered segment must be an ordinary Parquet file that a reader with no
     /// knowledge of chronix can open — that is the entire argument for the cold
-    /// tier not being `.csx` (D6).
+    /// tier not being `.csx`.
     #[tokio::test]
     async fn a_tiered_segment_is_readable_as_plain_parquet() {
         let tmp = tempfile::tempdir().unwrap();

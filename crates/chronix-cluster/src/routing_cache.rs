@@ -2,10 +2,9 @@
 //!
 //! [`RoutingCache`] wraps a local copy of the global routing table and
 //! transparently refreshes it when a lookup fails or the version becomes
-//! stale. This implements the "stale routing retry" pattern from
-//! Story 1.3.
+//! stale — the "stale routing retry" pattern.
 //!
-//! ## Backoff (R4 hardening)
+//! ## Backoff
 //!
 //! Refresh retries use exponential backoff with jitter (base 50 ms,
 //! capped at 800 ms) to avoid thundering-herd effects against the
@@ -18,7 +17,7 @@ use std::time::Duration;
 
 use chronix_meta::{RegionId, RouteEntry, RoutingSnapshot};
 use parking_lot::{Mutex, RwLock};
-use rand::Rng;
+use rand::RngExt;
 use tracing::{debug, warn};
 
 use crate::client::MetaClient;

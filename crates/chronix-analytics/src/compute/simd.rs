@@ -1283,7 +1283,8 @@ pub fn simd_tier() -> &'static str {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return "AVX2+FMA (4×f64, 256-bit)";
         }
-        return "SSE2 (2×f64, 128-bit)";
+        // The block's tail, not an early exit: the two above are.
+        "SSE2 (2×f64, 128-bit)"
     }
     #[cfg(target_arch = "aarch64")]
     {

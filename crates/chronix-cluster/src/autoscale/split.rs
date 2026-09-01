@@ -381,7 +381,7 @@ impl AutoScaler {
     /// atomically updating the routing table.
     ///
     /// This is the single-step split for backward compatibility.
-    /// For no-downtime behaviour, use [`prepare_split`] + [`commit_split`].
+    /// For no-downtime behaviour, use `prepare_split` + `commit_split`.
     ///
     /// This method:
     /// 1. Generates two new region IDs by deriving from the source ID.

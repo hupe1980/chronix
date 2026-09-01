@@ -43,12 +43,14 @@ cedar-policy.workspace = true
 
 # JWT / OIDC
 jsonwebtoken.workspace = true
+rand.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
 
 # Identifiers & encoding
 base64.workspace = true
 percent-encoding.workspace = true
-uuid.workspace = true
 
 # Serialization
 serde.workspace = true

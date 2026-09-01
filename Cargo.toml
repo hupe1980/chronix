@@ -14,7 +14,7 @@ members = [
     # ── Dev-only tooling ───────────────────────────────────────────
     "crates/chronix-chaos",
     # ── Frozen: distributed cluster (build with `-p` or `--workspace`;
-    #    thaw is a post-v1.0 decision — see concepts/CLUSTER.md) ──────────
+    #    thaw is a post-v1.0 decision) ───────────────────────────────────
     "crates/chronix-meta",
     "crates/chronix-cluster",
     "crates/chronix-dsim",
@@ -66,12 +66,11 @@ chronix-analytics = { path = "crates/chronix-analytics", version = "0.1.0" }
 chronix-meta = { path = "crates/chronix-meta" }
 chronix-cluster = { path = "crates/chronix-cluster" }
 chronix-chaos = { path = "crates/chronix-chaos" }
-chronix-dsim = { path = "crates/chronix-dsim" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 # Binary serialization for the WAL, segment metadata, the catalog manifest and
 # model snapshots.
 #
@@ -119,49 +118,67 @@ metrics = "0.24"
 # `/metrics` through its own axum route, so the crate's HTTP listener and
 # push-gateway clients are unused — and they are what drag `hyper-rustls`,
 # and with it a second rustls crypto provider and a C build of aws-lc-sys.
-metrics-exporter-prometheus = { version = "0.16", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # HTTP
 axum = { version = "0.8", features = ["json"] }
 tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 
 # gRPC
-tonic = { version = "0.14", features = ["tls-ring"] }
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
 tonic-health = "0.14"
 prost = "0.14"
+prost-build = "0.14"
 prost-types = "0.14"
 
 # TLS
 #
-# `default-features = false` matters: rustls's defaults enable `aws-lc-rs`, and
-# with two providers compiled in and none installed `ServerConfig::builder()`
-# cannot choose and **panics** (D41). It also drags `aws-lc-sys`, which builds C
-# through cmake — the toolchain the aarch64 cross-compile does not have (R11).
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-# PEM parsing comes from rustls-pki-types: rustls-pemfile is unmaintained
-# (RUSTSEC-2025-0134) and is now only a thin wrapper over this.
-rustls-pki-types = "1.12"
-# `default-features = false`: tokio-rustls's defaults enable `aws_lc_rs` too.
-# Four separate crates pulled a second provider in this way, and it takes all
-# four to remove it — any one of them left alone reinstates the panic (D41).
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-# `tls-rustls-no-provider` rather than `tls-rustls`: the latter forces
-# `rustls/aws-lc-rs` on, which is the other half of the two-provider panic.
-axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+# `rustls-platform-verifier` is declared so the *library* crates can build a
+# client TLS config explicitly rather than relying on a process-global
+# provider — see `chronix_security::auth::oidc`. It is already in the graph
+# through reqwest; naming it here is what lets a library use it directly.
+rustls-platform-verifier = "0.7"
+#
+# **Exactly one crypto provider is compiled in, and it is `aws-lc-rs`.** With
+# two compiled in and none installed, `ServerConfig::builder()` cannot choose
+# and *panics*, so every rustls-adjacent dependency below carries
+# `default-features = false` and names the provider explicitly rather than
+# taking a default nobody wrote down (D41).
+#
+# `aws-lc-rs` rather than `ring`: it is rustls's own default, is actively
+# released where `ring` has had none since March 2025, is the only
+# FIPS-certifiable option, and is the only one with post-quantum key exchange.
+# Neither is toolchain-free — `ring` compiles 17 C files and 90 assembly files
+# and fails an aarch64 cross-compile without a cross C compiler exactly as
+# `aws-lc-sys` does — and `aws-lc-sys` no longer needs CMake for this target:
+# it ships a `cc_builder` with pregenerated configuration for `linux_aarch64`.
+#
+# Verify the count after any dependency change, because it is a property of
+# the whole graph rather than of this line:
+#
+#     cargo tree -p chronixd --all-features -e normal -f "{p} {f}" | grep rustls
+#
+# It must read `aws-lc-rs,aws_lc_rs,…` with no `ring`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
+# Same provider as rustls above; naming it is what keeps the count at one.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
+# `tls-rustls-no-provider`: provider-agnostic, so the choice stays in one place
+# above rather than being made again here.
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 
 # Arrow Flight
-arrow-flight = { version = "59", features = ["flight-sql", "tls-ring"] }
+arrow-flight = { version = "59", features = ["flight-sql", "tls-aws-lc"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
 # Compression
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 zstd = "0.13"
 
 # Memory-mapped I/O
@@ -181,7 +198,6 @@ datafusion = "55"
 
 # Concurrency
 crossbeam-skiplist = "0.1"
-crossbeam-epoch = "0.9"
 parking_lot = "0.12"
 dashmap = "6"
 bytes = "1"
@@ -191,15 +207,26 @@ futures = "0.3"
 fs2 = "0.4"
 
 # Auth & crypto
+# Held at 0.5 deliberately. 0.6 moves to `password-hash` 0.6, which
+# restructures the PHC string types into a separate crate and changes
+# `hash_password`'s signature — that is the *stored format* of every API key,
+# not a rename, so it needs its own change with a migration path and a test
+# that an existing hash still verifies. No advisory forces it.
 argon2 = "0.5"
-jsonwebtoken = "9"
-aes-gcm = "0.10"
-hmac = "0.12"
-sha2 = "0.10"
+# `aws_lc_rs`, never `rust_crypto`: 11.0 requires choosing a backend, and
+# `rust_crypto` pulls the `rsa` crate — **RUSTSEC-2023-0071**, the Marvin
+# timing sidechannel, key recovery over the network, with no fixed version —
+# into JWT signature verification, which is precisely a setting where an
+# attacker observes timing. `aws_lc_rs` is the crate the workspace already
+# compiles as its rustls provider (D59), so it costs nothing here.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+aes-gcm = "0.11"
+hmac = "0.13"
+sha2 = "0.11"
 subtle = "2"
 zeroize = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
+base64 = "0.23"
 chrono-tz = "0.10"
 chrono = "0.4"
 
@@ -211,17 +238,27 @@ percent-encoding = "2"
 form_urlencoded = "1"
 
 # HTTP client
-# `rustls-tls-webpki-roots-no-provider` rather than `rustls-tls`: reqwest's
-# `rustls-tls` is `rustls-tls-webpki-roots` plus a forced `aws-lc-rs`
-# provider, so this changes the crypto provider and nothing else — the trust
-# anchors are the same bundled WebPKI roots either way. It is one of the four
-# edges that put a *second* rustls provider in the graph, which is the
-# condition under which `ServerConfig::builder()` cannot choose and panics
-# (D41).
-# With ring as the only provider compiled in, rustls resolves it
-# unambiguously in every crate, `chronix-security` used on its own included.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
-ureq = "3"
+#
+# `rustls-no-provider` rather than `rustls`: the latter pulls `aws-lc-rs` in
+# beside the `ring` this workspace asked for, and two compiled-in providers
+# with none installed is the condition under which `ServerConfig::builder()`
+# cannot choose and panics. With `ring` as the only provider, rustls resolves
+# it unambiguously in every crate, `chronix-security` used on its own
+# included. `cargo deny` is the structural guard: `aws-lc-sys` carries an
+# OpenSSL clause that no longer has a licence exception, so its return fails
+# the dependency check rather than surfacing later as a runtime panic.
+#
+# 0.13 removed the root-certificate features and verifies with
+# `rustls-platform-verifier`, so the host's CA store decides which endpoints
+# are reachable. Both users are server-side (OIDC discovery, webhook
+# delivery), where the platform store is the better default; the embedded
+# library never reaches either.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+# `default-features = false`: ureq's default `rustls` feature is
+# `rustls-no-provider + _ring + rustls-webpki-roots`, so taking it forces
+# `rustls/ring` on and makes the provider choice twice. Naming the parts
+# leaves the choice in one place (D41).
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
 
 # Authorization
 cedar-policy = "4"
@@ -230,7 +267,7 @@ cedar-policy = "4"
 snap = "1"
 
 # Embedded key-value storage (Raft log persistence)
-redb = "2"
+redb = "4"
 
 # Ingestion connectors (optional).
 #
@@ -238,14 +275,14 @@ redb = "2"
 # is exactly the toolchain the embedded aarch64 cross-compile job does not have
 # (R11). krafka is pure async Rust with `unsafe_code = "deny"`, so the `kafka`
 # feature no longer costs a C toolchain or an unaudited FFI surface (D38).
-krafka = { version = "0.21", default-features = false, features = ["gzip", "snappy", "lz4", "ring"] }
-rumqttc = { version = "0.24" }
+krafka = { version = "0.21", default-features = false, features = ["gzip", "snappy", "lz4", "rustls-aws-lc-rs"] }
+rumqttc = { version = "0.25" }
 
 # Testing
 proptest = "1"
 tempfile = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
-rand = "0.9"
+criterion = { version = "0.8", features = ["html_reports"] }
+rand = "0.10"
 testcontainers-modules = { version = "0.15", features = ["kafka", "mosquitto"] }
 
 # Regex
@@ -265,7 +302,7 @@ unsafe_code = "warn"
 panic = "warn"
 unwrap_used = "warn"
 expect_used = "allow"       # expect with a message is fine
-# Re-enabling module-by-module is tracked in concepts/ROADMAP.md — the numeric
+# Re-enabling module-by-module is in the backlog — the numeric
 # kernels (forecast, multivariate, SIMD, codecs) index pervasively with
 # structural bounds; empirically panicking sites were fixed in passes 1–25.
 indexing_slicing = "allow"
@@ -273,7 +310,7 @@ indexing_slicing = "allow"
 # Style & clarity
 needless_pass_by_value = "warn"
 redundant_closure_for_method_calls = "warn"
-# 25 pre-existing sites; re-enable after a dedicated style pass (concepts/ROADMAP.md).
+# 25 pre-existing sites; re-enable after a dedicated style pass.
 manual_let_else = "allow"
 cloned_instead_of_copied = "warn"
 flat_map_option = "warn"

@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use rand::Rng;
+use rand::RngExt;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -527,7 +527,7 @@ fn bench_concurrent_writers_readers(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Story 9.2 — E2E Scale benchmarks ──────────────────────────────────
+// ── E2E Scale benchmarks ──────────────────────────────────────────────
 
 /// High-volume write benchmark: 10K points per batch, measuring sustained
 /// write throughput (target: ≥ 50K points/sec on single node).
