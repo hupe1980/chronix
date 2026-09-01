@@ -37,6 +37,10 @@ zola --root site check   # links and anchors; CI runs this
 ./scripts/check-docs.sh  # prose against the code; CI runs this too
 ```
 
+Install **Zola 0.23.4**, the version CI pins. A newer Zola accepts Tera syntax
+an older one rejects, so a mismatched local build passes on templates CI
+refuses.
+
 `site/README.md` covers the conventions. Two are worth knowing before you
 write a page: link between pages with `@/` (`[Operations](@/docs/operations.md)`)
 so a rename breaks the build instead of shipping a 404, and give every page a

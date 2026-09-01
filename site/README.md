@@ -9,6 +9,12 @@ zola build        # → public/
 zola check        # link and anchor check; CI runs this
 ```
 
+**Use Zola 0.23.4** — the version CI pins in `ci.yml` and `site.yml`. Tera's
+accepted syntax has widened between releases, so a newer Zola parses templates
+an older one rejects: a map literal in `{{ … }}` builds locally on 0.23 and
+fails CI on 0.21. Matching the pin is what makes a local `zola build` mean
+anything.
+
 ## Layout
 
 | Path | What it holds |

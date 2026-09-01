@@ -42,17 +42,6 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# aws-lc-sys declares "ISC AND (Apache-2.0 OR ISC) AND OpenSSL". The OpenSSL
-# clause covers the vendored BoringSSL-derived C and is an
-# advertising-clause-free permissive licence. It is accepted for this crate
-# only rather than allowed globally, because a blanket `OpenSSL` allow would
-# also permit the far more awkward OpenSSL 1.x combination elsewhere.
-#
-# It is a deliberate first-party dependency: `aws-lc-rs` is the workspace's
-# single rustls crypto provider (D41, D59).
-[[licenses.exceptions]]
-name = "aws-lc-sys"
-allow = ["OpenSSL"]
 
 [bans]
 multiple-versions = "warn"

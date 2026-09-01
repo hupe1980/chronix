@@ -276,7 +276,14 @@ redb = "4"
 # (R11). krafka is pure async Rust with `unsafe_code = "deny"`, so the `kafka`
 # feature no longer costs a C toolchain or an unaudited FFI surface (D38).
 krafka = { version = "0.21", default-features = false, features = ["gzip", "snappy", "lz4", "rustls-aws-lc-rs"] }
-rumqttc = { version = "0.25" }
+# `default-features = false` drops `use-rustls`, which is not a TLS *option*
+# here but a liability: the connector never constructs a `Transport`, so the
+# feature only ever added `rustls-webpki` 0.102 (two advisories, capped below
+# the fixed 0.103.10 by rumqttc's own `^0.102.8`), the unmaintained
+# `rustls-pemfile`, and `ring` via `tokio-rustls/default`. MQTT is plaintext
+# here; restoring TLS means waiting for rumqttc to move to rustls 0.23's
+# provider-agnostic stack, not re-enabling this.
+rumqttc = { version = "0.25", default-features = false }
 
 # Testing
 proptest = "1"

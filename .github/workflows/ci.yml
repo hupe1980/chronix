@@ -66,12 +66,15 @@ jobs:
     # The first deployment target is an aarch64 Linux gateway
     # (512 MB–1 GB RAM, eMMC/SD). Keep the embedded build compiling for it.
     #
+    # Both targets go through `cross`, which supplies a C toolchain per target
+    # in a container. A bare runner cannot do this: `aws-lc-rs` compiles C for
+    # the *target*, so `cargo clippy --target aarch64-…` dies in `cc-rs` with
+    # `failed to find tool "aarch64-linux-gnu-gcc"`. `release.yml` builds the
+    # shipped binaries the same way, so CI and the release use one mechanism.
+    #
     # musl is checked alongside gnu because it is where a build script that
     # needs more than a C compiler falls over: one that shells out to cmake
-    # compiles on the gnu host and fails here. The claim being kept true is
-    # "nothing needs a toolchain beyond `cc`" — not "nothing builds C", which
-    # was never accurate: `ring` compiles 17 C files and 90 assembly files.
-    # The design partner asked for both targets.
+    # compiles for gnu and fails here. The design partner asked for both.
     name: Cross-compile (aarch64 Linux, ${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
@@ -93,10 +96,14 @@ jobs:
       # are invisible to the x86_64 Clippy job — and the x86 paths are
       # invisible to anyone developing on an aarch64 machine. This is the only
       # job that lints the target the design partner actually ships on.
-      - run: cargo clippy -p chronix -p chronixd --target ${{ matrix.target }} -- -D warnings
+      # `cross` mounts the host rustup toolchain, so the `clippy` component and
+      # the target installed above are the ones used inside the container.
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+      - run: cross clippy -p chronix -p chronixd --target ${{ matrix.target }} -- -D warnings
       # The connectors are the features most likely to reintroduce a C
       # dependency, so they are cross-checked rather than assumed.
-      - run: cargo clippy -p chronixd --features all-connectors --target ${{ matrix.target }} -- -D warnings
+      - run: cross clippy -p chronixd --features all-connectors --target ${{ matrix.target }} -- -D warnings
 
   frozen-tier:
     # The distributed cluster tier is frozen (no active development) but
@@ -177,7 +184,7 @@ jobs:
       - name: Install Zola
         run: |
           set -euo pipefail
-          VERSION=v0.21.0
+          VERSION=v0.23.4
           curl -sSL "https://github.com/getzola/zola/releases/download/${VERSION}/zola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C /usr/local/bin zola
           zola --version
