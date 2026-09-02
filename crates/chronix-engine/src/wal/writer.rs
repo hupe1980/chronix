@@ -1557,12 +1557,24 @@ mod tests {
         writer.append(b"periodic-1").unwrap();
         writer.append(b"periodic-2").unwrap();
 
-        // Wait for at least one periodic sync cycle
-        std::thread::sleep(Duration::from_millis(80));
-
-        // Data should be durable on disk after the periodic sync
-        let records = crate::wal::replay_all(dir.path()).unwrap();
-        assert_eq!(records.len(), 2);
+        // Poll rather than sleep for a fixed span. The property is that the
+        // background thread *eventually* makes the records durable, not that
+        // it does so within one interval: a 50 ms interval read after an 80 ms
+        // sleep leaves 30 ms of margin, and a loaded runner does not provide
+        // it. This failed on macOS with zero records replayed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let records = loop {
+            let records = crate::wal::replay_all(dir.path()).unwrap();
+            if records.len() == 2 || std::time::Instant::now() >= deadline {
+                break records;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            records.len(),
+            2,
+            "the periodic sync thread never made the records durable"
+        );
 
         // Clean shutdown
         writer.shutdown_periodic_sync();
