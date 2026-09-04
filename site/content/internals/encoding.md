@@ -30,8 +30,8 @@ inflated by an order of magnitude.
 
 | Column Type | Technique | Typical Ratio | Key Insight |
 |-------------|-----------|---------------|-------------|
-| Timestamps | Delta-of-delta | 30–55× | Regular intervals → zero residuals |
-| Floats (decimal) | ALP | 4–9× | The value was a scaled integer before IEEE-754 stored it |
+| Timestamps | pco (delta-of-delta second) | 2.7× jittered, 345× with gaps, 1092× regular | pco entropy-codes the interval deltas, so millisecond jitter costs bits rather than a varint per point. Delta-of-delta made a jittered column *larger* than plain (0.9×) |
+| Floats (decimal) | pco (ALP second) | 5–29× realistic, 46–85× clean counters | The value was a scaled integer before IEEE-754 stored it; pco then entropy-codes the deltas |
 | Floats (non-decimal) | Gorilla / Chimp / Patas | 1.3–2× | XOR of successive values is sparse |
 | Floats (random) | Plain | 1× | Incompressible by construction |
 | Integers | Delta + ZigZag | 10–25× | Monotonic sequences → small deltas |

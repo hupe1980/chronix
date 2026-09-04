@@ -1,7 +1,9 @@
 //! IQR (Interquartile Range) anomaly detector.
 
 use crate::anomaly::error::AnomalyError;
-use crate::anomaly::traits::{validate_lengths, AnomalyDetector, AnomalyScore, DetectorType};
+use crate::anomaly::traits::{
+    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+};
 
 /// Flags points outside the fences Q1 − k·IQR .. Q3 + k·IQR.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -46,23 +48,26 @@ impl IqrDetector {
         }
     }
 
+    /// The dispersion the fences and the score both divide by.
+    ///
+    /// With `IQR == 0` — constant or heavily quantised data — the raw fences
+    /// collapse onto `Q1 == Q3`, so `42.0 + 1e-13` falls outside them and is
+    /// flagged. `score_value` already floored its denominator; the *fences*
+    /// did not, so the score said "0.0, not an outlier" while `is_anomaly`
+    /// said yes. One floor, used by both.
+    #[inline]
+    fn effective_iqr(&self) -> f64 {
+        scale_floor(self.iqr, (self.q1 + self.q3) / 2.0)
+    }
+
+    /// Distance beyond the nearer fence, in units of the effective IQR.
     #[inline]
     fn score_value(&self, value: f64) -> f64 {
-        // When IQR ≈ 0 (constant data), use a proportional floor
-        // consistent with the approach in Modified Z-Score. This avoids
-        // ad-hoc absolute-distance scoring that produces scale-dependent
-        // results. The floor absorbs floating-point noise while still
-        // allowing genuine outliers to score highly.
-        let effective_iqr = if self.iqr < 1e-15 {
-            let median = (self.q1 + self.q3) / 2.0;
-            (median.abs() * f64::EPSILON * 1e6).max(1e-12)
-        } else {
-            self.iqr
-        };
+        let scale = self.effective_iqr();
         if value < self.lower_fence {
-            (self.lower_fence - value) / effective_iqr
+            (self.lower_fence - value) / scale
         } else if value > self.upper_fence {
-            (value - self.upper_fence) / effective_iqr
+            (value - self.upper_fence) / scale
         } else {
             0.0
         }
@@ -89,8 +94,11 @@ impl AnomalyDetector for IqrDetector {
         self.q1 = Self::percentile(&sorted, 0.25);
         self.q3 = Self::percentile(&sorted, 0.75);
         self.iqr = self.q3 - self.q1;
-        self.lower_fence = self.q1 - self.k * self.iqr;
-        self.upper_fence = self.q3 + self.k * self.iqr;
+        // The fences use the *floored* dispersion, so they never collapse to
+        // a single point on constant data. See `effective_iqr`.
+        let scale = self.effective_iqr();
+        self.lower_fence = self.q1 - self.k * scale;
+        self.upper_fence = self.q3 + self.k * scale;
         self.fitted = true;
         metrics::histogram!("chronix_anomaly_fit_duration_seconds", "method" => "iqr")
             .record(_start.elapsed().as_secs_f64());

@@ -11,11 +11,11 @@ use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tokio::signal;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
-use chronix::compaction_scheduler::CompactionScheduler;
 use chronix::Chronix;
 
 use crate::config::ServerConfig;
@@ -84,11 +84,6 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         None
     };
 
-    // ── Start compaction scheduler ─────────────────────────────────────
-    let scheduler = CompactionScheduler::new(db.clone());
-    scheduler.start();
-    info!("compaction scheduler started");
-
     // ── Prometheus metrics ─────────────────────────────────────────────
     let metrics_handle = setup_prometheus()?;
 
@@ -101,14 +96,22 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
 
     // Register configured connectors
     if let Some(ref kafka_cfg) = config.kafka {
-        let consumer =
-            crate::kafka::KafkaConsumer::new_arc("kafka-default", kafka_cfg.clone(), db.clone());
+        let consumer = crate::kafka::KafkaConsumer::new_arc(
+            "kafka-default",
+            kafka_cfg.clone(),
+            db.clone(),
+            config.multi_tenancy,
+        );
         connector_manager.register(consumer).await;
     }
 
     if let Some(ref mqtt_cfg) = config.mqtt {
-        let subscriber =
-            crate::mqtt::MqttSubscriber::new_arc("mqtt-default", mqtt_cfg.clone(), db.clone());
+        let subscriber = crate::mqtt::MqttSubscriber::new_arc(
+            "mqtt-default",
+            mqtt_cfg.clone(),
+            db.clone(),
+            config.multi_tenancy,
+        );
         connector_manager.register(subscriber).await;
     }
 
@@ -129,12 +132,30 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         }
     }
 
-    let auth_state = config
+    let mut auth_state = config
         .auth
         .as_ref()
         .map(crate::auth::AuthState::from_config)
         .transpose()
         .map_err(|e| ServerError::Internal(format!("auth configuration error: {e}")))?;
+
+    // Fetch the issuer's published keys before serving. A configured JWKS
+    // URL that is never fetched is worse than none: the server starts, and
+    // then rejects every token the issuer signs.
+    if let (Some(state), Some(url)) = (
+        auth_state.as_mut(),
+        config
+            .auth
+            .as_ref()
+            .and_then(|a| a.jwt.as_ref())
+            .and_then(|j| j.jwks_url.as_deref()),
+    ) {
+        state
+            .attach_jwks(url, std::time::Duration::from_secs(3600))
+            .await
+            .map_err(|e| ServerError::Internal(format!("JWKS error: {e}")))?;
+    }
+    let auth_state = auth_state;
 
     // ── Authorization engine (optional) ──────────────────────────────────
     let authz_engine = if let Some(ref policy_dir) = config.authz_policy_dir {
@@ -161,24 +182,94 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
 
     // ── Audit logger ───────────────────────────────────────────────────
     let audit_logger = {
-        let logger = chronix_security::audit::AuditLogger::new();
+        let mut logger = chronix_security::audit::AuditLogger::new();
+
+        // An audit file, when one is configured. Two things make it a
+        // trail rather than a log: it is `fsync`ed, and the hash chain
+        // **continues** across restarts by anchoring on the last event
+        // already in the file. Without the anchor every restart began a
+        // fresh chain in the same file, and a verifier cannot tell that
+        // from a truncation — which is precisely what it exists to detect.
+        if let Some(audit_cfg) = config.audit.as_ref() {
+            let key = match audit_cfg.hmac_key_env.as_ref() {
+                Some(var) => match std::env::var(var) {
+                    Ok(v) if !v.is_empty() => Some(v.into_bytes()),
+                    _ => {
+                        return Err(ServerError::Internal(format!(
+                            "audit.hmac_key_env names `{var}`, which is unset or empty; \
+                             an unsealed chain can be recomputed by anyone who can write \
+                             the log, so it proves nothing"
+                        )));
+                    }
+                },
+                None => None,
+            };
+            if let Some(key) = key {
+                logger = logger.with_hmac_key(key);
+            } else {
+                warn!(
+                    "audit chain is sealed with a bare SHA-256 hash — set \
+                     `audit.hmac_key_env` so that tampering, not just corruption, \
+                     is detectable"
+                );
+            }
+
+            let anchor = chronix_security::audit::last_event(&audit_cfg.path).map_err(|e| {
+                ServerError::Internal(format!(
+                    "cannot read the audit log at {}: {e}",
+                    audit_cfg.path.display()
+                ))
+            })?;
+            if let Some(last) = anchor {
+                info!(last_id = last.id, "continuing the existing audit chain");
+                logger = logger.resume_from(last.id, last.event_hash.clone());
+            }
+
+            let sink =
+                chronix_security::audit::FileSink::open(&audit_cfg.path, audit_cfg.sync_each)
+                    .map_err(|e| {
+                        ServerError::Internal(format!(
+                            "cannot open the audit log at {}: {e}",
+                            audit_cfg.path.display()
+                        ))
+                    })?;
+            logger.add_sink(Box::new(sink));
+            info!(path = %audit_cfg.path.display(), "audit log opened");
+        }
+
         // Always add the tracing-based sink so audit events appear in
         // structured logs (forwarded to whatever tracing subscriber is
         // configured, e.g. JSON file, stdout, OTLP).
         logger.add_sink(Box::new(chronix_security::audit::TracingSink));
-        info!("audit logger enabled with tracing sink");
         Some(Arc::new(logger))
     };
 
     // ── Shared state ───────────────────────────────────────────────────
+    // The registry lives beside the data it scopes, so a restart keeps the
+    // tenants. A failure to open it is fatal rather than a silent fall back
+    // to an empty in-memory one, which would answer 400 for every tenant.
+    let namespace_registry = {
+        let dir = db.data_dir().join("namespaces");
+        chronix_security::tenant::NamespaceRegistry::open(&dir).map_err(|e| {
+            ServerError::Internal(format!(
+                "cannot open the namespace registry at {}: {e}",
+                dir.display()
+            ))
+        })?
+    };
+
     let sql_contexts = crate::namespace::SqlContexts::new(db.clone());
     #[cfg(feature = "cluster")]
     let meta_client = cluster_state.as_ref().map(|cs| match cs {
         ClusterState::Meta(s) => Arc::clone(&s.meta_client),
         ClusterState::Data(s) => Arc::clone(s.manager.meta_client()),
     });
+    // ── Signal triggers (optional) ─────────────────────────────────────
+    let pipeline = build_trigger_pipeline(&config, &db)?;
+
     let state: AppState = Arc::new(SharedState {
         db: db.clone(),
+        pipeline: pipeline.clone(),
         config: config.clone(),
         start_time,
         connector_manager: Some(connector_manager.clone()),
@@ -186,7 +277,12 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         auth_state: auth_state.clone(),
         #[cfg(feature = "cluster")]
         meta_client,
-        namespace_registry: Some(Arc::new(chronix_security::tenant::NamespaceRegistry::new())),
+        // **Durable**, not in memory. A namespace that vanished at restart
+        // made every non-default tenant's data unreachable — the middleware
+        // answers `400 namespace not found` for a namespace the registry
+        // does not know, so the rows were still on disk and nothing could
+        // ask for them. `open()` existed the whole time.
+        namespace_registry: Some(Arc::new(namespace_registry)),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -206,6 +302,16 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         write_timeout: std::time::Duration::from_secs(config.write_timeout_secs),
         openapi_json: std::sync::OnceLock::new(),
     });
+
+    // The pipeline is fed by the database's CDC bus, which is what makes a
+    // write evaluate a trigger. Without this subscription the trigger engine
+    // is a correctly implemented thing that never sees an event.
+    if let Some(pipeline) = pipeline.as_ref() {
+        pipeline.spawn_cdc_listener(db.event_bus());
+        info!("signal triggers enabled");
+    }
+
+    spawn_cold_archiver(&config, &db)?;
 
     // ── TLS (optional) ─────────────────────────────────────────────────
     let tls_rustls_config = if let Some(ref tls_cfg) = config.tls {
@@ -610,9 +716,6 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     connector_manager.stop_all().await;
     info!("connectors stopped");
 
-    scheduler.stop();
-    info!("compaction scheduler stopped");
-
     // Flush and close database
     let db_close = db.clone();
     if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -664,22 +767,83 @@ pub fn build_router(
                 async move { handle.render() }
             }),
         )
-        // Write
+        // Write — chronix's JSON body, and InfluxDB Line Protocol at the
+        // paths Telegraf posts to. `outputs.influxdb` appends `/write` to
+        // its URL and `outputs.influxdb_v2` appends `/api/v2/write`, so a
+        // server offering neither cannot be written to by Telegraf at all,
+        // whatever else it implements.
         .route("/api/v1/write", post(http::write_handler))
+        .route("/write", post(http::write_influx_handler))
+        .route("/api/v2/write", post(http::write_influx_handler))
         .route("/api/v1/write/influx", post(http::write_influx_handler))
-        // Query
-        .route("/api/v1/query", post(http::query_handler))
-        // Query explain
-        .route("/api/v1/query/explain", post(http::query_explain_handler))
-        // SQL
-        .route("/api/v1/sql", post(http::sql_handler))
-        // PromQL
-        .route("/api/v1/prom/query", get(http::prom_instant_query_handler).post(http::prom_instant_query_handler))
-        .route("/api/v1/prom/query_range", get(http::prom_range_query_handler).post(http::prom_range_query_handler))
-        .route("/api/v1/prom/labels", get(http::prom_labels_handler))
-        .route("/api/v1/prom/label/{name}/values", get(http::prom_label_values_handler))
-        .route("/api/v1/prom/series", get(http::prom_series_handler))
+        // Chronix's own JSON query API.
+        //
+        // It used to live at `/api/v1/query`, which is where a Grafana
+        // Prometheus datasource pointed at this server's base URL looks for
+        // the *Prometheus* API — so the two collided and the Prometheus one
+        // had to hide under `/api/v1/prom/`, which no client derives. The
+        // native API moved instead: `/api/v1/query` now means what every
+        // Prometheus client expects it to mean.
+        .route("/api/v1/chronix/query", post(http::query_handler))
+        .route("/api/v1/chronix/query/explain", post(http::query_explain_handler))
+        .route("/api/v1/chronix/sql", post(http::sql_handler))
+        // PromQL — at the paths a Prometheus client derives from a base URL,
+        // and on both methods, because Grafana POSTs a form body by default.
+        .route(
+            "/api/v1/query",
+            get(http::prom_instant_query_handler).post(http::prom_instant_query_handler),
+        )
+        .route(
+            "/api/v1/query_range",
+            get(http::prom_range_query_handler).post(http::prom_range_query_handler),
+        )
+        .route(
+            "/api/v1/labels",
+            get(http::prom_labels_handler).post(http::prom_labels_handler),
+        )
+        .route(
+            "/api/v1/label/{name}/values",
+            get(http::prom_label_values_handler).post(http::prom_label_values_handler),
+        )
+        .route(
+            "/api/v1/series",
+            get(http::prom_series_handler).post(http::prom_series_handler),
+        )
+        .route("/api/v1/metadata", get(http::prom_metadata_handler))
+        .route("/api/v1/status/buildinfo", get(http::prom_buildinfo_handler))
+        .route("/api/v1/rules", get(http::prom_empty_rules_handler))
+        .route("/api/v1/alerts", get(http::prom_empty_alerts_handler))
+        .route("/api/v1/query_exemplars", get(http::prom_empty_exemplars_handler))
+        // The old prefix stays as an alias, so a deployment that configured
+        // it explicitly keeps working.
+        .route(
+            "/api/v1/prom/query",
+            get(http::prom_instant_query_handler).post(http::prom_instant_query_handler),
+        )
+        .route(
+            "/api/v1/prom/query_range",
+            get(http::prom_range_query_handler).post(http::prom_range_query_handler),
+        )
+        .route(
+            "/api/v1/prom/labels",
+            get(http::prom_labels_handler).post(http::prom_labels_handler),
+        )
+        .route(
+            "/api/v1/prom/label/{name}/values",
+            get(http::prom_label_values_handler).post(http::prom_label_values_handler),
+        )
+        .route(
+            "/api/v1/prom/series",
+            get(http::prom_series_handler).post(http::prom_series_handler),
+        )
         .route("/api/v1/prom/metadata", get(http::prom_metadata_handler))
+        // Signal triggers — 404 unless `[triggers]` is configured.
+        .route(
+            "/api/v1/triggers",
+            get(http::list_triggers_handler).post(http::trigger_sql_handler),
+        )
+        .route("/api/v1/triggers/{name}", delete(http::drop_trigger_handler))
+        .route("/api/v1/signals", get(http::list_signals_handler))
         // Grafana annotations
         .route("/api/v1/annotations", get(http::annotations_handler))
         .route("/api/v1/annotations/stream", get(http::annotations_stream_handler))
@@ -691,6 +855,11 @@ pub fn build_router(
         .route("/api/v1/prom/write", post(crate::wire::prometheus::remote_write_handler))
         .route("/api/v1/prom/read", post(crate::wire::prometheus::remote_read_handler))
         // Wire protocols: OTLP metrics
+        // OTLP — at the path the Collector derives. `otlphttp` appends
+        // `/v1/metrics` to its configured endpoint, so a server that only
+        // listens on `/api/v1/otlp/metrics` needs the exporter's
+        // `metrics_endpoint` overridden, which no default configuration does.
+        .route("/v1/metrics", post(crate::wire::otlp::otlp_metrics_handler))
         .route("/api/v1/otlp/metrics", post(crate::wire::otlp::otlp_metrics_handler))
         // Management
         .route("/api/v1/measurements", get(http::list_measurements_handler))
@@ -706,6 +875,10 @@ pub fn build_router(
         // Bulk delete
         .route("/api/v1/delete_batch", post(http::delete_batch_handler))
         .route("/api/v1/rollups", get(http::list_rollups_handler).post(http::create_rollup_handler))
+        .route(
+            "/api/v1/rollups/{name}/refresh",
+            post(http::refresh_rollup_handler),
+        )
         .route("/api/v1/rollups/{name}", delete(http::delete_rollup_handler))
         .route(
             "/api/v1/export/parquet",
@@ -953,7 +1126,25 @@ pub fn build_router(
                     ])
             }
         })
+        // The body limit is applied to the *decompressed* body, so the
+        // decompression layer sits inside it: a gzip bomb is caught by the
+        // limit rather than by the allocator.
         .layer(RequestBodyLimitLayer::new(max_body_size))
+        // The OpenTelemetry Collector's `otlphttp` exporter and Telegraf's
+        // InfluxDB outputs both gzip by default. Without this every one of
+        // their batches was a decode error — a 400, which both clients treat
+        // as permanent, so the data was dropped rather than retried.
+        // `pass_through_unaccepted` is load-bearing: Prometheus remote
+        // write and read set `Content-Encoding: snappy`, which this layer
+        // does not handle and would otherwise answer with 415 — so adding
+        // gzip support for Telegraf and the OTel Collector would have broken
+        // every Prometheus sender. Snappy is decompressed by the handler
+        // that understands the payload.
+        .layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .pass_through_unaccepted(true),
+        )
         .with_state(state)
 }
 
@@ -1007,4 +1198,145 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
     }
+}
+
+/// Build the signal-trigger pipeline when `[triggers]` is configured.
+///
+/// Restores the persisted trigger catalog before returning, so a restart does
+/// not silently stop alerting.
+fn build_trigger_pipeline(
+    config: &crate::config::ServerConfig,
+    db: &Arc<chronix::Chronix>,
+) -> Result<Option<Arc<chronix::Pipeline>>, ServerError> {
+    let Some(cfg) = config.triggers.as_ref() else {
+        return Ok(None);
+    };
+
+    let secret = match cfg.webhook_signing_secret.as_deref() {
+        None => None,
+        Some(raw) => Some(crate::config::resolve_env_reference(raw).map_err(|var| {
+            ServerError::Config(crate::config::ServerConfigError::Invalid(format!(
+                "triggers.webhook_signing_secret references ${{{var}}}, which is not set"
+            )))
+        })?),
+    };
+
+    // A relative catalog path belongs under the data directory, not under
+    // whatever directory the process happened to start in.
+    let catalog_path = cfg.catalog_path.as_ref().map(|p| {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            config.database.data_dir.join(p)
+        }
+    });
+
+    let pipeline = Arc::new(chronix::Pipeline::with_config(chronix::PipelineConfig {
+        trigger_catalog_path: catalog_path,
+        signal_store_capacity: cfg.signal_store_capacity,
+        webhook_signing_secret: secret,
+        webhook_timeout: std::time::Duration::from_secs(cfg.webhook_timeout_secs),
+        webhook_allow_private_targets: cfg.webhook_allow_private_targets,
+        ..chronix::PipelineConfig::default()
+    }));
+
+    let _ = db;
+    Ok(Some(pipeline))
+}
+
+/// Run a cold-archiving pass periodically, when `[cold_archive]` is configured.
+///
+/// Archiving was an embedded API call with no trigger anywhere in the server:
+/// a deployment that wanted it had to write its own scheduler around
+/// `Chronix::archive_cold_segments`. A reclamation nobody runs is one that
+/// runs for the first time when the disk is already full.
+///
+/// The pass is bounded (`max_objects_per_run`) and its failures are logged
+/// rather than fatal: an object store that is briefly unreachable must not
+/// take the database down, and the next pass picks up where this one stopped.
+#[cfg(feature = "object-store")]
+fn spawn_cold_archiver(
+    config: &crate::config::ServerConfig,
+    db: &Arc<chronix::Chronix>,
+) -> Result<(), ServerError> {
+    let Some(cfg) = config.cold_archive.as_ref() else {
+        return Ok(());
+    };
+    if cfg.remote_url.is_empty() {
+        return Err(ServerError::Config(
+            crate::config::ServerConfigError::Invalid(
+                "cold_archive.remote_url must not be empty".into(),
+            ),
+        ));
+    }
+
+    let archive = chronix::cold_archive::ArchiveConfig {
+        cold_after: std::time::Duration::from_secs(cfg.cold_after_secs),
+        remote_url: cfg.remote_url.clone(),
+        max_objects_per_run: cfg.max_objects_per_run,
+    };
+    let period = std::time::Duration::from_secs(cfg.interval_secs.max(1));
+    let db = Arc::clone(db);
+
+    info!(
+        remote = %archive.remote_url,
+        interval_secs = cfg.interval_secs,
+        "cold archiving enabled"
+    );
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        // The first tick fires immediately; skip it so a restart loop cannot
+        // turn into an archiving loop.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match db.archive_cold_segments(&archive).await {
+                Ok(outcome) if outcome.objects > 0 || outcome.failed > 0 => {
+                    info!(
+                        objects = outcome.objects,
+                        segments = outcome.segments,
+                        rows = outcome.rows,
+                        bytes = outcome.bytes,
+                        failed = outcome.failed,
+                        "cold archive pass complete"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Not fatal: the data is still hot and queryable, which is
+                    // the correct failure direction for an operation whose
+                    // next step is a delete.
+                    tracing::warn!(error = %e, "cold archive pass failed");
+                    metrics::counter!("chronix_cold_archive_pass_failures_total").increment(1);
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Without the `object-store` feature there is nothing to archive with, so a
+/// configuration asking for it is a **startup error** rather than a section
+/// the binary quietly ignores.
+///
+/// A configured-and-ignored setting is the defect class this tree has just
+/// spent a pass removing: nothing fails, and the operator finds out when the
+/// disk fills.
+#[cfg(not(feature = "object-store"))]
+fn spawn_cold_archiver(
+    config: &crate::config::ServerConfig,
+    _db: &Arc<chronix::Chronix>,
+) -> Result<(), ServerError> {
+    if config.cold_archive.is_some() {
+        return Err(ServerError::Config(
+            crate::config::ServerConfigError::Invalid(
+                "[cold_archive] is configured but this binary was built without the \
+                 `object-store` feature: rebuild with `--features object-store`, or \
+                 remove the section"
+                    .into(),
+            ),
+        ));
+    }
+    Ok(())
 }

@@ -382,7 +382,7 @@ cached per `GrpcNetwork` instance and reused across all RPCs
 2. DataNode forwards to region leader
 3. Leader appends to WAL, replicates to followers via Raft (durably persisted to redb)
 4. Majority acknowledgment → write committed
-5. Memtable updated, background `FlushScheduler` flushes to immutable segments
+5. Memtable updated; the database's maintenance thread flushes it to immutable segments
 
 #### Admission Control
 

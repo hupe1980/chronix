@@ -323,12 +323,15 @@ fn arma_forecast(
     let mut eps = residuals.to_vec();
     // Align the innovation history with the value history: a shorter residual
     // vector (after streaming updates trimmed it) must not shift the MA lags.
+    // Both adjustments happen at the *front*: `truncate` dropped the newest
+    // innovations, which are exactly the ones the MA lags read, so an
+    // over-long buffer shifted every lag by the excess.
     if eps.len() < n {
         let mut padded = vec![0.0; n - eps.len()];
         padded.extend_from_slice(&eps);
         eps = padded;
-    } else {
-        eps.truncate(n);
+    } else if eps.len() > n {
+        eps.drain(..eps.len() - n);
     }
 
     for _ in 0..horizon {
@@ -364,16 +367,52 @@ fn residual_std(residuals: &[f64], warmup: usize, n_params: usize) -> f64 {
     var.sqrt()
 }
 
-/// Build symmetric 95 % prediction intervals from the ψ-weights.
+/// The **full** autoregressive operator of an ARIMA/SARIMA model,
+/// `φ(B)·Φ(Bᵐ)·(1-B)ᵈ·(1-Bᵐ)ᴰ`, expanded into a single coefficient vector in
+/// the same convention as `ar` (`xₜ = Σᵢ cᵢ·xₜ₋ᵢ + …`).
+///
+/// # Why the differencing has to be in here
+///
+/// The ψ-weights of the *stationary* ARMA part describe the error of the
+/// differenced series. The forecast is issued on the original scale, and
+/// integration accumulates those errors: for `ARIMA(0,1,0)` every ψⱼ is 1, so
+/// `Var[e_h] = h·σ²` and the interval widens as `√h`. Taking ψ from the ARMA
+/// part alone gives `ψ = [1]` and a **constant-width** interval for a random
+/// walk — the textbook example of an interval that must widen.
+pub(crate) fn integrated_ar(ar: &[f64], d: usize, seasonal_d: usize, m: usize) -> Vec<f64> {
+    // φ(B) = 1 - φ₁B - … - φₚBᵖ
+    let mut poly = Vec::with_capacity(ar.len() + 1);
+    poly.push(1.0);
+    poly.extend(ar.iter().map(|c| -c));
+    for _ in 0..d {
+        poly = poly_mul(&poly, &[1.0, -1.0]);
+    }
+    if m > 0 && seasonal_d > 0 {
+        let mut sd = vec![0.0; m + 1];
+        sd[0] = 1.0;
+        sd[m] = -1.0;
+        for _ in 0..seasonal_d {
+            poly = poly_mul(&poly, &sd);
+        }
+    }
+    poly[1..].iter().map(|c| -c).collect()
+}
+
+/// Build symmetric 95 % prediction intervals from the ψ-weights of the
+/// **integrated** model — see [`integrated_ar`].
 fn prediction_intervals(
     values: &[f64],
     ar: &[f64],
     ma: &[f64],
     sigma: f64,
     horizon: usize,
+    d: usize,
+    seasonal_d: usize,
+    m: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     const Z95: f64 = 1.959_963_984_540_054;
-    let psi = psi_weights(ar, ma, horizon);
+    let phi_star = integrated_ar(ar, d, seasonal_d, m);
+    let psi = psi_weights(&phi_star, ma, horizon);
     let mut lower = Vec::with_capacity(horizon);
     let mut upper = Vec::with_capacity(horizon);
     for h in 1..=horizon {
@@ -652,7 +691,8 @@ impl ForecastModel for ArimaModel {
             values = undifference_lag(&values, &[anchor], 1);
         }
 
-        let (lower, upper) = prediction_intervals(&values, ar_coeffs, ma_coeffs, *sigma, horizon);
+        let (lower, upper) =
+            prediction_intervals(&values, ar_coeffs, ma_coeffs, *sigma, horizon, self.d, 0, 0);
 
         metrics::histogram!("chronix_forecast_predict_duration_seconds", "model_type" => "arima")
             .record(_start.elapsed().as_secs_f64());
@@ -703,15 +743,22 @@ impl ForecastModel for ArimaModel {
         }
         self.residuals.push(diffed[idx] - pred);
 
-        // Bound both buffers so a long-running streaming update does not grow
-        // without limit, keeping enough context for the model orders.
+        // Bound the buffers so a long-running stream does not grow without
+        // limit, keeping enough context for the model orders.
+        //
+        // `residuals` is aligned one-for-one with `difference(history, d)`,
+        // which is the only reason `predict` may read them at the same index.
+        // Trimming the two to *independent* caps broke that alignment by `d`
+        // after the first trim, silently shifting every MA lag from then on.
+        // One cap, and the residual buffer follows the history buffer.
         let max_history = (self.p + self.d + self.q + 1).max(64) * 4;
         if self.history.len() > max_history {
             self.history.drain(..self.history.len() - max_history);
         }
-        let max_residuals = self.q.max(64) * 4;
-        if self.residuals.len() > max_residuals {
-            self.residuals.drain(..self.residuals.len() - max_residuals);
+        let want_residuals = self.history.len().saturating_sub(self.d);
+        if self.residuals.len() > want_residuals {
+            self.residuals
+                .drain(..self.residuals.len() - want_residuals);
         }
         Ok(())
     }
@@ -1033,16 +1080,20 @@ impl ForecastModel for SarimaModel {
             values = undifference_lag(&values, anchor, self.m);
         }
 
-        // The interval is computed on the differenced scale and carried
-        // outward unchanged: differencing is a linear filter with unit lead
-        // coefficient, so the h-step forecast error is the same random
-        // variable on both scales.
+        // The interval is computed from the ψ-weights of the *integrated*
+        // operator: differencing has unit lead coefficient, so the one-step
+        // error is the same on both scales, but beyond one step integration
+        // accumulates the earlier errors and the interval on the original
+        // scale is strictly wider than the one on the differenced scale.
         let (lower, upper) = prediction_intervals(
             &values,
             &self.ar_expanded,
             &self.ma_expanded,
             *sigma,
             horizon,
+            self.cfg_d,
+            self.sd,
+            self.m,
         );
 
         metrics::histogram!("chronix_forecast_predict_duration_seconds", "model_type" => "sarima")
@@ -1081,15 +1132,18 @@ impl ForecastModel for SarimaModel {
         self.residuals.push(w[idx] - pred);
 
         // Keep enough original-scale history to re-derive the differenced
-        // series the recursion reads, plus a margin.
+        // series the recursion reads, plus a margin — and keep `residuals`
+        // aligned one-for-one with that differenced series, which is the
+        // invariant `predict` depends on. See `ArimaModel::update`.
         let reach = self.ar_expanded.len().max(self.ma_expanded.len());
         let max_history = (reach + self.cfg_d + self.sd * self.m + 1).max(64) * 4;
         if self.history.len() > max_history {
             self.history.drain(..self.history.len() - max_history);
         }
-        let max_residuals = self.ma_expanded.len().max(64) * 4;
-        if self.residuals.len() > max_residuals {
-            self.residuals.drain(..self.residuals.len() - max_residuals);
+        let want_residuals = self.centered(&self.history).len();
+        if self.residuals.len() > want_residuals {
+            self.residuals
+                .drain(..self.residuals.len() - want_residuals);
         }
         Ok(())
     }
@@ -1568,6 +1622,167 @@ mod tests {
 
     // ── ARIMA ───────────────────────────────────────────────────────
 
+    /// A random walk is `ARIMA(0,1,0)`: every ψⱼ is 1, so `Var[e_h] = h·σ²`
+    /// and the variance ratio is **exactly** `h`. Before the integration term
+    /// entered the ψ-weights this was a constant-width interval.
+    #[test]
+    fn random_walk_interval_variance_grows_exactly_linearly() {
+        let e = noise(7, 200, 1.0);
+        let mut vals = vec![100.0];
+        for v in e.iter().take(199) {
+            vals.push(vals.last().unwrap() + v);
+        }
+        let mut model = ArimaModel::new(0, 1, 0);
+        model.fit(&ts(200), &vals).unwrap();
+        let r = model.predict(12).unwrap();
+        let half = |h: usize| r.confidence_upper[h] - r.values[h];
+        assert!(half(0) > 0.0);
+        for h in 1..=12 {
+            let ratio = (half(h - 1) / half(0)).powi(2);
+            assert!(
+                (ratio - h as f64).abs() < 1e-9,
+                "var({h})/var(1) = {ratio}, want {h}"
+            );
+        }
+    }
+
+    /// `ARIMA(1,1,0)`: `φ*(B) = (1-φB)(1-B)`, so
+    /// `ψⱼ = 1 + φ + … + φʲ = (1-φ^{j+1})/(1-φ)`.
+    #[test]
+    fn arima_110_interval_matches_the_psi_closed_form() {
+        let e = noise(11, 240, 1.0);
+        let mut vals = vec![50.0];
+        let mut prev_d = 0.0;
+        for v in e.iter().take(239) {
+            let d = 0.6 * prev_d + v;
+            vals.push(vals.last().unwrap() + d);
+            prev_d = d;
+        }
+        let mut model = ArimaModel::new(1, 1, 0);
+        model.fit(&ts(240), &vals).unwrap();
+        let ModelParams::Arima {
+            ar_coeffs,
+            residual_std,
+            ..
+        } = model.params()
+        else {
+            panic!()
+        };
+        let phi = ar_coeffs[0];
+        assert!(phi.abs() > 0.1, "need a non-trivial φ, got {phi}");
+        let r = model.predict(10).unwrap();
+        for h in 1..=10 {
+            let factor: f64 = (0..h)
+                .map(|j| {
+                    let psi = (1.0 - phi.powi(j as i32 + 1)) / (1.0 - phi);
+                    psi * psi
+                })
+                .sum::<f64>();
+            let expected = 1.959_963_984_540_054 * residual_std * factor.sqrt();
+            let half = r.confidence_upper[h - 1] - r.values[h - 1];
+            assert!(
+                (half - expected).abs() < 1e-9,
+                "h={h}: half-width {half} != {expected}"
+            );
+        }
+    }
+
+    /// `integrated_ar` must expand `φ(B)(1-B)^d(1-B^m)^D` exactly.
+    #[test]
+    fn integrated_ar_expands_the_differencing_operator() {
+        // (1-B) → xₜ = xₜ₋₁
+        assert_eq!(integrated_ar(&[], 1, 0, 0), vec![1.0]);
+        // (1-B)² = 1 - 2B + B² → xₜ = 2xₜ₋₁ - xₜ₋₂
+        let d2 = integrated_ar(&[], 2, 0, 0);
+        assert!((d2[0] - 2.0).abs() < 1e-12 && (d2[1] + 1.0).abs() < 1e-12);
+        // (1-0.5B)(1-B) = 1 - 1.5B + 0.5B²
+        let m = integrated_ar(&[0.5], 1, 0, 0);
+        assert!((m[0] - 1.5).abs() < 1e-12 && (m[1] + 0.5).abs() < 1e-12);
+        // (1-B⁴): coefficient 1 at lag 4, zero elsewhere.
+        let sd = integrated_ar(&[], 0, 1, 4);
+        assert_eq!(sd.len(), 4);
+        assert!((sd[3] - 1.0).abs() < 1e-12);
+        assert!(sd[..3].iter().all(|c| c.abs() < 1e-12));
+        // No differencing → unchanged.
+        assert_eq!(integrated_ar(&[0.3, -0.2], 0, 0, 12), vec![0.3, -0.2]);
+    }
+
+    /// `arma_forecast` must read the **newest** innovations. With a residual
+    /// buffer longer than the value buffer, `θ₁ = 0.5` and last innovation
+    /// 5.0, the one-step forecast is exactly 2.5; truncating from the tail
+    /// gave 1.5.
+    #[test]
+    fn arma_forecast_reads_the_newest_innovations() {
+        let values = [0.0, 0.0, 0.0];
+        let residuals = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let out = arma_forecast(&values, &residuals, &[], &[0.5], 1);
+        assert!((out[0] - 2.5).abs() < 1e-12, "got {}", out[0]);
+    }
+
+    /// `predict` reads `residuals[i]` alongside `difference(history, d)[i]`,
+    /// so after the streaming buffers are trimmed the two lengths must still
+    /// differ by exactly `d`.
+    #[test]
+    fn update_keeps_history_and_residuals_aligned() {
+        let vals: Vec<f64> = (0..100)
+            .map(|i| 10.0 + i as f64 * 0.3 + ((i * 17) % 7) as f64 * 0.4)
+            .collect();
+        let mut model = ArimaModel::new(1, 1, 1);
+        model.fit(&ts(100), &vals).unwrap();
+        for i in 0..300 {
+            let v = 40.0 + ((i * 13) % 11) as f64 * 0.5;
+            model.update((100 + i) as i64 * 1_000_000_000, v).unwrap();
+        }
+        assert!(model.history.len() < 300, "history was never trimmed");
+        assert_eq!(
+            model.residuals.len(),
+            model.history.len() - model.d,
+            "residuals must stay aligned with difference(history, d)"
+        );
+
+        // …and the MA term of the one-step forecast must use the newest
+        // innovation: ŷ = last + c + θ₁·e_last for ARIMA(p,1,1) with p's
+        // contribution written out from the differenced history.
+        let ModelParams::Arima {
+            ar_coeffs,
+            ma_coeffs,
+            constant,
+            ..
+        } = model.params().clone()
+        else {
+            panic!()
+        };
+        let diffed: Vec<f64> = difference(&model.history, 1)
+            .into_iter()
+            .map(|v| v - constant)
+            .collect();
+        let n = diffed.len();
+        let expected_diff = constant
+            + ar_coeffs[0] * diffed[n - 1]
+            + ma_coeffs[0] * model.residuals[model.residuals.len() - 1];
+        let expected = model.history[model.history.len() - 1] + expected_diff;
+        let got = model.predict(1).unwrap().values[0];
+        assert!((got - expected).abs() < 1e-9, "{got} != {expected}");
+    }
+
+    /// The same alignment invariant for SARIMA.
+    #[test]
+    fn sarima_update_keeps_history_and_residuals_aligned() {
+        let vals = {
+            (0..120)
+                .map(|i| 50.0 + 5.0 * (std::f64::consts::TAU * (i % 12) as f64 / 12.0).sin())
+                .collect::<Vec<f64>>()
+        };
+        let mut model = SarimaModel::new(1, 1, 1, 0, 1, 0, 12);
+        model.fit(&ts(120), &vals).unwrap();
+        for i in 0..400 {
+            let v = 50.0 + 5.0 * (std::f64::consts::TAU * (i % 12) as f64 / 12.0).sin();
+            model.update((120 + i) as i64 * 1_000_000_000, v).unwrap();
+        }
+        assert!(model.history.len() < 400, "history was never trimmed");
+        assert_eq!(model.residuals.len(), model.centered(&model.history).len());
+    }
+
     #[test]
     fn arima_random_walk() {
         let e = noise(42, 200, 1.0);
@@ -1992,7 +2207,30 @@ mod tests {
         model.fit(&ts(240), &vals).unwrap();
         let r = model.predict(24).unwrap();
         let width = |h: usize| r.confidence_upper[h] - r.confidence_lower[h];
-        assert!(width(23) >= width(0), "{} vs {}", width(23), width(0));
+        // Strict growth, with the ψ-weight closed form: `>=` also passes for
+        // a constant-width interval, which is exactly the bug it missed.
+        for h in 1..24 {
+            assert!(
+                width(h) > width(h - 1),
+                "width must grow strictly: h={h} {} vs {}",
+                width(h),
+                width(h - 1)
+            );
+        }
+        let ModelParams::Sarima { residual_std, .. } = model.params() else {
+            panic!()
+        };
+        let phi_star = integrated_ar(&model.ar_expanded, 0, 0, 12);
+        let psi = psi_weights(&phi_star, &model.ma_expanded, 24);
+        for h in 1..=24 {
+            let scale: f64 = psi[..h].iter().map(|w| w * w).sum::<f64>().sqrt();
+            let expected = 2.0 * 1.959_963_984_540_054 * residual_std * scale;
+            assert!(
+                (width(h - 1) - expected).abs() < 1e-9,
+                "h={h}: width {} != {expected}",
+                width(h - 1)
+            );
+        }
         for h in 0..24 {
             assert!(r.confidence_lower[h] <= r.values[h]);
             assert!(r.confidence_upper[h] >= r.values[h]);

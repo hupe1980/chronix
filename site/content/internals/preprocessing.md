@@ -142,12 +142,22 @@ $$
 Preprocessing is available as SQL functions:
 
 ```sql
-SELECT
-    time,
-    FILL(value, 'locf') AS filled,
-    RESAMPLE(value, '1m', 'avg') AS resampled,
-    SMOOTH(value, 'ema', 0.3) AS smoothed
+-- Resampling is a time bucket.
+SELECT time_bucket('1m', _time) AS bucket,
+       avg(value)               AS resampled
 FROM metrics
 WHERE metric_name = 'cpu'
-AND time > now() - INTERVAL '1 hour';
+  AND _time > now() - INTERVAL '1 hour'
+GROUP BY bucket;
+
+-- Smoothing is `ewm`, a window function: it needs the ordering to smooth
+-- along, so it is always used with OVER.
+SELECT _time,
+       ewm(value, 0.3) OVER (ORDER BY _time) AS smoothed
+FROM metrics
+WHERE metric_name = 'cpu';
+
+-- Gap filling has no SQL form. It is a preprocessing step on the Rust API,
+-- because "what value belongs in a gap" is a modelling choice a query
+-- cannot make on your behalf.
 ```

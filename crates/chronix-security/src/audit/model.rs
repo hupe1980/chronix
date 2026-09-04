@@ -343,7 +343,22 @@ pub fn verify_hash_chain_with_key(
     events: &[AuditEvent],
     hmac_key: Option<&[u8]>,
 ) -> std::result::Result<(), String> {
-    let mut expected_prev: Option<&str> = None;
+    verify_chain_from(events, None, hmac_key)
+}
+
+/// Verify a chain that continues from an earlier one.
+///
+/// `expected_first_prev` is the `event_hash` of the last event before this
+/// slice, or `None` when the slice starts the chain. A log that survives
+/// restarts is one chain, so verifying a tail of it needs the link it
+/// hangs from — without this a reader could only ever check a whole file
+/// from its first byte.
+pub fn verify_chain_from(
+    events: &[AuditEvent],
+    expected_first_prev: Option<&str>,
+    hmac_key: Option<&[u8]>,
+) -> std::result::Result<(), String> {
+    let mut expected_prev: Option<&str> = expected_first_prev;
 
     for (idx, event) in events.iter().enumerate() {
         // Check prev_hash linkage

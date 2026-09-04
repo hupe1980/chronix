@@ -93,9 +93,9 @@ handles versioning, training, and retraining. The query engine exposes
 forecasting through the `FORECAST` SQL extension:
 
 ```sql
-SELECT FORECAST(value, 24) FROM metrics
+SELECT forecast(value, _time, 24) FROM metrics
 WHERE metric_name = 'cpu'
-AND time > now() - INTERVAL '7 days';
+  AND _time > now() - INTERVAL '7 days';
 ```
 
 Deep dives into each method family follow in the sub-sections.

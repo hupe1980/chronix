@@ -126,7 +126,7 @@ async fn kafka_line_protocol_end_to_end() {
         vec![topic.to_string()],
         ConnectorFormat::LineProtocol,
     );
-    let consumer = KafkaConsumer::new_arc("kafka-lp-test", config, db.clone());
+    let consumer = KafkaConsumer::new_arc("kafka-lp-test", config, db.clone(), false);
 
     consumer.start().await.expect("consumer start");
 
@@ -201,7 +201,7 @@ async fn kafka_json_end_to_end() {
 
     let (db, _tmp) = open_test_db();
     let config = make_kafka_config(&bootstrap, vec![topic.to_string()], ConnectorFormat::Json);
-    let consumer = KafkaConsumer::new_arc("kafka-json-test", config, db.clone());
+    let consumer = KafkaConsumer::new_arc("kafka-json-test", config, db.clone(), false);
 
     consumer.start().await.expect("consumer start");
 
@@ -280,7 +280,7 @@ async fn kafka_multi_topic_mapping() {
 
     let (db, _tmp) = open_test_db();
     let config = make_kafka_config(&bootstrap, topics, ConnectorFormat::LineProtocol);
-    let consumer = KafkaConsumer::new_arc("kafka-multi-test", config, db.clone());
+    let consumer = KafkaConsumer::new_arc("kafka-multi-test", config, db.clone(), false);
 
     consumer.start().await.expect("consumer start");
 
@@ -379,7 +379,7 @@ async fn kafka_decode_error_resilience() {
         vec![topic.to_string()],
         ConnectorFormat::LineProtocol,
     );
-    let consumer = KafkaConsumer::new_arc("kafka-error-test", config, db.clone());
+    let consumer = KafkaConsumer::new_arc("kafka-error-test", config, db.clone(), false);
 
     consumer.start().await.expect("consumer start");
 
@@ -436,7 +436,7 @@ async fn kafka_connector_lifecycle_live() {
         vec!["lifecycle-test".to_string()],
         ConnectorFormat::Json,
     );
-    let consumer = KafkaConsumer::new_arc("kafka-lifecycle", config, db);
+    let consumer = KafkaConsumer::new_arc("kafka-lifecycle", config, db, false);
 
     assert_eq!(consumer.status().await, ConnectorStatus::Stopped);
 

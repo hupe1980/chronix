@@ -65,6 +65,7 @@ async fn start_tls_server() -> (String, Vec<u8>, TempDir) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -160,7 +161,7 @@ async fn tls_write_and_query_round_trip() {
         "range": {"start": 1_609_459_199_000_000_000_i64, "end": 1_609_459_201_000_000_000_i64}
     });
     let resp = client
-        .post(format!("{base}/api/v1/query"))
+        .post(format!("{base}/api/v1/chronix/query"))
         .json(&query_body)
         .send()
         .await

@@ -122,36 +122,77 @@ impl ScalarUDFImpl for TimeBucketUdf {
 
 /// Bucket a single nanosecond UTC timestamp.
 ///
-/// When `tz` is `Some`, converts to local time, truncates, then converts
-/// back to UTC. This ensures day/hour boundaries align with the local
-/// clock, handling DST transitions correctly.
+/// Without a zone this is plain truncation of the UTC instant.
+///
+/// # Why the zoned path reads a *naive* clock
+///
+/// With a zone the bucket boundary is a local wall-clock boundary — local
+/// midnight, local hour — so the truncation has to happen on the local clock
+/// reading, not on the instant.
+///
+/// The distinction is easy to lose, and this function lost it:
+/// `utc_dt.with_timezone(tz).timestamp_nanos_opt()` returns the **same number**
+/// it was given. `with_timezone` changes how an instant is displayed, never
+/// which instant it is, so the code truncated the UTC clock and then
+/// interpreted the result as a local time. Whenever the UTC date and the local
+/// date differ — which is most of every day, in every zone — the bucket landed
+/// a whole interval out: 02:00 UTC on the 15th is 22:00 on the *14th* in New
+/// York, and it was bucketed to the 15th.
+///
+/// `naive_local()` is the local clock reading; `and_utc()` then reads that
+/// reading as a count of nanoseconds, which is the number to truncate.
 fn bucket_timestamp(ts_nanos: i64, interval_nanos: i64, tz: Option<&chrono_tz::Tz>) -> i64 {
-    match tz {
-        None => ts_nanos - ts_nanos.rem_euclid(interval_nanos),
-        Some(tz) => {
-            use chrono::{DateTime, TimeZone};
-            let utc_dt = DateTime::from_timestamp_nanos(ts_nanos);
-            let local_dt = utc_dt.with_timezone(tz);
-            let local_nanos = local_dt.timestamp_nanos_opt().unwrap_or(ts_nanos);
-            let bucketed_local = local_nanos - local_nanos.rem_euclid(interval_nanos);
-            // Convert bucketed local time back to UTC.
-            let bucketed_naive = DateTime::from_timestamp(
-                bucketed_local.div_euclid(1_000_000_000),
-                (bucketed_local.rem_euclid(1_000_000_000)) as u32,
-            )
-            .map_or_else(|| utc_dt.naive_utc(), |dt| dt.naive_utc());
-            // Use the timezone to convert back; earliest is safest for ambiguous times.
-            match tz.from_local_datetime(&bucketed_naive) {
-                chrono::LocalResult::Single(dt) => dt.timestamp_nanos_opt().unwrap_or(ts_nanos),
-                chrono::LocalResult::Ambiguous(earliest, _) => {
-                    earliest.timestamp_nanos_opt().unwrap_or(ts_nanos)
-                }
-                chrono::LocalResult::None => {
-                    // Gap (spring forward): use next valid time.
-                    let _ = bucketed_naive;
-                    ts_nanos - ts_nanos.rem_euclid(interval_nanos) // fallback to UTC
-                }
-            }
+    let utc_truncated = ts_nanos - ts_nanos.rem_euclid(interval_nanos);
+    let Some(tz) = tz else {
+        return utc_truncated;
+    };
+
+    use chrono::{DateTime, TimeZone};
+    let utc_dt = DateTime::from_timestamp_nanos(ts_nanos);
+
+    // The local wall-clock reading, as nanoseconds on that clock.
+    let Some(local_nanos) = utc_dt
+        .with_timezone(tz)
+        .naive_local()
+        .and_utc()
+        .timestamp_nanos_opt()
+    else {
+        return utc_truncated;
+    };
+    let bucketed_local = local_nanos - local_nanos.rem_euclid(interval_nanos);
+    let bucketed_naive = DateTime::from_timestamp_nanos(bucketed_local).naive_utc();
+
+    match tz.from_local_datetime(&bucketed_naive) {
+        chrono::LocalResult::Single(dt) => dt.timestamp_nanos_opt().unwrap_or(utc_truncated),
+        // Autumn fall-back: the local time occurs twice. The earliest is the
+        // start of the bucket, which is what a boundary means.
+        chrono::LocalResult::Ambiguous(earliest, _) => {
+            earliest.timestamp_nanos_opt().unwrap_or(utc_truncated)
+        }
+        // Spring forward: the local time does not exist — the clock jumped
+        // over it. The bucket starts at the instant the clock resumed, which
+        // is the transition itself, so walk forward to the first local time
+        // that does exist rather than silently falling back to a UTC bucket
+        // (which is not a boundary in this zone at all).
+        chrono::LocalResult::None => {
+            const MINUTE_NS: i64 = 60 * 1_000_000_000;
+            // A DST gap is at most a couple of hours; 180 one-minute steps
+            // covers every transition in the tz database.
+            (1..=180)
+                .find_map(|step| {
+                    let probe = DateTime::from_timestamp_nanos(
+                        bucketed_local.saturating_add(step * MINUTE_NS),
+                    )
+                    .naive_utc();
+                    match tz.from_local_datetime(&probe) {
+                        chrono::LocalResult::Single(dt) => dt.timestamp_nanos_opt(),
+                        chrono::LocalResult::Ambiguous(earliest, _) => {
+                            earliest.timestamp_nanos_opt()
+                        }
+                        chrono::LocalResult::None => None,
+                    }
+                })
+                .unwrap_or(utc_truncated)
         }
     }
 }
@@ -246,5 +287,101 @@ mod tests {
             }
             _ => panic!("expected array"),
         }
+    }
+}
+
+#[cfg(test)]
+mod timezone_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    const DAY: i64 = 86_400 * 1_000_000_000;
+    const HOUR: i64 = 3_600 * 1_000_000_000;
+
+    /// Parse an RFC3339 instant to epoch nanoseconds.
+    fn ts(s: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap()
+    }
+
+    /// A zoned day bucket must be the local midnight, not the UTC midnight
+    /// re-labelled.
+    ///
+    /// The old implementation read the *UTC* clock, truncated that, and then
+    /// interpreted the result as a local time. Whenever the UTC date and the
+    /// local date differ — which is most of every day for a western zone —
+    /// that lands a whole day out.
+    #[test]
+    fn a_zoned_day_bucket_is_local_midnight() {
+        let ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+
+        // 02:00 UTC on the 15th is 22:00 on the *14th* in New York, so the
+        // day bucket is the 14th's local midnight = 04:00Z on the 14th.
+        let got = bucket_timestamp(ts("2024-03-15T02:00:00Z"), DAY, Some(&ny));
+        assert_eq!(
+            got,
+            ts("2024-03-14T04:00:00Z"),
+            "22:00 local on the 14th belongs to the 14th's bucket"
+        );
+
+        // And an instant that is already the same date in both zones.
+        let got = bucket_timestamp(ts("2024-03-15T18:00:00Z"), DAY, Some(&ny));
+        assert_eq!(got, ts("2024-03-15T04:00:00Z"));
+    }
+
+    /// East of Greenwich, the error ran the other way.
+    #[test]
+    fn a_zoned_day_bucket_east_of_utc() {
+        let tokyo: chrono_tz::Tz = "Asia/Tokyo".parse().unwrap();
+
+        // 20:00 UTC on the 15th is 05:00 on the *16th* in Tokyo, so the bucket
+        // is the 16th's local midnight = 15:00Z on the 15th.
+        let got = bucket_timestamp(ts("2024-03-15T20:00:00Z"), DAY, Some(&tokyo));
+        assert_eq!(got, ts("2024-03-15T15:00:00Z"));
+    }
+
+    /// The whole reason for zoned bucketing: a DST day is 23 or 25 hours long,
+    /// and both its local midnights must still be bucket boundaries.
+    #[test]
+    fn dst_days_keep_their_local_midnights() {
+        let ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+
+        // Spring forward: 2024-03-10 is a 23-hour day in New York.
+        let before = bucket_timestamp(ts("2024-03-10T06:00:00Z"), DAY, Some(&ny)); // 01:00 EST
+        let after = bucket_timestamp(ts("2024-03-10T20:00:00Z"), DAY, Some(&ny)); // 16:00 EDT
+        assert_eq!(before, ts("2024-03-10T05:00:00Z"), "local midnight EST");
+        assert_eq!(after, before, "both instants are the same local day");
+
+        // The next local midnight is 23 hours later, not 24.
+        let next = bucket_timestamp(ts("2024-03-11T12:00:00Z"), DAY, Some(&ny));
+        assert_eq!(next - before, 23 * HOUR, "a spring-forward day is 23 hours");
+    }
+
+    /// An unzoned bucket is plain UTC truncation, unchanged.
+    #[test]
+    fn an_unzoned_bucket_truncates_utc() {
+        assert_eq!(
+            bucket_timestamp(ts("2024-03-15T02:00:00Z"), DAY, None),
+            ts("2024-03-15T00:00:00Z")
+        );
+        assert_eq!(
+            bucket_timestamp(ts("2024-03-15T02:34:56Z"), HOUR, None),
+            ts("2024-03-15T02:00:00Z")
+        );
+    }
+
+    /// Sub-day buckets are unaffected by the zone whenever the offset is a
+    /// whole number of hours — but a half-hour zone is exactly where a wrong
+    /// implementation shows up.
+    #[test]
+    fn a_half_hour_zone_buckets_on_its_own_clock() {
+        let kolkata: chrono_tz::Tz = "Asia/Kolkata".parse().unwrap(); // UTC+05:30
+                                                                      // 00:10 UTC is 05:40 local; the hour bucket is 05:00 local = 23:30Z
+                                                                      // the previous day.
+        let got = bucket_timestamp(ts("2024-03-15T00:10:00Z"), HOUR, Some(&kolkata));
+        assert_eq!(got, ts("2024-03-14T23:30:00Z"));
     }
 }

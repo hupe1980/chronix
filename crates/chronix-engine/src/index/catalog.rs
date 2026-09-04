@@ -95,6 +95,47 @@ enum ManifestEntry {
     AddTombstone(Tombstone),
     /// A tombstone was reclaimed — every segment it was issued against is gone.
     RemoveTombstone(Tombstone),
+    /// Every WAL record with a sequence number at or below this is in a
+    /// segment. Replay starts after it.
+    SetWalFloor(u64),
+    /// Compaction merged `inputs` into `output`: every tombstone that named
+    /// an input now names the output too.
+    Compacted {
+        /// The input segment ids.
+        inputs: Vec<u64>,
+        /// The output segment id.
+        output: u64,
+    },
+    /// A rollup definition was created or replaced. The payload is the
+    /// facade's `RollupConfig`, opaque here — the catalog persists it, the
+    /// facade interprets it.
+    SetRollup {
+        /// The rollup's name, its identity.
+        name: String,
+        /// Postcard-encoded definition.
+        definition: Vec<u8>,
+    },
+    /// A rollup definition was deleted.
+    RemoveRollup(String),
+    /// A rollup's materialisation state changed: its watermark advanced, or
+    /// a write below the watermark invalidated some of its buckets.
+    SetRollupState {
+        /// The rollup's name.
+        name: String,
+        /// Postcard-encoded state.
+        state: Vec<u8>,
+    },
+}
+
+/// A rollup's persisted definition and state, as opaque payloads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollupRecord {
+    /// Postcard-encoded definition, absent while only state is known.
+    #[serde(default)]
+    pub definition: Vec<u8>,
+    /// Postcard-encoded materialisation state.
+    #[serde(default)]
+    pub state: Vec<u8>,
 }
 
 /// Segment metadata catalog with manifest persistence.
@@ -105,7 +146,8 @@ enum ManifestEntry {
 ///
 /// # Persistence
 ///
-/// Changes are appended to `manifest.wal` as JSON lines.
+/// Changes are appended to `manifest.wal` as length-prefixed, CRC-32C
+/// framed postcard entries.
 /// Periodic snapshots written to `manifest.snapshot.bin`.
 /// On startup: load latest snapshot, replay WAL entries.
 ///
@@ -136,6 +178,22 @@ pub struct SegmentCatalog {
     /// open. The manifest is only ever rewritten by a snapshot that carries
     /// its full contents forward.
     tombstones: TombstoneSet,
+    /// The WAL floor: every data-WAL record with `sequence_no <= wal_floor`
+    /// has been flushed into a segment that this catalog registers.
+    ///
+    /// Recorded here rather than inferred from the WAL files, because the
+    /// active WAL file is never deleted by truncation. Without a floor every
+    /// restart replayed that file — up to 32 MB of already-flushed points —
+    /// into the memtable, and the next flush wrote them to disk a second
+    /// time. Dedup hid the duplicates from queries; the flash wear was real.
+    wal_floor: u64,
+    /// Rollup definitions and state, persisted with everything else that
+    /// a restart must not lose. They used to live in a hand-written JSON
+    /// file beside the data directory with no fsync and no CRC, and a
+    /// failure to parse it was logged and swallowed — leaving a database
+    /// that believed it had no rollups, and a retention pass that then
+    /// dropped the raw data those rollups existed to preserve.
+    rollups: BTreeMap<String, RollupRecord>,
     /// Monotonically increasing catalog version.
     manifest_seq: u64,
     /// Directory for manifest files.
@@ -181,6 +239,8 @@ impl SegmentCatalog {
             segments: BTreeMap::new(),
             schemas: HashMap::new(),
             tombstones: TombstoneSet::new(),
+            wal_floor: 0,
+            rollups: BTreeMap::new(),
             manifest_seq: 0,
             manifest_dir,
             changes_since_snapshot: 0,
@@ -221,6 +281,8 @@ impl SegmentCatalog {
                 segments: snapshot.segments,
                 schemas: snapshot.schemas,
                 tombstones: snapshot.tombstones,
+                wal_floor: snapshot.wal_floor,
+                rollups: snapshot.rollups,
                 manifest_seq: snapshot.manifest_seq,
                 manifest_dir: manifest_dir.clone(),
                 changes_since_snapshot: 0,
@@ -233,6 +295,8 @@ impl SegmentCatalog {
                 segments: BTreeMap::new(),
                 schemas: HashMap::new(),
                 tombstones: TombstoneSet::new(),
+                wal_floor: 0,
+                rollups: BTreeMap::new(),
                 manifest_seq: 0,
                 manifest_dir: manifest_dir.clone(),
                 changes_since_snapshot: 0,
@@ -384,6 +448,69 @@ impl SegmentCatalog {
     }
 
     /// Get the total number of segments.
+    /// The largest number of active segments any one `(shard, measurement)`
+    /// holds — the count a compaction pass can actually reduce, and so the
+    /// number write backpressure is keyed on.
+    #[must_use]
+    pub fn max_segments_per_shard_measurement(&self) -> usize {
+        let mut counts: std::collections::HashMap<(i64, &str), usize> =
+            std::collections::HashMap::new();
+        for e in self.all_segments() {
+            if e.state == chronix_core::SegmentState::Active {
+                *counts
+                    .entry((e.shard_id.0, e.measurement.as_str()))
+                    .or_default() += 1;
+            }
+        }
+        counts.into_values().max().unwrap_or(0)
+    }
+
+    /// Approximate heap bytes held by the catalog.
+    ///
+    /// One entry per segment, each carrying a measurement name, a path and its
+    /// per-column statistics — so this grows with segment count, not with row
+    /// count, and it is the term that a long-running gateway accumulates
+    /// between compactions. The schema registry and the tombstone set are
+    /// counted with it: all three live for the process's lifetime, which is
+    /// what makes them worth a number rather than an estimate.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        let entries: usize = self
+            .segments
+            .values()
+            .map(|v| {
+                v.capacity() * std::mem::size_of::<SegmentCatalogEntry>()
+                    + v.iter()
+                        .map(|e| {
+                            e.measurement.capacity()
+                                + e.path.as_os_str().len()
+                                + e.column_stats.capacity()
+                                    * std::mem::size_of::<CatalogColumnStats>()
+                                + e.column_stats
+                                    .iter()
+                                    .map(|c| c.name.capacity())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+
+        let schemas: usize = self
+            .schemas
+            .iter()
+            .map(|(name, ms)| {
+                name.capacity()
+                    + ms.columns()
+                        .iter()
+                        .map(|c| c.name.capacity() + std::mem::size_of_val(c))
+                        .sum::<usize>()
+            })
+            .sum();
+
+        entries + schemas + self.tombstones.len() * std::mem::size_of::<u64>() * 4
+    }
+
+    /// Total number of segments the catalog holds, in any state.
     #[must_use]
     pub fn segment_count(&self) -> usize {
         self.segments.values().map(Vec::len).sum()
@@ -400,6 +527,65 @@ impl SegmentCatalog {
     #[must_use]
     pub fn manifest_seq(&self) -> u64 {
         self.manifest_seq
+    }
+
+    /// Every persisted rollup, by name.
+    #[must_use]
+    pub fn rollups(&self) -> &BTreeMap<String, RollupRecord> {
+        &self.rollups
+    }
+
+    /// Persist a rollup definition, durably.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be written or synced.
+    pub fn set_rollup(&mut self, name: &str, definition: Vec<u8>) -> Result<()> {
+        self.append_manifest(&ManifestEntry::SetRollup {
+            name: name.to_string(),
+            definition: definition.clone(),
+        })?;
+        self.rollups.entry(name.to_string()).or_default().definition = definition;
+        self.sync_manifest()?;
+        self.maybe_snapshot()?;
+        Ok(())
+    }
+
+    /// Persist a rollup's materialisation state, durably.
+    ///
+    /// Called after the rollup's points are durable, never before: a
+    /// watermark that outlives the rows it claims is a permanent hole in
+    /// the tier, because nothing recomputes a bucket the watermark has
+    /// already passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be written or synced.
+    pub fn set_rollup_state(&mut self, name: &str, state: Vec<u8>) -> Result<()> {
+        self.append_manifest(&ManifestEntry::SetRollupState {
+            name: name.to_string(),
+            state: state.clone(),
+        })?;
+        self.rollups.entry(name.to_string()).or_default().state = state;
+        self.sync_manifest()?;
+        self.maybe_snapshot()?;
+        Ok(())
+    }
+
+    /// Delete a rollup definition and its state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be written.
+    pub fn remove_rollup(&mut self, name: &str) -> Result<bool> {
+        if !self.rollups.contains_key(name) {
+            return Ok(false);
+        }
+        self.append_manifest(&ManifestEntry::RemoveRollup(name.to_string()))?;
+        self.rollups.remove(name);
+        self.sync_manifest()?;
+        self.maybe_snapshot()?;
+        Ok(true)
     }
 
     /// The tombstones recorded by deletes.
@@ -423,6 +609,42 @@ impl SegmentCatalog {
             self.append_manifest(&ManifestEntry::AddTombstone(tombstone.clone()))?;
             self.tombstones.insert(tombstone.clone());
         }
+        self.sync_manifest()?;
+        self.maybe_snapshot()?;
+        Ok(())
+    }
+
+    /// Register a compaction's output and retire its inputs, as one
+    /// durable step.
+    ///
+    /// Adds `output`, soft-deletes every input, and extends every tombstone
+    /// that named an input to the output. That last part is what closes the
+    /// window in which a delete issued *while* the merge ran was undone: the
+    /// merge applied the tombstones it snapshotted, the late tombstone named
+    /// only the inputs, and once GC removed them the tombstone was reclaimed
+    /// with its rows alive in the output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be written.
+    pub fn complete_compaction(
+        &mut self,
+        output: SegmentCatalogEntry,
+        inputs: &[SegmentId],
+        now_ms: u64,
+    ) -> Result<()> {
+        let output_id = output.segment_id.0;
+        self.add_segment(output)?;
+        for input in inputs {
+            self.soft_delete_segment(*input, now_ms)?;
+        }
+        let inputs: Vec<u64> = inputs.iter().map(|id| id.0).collect();
+        self.append_manifest(&ManifestEntry::Compacted {
+            inputs: inputs.clone(),
+            output: output_id,
+        })?;
+        self.tombstones
+            .extend_to_compaction_output(&inputs, output_id);
         self.sync_manifest()?;
         self.maybe_snapshot()?;
         Ok(())
@@ -488,6 +710,33 @@ impl SegmentCatalog {
         let removed = self.schemas.remove(measurement);
         self.maybe_snapshot()?;
         Ok(removed)
+    }
+
+    /// The WAL floor: the highest data-WAL sequence number known to be
+    /// fully represented by the segments this catalog registers.
+    ///
+    /// `open()` replays only records above it.
+    #[must_use]
+    pub fn wal_floor(&self) -> u64 {
+        self.wal_floor
+    }
+
+    /// Raise the WAL floor to `sequence_no`.
+    ///
+    /// Persisted before it is applied, like every other catalog change. A
+    /// floor never moves backwards; a lower value is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest append fails.
+    pub fn set_wal_floor(&mut self, sequence_no: u64) -> Result<()> {
+        if sequence_no <= self.wal_floor {
+            return Ok(());
+        }
+        self.append_manifest(&ManifestEntry::SetWalFloor(sequence_no))?;
+        self.wal_floor = sequence_no;
+        self.maybe_snapshot()?;
+        Ok(())
     }
 
     /// Look up a measurement schema.
@@ -746,6 +995,21 @@ impl SegmentCatalog {
             ManifestEntry::RemoveTombstone(t) => {
                 self.tombstones.retain_tombstones(|existing| existing != &t);
             }
+            ManifestEntry::SetWalFloor(seq) => {
+                self.wal_floor = self.wal_floor.max(seq);
+            }
+            ManifestEntry::SetRollup { name, definition } => {
+                self.rollups.entry(name).or_default().definition = definition;
+            }
+            ManifestEntry::RemoveRollup(name) => {
+                self.rollups.remove(&name);
+            }
+            ManifestEntry::SetRollupState { name, state } => {
+                self.rollups.entry(name).or_default().state = state;
+            }
+            ManifestEntry::Compacted { inputs, output } => {
+                self.tombstones.extend_to_compaction_output(&inputs, output);
+            }
         }
     }
 
@@ -756,6 +1020,8 @@ impl SegmentCatalog {
             segments: self.segments.clone(),
             schemas: self.schemas.clone(),
             tombstones: self.tombstones.clone(),
+            wal_floor: self.wal_floor,
+            rollups: self.rollups.clone(),
             manifest_seq: self.manifest_seq,
             next_segment_id: self.next_segment_id,
         };
@@ -788,7 +1054,15 @@ impl SegmentCatalog {
         // gets re-opened on the next append.
         let wal_path = self.manifest_dir.join("manifest.wal");
         if wal_path.exists() {
-            std::fs::write(&wal_path, "")?;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&wal_path)?;
+            // The truncation must be durable too. Replay is idempotent for
+            // every entry kind, so a resurrected entry is harmless — but an
+            // unsynced truncation is exactly the kind of "probably fine"
+            // this catalog does not deal in.
+            file.sync_all()?;
         }
         self.manifest_wal_file = None;
 
@@ -821,6 +1095,14 @@ struct CatalogSnapshot {
     /// undo every delete the moment the manifest WAL was folded into it.
     #[serde(default)]
     tombstones: TombstoneSet,
+    /// See [`SegmentCatalog::wal_floor`].
+    #[serde(default)]
+    wal_floor: u64,
+    /// Rollup definitions and their materialisation state, by name. Opaque
+    /// bytes: the catalog is where they are durable, the facade is where
+    /// they mean something.
+    #[serde(default)]
+    rollups: BTreeMap<String, RollupRecord>,
     manifest_seq: u64,
     next_segment_id: u64,
 }

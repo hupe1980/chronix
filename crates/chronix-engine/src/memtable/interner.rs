@@ -84,6 +84,25 @@ impl StringInterner {
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
+
+    /// Approximate heap bytes held by the interner.
+    ///
+    /// The interned strings themselves plus the map's per-entry overhead: an
+    /// `Arc<str>` header (two `usize` counts), the fat pointer the map stores,
+    /// and a hash slot. Interned strings are tag keys, tag values and
+    /// measurement names, so on a high-cardinality workload this is the term
+    /// that grows, and on the gateway it is one of the three that the memtable
+    /// budget does not count.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+        const SLOT: usize = std::mem::size_of::<(usize, usize)>() + std::mem::size_of::<usize>();
+
+        self.map
+            .iter()
+            .map(|e| e.key().len() + ARC_HEADER + SLOT)
+            .sum()
+    }
 }
 
 impl Default for StringInterner {

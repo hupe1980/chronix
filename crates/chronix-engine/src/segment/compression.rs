@@ -113,7 +113,7 @@ pub fn compress_block_with_codec(data: &[u8], codec: CompressionCodec) -> Result
 /// Default Zstd compression level (balanced speed/ratio).
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
-/// Maximum Zstd compression level for cold/warm tier recompression.
+/// Maximum Zstd compression level for cold-tier recompression.
 pub const ZSTD_HIGH_LEVEL: i32 = 9;
 
 /// Compress a block using Zstd at a specific level.

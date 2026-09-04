@@ -183,8 +183,16 @@ impl PromQLEvaluator {
                 let PromQLValue::Scalar(max) = self.eval(&args[2], params)? else {
                     return Err(EvalError("clamp() max must be scalar".into()));
                 };
+                // `max < min` is an **empty** vector, not a vector of NaN:
+                // `functions.go` returns `enh.Out` untouched. The difference
+                // matters because NaN survives arithmetic and appears in a
+                // legend, where "no series" is the honest answer to a bound
+                // that cannot be satisfied.
+                if max < min {
+                    return Ok(PromQLValue::Vector(Vec::new()));
+                }
                 apply_scalar_fn(val, |v| {
-                    if min.is_nan() || max.is_nan() || min > max {
+                    if min.is_nan() || max.is_nan() {
                         f64::NAN
                     } else {
                         v.clamp(min, max)
@@ -348,9 +356,12 @@ impl PromQLEvaluator {
             }
             // The last sample, NaN or not — `last_over_time` reports what was
             // written, and a NaN written is a NaN read.
+            // The one member of the family that keeps `__name__`: it returns
+            // an actual sample of the original series rather than an aggregate
+            // about it.
             "last_over_time" => {
-                eval_over_time_fn(self, args, params, NanPolicy::Propagate, |vals| {
-                    vals.last().copied().unwrap_or(f64::NAN)
+                eval_over_time_fn_opt(self, args, params, MetricName::Keep, |samples| {
+                    samples.last().map(|s| s.value)
                 })
             }
             // Presence, not numerosity: a window holding only NaN samples
@@ -420,9 +431,11 @@ impl PromQLEvaluator {
                     .filter(|w| w[1].value < w[0].value)
                     .count() as f64
             }),
-            "deriv" => eval_over_time_fn_full(self, args, params, |samples| {
+            "deriv" => eval_over_time_fn_opt(self, args, params, MetricName::Drop, |samples| {
                 if samples.len() < 2 {
-                    return f64::NAN;
+                    // Fewer than two points is no slope, and Prometheus leaves
+                    // the series out rather than reporting NaN.
+                    return None;
                 }
                 // Linear regression using relative timestamps to avoid
                 // catastrophic cancellation with nanosecond-scale values.
@@ -443,10 +456,14 @@ impl PromQLEvaluator {
                     .sum();
                 let denom = n * sum_x2 - sum_x * sum_x;
                 if denom.abs() < f64::EPSILON {
-                    return f64::NAN;
+                    // Every sample at the same instant: the slope is genuinely
+                    // undefined rather than uncomputable, and Prometheus's
+                    // `linearRegression` yields NaN here too. Only the
+                    // fewer-than-two case drops the series.
+                    return Some(f64::NAN);
                 }
                 // Convert from per-nanosecond to per-second.
-                (n * sum_xy - sum_x * sum_y) / denom * 1_000_000_000.0
+                Some((n * sum_xy - sum_x * sum_y) / denom * 1_000_000_000.0)
             }),
             "predict_linear" => {
                 if args.len() != 2 {
@@ -571,6 +588,16 @@ impl PromQLEvaluator {
                     Expr::StringLiteral(s) => s.clone(),
                     _ => return Err(EvalError("label_replace() regex must be string".into())),
                 };
+                // A destination that is not a legal label name would produce a
+                // series nothing can select, match or aggregate by — so
+                // Prometheus refuses it rather than building one. Silently
+                // writing it meant `label_replace(m, "1bad", …)` returned a
+                // series whose label could never be named again.
+                if !is_valid_label_name(&dst_label) {
+                    return Err(EvalError(format!(
+                        "invalid destination label name in label_replace(): {dst_label}"
+                    )));
+                }
                 // Cache the compiled regex: a range query would otherwise
                 // recompile the same pattern at every step.
                 let anchored = format!("^(?:{regex_str})$");
@@ -1033,6 +1060,13 @@ impl PromQLEvaluator {
                         let result = series
                             .into_iter()
                             .map(|mut s| {
+                                // The value is a time, not a measurement of
+                                // this metric, so the name goes — Prometheus
+                                // builds the output through `DropMetricName`.
+                                // Keeping it let `timestamp(m)` and `m` match
+                                // each other in a binary operation, which
+                                // compares a clock reading against a value.
+                                s.labels.retain(|(k, _)| k != "__name__");
                                 for sample in &mut s.samples {
                                     sample.value = sample.timestamp as f64 / 1_000_000_000.0;
                                 }
@@ -1044,12 +1078,12 @@ impl PromQLEvaluator {
                     _ => Err(EvalError("timestamp() requires instant vector".into())),
                 }
             }
-            "idelta" => eval_over_time_fn_full(self, args, params, |samples| {
+            "idelta" => eval_over_time_fn_opt(self, args, params, MetricName::Drop, |samples| {
                 if samples.len() < 2 {
-                    return f64::NAN;
+                    return None;
                 }
                 let n = samples.len();
-                samples[n - 1].value - samples[n - 2].value
+                Some(samples[n - 1].value - samples[n - 2].value)
             }),
             "sgn" => {
                 if args.len() != 1 {
@@ -1295,6 +1329,39 @@ fn eval_over_time_fn_full(
     params: &QueryParams,
     f: impl Fn(&[Sample]) -> f64,
 ) -> Result<PromQLValue, EvalError> {
+    eval_over_time_fn_opt(evaluator, args, params, MetricName::Drop, |s| Some(f(s)))
+}
+
+/// Whether a range function keeps the input series' `__name__`.
+///
+/// Almost every `*_over_time` drops it: the output is an aggregate *about* the
+/// series, not a sample *of* it, and keeping the name would let
+/// `avg_over_time(m[5m])` and `m` collide in a binary operation.
+/// `last_over_time` is the exception in Prometheus, because it returns an
+/// actual sample of the original series — `functions.go` registers it without
+/// the `dropSeriesName` the rest of the family shares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetricName {
+    Keep,
+    Drop,
+}
+
+/// The general driver: a function may decline to produce a value, and the
+/// series is then **absent** rather than NaN.
+///
+/// `deriv` and `idelta` need two samples; with fewer, Prometheus leaves the
+/// series out of the result (`functions.go` returns `enh.Out` untouched).
+/// Emitting NaN instead puts the series in the legend of a dashboard with a
+/// gap where its value should be, which reads as "broken" rather than as "not
+/// enough data" — and it survives arithmetic, so one under-sampled series
+/// turns a whole expression NaN.
+fn eval_over_time_fn_opt(
+    evaluator: &PromQLEvaluator,
+    args: &[Expr],
+    params: &QueryParams,
+    name: MetricName,
+    f: impl Fn(&[Sample]) -> Option<f64>,
+) -> Result<PromQLValue, EvalError> {
     if args.len() != 1 {
         return Err(EvalError("function requires exactly 1 argument".into()));
     }
@@ -1304,17 +1371,20 @@ fn eval_over_time_fn_full(
             series
                 .iter()
                 .filter(|s| !s.samples.is_empty())
-                .map(|s| Series {
-                    labels: s
-                        .labels
-                        .iter()
-                        .filter(|(k, _)| k != "__name__")
-                        .cloned()
-                        .collect(),
-                    samples: vec![Sample {
-                        timestamp: params.time,
-                        value: f(&s.samples),
-                    }],
+                .filter_map(|s| {
+                    let value = f(&s.samples)?;
+                    Some(Series {
+                        labels: s
+                            .labels
+                            .iter()
+                            .filter(|(k, _)| name == MetricName::Keep || k != "__name__")
+                            .cloned()
+                            .collect(),
+                        samples: vec![Sample {
+                            timestamp: params.time,
+                            value,
+                        }],
+                    })
                 })
                 .collect(),
         )),
@@ -1323,11 +1393,29 @@ fn eval_over_time_fn_full(
 }
 
 /// Extract the range duration (in ns) from a MatrixSelector expression.
+/// Whether `name` is a legal Prometheus label name.
+///
+/// `[a-zA-Z_][a-zA-Z0-9_]*`, which is `model.LabelName.IsValid()` upstream.
+/// A label outside it cannot be written in a selector, a `by` clause or a
+/// `group_left` list, so a function that produced one would produce a series
+/// nothing could ever refer to.
+fn is_valid_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub(crate) fn extract_range_ns(expr: &Expr) -> Option<i64> {
-    if let Expr::MatrixSelector { range, .. } = expr {
-        Some(range.as_nanos())
-    } else {
-        None
+    // A subquery is a range vector too, and its `[range:step]` is the range —
+    // so `rate(x[5m:15s])` extrapolates over five minutes exactly as
+    // `rate(x[5m])` does. Matching only `MatrixSelector` meant the two forms
+    // gave different answers for the same data.
+    match expr {
+        Expr::MatrixSelector { range, .. } | Expr::Subquery { range, .. } => Some(range.as_nanos()),
+        _ => None,
     }
 }
 
@@ -2131,6 +2219,7 @@ mod tests {
                 },
             ],
             offset: None,
+            at: None,
         });
         // Should include job=api but NOT __name__ and NOT regex matchers
         assert_eq!(labels.len(), 1);
@@ -2280,6 +2369,7 @@ mod tests {
                 name: Some("metric".into()),
                 matchers: vec![],
                 offset: Some(Duration(600.0)), // 10 minutes
+                at: None,
             }),
             range: Duration(300.0), // 5 minutes
         };
@@ -2291,6 +2381,7 @@ mod tests {
                 name: Some("metric".into()),
                 matchers: vec![],
                 offset: None,
+                at: None,
             }),
             range: Duration(300.0),
         };

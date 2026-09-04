@@ -21,7 +21,7 @@ The `Chronix` struct and its methods are organized into focused submodules:
 | `stream.rs`       | `execute_iter` — time-disjoint bucketing for bounded-memory scans |
 | `delete.rs`       | `drop_measurement`, tombstones, hard delete           |
 | `lifecycle.rs`    | `flush`, `close`, `compact`, GC, retention enforcement |
-| `rollup.rs`       | Rollup management, warm-tier migration                |
+| `rollup.rs`       | Rollup definitions, materialisation, the real-time view |
 | `backup.rs`       | Online backup and restore                             |
 | `analytics_api.rs`| Anomaly detection, forecast API surface               |
 
@@ -33,30 +33,33 @@ Chronix::open(config)
     ├── Create/validate directories
     ├── Acquire exclusive file lock (fs2)
     ├── Open segment catalog (manifest + snapshot)
-    ├── load_catalog_state(): build time indices + load .bloom sidecar files
+    ├── load_catalog_state(): time indices, blooms, tag index and the
+    │     series set — all from the .series sidecars, no segment decoded
     ├── Open WAL writer
-    ├── Restore schemas from catalog → pre-populate SchemaRegistry
-    ├── Replay WAL records → memtable + rebuild known_series
+    ├── Restore schemas from catalog, reconcile with segment column lists
+    ├── Replay WAL records above the catalog's WAL floor → memtable
     │
     ▼
-  ┌─────────────────────────────┐
-  │  insert(&Point) / insert_batch()  │
-  │    → schema validation            │
-  │    → WAL append_durable           │
-  │    → memtable insert              │
-  │    → auto-flush if threshold      │
-  └─────────────────────────────┘
+  ┌──────────────────────────────────────────────┐
+  │  insert(&Point) / insert_batch() / backfill() │
+  │    → admission: open, capacity, window,       │
+  │      cardinality (per point, nothing durable) │
+  │    → schema: whole batch or nothing,          │
+  │      persisted to the manifest first          │
+  │    → one WAL record for the batch             │
+  │    → memtable insert, unconditionally         │
+  │    → wake the maintenance thread if needed    │
+  └──────────────────────────────────────────────┘
     │
     ▼
   flush()
     │  for each shard:
     │    freeze_and_swap active memtable
-    │    write frozen → SegmentWriter → .csx
+    │    write frozen → SegmentWriter → .csx (+ .series sidecar)
     │    register in catalog (including CatalogColumnStats)
-    │    update time index
-    │    build bloom filter from series keys
-    │    persist bloom filter as .bloom sidecar file
-    │  after ALL shards flushed: truncate WAL
+    │    update time index, bloom, tag index from the writer's series keys
+    │  after ALL shards flushed: raise the WAL floor, truncate WAL,
+    │  retire idle shards below the window
     │
     ▼
   compact()
@@ -64,24 +67,25 @@ Chronix::open(config)
     │  filter catalog to Active-only segments
     │  CompactionPicker::pick() → CompactionTask list
     │  CompactionExecutor::execute() per task
-    │  register compacted segment in catalog
+    │  register compacted segment in catalog (+ .series sidecar)
     │  populate metadata cache, bloom, tag index
     │  soft-delete input segments (marked SoftDeleted in catalog)
-    │  compute rollups if configured (rollup_registry)
-    │  insert rollup points into target measurement
+    │  materialise_rollups(): every rollup up to its final bucket
     │
     ▼
   gc() / gc_with_grace(ms)
     │  find soft-deleted segments past grace period (default: 5 min)
-    │  hard-delete segment files (.csx + .bloom)
+    │  hard-delete segment files (.csx + .series)
     │  remove catalog entries
     │  remove from blooms, tag_index, and metadata_cache
     │
     ▼
-  warm_tier_migrate(config)
-    │  evaluate shard age vs warm_after threshold
-    │  migrate eligible shards via warm_tier::migrate_shard_segments()
-    │  update catalog paths to warm location
+  archive_cold_segments(config)          [feature = "object-store"]
+    │  group Active segments by (measurement, shard), keep the cold ones
+    │  skip a group that is incomplete: another segment or an unflushed
+    │    row overlaps it, or its rollups are not materialised past it
+    │  read the group through execute_iter (dedup + tombstones)
+    │  encode Parquet → upload → verify → drop catalog entries → delete files
     │
     ▼
   scan(measurement, min_ts, max_ts)
@@ -213,18 +217,33 @@ time_range, segments }`:**
 - **`time_range` is always present.** There is no open-ended "delete this
   series" tombstone. A delete with no explicit upper bound resolves one *per
   series*, to the newest timestamp that series actually holds, so the delete
-  covers the data that exists and a point written afterwards **re-creates the
-  series** rather than being masked. This matches Prometheus and InfluxDB:
-  backfilling *into* a deleted interval stays masked until compaction
-  materialises the delete.
-- **`segments` records the segment ids the delete was issued against.** It is
-  never consulted on the read path; it is what makes reclaiming a tombstone
-  provable — see *Tombstone lifecycle* below.
+  covers the data that exists.
+- **`segments` is the tombstone's scope, on the read path as much as for
+  reclaiming it**: the segments active when the delete was issued, plus
+  every compaction output those were merged into since. A row is masked only
+  if it came from one of them.
+
+Two properties follow from the scope:
+
+- **A point written after a delete is visible at once**, even inside the
+  interval the delete covered, because it lands in a newer segment that no
+  tombstone names. Backfilling into a deleted interval behaves the same way.
+- **A delete issued while a compaction is running still applies.** Registering
+  a compaction extends every tombstone that named an input to name the output
+  too, as one durable manifest step.
+
+Memtable rows are never masked, and that is a property rather than an
+omission: a delete flushes before it scans, so everything in a memtable was
+written after every tombstone that exists.
+
+**A whole-series delete also rewrites the series sidecars** of the segments it
+scanned: the cardinality budget is rebuilt from those sidecars at open, so a
+deleted series must not come back into the count at the next restart.
 
 **Durability.** Tombstones are appended to the **catalog manifest** and fsynced
 before `execute_delete` returns. They are *not* kept in the data WAL for
 durability: that WAL is truncated once the memtable it covers has been flushed,
-so a delete recorded only there survived exactly until the next flush. The WAL
+which is sooner than a tombstone must live. The WAL
 still logs the resolved tombstones so a point-in-time restore replays the
 delete, and the catalog is what a plain restart reads.
 
@@ -246,7 +265,7 @@ tombstone set. Supports both plain `Utf8` and dictionary-encoded
 (`Dictionary<Int32, Utf8>`) tag columns.
 - **`drop_measurement(measurement)`** — removes the measurement schema from the
   `SchemaRegistry`, deletes all catalog entries, segment files (`.csx`), and
-  bloom sidecar files (`.bloom`) on disk, and clears time index and bloom filter
+  series sidecar files (`.series`) on disk, and clears time index and bloom filter
   entries. This is an atomic, irreversible operation.
 
 ### Segment Lifecycle

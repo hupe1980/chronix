@@ -454,10 +454,24 @@ impl WalWriter {
     }
 
     /// `fsync` the data file and count it. Caller holds `inner`.
+    ///
+    /// A failed `fsync` poisons the writer. After one, the kernel may have
+    /// discarded dirty pages, so the file's contents are unknown — and the
+    /// records the failed call covered are still in the file, where a
+    /// *later* successful sync (by a group-commit follower, or the periodic
+    /// thread) would make them durable after the caller was told they were
+    /// not. Refusing further writes is the only honest state.
     fn sync_locked(&self, inner: &mut WalWriterInner) -> Result<(), WalError> {
-        inner.writer.get_ref().sync_data()?;
+        let started = std::time::Instant::now();
+        if let Err(e) = inner.writer.get_ref().sync_data() {
+            inner.poisoned = true;
+            tracing::error!(error = %e, "WAL fsync failed — writer poisoned");
+            return Err(e.into());
+        }
         self.fsync_count.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("chronix_wal_fsync_total").increment(1);
+        metrics::histogram!("chronix_wal_write_duration_seconds")
+            .record(started.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -743,6 +757,18 @@ impl WalWriter {
         Ok(archived)
     }
 
+    /// Approximate heap bytes held by the writer's own buffers.
+    ///
+    /// The `BufWriter`'s capacity, which is what stands between an append and
+    /// an `fsync`. It is one of the three terms the memtable budget does not
+    /// count, and unlike the other two it is fixed rather than a function of
+    /// the workload — so it is worth having as a number precisely because it
+    /// is easy to forget.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        self.inner.lock().writer.capacity()
+    }
+
     /// Returns the current sequence number (the last assigned).
     #[inline]
     #[must_use]
@@ -763,7 +789,10 @@ impl WalWriter {
     ///
     /// Returns [`WalError`] if the directory cannot be read.
     pub fn file_count(&self) -> Result<usize, WalError> {
-        Ok(list_wal_files(&self.dir)?.len())
+        // The writer maintains this count across rotation and truncation;
+        // the directory is listed once, at open. Listing it here made every
+        // `insert()` pay a `readdir` for its admission check.
+        Ok(self.inner.lock().cached_file_count)
     }
 
     /// Returns the total size in bytes of all WAL files on disk.

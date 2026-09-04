@@ -190,10 +190,54 @@ impl FieldKeyProvider for StaticKeyProvider {
     }
 }
 
-/// Encrypt a column block using AES-256-GCM.
+/// Where an encrypted block belongs, bound into its authentication tag.
+///
+/// AES-GCM proves a ciphertext was written by someone holding the key. It
+/// says nothing about **which** ciphertext this is, so without associated
+/// data any encrypted block decrypts correctly in any other block's place:
+/// one column reads as another, or one segment's values as another's, by
+/// swapping bytes between two files that share a key. Nothing detects it,
+/// because the tag verifies.
+///
+/// Binding the column and the segment makes a moved block fail to
+/// authenticate.
+///
+/// The segment is identified by its header's creation timestamp rather than
+/// by a catalog ID: the catalog assigns an ID only after the file is
+/// written, whereas the header is written before the first block, so it is
+/// the one segment-unique value both the writer and the reader hold at the
+/// moment they need it. Compaction writes a new segment with its own
+/// timestamp and re-encrypts, so a compacted block is bound to where it
+/// actually ended up.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockContext<'a> {
+    /// Column name.
+    pub column: &'a str,
+    /// The `created_at` of the segment holding this block.
+    pub segment_created_at: i64,
+}
+
+impl BlockContext<'_> {
+    /// The associated-data bytes. Length-prefixed, so that a measurement
+    /// and column pair cannot be re-split to produce the same bytes.
+    fn associated_data(self) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(self.column.len() + 32);
+        aad.extend_from_slice(b"chronix-field-v1");
+        aad.extend_from_slice(&(self.column.len() as u32).to_le_bytes());
+        aad.extend_from_slice(self.column.as_bytes());
+        aad.extend_from_slice(&self.segment_created_at.to_le_bytes());
+        aad
+    }
+}
+
+/// Encrypt a column block using AES-256-GCM, bound to where it belongs.
 ///
 /// Returns `[nonce (12)][ciphertext + tag]`.
-pub(crate) fn encrypt_block(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+pub(crate) fn encrypt_block(
+    plaintext: &[u8],
+    key: &[u8; 32],
+    context: BlockContext<'_>,
+) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| SegmentError::CorruptFile {
         detail: format!("invalid encryption key: {e}"),
     })?;
@@ -205,8 +249,15 @@ pub(crate) fn encrypt_block(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>>
     let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| SegmentError::CorruptFile {
         detail: "nonce must be 12 bytes".into(),
     })?;
+    let aad = context.associated_data();
     let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
+        .encrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| SegmentError::CorruptFile {
             detail: format!("field encryption failed: {e}"),
         })?;
@@ -219,8 +270,14 @@ pub(crate) fn encrypt_block(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>>
 
 /// Decrypt a column block using AES-256-GCM.
 ///
-/// Expects `[nonce (12)][ciphertext + tag]`.
-pub(crate) fn decrypt_block(encrypted: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+/// Expects `[nonce (12)][ciphertext + tag]`, and the same context the
+/// block was encrypted under. A block moved to another column or another
+/// segment fails to authenticate.
+pub(crate) fn decrypt_block(
+    encrypted: &[u8],
+    key: &[u8; 32],
+    context: BlockContext<'_>,
+) -> Result<Vec<u8>> {
     if encrypted.len() < NONCE_SIZE + TAG_SIZE {
         return Err(SegmentError::CorruptFile {
             detail: format!(
@@ -240,17 +297,34 @@ pub(crate) fn decrypt_block(encrypted: &[u8], key: &[u8; 32]) -> Result<Vec<u8>>
             detail: "nonce must be 12 bytes".into(),
         })?;
     let ciphertext = &encrypted[NONCE_SIZE..];
+    let aad = context.associated_data();
 
     cipher
-        .decrypt(&nonce, ciphertext)
+        .decrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| SegmentError::CorruptFile {
-            detail: format!("field decryption failed (wrong key or tampered data): {e}"),
+            detail: format!(
+                "field decryption failed (wrong key, moved block, or tampered data): {e}"
+            ),
         })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed context for the round-trip tests.
+    fn ctx() -> BlockContext<'static> {
+        BlockContext {
+            column: "value",
+            segment_created_at: 1_700_000_000_000_000_000,
+        }
+    }
 
     fn test_key() -> [u8; 32] {
         let mut key = [0u8; 32];
@@ -264,10 +338,10 @@ mod tests {
     fn encrypt_decrypt_roundtrip() {
         let key = test_key();
         let plaintext = b"Hello, field-level encryption!";
-        let encrypted = encrypt_block(plaintext, &key).unwrap();
+        let encrypted = encrypt_block(plaintext, &key, ctx()).unwrap();
         assert_ne!(encrypted, plaintext);
         assert!(encrypted.len() > plaintext.len()); // nonce + tag overhead
-        let decrypted = decrypt_block(&encrypted, &key).unwrap();
+        let decrypted = decrypt_block(&encrypted, &key, ctx()).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -275,8 +349,8 @@ mod tests {
     fn different_nonces_produce_different_ciphertext() {
         let key = test_key();
         let plaintext = b"same data";
-        let enc1 = encrypt_block(plaintext, &key).unwrap();
-        let enc2 = encrypt_block(plaintext, &key).unwrap();
+        let enc1 = encrypt_block(plaintext, &key, ctx()).unwrap();
+        let enc2 = encrypt_block(plaintext, &key, ctx()).unwrap();
         // Nonces should differ (with overwhelming probability)
         assert_ne!(&enc1[..NONCE_SIZE], &enc2[..NONCE_SIZE]);
     }
@@ -286,26 +360,26 @@ mod tests {
         let key1 = test_key();
         let mut key2 = test_key();
         key2[0] ^= 0xFF; // flip a bit
-        let encrypted = encrypt_block(b"secret", &key1).unwrap();
-        let result = decrypt_block(&encrypted, &key2);
+        let encrypted = encrypt_block(b"secret", &key1, ctx()).unwrap();
+        let result = decrypt_block(&encrypted, &key2, ctx());
         assert!(result.is_err());
     }
 
     #[test]
     fn tampered_ciphertext_fails() {
         let key = test_key();
-        let mut encrypted = encrypt_block(b"important data", &key).unwrap();
+        let mut encrypted = encrypt_block(b"important data", &key, ctx()).unwrap();
         // Flip a byte in the ciphertext
         let last = encrypted.len() - 1;
         encrypted[last] ^= 0x01;
-        let result = decrypt_block(&encrypted, &key);
+        let result = decrypt_block(&encrypted, &key, ctx());
         assert!(result.is_err());
     }
 
     #[test]
     fn too_short_encrypted_block_fails() {
         let key = test_key();
-        let result = decrypt_block(&[0u8; 10], &key);
+        let result = decrypt_block(&[0u8; 10], &key, ctx());
         assert!(result.is_err());
     }
 
@@ -343,9 +417,9 @@ mod tests {
     #[test]
     fn encrypt_empty_block() {
         let key = test_key();
-        let encrypted = encrypt_block(b"", &key).unwrap();
+        let encrypted = encrypt_block(b"", &key, ctx()).unwrap();
         assert_eq!(encrypted.len(), NONCE_SIZE + TAG_SIZE); // nonce + tag, no ciphertext
-        let decrypted = decrypt_block(&encrypted, &key).unwrap();
+        let decrypted = decrypt_block(&encrypted, &key, ctx()).unwrap();
         assert!(decrypted.is_empty());
     }
 
@@ -353,8 +427,79 @@ mod tests {
     fn encrypt_large_block() {
         let key = test_key();
         let plaintext = vec![0xABu8; 1024 * 1024]; // 1 MiB
-        let encrypted = encrypt_block(&plaintext, &key).unwrap();
-        let decrypted = decrypt_block(&encrypted, &key).unwrap();
+        let encrypted = encrypt_block(&plaintext, &key, ctx()).unwrap();
+        let decrypted = decrypt_block(&encrypted, &key, ctx()).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// AES-GCM proves *who* wrote a block, never *which* block it is. With
+    /// no associated data, one column's ciphertext decrypted cleanly in
+    /// another column's place — so a file holding a public column and a
+    /// private one under the same key leaked the private values to anyone
+    /// who could swap the bytes, and the authentication tag still verified.
+    #[test]
+    fn a_block_moved_to_another_column_fails_to_authenticate() {
+        let key = test_key();
+        let salary = encrypt_block(
+            b"180000",
+            &key,
+            BlockContext {
+                column: "salary",
+                segment_created_at: 42,
+            },
+        )
+        .unwrap();
+
+        let err = decrypt_block(
+            &salary,
+            &key,
+            BlockContext {
+                column: "public_note",
+                segment_created_at: 42,
+            },
+        )
+        .expect_err("a block must not decrypt under another column's name");
+        assert!(err.to_string().contains("decryption failed"), "{err}");
+    }
+
+    /// The same for a block lifted into another segment: the header's
+    /// creation timestamp is part of what the tag covers.
+    #[test]
+    fn a_block_moved_to_another_segment_fails_to_authenticate() {
+        let key = test_key();
+        let block = encrypt_block(
+            b"readings",
+            &key,
+            BlockContext {
+                column: "value",
+                segment_created_at: 1_000,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            decrypt_block(
+                &block,
+                &key,
+                BlockContext {
+                    column: "value",
+                    segment_created_at: 2_000,
+                },
+            )
+            .is_err(),
+            "a block must not decrypt inside a different segment"
+        );
+
+        // And it still reads correctly where it belongs.
+        let plain = decrypt_block(
+            &block,
+            &key,
+            BlockContext {
+                column: "value",
+                segment_created_at: 1_000,
+            },
+        )
+        .expect("the block reads in its own place");
+        assert_eq!(plain, b"readings");
     }
 }

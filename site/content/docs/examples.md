@@ -49,7 +49,6 @@ cargo run -p chronix --features object-store --example cold_tier
 | Example | Description |
 |---------|-------------|
 | [data_pipeline](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/data_pipeline.rs) | CDC-driven real-time pipeline with triggers, alerts, streaming anomaly, and forecasting |
-| [stream_aggregation](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/stream_aggregation.rs) | CDC event bus and continuous aggregation for real-time downsampled views |
 | [alerting](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/alerting.rs) | Streaming anomaly detection with threshold-based alerts and cooldown |
 | [signal_triggers](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/signal_triggers.rs) | Trigger engine with SQL triggers, delivery routing, and dead-letter queues |
 
@@ -57,7 +56,8 @@ cargo run -p chronix --features object-store --example cold_tier
 
 | Example | Description |
 |---------|-------------|
-| [storage_lifecycle](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/storage_lifecycle.rs) | Manual flush, compaction, retention enforcement, and continuous rollup |
+| [gateway_footprint](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/gateway_footprint.rs) | The small preset under the design partner's workload, printing the process's resident set at each step |
+| [storage_lifecycle](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/storage_lifecycle.rs) | Manual flush, compaction, rollup materialisation, and retention enforcement |
 | [delete_operations](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/delete_operations.rs) | Tombstone-based deletes, predicate deletes, and measurement drops |
 | [encoding](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/encoding.rs) | Compression codecs, adaptive encoding, and compression ratio comparison |
 | [compute_engine](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/compute_engine.rs) | SIMD-accelerated computation, hardware tier detection, and buffer pool |

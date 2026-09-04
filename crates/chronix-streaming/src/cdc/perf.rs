@@ -2,7 +2,6 @@
 //!
 //! Validates:
 //! - CDC event delivery < 5 ms from publish to subscriber
-//! - Continuous aggregation < 50 ms from write to aggregated row
 
 #[cfg(test)]
 mod tests {
@@ -113,66 +112,6 @@ mod tests {
 
     // ── Continuous Aggregation Latency ──────────────────────────────
 
-    #[test]
-    fn aggregation_latency_under_50ms() {
-        use crate::cdc::aggregation::{
-            AggFunction, ContinuousAggregationConfig, ContinuousAggregationEngine,
-        };
-
-        let config = ContinuousAggregationConfig {
-            name: "agg_cpu".into(),
-            source_measurement: "cpu".into(),
-            target_measurement: "cpu_1m".into(),
-            source_field: "value".into(),
-            interval: Duration::from_secs(60),
-            functions: vec![AggFunction::Sum, AggFunction::Count, AggFunction::Mean],
-            late_arrival_window: Duration::from_secs(5),
-        };
-
-        let mut engine = ContinuousAggregationEngine::new(config).unwrap();
-
-        let mut tags = BTreeMap::new();
-        tags.insert("host".into(), "server1".into());
-        let mut fields = BTreeMap::new();
-        fields.insert("value".into(), FieldValue::F64(42.0));
-
-        // Process 120 events (2 minutes of 1-second data)
-        let iterations = 120;
-        let mut total = Duration::ZERO;
-        let mut max_latency = Duration::ZERO;
-
-        for i in 0..iterations {
-            let event = CdcEvent::PointWritten {
-                measurement: "cpu".into(),
-                tags: tags.clone(),
-                fields: fields.clone(),
-                timestamp: i * 1_000_000_000, // 1-second intervals in nanoseconds
-                seq: i as u64,
-            };
-
-            let start = Instant::now();
-            let _results = engine.process_event(&event);
-            let elapsed = start.elapsed();
-
-            total += elapsed;
-            if elapsed > max_latency {
-                max_latency = elapsed;
-            }
-        }
-
-        let avg = total / iterations as u32;
-        let target = Duration::from_millis(50);
-
-        assert!(
-            avg < target,
-            "Aggregation average latency {avg:?} exceeds 50ms target"
-        );
-        assert!(
-            max_latency < target,
-            "Aggregation max latency {max_latency:?} exceeds 50ms target"
-        );
-    }
-
     // ── Throughput ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -209,49 +148,6 @@ mod tests {
         assert!(
             events_per_sec > 10_000.0,
             "CDC throughput {events_per_sec:.0} events/s is below 10K target"
-        );
-    }
-
-    #[test]
-    fn aggregation_handles_high_cardinality() {
-        use crate::cdc::aggregation::{
-            AggFunction, ContinuousAggregationConfig, ContinuousAggregationEngine,
-        };
-
-        let config = ContinuousAggregationConfig {
-            name: "agg_cpu".into(),
-            source_measurement: "cpu".into(),
-            target_measurement: "cpu_1m".into(),
-            source_field: "value".into(),
-            interval: Duration::from_secs(60),
-            functions: vec![AggFunction::Sum, AggFunction::Mean],
-            late_arrival_window: Duration::from_secs(5),
-        };
-
-        let mut engine = ContinuousAggregationEngine::new(config).unwrap();
-
-        // 100 unique tag combinations
-        let start = Instant::now();
-        for host_id in 0..100 {
-            let mut tags = BTreeMap::new();
-            tags.insert("host".into(), format!("server{host_id}"));
-            let mut fields = BTreeMap::new();
-            fields.insert("value".into(), FieldValue::F64(42.0 + host_id as f64));
-
-            let event = CdcEvent::PointWritten {
-                measurement: "cpu".into(),
-                tags,
-                fields,
-                timestamp: 0,
-                seq: host_id as u64,
-            };
-            engine.process_event(&event);
-        }
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "100-cardinality aggregation took {elapsed:?}, exceeds 50ms"
         );
     }
 }

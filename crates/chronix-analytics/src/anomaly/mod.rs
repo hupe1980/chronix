@@ -53,5 +53,5 @@ pub use iqr::IqrDetector;
 pub use modified_zscore::ModifiedZScoreDetector;
 pub use moving_average::MovingAverageResidualDetector;
 pub use storage::DetectorStore;
-pub use traits::{AnomalyDetector, AnomalyScore, DetectorType};
+pub use traits::{scale_floor, AnomalyDetector, AnomalyScore, DetectorType};
 pub use zscore::ZScoreDetector;

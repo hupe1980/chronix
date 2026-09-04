@@ -35,9 +35,9 @@
 //!
 //! | Level | Mechanism | Method |
 //! |---|---|---|
-//! | **Segment** | Catalog-level time-range + tag-index + bloom filter | `db.rs` `execute_inner()` |
+//! | **Segment** | Catalog-level time-range + tag-index + bloom filter | `Chronix::prune_segments()` |
 //! | **Row group — time** | `min_ts`/`max_ts` from timestamp column stats | `read_projected_filtered` |
-//! | **Row group — tags** | `value_count == 0` (all-null block → impossible match) | `read_projected_filtered_with_predicates` |
+//! | **Row group — tags** | `value_count == 0` with a non-zero `null_count` (a genuinely all-null block → impossible match) | `read_projected_filtered_with_predicates` |
 //! | **Column** | projection pushdown (only requested columns decoded) | `read_projected` |
 
 use std::fs::File;
@@ -95,7 +95,15 @@ pub struct FieldPredicate {
 impl FieldPredicate {
     /// Test whether a row group with the given float min/max statistics
     /// could possibly contain rows matching this predicate.
+    ///
+    /// A NaN bound makes every comparison false, which would prune the
+    /// group — so an unusable bound is reported as "may match" instead.
+    /// **A pruning step may only ever be wrong in the direction of doing
+    /// more work**; one that can drop rows is a wrong answer, not a slow one.
     fn may_match_f64(&self, rg_min: f64, rg_max: f64) -> bool {
+        if rg_min.is_nan() || rg_max.is_nan() || rg_min > rg_max {
+            return true;
+        }
         match self.op {
             ZoneMapOp::Eq => self.value >= rg_min && self.value <= rg_max,
             ZoneMapOp::Gt => rg_max > self.value,
@@ -107,14 +115,31 @@ impl FieldPredicate {
 
     /// Test whether a row group with i64 min/max statistics could
     /// possibly match.
+    ///
+    /// The predicate value is an `f64`, so it is compared as one: casting
+    /// it to `i64` first truncated the bound, and `n < 1.5` then pruned a
+    /// row group holding `{1, 2, 3}` because `1 < 1` is false. Above 2^53 an
+    /// `i64` bound is not representable as an `f64` at all, and the group is
+    /// kept rather than compared wrongly.
     fn may_match_i64(&self, rg_min: i64, rg_max: i64) -> bool {
-        let v = self.value as i64;
+        if rg_min > rg_max {
+            return true;
+        }
+        const EXACT: i64 = 1 << 53;
+        if rg_min <= -EXACT || rg_max >= EXACT {
+            return true;
+        }
+        #[allow(clippy::cast_precision_loss)] // bounded above by 2^53
+        let (lo, hi) = (rg_min as f64, rg_max as f64);
         match self.op {
-            ZoneMapOp::Eq => v >= rg_min && v <= rg_max,
-            ZoneMapOp::Gt => rg_max > v,
-            ZoneMapOp::GtEq => rg_max >= v,
-            ZoneMapOp::Lt => rg_min < v,
-            ZoneMapOp::LtEq => rg_min <= v,
+            // The column is integral, so an equality against a fractional
+            // value cannot match any row in it, whatever the range says.
+            ZoneMapOp::Eq if self.value.fract() != 0.0 => false,
+            ZoneMapOp::Eq => self.value >= lo && self.value <= hi,
+            ZoneMapOp::Gt => hi > self.value,
+            ZoneMapOp::GtEq => hi >= self.value,
+            ZoneMapOp::Lt => lo < self.value,
+            ZoneMapOp::LtEq => lo <= self.value,
         }
     }
 }
@@ -710,13 +735,18 @@ impl SegmentReader {
             // would require decoding the block (which is what we're trying
             // to avoid).  Full value-level filtering is done post-decode
             // by `filter_batch()`.
+            //
+            // An encrypted column's statistics are suppressed deliberately,
+            // which leaves `value_count` at zero — indistinguishable from
+            // an all-null block unless `null_count` is consulted too. Only
+            // a genuinely all-null block is impossible to match.
             if !tag_predicates.is_empty() {
                 let mut skip = false;
                 for &tag_idx in &tag_col_indices {
                     if let Some(tag_block) =
                         rg_blocks.iter().find(|b| b.column_index == tag_idx as u16)
                     {
-                        if tag_block.stats.value_count == 0 {
+                        if tag_block.stats.value_count == 0 && !tag_block.stats.says_nothing() {
                             skip = true;
                             break;
                         }
@@ -778,16 +808,24 @@ impl SegmentReader {
                         if let Some(block) =
                             rg_blocks.iter().find(|b| b.column_index == col_idx as u16)
                         {
-                            let matches = match col_meta.data_type {
-                                data_types::F64 => {
-                                    let rg_min = ordered_i64_to_f64(block.stats.min_value);
-                                    let rg_max = ordered_i64_to_f64(block.stats.max_value);
-                                    pred.may_match_f64(rg_min, rg_max)
+                            // Statistics that say nothing — an encrypted
+                            // block, whose stats are suppressed so the zone
+                            // map cannot leak its values — must not prune.
+                            let matches = if block.stats.says_nothing() {
+                                true
+                            } else {
+                                match col_meta.data_type {
+                                    data_types::F64 => {
+                                        let rg_min = ordered_i64_to_f64(block.stats.min_value);
+                                        let rg_max = ordered_i64_to_f64(block.stats.max_value);
+                                        pred.may_match_f64(rg_min, rg_max)
+                                    }
+                                    data_types::TIMESTAMP | data_types::I64 => pred.may_match_i64(
+                                        block.stats.min_value,
+                                        block.stats.max_value,
+                                    ),
+                                    _ => true, // non-numeric → can't prune
                                 }
-                                data_types::TIMESTAMP | data_types::I64 => {
-                                    pred.may_match_i64(block.stats.min_value, block.stats.max_value)
-                                }
-                                _ => true, // non-numeric → can't prune
                             };
                             if !matches {
                                 skip = true;
@@ -968,10 +1006,17 @@ impl SegmentReader {
                         key_id, col_meta.name,
                     ),
                 })?;
-            let decrypted = crate::segment::field_encryption::decrypt_block(raw_data, &key)
-                .map_err(|e| SegmentError::CorruptFile {
-                    detail: format!("failed to decrypt column {}: {e}", col_meta.name,),
-                })?;
+            let decrypted = crate::segment::field_encryption::decrypt_block(
+                raw_data,
+                &key,
+                crate::segment::field_encryption::BlockContext {
+                    column: &col_meta.name,
+                    segment_created_at: self.header.created_at,
+                },
+            )
+            .map_err(|e| SegmentError::CorruptFile {
+                detail: format!("failed to decrypt column {}: {e}", col_meta.name,),
+            })?;
             std::borrow::Cow::Owned(decrypted)
         } else {
             std::borrow::Cow::Borrowed(raw_data)
@@ -1128,6 +1173,66 @@ fn decoded_to_arrow(
                 std::mem::discriminant(&decoded),
             ),
         }),
+    }
+}
+
+#[cfg(test)]
+mod zone_map_tests {
+    use super::*;
+
+    fn pred(op: ZoneMapOp, value: f64) -> FieldPredicate {
+        FieldPredicate {
+            column: "n".into(),
+            op,
+            value,
+        }
+    }
+
+    /// A fractional bound must not be truncated to an integer. `n < 1.5`
+    /// used to become `n < 1`, which prunes a block holding `{1, 2, 3}`
+    /// even though 1 matches — a pruning step that loses rows.
+    #[test]
+    fn a_fractional_bound_does_not_prune_an_integer_block() {
+        assert!(pred(ZoneMapOp::Lt, 1.5).may_match_i64(1, 3));
+        assert!(pred(ZoneMapOp::LtEq, 1.5).may_match_i64(1, 3));
+        assert!(pred(ZoneMapOp::Gt, 2.5).may_match_i64(1, 3));
+        assert!(pred(ZoneMapOp::GtEq, 2.5).may_match_i64(1, 3));
+        assert!(pred(ZoneMapOp::Eq, 2.0).may_match_i64(1, 3));
+        // And it still prunes what it should.
+        assert!(!pred(ZoneMapOp::Lt, 1.0).may_match_i64(1, 3));
+        assert!(!pred(ZoneMapOp::Gt, 3.0).may_match_i64(1, 3));
+        // An integer column cannot hold 2.5 at all.
+        assert!(!pred(ZoneMapOp::Eq, 2.5).may_match_i64(1, 3));
+    }
+
+    /// Beyond 2^53 an `i64` bound cannot be compared as an `f64`, so the
+    /// row group is kept rather than compared wrongly.
+    #[test]
+    fn a_bound_beyond_exact_float_range_never_prunes() {
+        let big = (1_i64 << 53) + 1;
+        assert!(pred(ZoneMapOp::Eq, big as f64).may_match_i64(big, big));
+        assert!(pred(ZoneMapOp::Lt, 0.0).may_match_i64(big, big + 10));
+    }
+
+    /// Statistics that say nothing — the sentinel range an encrypted block
+    /// carries — must read as "unknown", not as an empty range. As an empty
+    /// range every comparison is false, so a predicate on an encrypted
+    /// column pruned every row group and the query returned nothing.
+    #[test]
+    fn suppressed_statistics_never_prune() {
+        let empty = crate::segment::stats::ColumnStats::empty();
+        assert!(empty.says_nothing());
+        assert!(
+            pred(ZoneMapOp::Gt, 0.0).may_match_i64(empty.min_value, empty.max_value),
+            "an inverted sentinel range must not prune"
+        );
+        assert!(pred(ZoneMapOp::Eq, 42.0).may_match_f64(f64::NAN, f64::NAN));
+
+        // A genuinely all-null block *is* impossible to match, and pruning
+        // it stays correct.
+        let mut all_null = crate::segment::stats::ColumnStats::empty();
+        all_null.record_null();
+        assert!(!all_null.says_nothing());
     }
 }
 

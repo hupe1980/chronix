@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use chronix::chronix_audit::{
+use chronix::chronix_security::audit::{
     AuditAction, AuditDecision, AuditEvent, AuditLogger, AuditSink, MemorySink, TracingSink,
 };
 
@@ -19,10 +19,10 @@ use chronix::chronix_audit::{
 struct SinkWrapper(Arc<MemorySink>);
 
 impl AuditSink for SinkWrapper {
-    fn emit(&self, event: &AuditEvent) -> chronix::chronix_audit::error::Result<()> {
+    fn emit(&self, event: &AuditEvent) -> chronix::chronix_security::audit::error::Result<()> {
         self.0.emit(event)
     }
-    fn flush(&self) -> chronix::chronix_audit::error::Result<()> {
+    fn flush(&self) -> chronix::chronix_security::audit::error::Result<()> {
         self.0.flush()
     }
 }

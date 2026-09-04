@@ -182,7 +182,14 @@ pub fn sort_merge_dedup_chunked(
         return Err(QueryError::Validation("no batches to deduplicate".into()));
     }
 
-    // Fast path: single batch, no dedup needed — just chunk it.
+    // Fast path: one input, so nothing can be a duplicate of anything —
+    // but the rows still have to come out in timestamp order, because that
+    // is what this function promises and what every consumer assumes. A
+    // segment is written series-major, so returning it as it lies handed
+    // back rows that jumped backwards in time whenever a segment held more
+    // than one series: the streaming rollup accumulator closed a bucket on
+    // the first series and then saw the second, and last-write-wins kept
+    // one series' worth of a twenty-series aggregate.
     if batches.len() == 1 {
         let batch = batches
             .into_iter()
@@ -191,7 +198,8 @@ pub fn sort_merge_dedup_chunked(
         if batch.num_rows() == 0 {
             return Ok(vec![]);
         }
-        return Ok(chunk_batch(&batch, chunk_size));
+        let sorted = sort_batch_by_timestamp(&batch)?;
+        return Ok(chunk_batch(&sorted, chunk_size));
     }
 
     let (_schema, plan) = plan_merge(batches, measurement, memory_tracker)?;
@@ -199,6 +207,34 @@ pub fn sort_merge_dedup_chunked(
         return Ok(vec![]);
     };
     merge_chunks(&plan, chunk_size, memory_tracker)
+}
+
+/// Sort a batch ascending by timestamp, stably, so equal timestamps keep
+/// their relative order (which is write order, and so last-write-wins).
+///
+/// A no-op when the batch is already ordered, which is the common case:
+/// the memtable and every merged output are ordered already.
+fn sort_batch_by_timestamp(batch: &RecordBatch) -> Result<RecordBatch> {
+    let Some(ts) = batch
+        .column_by_name("timestamp")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+    else {
+        // No timestamp column to order by (a projection that dropped it);
+        // the caller gets what it asked for.
+        return Ok(batch.clone());
+    };
+    if ts.values().windows(2).all(|w| w[0] <= w[1]) {
+        return Ok(batch.clone());
+    }
+    let mut order: Vec<u32> = (0..batch.num_rows() as u32).collect();
+    order.sort_by_key(|&i| (ts.value(i as usize), i));
+    let indices = arrow::array::UInt32Array::from(order);
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 /// Metadata cursor for a batch participating in k-way merge.
@@ -945,5 +981,79 @@ mod tests {
         let tiny_tracker = crate::memory::MemoryTracker::new(1);
         let err = sort_merge_dedup(vec![b1, b2], "cpu", Some(&tiny_tracker));
         assert!(err.is_err(), "should fail when memory budget exceeded");
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// A single input is returned in timestamp order, not in the order it
+    /// happens to lie on disk.
+    ///
+    /// A segment is written series-major, so its rows jump backwards in
+    /// time at every series boundary. Handing that back unsorted broke
+    /// every consumer that assumed the promised order — the streaming
+    /// rollup accumulator closed a bucket on the first series and then saw
+    /// the second, and last-write-wins kept one series' share of the
+    /// aggregate.
+    #[test]
+    fn a_single_series_major_batch_comes_back_in_time_order() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("host", DataType::Utf8, true),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        // host a at t=1,2,3 then host b at t=1,2,3 — series-major.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "a", "a", "b", "b", "b"])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            ],
+        )
+        .unwrap();
+
+        let out = sort_merge_dedup_chunked(vec![batch], "m", 1024, None).unwrap();
+        assert_eq!(out.len(), 1);
+        let ts = out[0]
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts.values(), &[1, 1, 2, 2, 3, 3]);
+        // Both series survive: this sorts, it does not deduplicate across
+        // series that merely share a timestamp.
+        assert_eq!(out[0].num_rows(), 6);
+    }
+
+    /// An already-ordered batch is passed through untouched.
+    #[test]
+    fn an_ordered_batch_is_not_reshuffled() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("v", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+            ],
+        )
+        .unwrap();
+        let out = sort_merge_dedup_chunked(vec![batch], "m", 1024, None).unwrap();
+        let v = out[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(v.values(), &[1.0, 2.0, 3.0]);
     }
 }

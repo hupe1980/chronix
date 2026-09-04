@@ -108,6 +108,7 @@ fn bench_http_write(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -201,6 +202,7 @@ fn bench_http_query(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -558,6 +560,7 @@ fn bench_scale_http_write_10k(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -635,6 +638,7 @@ fn bench_scale_multi_measurement(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -744,6 +748,7 @@ fn bench_scale_targeted_query(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -823,6 +828,7 @@ fn bench_tsbs_devops_workload(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -913,6 +919,7 @@ fn bench_replicated_write_throughput(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -1042,6 +1049,7 @@ fn bench_multi_tenant_100ns(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -1160,6 +1168,7 @@ fn bench_large_scale_targeted_query(c: &mut Criterion) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 

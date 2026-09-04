@@ -29,6 +29,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 
+    /// Signal triggers (optional — the endpoints 404 if absent).
+    #[serde(default)]
+    pub triggers: Option<TriggersConfig>,
+
+    /// Periodic cold archiving (optional — nothing runs if absent).
+    #[serde(default)]
+    pub cold_archive: Option<ColdArchiveConfig>,
+
     /// Absolute base URL clients use to reach this server, e.g.
     /// `https://metrics.example.com/chronix`.
     ///
@@ -121,6 +129,24 @@ pub struct ServerConfig {
     #[serde(default)]
     pub auth: Option<AuthConfig>,
 
+    /// Root directory that backup and restore paths are confined to.
+    ///
+    /// Defaults to `backups/` inside the data directory. Everything the
+    /// admin API reads or writes on the filesystem stays under this root:
+    /// the endpoints take a path from the caller, and an absolute path used
+    /// to be accepted anywhere, so a restore could read `/etc` and a backup
+    /// could write over it.
+    #[serde(default)]
+    pub backup_root: Option<PathBuf>,
+
+    /// Audit log configuration.
+    ///
+    /// Absent means the audit trail exists only in the process log, which
+    /// is not an audit trail: it does not survive a restart and nothing
+    /// can prove it was not edited.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+
     /// Authorization — path to a directory of `.cedar` policy files.
     /// When set, the Cedar authorization engine is enabled.
     /// When absent, all requests are permitted (open mode).
@@ -184,10 +210,13 @@ pub struct ServerConfig {
 
     /// Maximum evaluation points for a PromQL range query (default: 11 000).
     ///
-    /// This value is **configurable** via the config file or
-    /// environment variable `CHRONIXD_MAX_RANGE_QUERY_POINTS`. The default
-    /// (11 000) matches the Prometheus server default. Set a lower value
-    /// for memory-constrained deployments.
+    /// Set in the config file; the default (11 000) matches the Prometheus
+    /// server default. Set a lower value for memory-constrained deployments.
+    ///
+    /// There is no environment-variable override. This comment used to claim
+    /// `CHRONIXD_MAX_RANGE_QUERY_POINTS`, which nothing has ever read: the
+    /// only environment resolution in the config layer is the `${VAR}` form
+    /// on individual secret-bearing fields.
     #[serde(default = "default_max_range_query_points")]
     pub max_range_query_points: u64,
 
@@ -328,6 +357,180 @@ pub struct TlsConfig {
     pub reload_interval_secs: u64,
 }
 
+/// Periodic cold-archiving configuration.
+///
+/// Absent means nothing archives. Archiving was an embedded API call with no
+/// trigger anywhere in the server, so a deployment that wanted it had to write
+/// its own scheduler around `Chronix::archive_cold_segments` — and a
+/// maintenance operation nobody runs is one that runs for the first time when
+/// the disk is already full.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ColdArchiveConfig {
+    /// Object-store URL to archive into (`s3://`, `gs://`, `az://`, `file://`).
+    pub remote_url: String,
+
+    /// How old the newest point in a `(measurement, shard)` group must be
+    /// before it is archived, in seconds.
+    #[serde(default = "default_cold_after_secs")]
+    pub cold_after_secs: u64,
+
+    /// How often to run a pass, in seconds.
+    ///
+    /// A pass reads, encodes and uploads whole groups, so this is deliberately
+    /// long by default: it is a background reclamation, not a hot path.
+    #[serde(default = "default_archive_interval_secs")]
+    pub interval_secs: u64,
+
+    /// Maximum archive objects to write in one pass.
+    ///
+    /// Bounds the stall a pass can cause on a small machine; the next pass
+    /// picks up where this one stopped.
+    #[serde(default = "default_max_objects_per_run")]
+    pub max_objects_per_run: usize,
+}
+
+const fn default_cold_after_secs() -> u64 {
+    30 * 86_400
+}
+
+const fn default_archive_interval_secs() -> u64 {
+    3_600
+}
+
+const fn default_max_objects_per_run() -> usize {
+    8
+}
+
+/// Signal-trigger configuration.
+///
+/// Absent means the trigger endpoints are not served. Triggers were embedded
+/// -only for their whole existence: `Pipeline` — which owns the trigger
+/// engine, the delivery router and the signal store — was never constructed by
+/// this server, so `CREATE TRIGGER` could not be reached from any protocol
+/// surface however well it worked.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TriggersConfig {
+    /// Where trigger definitions are persisted so they survive a restart.
+    ///
+    /// Relative paths are resolved against the data directory. `None` keeps
+    /// triggers in memory, which means a restart silently stops alerting.
+    #[serde(default)]
+    pub catalog_path: Option<PathBuf>,
+
+    /// HMAC-SHA256 secret every `DELIVER webhook(…)` channel signs with.
+    ///
+    /// Without it a `DELIVER webhook(…)` is **refused** rather than accepted
+    /// and dropped. Signing is mandatory — an unsigned webhook is a payload
+    /// anyone can forge — and the secret is configured here rather than
+    /// written in SQL so it stays out of the trigger catalog on disk and out
+    /// of `SHOW TRIGGERS`. `${VAR}` or `$VAR` resolves against the
+    /// environment at startup, so it need not be in the file either.
+    #[serde(default)]
+    pub webhook_signing_secret: Option<String>,
+
+    /// Timeout for one webhook request, in seconds.
+    #[serde(default = "default_webhook_timeout_secs")]
+    pub webhook_timeout_secs: u64,
+
+    /// Permit a webhook target that resolves inside this deployment's network.
+    ///
+    /// Off by default. The legitimate case is an alerting endpoint on the
+    /// operator's own network — `https://alertmanager.corp.example/` resolving
+    /// to 10.x — which is indistinguishable, at the connection, from a URL a
+    /// tenant pointed at the cloud metadata service. So it is a switch rather
+    /// than a guess.
+    #[serde(default)]
+    pub webhook_allow_private_targets: bool,
+
+    /// How many fired signals to keep for `GET /api/v1/signals`.
+    #[serde(default = "default_signal_store_capacity")]
+    pub signal_store_capacity: usize,
+}
+
+impl Default for TriggersConfig {
+    fn default() -> Self {
+        Self {
+            catalog_path: None,
+            webhook_signing_secret: None,
+            webhook_timeout_secs: default_webhook_timeout_secs(),
+            webhook_allow_private_targets: false,
+            signal_store_capacity: default_signal_store_capacity(),
+        }
+    }
+}
+
+const fn default_webhook_timeout_secs() -> u64 {
+    10
+}
+
+const fn default_signal_store_capacity() -> usize {
+    10_000
+}
+
+/// Resolve a `${VAR}` or `$VAR` reference against the environment.
+///
+/// A value that is not a reference is returned unchanged, so a literal secret
+/// still works — this is a way to keep credentials out of a config file, not a
+/// requirement to.
+///
+/// # Errors
+///
+/// Returns the variable name if it is referenced and not set. Failing to start
+/// is the right answer there: the alternative is a server that runs with a
+/// credential it silently does not have.
+pub fn resolve_env_reference(value: &str) -> std::result::Result<String, String> {
+    let var = if let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+        inner
+    } else if let Some(inner) = value.strip_prefix('$') {
+        // `$argon2…` is a PHC hash, not a variable.
+        if inner.starts_with("argon2") {
+            return Ok(value.to_string());
+        }
+        inner
+    } else {
+        return Ok(value.to_string());
+    };
+    std::env::var(var).map_err(|_| var.to_string())
+}
+
+/// Serde default for boolean fields that default to `true`.
+const fn default_true() -> bool {
+    true
+}
+
+/// Audit log configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// Path to the append-only JSON-lines audit file.
+    pub path: PathBuf,
+
+    /// Environment variable holding the HMAC key that seals the chain.
+    ///
+    /// Without a key the chain is plain SHA-256, which anyone who can write
+    /// the file can recompute — so it detects corruption, not tampering.
+    /// The key is read from the environment rather than the file so that
+    /// reading the config does not hand over the ability to forge history.
+    #[serde(default)]
+    pub hmac_key_env: Option<String>,
+
+    /// `fsync` after every event.
+    ///
+    /// On by default: the events worth having are the ones written just
+    /// before the machine went down.
+    #[serde(default = "default_true")]
+    pub sync_each: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from("audit.jsonl"),
+            hmac_key_env: None,
+            sync_each: true,
+        }
+    }
+}
+
 /// Authentication configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
@@ -354,6 +557,17 @@ pub struct ApiKeyEntry {
     pub name: String,
     /// The raw API key value (will be hashed on load).
     pub key: String,
+    /// Namespaces this key may act in.
+    ///
+    /// Empty means unrestricted, which a multi-tenant server rejects at
+    /// startup: an unconfined key erases the tenant boundary, and it fails
+    /// open, so nothing in normal operation would surface the mistake.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Whether this key may perform administrative operations (restore,
+    /// namespace management, key management).
+    #[serde(default)]
+    pub admin: bool,
 }
 
 impl std::fmt::Debug for ApiKeyEntry {
@@ -372,7 +586,24 @@ impl std::fmt::Debug for ApiKeyEntry {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct JwtAuthConfig {
     /// Secret or PEM public key for validation.
+    ///
+    /// Only the HMAC family (`HS*`) uses this. Leave it empty for the
+    /// asymmetric families and set `public_key_pem_file` instead.
+    #[serde(default)]
     pub secret: String,
+    /// Path to a PEM file holding the public key, for the asymmetric
+    /// families (`RS*`, `PS*`, `ES*`, `EdDSA`).
+    ///
+    /// A path rather than inline PEM, so the key can be mounted as a file
+    /// and rotated without rewriting the config.
+    #[serde(default)]
+    pub public_key_pem_file: Option<PathBuf>,
+    /// OIDC JWKS endpoint, for providers that publish and rotate their own
+    /// keys.
+    ///
+    /// Takes the place of `public_key_pem_file` when set.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
     /// Algorithm: "HS256", "RS256", etc.
     #[serde(default = "default_jwt_algorithm")]
     pub algorithm: String,
@@ -477,6 +708,8 @@ pub struct ClusterTlsConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            triggers: None,
+            cold_archive: None,
             http_addr: default_http_addr(),
             grpc_addr: default_grpc_addr(),
             flight_addr: default_flight_addr(),
@@ -518,6 +751,8 @@ impl Default for ServerConfig {
             database: DatabaseConfig::default(),
             write_timeout_secs: default_write_timeout_secs(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            audit: None,
+            backup_root: None,
         }
     }
 }
@@ -593,6 +828,69 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// Validate the authentication configuration.
+    ///
+    /// An `[auth]` section with no key and no JWT configuration builds a
+    /// middleware with no provider, which then rejects **every** request.
+    /// The section looks configured and the server starts, so the first
+    /// sign of trouble is a deployment where nothing works and the logs say
+    /// only "authentication required".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when authentication is configured with no way to
+    /// authenticate anyone.
+    pub fn validate_auth(&self) -> Result<(), ServerConfigError> {
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        if auth.api_keys.is_empty() && auth.jwt.is_none() {
+            return Err(ServerConfigError::Invalid(
+                "the [auth] section configures no way to authenticate: add at \
+                 least one [[auth.api_keys]] entry or an [auth.jwt] section. \
+                 As written, every request would be rejected. To run without \
+                 authentication, remove the [auth] section entirely."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the tenant isolation configuration.
+    ///
+    /// A multi-tenant server rejects an API key that names no namespaces.
+    /// Namespace confinement fails **open** — an unconfined key works
+    /// perfectly for its own tenant and also reads every other one — so
+    /// nothing short of an audit would surface the mistake in operation.
+    /// Starting is the only moment the server can still refuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming every unconfined key.
+    pub fn validate_tenancy(&self) -> Result<(), ServerConfigError> {
+        if !self.multi_tenancy {
+            return Ok(());
+        }
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        let unconfined: Vec<&str> = auth
+            .api_keys
+            .iter()
+            .filter(|k| k.namespaces.is_empty())
+            .map(|k| k.name.as_str())
+            .collect();
+        if !unconfined.is_empty() {
+            return Err(ServerConfigError::Invalid(format!(
+                "multi-tenancy is on but these API keys name no namespaces, so each \
+                 one can read and delete every tenant's data: {}. Add \
+                 `namespaces = [\"...\"]` to each key.",
+                unconfined.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Load configuration from a TOML file.
     ///
     /// # Errors
@@ -603,6 +901,91 @@ impl ServerConfig {
             .map_err(|e| ServerConfigError::Io(path.display().to_string(), e))?;
         toml::from_str(&content)
             .map_err(|e| ServerConfigError::Parse(path.display().to_string(), e.to_string()))
+    }
+
+    /// Apply `CHRONIX_*` environment overrides in place.
+    ///
+    /// # Precedence
+    ///
+    /// File, then environment, then CLI flags — so a container image can carry
+    /// a config file and a deployment can override the handful of settings
+    /// that differ per environment without templating the file, while an
+    /// operator debugging by hand still wins with a flag.
+    ///
+    /// # Why this exists
+    ///
+    /// It was documented and not implemented. The deployment guide listed
+    /// `CHRONIX_DATA_DIR`, `CHRONIX_LOG_LEVEL`, `CHRONIX_HTTP_ADDR` and
+    /// `CHRONIX_JWT_SECRET` in a table of overrides, and nothing in the tree
+    /// read any of them — so a container setting `CHRONIX_DATA_DIR` wrote to
+    /// `./chronix-data` instead, silently, which is the worst possible way to
+    /// find out. `documented_env_vars` now checks the table against the code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerConfigError::Invalid`] if a variable is set to
+    /// something that cannot be parsed. Failing to start is right: the
+    /// alternative is running with a value the operator did not ask for.
+    pub fn apply_env_overrides(&mut self) -> Result<(), ServerConfigError> {
+        self.apply_overrides_from(|name| std::env::var(name).ok())
+    }
+
+    /// The body of [`apply_env_overrides`](Self::apply_env_overrides), against
+    /// an arbitrary lookup.
+    ///
+    /// Taking the lookup as a parameter is what makes this testable: the
+    /// process environment is global and the test harness is threaded, so
+    /// tests that set variables have to take turns and can still be defeated
+    /// by anything else in the binary that reads one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerConfigError::Invalid`] if a value cannot be parsed, or
+    /// if `CHRONIX_JWT_SECRET` is set with no `[auth.jwt]` section to apply it
+    /// to.
+    pub fn apply_overrides_from(
+        &mut self,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), ServerConfigError> {
+        if let Some(dir) = get("CHRONIX_DATA_DIR") {
+            self.database.data_dir = PathBuf::from(dir);
+        }
+        if let Some(level) = get("CHRONIX_LOG_LEVEL") {
+            self.log_level = level;
+        }
+        if let Some(addr) = get("CHRONIX_HTTP_ADDR") {
+            self.http_addr = addr.parse().map_err(|e| {
+                ServerConfigError::Invalid(format!(
+                    "CHRONIX_HTTP_ADDR {addr:?} is not an address: {e}"
+                ))
+            })?;
+        }
+        if let Some(secret) = get("CHRONIX_JWT_SECRET") {
+            // Overrides a JWT configuration that exists; it does not conjure
+            // one. An environment variable that silently *enables*
+            // authentication with everything else defaulted is a worse
+            // outcome than refusing to start, and an operator who set this
+            // variable plainly expects JWT auth to be on — so the absence is
+            // an error rather than a no-op.
+            let jwt = self
+                .auth
+                .as_mut()
+                .and_then(|a| a.jwt.as_mut())
+                .ok_or_else(|| {
+                    ServerConfigError::Invalid(
+                        "CHRONIX_JWT_SECRET is set but there is no [auth.jwt] section to \
+                         override: add one, or unset the variable"
+                            .into(),
+                    )
+                })?;
+            jwt.secret = secret;
+        }
+        if let Some(secret) = get("CHRONIX_WEBHOOK_SIGNING_SECRET") {
+            self.triggers
+                .get_or_insert_with(TriggersConfig::default)
+                .webhook_signing_secret = Some(secret);
+        }
+        Ok(())
     }
 
     /// Convert to a [`chronix_core::ChronixConfig`] for opening the database.
@@ -1005,5 +1388,33 @@ mod tests {
         config.flight_addr = config.grpc_addr;
         let err = config.validate_ports().unwrap_err();
         assert!(err.to_string().contains("gRPC and Flight SQL"), "{err}");
+    }
+
+    /// An `[auth]` section with no provider builds a middleware that
+    /// rejects everything, and the server starts happily — so the first
+    /// symptom is a deployment where nothing works and the log says only
+    /// "authentication required". The site documented exactly this shape.
+    #[test]
+    fn an_auth_section_that_authenticates_nobody_is_refused() {
+        let config = ServerConfig {
+            auth: Some(AuthConfig {
+                api_keys: Vec::new(),
+                jwt: None,
+                exempt_paths: vec!["/health".to_string()],
+            }),
+            ..Default::default()
+        };
+        let err = config
+            .validate_auth()
+            .expect_err("an auth section with no provider must not start");
+        assert!(
+            err.to_string().contains("remove the [auth] section"),
+            "the error must say how to fix it: {err}"
+        );
+
+        assert!(
+            ServerConfig::default().validate_auth().is_ok(),
+            "no [auth] section at all is a deliberate open deployment"
+        );
     }
 }

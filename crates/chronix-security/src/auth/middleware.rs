@@ -34,6 +34,44 @@ pub struct AuthContext {
     pub method: AuthMethod,
     /// Additional claims from JWT (empty for API key / mTLS).
     pub claims: std::collections::HashMap<String, serde_json::Value>,
+    /// Whether this credential may perform administrative operations.
+    ///
+    /// Carried on the credential rather than derived from a policy engine,
+    /// because the policy engine is optional and "no policy" must not mean
+    /// "everyone is an admin".
+    pub admin: bool,
+    /// Namespaces this credential may act in; empty means unrestricted.
+    ///
+    /// Authentication answers *who is calling*; this answers *whose data
+    /// they may touch*. Keeping the second on the credential is what stops
+    /// a valid key from reading another tenant simply by changing a header.
+    pub namespaces: Vec<String>,
+}
+
+impl AuthContext {
+    /// Whether this credential may act in `namespace`.
+    #[must_use]
+    pub fn allows_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.is_empty() || self.namespaces.iter().any(|n| n == namespace)
+    }
+}
+
+/// Read the namespace confinement out of a JWT's claims.
+///
+/// Accepts `namespaces` as an array of strings or as a single string, which
+/// is what identity providers actually emit: a one-element list is often
+/// flattened to a bare string on the way through.
+fn namespaces_from_claims(
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<String> {
+    match extra.get("namespaces") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        Some(serde_json::Value::String(one)) => vec![one.clone()],
+        _ => Vec::new(),
+    }
 }
 
 /// Authentication middleware configuration.
@@ -157,6 +195,8 @@ impl AuthMiddleware {
                     principal: "anonymous".into(),
                     method: AuthMethod::None,
                     claims: std::collections::HashMap::new(),
+                    admin: false,
+                    namespaces: Vec::new(),
                 });
             }
             tracing::warn!(
@@ -184,6 +224,8 @@ impl AuthMiddleware {
                         principal: identity.principal().to_string(),
                         method: AuthMethod::Mtls,
                         claims: std::collections::HashMap::new(),
+                        admin: false,
+                        namespaces: Vec::new(),
                     });
                 }
             }
@@ -192,28 +234,8 @@ impl AuthMiddleware {
         // 2. Try JWT
         if let Some(ref jwt) = self.jwt_validator {
             if let Some(token) = bearer_token {
-                match jwt.validate(token) {
-                    Ok(claims) => {
-                        let principal = jwt
-                            .extract_principal(&claims)
-                            .unwrap_or_else(|| "unknown".into());
-                        return Ok(AuthContext {
-                            principal,
-                            method: AuthMethod::Jwt,
-                            claims: claims.extra,
-                        });
-                    }
-                    Err(AuthError::ExpiredJwt) => return Err(AuthError::ExpiredJwt),
-                    Err(e) => {
-                        // If the token has JWT structure (2+ dots),
-                        // treat it as a failed JWT — never fall through to
-                        // API key auth. This prevents auth downgrade attacks.
-                        let looks_like_jwt = token.bytes().filter(|&b| b == b'.').count() >= 2;
-                        if looks_like_jwt {
-                            return Err(e);
-                        }
-                        // Non-JWT-structured token — fall through to API key
-                    }
+                if let Some(outcome) = self.judge_jwt(token, jwt.validate(token)) {
+                    return outcome;
                 }
             }
         }
@@ -225,10 +247,14 @@ impl AuthMiddleware {
                 if !looks_like_jwt {
                     match store.validate(token) {
                         Ok(name) => {
+                            let namespaces = store.namespaces_for(&name).to_vec();
+                            let admin = store.is_admin(&name);
                             return Ok(AuthContext {
                                 principal: name,
                                 method: AuthMethod::ApiKey,
                                 claims: std::collections::HashMap::new(),
+                                admin,
+                                namespaces,
                             });
                         }
                         Err(AuthError::ExpiredApiKey(name)) => {
@@ -243,6 +269,109 @@ impl AuthMiddleware {
         }
 
         Err(AuthError::NoAuth)
+    }
+
+    /// Authenticate a request, consulting a JWKS endpoint when one is
+    /// configured.
+    ///
+    /// Identical to [`authenticate`](Self::authenticate) except that the
+    /// JWT step can fetch and cache the issuer's published keys. The two
+    /// share every decision — which method wins, when a failure may fall
+    /// through to a weaker one — so they cannot drift apart; only the JWT
+    /// call differs, because fetching keys needs to await.
+    ///
+    /// # Errors
+    ///
+    /// As [`authenticate`](Self::authenticate).
+    pub async fn authenticate_async(
+        &self,
+        bearer_token: Option<&str>,
+        client_cert_cn: Option<&str>,
+    ) -> Result<AuthContext, AuthError> {
+        // Only the JWT step can differ, and only when a JWKS cache exists.
+        let jwks_path = self
+            .jwt_validator
+            .as_ref()
+            .is_some_and(|j| j.jwks_cache().is_some());
+        if !jwks_path {
+            return self.authenticate(bearer_token, client_cert_cn);
+        }
+
+        // A presented client certificate wins outright, exactly as in the
+        // sync path, so delegate rather than restating the rule.
+        if let Some(ref mtls) = self.mtls_validator {
+            if client_cert_cn.is_some() && mtls.is_enabled() {
+                return self.authenticate(bearer_token, client_cert_cn);
+            }
+        }
+
+        if let (Some(jwt), Some(token)) = (self.jwt_validator.as_ref(), bearer_token) {
+            let result = jwt.validate_async(token).await;
+            if let Some(outcome) = self.judge_jwt(token, result) {
+                return outcome;
+            }
+        }
+
+        // Not a JWT — the API-key and no-provider paths are unchanged.
+        self.authenticate(bearer_token, client_cert_cn)
+    }
+
+    /// Turn a JWT validation result into a decision.
+    ///
+    /// `None` means "this was not a JWT, try the next method". Anything
+    /// else is final: a structurally valid JWT that failed must never fall
+    /// through to API-key authentication, which would let an attacker
+    /// downgrade to the weaker method by presenting a broken token.
+    fn judge_jwt(
+        &self,
+        token: &str,
+        result: Result<crate::auth::jwt::JwtClaims, AuthError>,
+    ) -> Option<Result<AuthContext, AuthError>> {
+        let jwt = self.jwt_validator.as_ref()?;
+        match result {
+            Ok(claims) => {
+                let principal = jwt
+                    .extract_principal(&claims)
+                    .unwrap_or_else(|| "unknown".into());
+                let namespaces = namespaces_from_claims(&claims.extra);
+                let admin = claims
+                    .extra
+                    .get("admin")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                Some(Ok(AuthContext {
+                    principal,
+                    method: AuthMethod::Jwt,
+                    claims: claims.extra,
+                    admin,
+                    namespaces,
+                }))
+            }
+            Err(AuthError::ExpiredJwt) => Some(Err(AuthError::ExpiredJwt)),
+            Err(e) => {
+                let looks_like_jwt = token.bytes().filter(|&b| b == b'.').count() >= 2;
+                if looks_like_jwt {
+                    Some(Err(e))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The JWT validator, when one is configured.
+    #[must_use]
+    pub fn jwt_validator(&self) -> Option<&JwtValidator> {
+        self.jwt_validator.as_ref()
+    }
+
+    /// Attach a JWKS cache to the JWT validator.
+    ///
+    /// Called at startup once the issuer's keys have been fetched.
+    pub fn set_jwks_cache(&mut self, cache: std::sync::Arc<crate::auth::oidc::JwksCache>) {
+        if let Some(validator) = self.jwt_validator.take() {
+            self.jwt_validator = Some(validator.with_jwks_cache(cache));
+        }
     }
 
     /// Check whether any authentication method is configured.

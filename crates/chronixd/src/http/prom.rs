@@ -3,33 +3,40 @@
 use arrow::array::Array;
 use axum::extract::{Json, Path, State};
 use axum::response::IntoResponse;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::error::ServerError;
 
-use super::types::{secs_to_nanos_i64, AppState};
+use super::types::AppState;
 
-/// `GET/POST /api/v1/prom/query` — PromQL instant query.
-#[derive(Debug, Deserialize)]
-pub struct PromInstantQuery {
-    /// The PromQL expression.
-    pub query: String,
-    /// Evaluation timestamp (Unix seconds, float). Defaults to now.
-    #[serde(default)]
-    pub time: Option<f64>,
-}
-
-/// `GET/POST /api/v1/prom/query_range` — PromQL range query.
-#[derive(Debug, Deserialize)]
-pub struct PromRangeQuery {
-    /// The PromQL expression.
-    pub query: String,
-    /// Start timestamp (Unix seconds, float).
-    pub start: f64,
-    /// End timestamp (Unix seconds, float).
-    pub end: f64,
-    /// Step in seconds (float).
-    pub step: f64,
+/// A Prometheus API error, as a response with the status code Prometheus
+/// uses for that `errorType`.
+///
+/// The status code is not cosmetic. Prometheus's own clients — and Grafana —
+/// branch on it: a 400 is a permanent failure to be reported to the user, a
+/// 503 is a timeout worth retrying. Chronix answered every error with HTTP
+/// 200 and an error body, so a failing query looked to Grafana like a
+/// successful one that returned nothing.
+fn prom_error(error_type: &str, message: impl Into<String>) -> axum::response::Response {
+    let code = match error_type {
+        "bad_data" => axum::http::StatusCode::BAD_REQUEST,
+        "timeout" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "canceled" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        // "execution" and anything else: Prometheus answers 422 for a query
+        // that parsed but could not be evaluated.
+        "internal" => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        _ => axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    (
+        code,
+        Json(PromResponse {
+            status: "error".into(),
+            data: None,
+            error: Some(message.into()),
+            error_type: Some(error_type.into()),
+        }),
+    )
+        .into_response()
 }
 
 /// Prometheus-compatible API response envelope.
@@ -110,28 +117,22 @@ fn record_scan_stats(kind: &'static str, stats: chronix::promql::eval::ScanStats
 pub async fn prom_instant_query_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
-    params: axum::extract::Query<PromInstantQuery>,
-) -> impl IntoResponse {
+    params: super::PromParams,
+) -> axum::response::Response {
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let query_str = &params.query;
-    let eval_time_secs = params.time.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
-    });
-    let eval_time_ns = secs_to_nanos_i64(eval_time_secs);
+    let query_str = match params.require("query") {
+        Ok(q) => q.to_string(),
+        Err(e) => return prom_error("bad_data", e.to_string()),
+    };
+    let eval_time_ns = match params.time("time") {
+        Ok(Some(ts)) => ts,
+        Ok(None) => super::types::now_nanos_i64(),
+        Err(e) => return prom_error("bad_data", e.to_string()),
+    };
 
-    let expr = match chronix::promql::parse(query_str) {
+    let expr = match chronix::promql::parse(&query_str) {
         Ok(e) => e,
-        Err(e) => {
-            return Json(PromResponse {
-                status: "error".into(),
-                data: None,
-                error: Some(e.to_string()),
-                error_type: Some("bad_data".into()),
-            });
-        }
+        Err(e) => return prom_error("bad_data", e.to_string()),
     };
 
     let query_kind = "instant";
@@ -154,12 +155,7 @@ pub async fn prom_instant_query_handler(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
             Ok(r) => r,
             Err(_) => {
-                return Json(PromResponse {
-                    status: "error".into(),
-                    data: None,
-                    error: Some(format!("query timed out after {timeout_secs}s")),
-                    error_type: Some("timeout".into()),
-                });
+                return prom_error("timeout", format!("query timed out after {timeout_secs}s"));
             }
         }
     } else {
@@ -172,19 +168,9 @@ pub async fn prom_instant_query_handler(
     });
 
     match result {
-        Ok(Ok(value)) => Json(prom_value_to_response(value)),
-        Ok(Err(e)) => Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some(e.to_string()),
-            error_type: Some("execution".into()),
-        }),
-        Err(e) => Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some(format!("query task failed: {e}")),
-            error_type: Some("internal".into()),
-        }),
+        Ok(Ok(value)) => Json(prom_value_to_response(value)).into_response(),
+        Ok(Err(e)) => prom_error("execution", e.to_string()),
+        Err(e) => prom_error("internal", format!("query task failed: {e}")),
     }
 }
 
@@ -192,75 +178,44 @@ pub async fn prom_instant_query_handler(
 pub async fn prom_range_query_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
-    params: axum::extract::Query<PromRangeQuery>,
-) -> impl IntoResponse {
+    params: super::PromParams,
+) -> axum::response::Response {
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let query_str = &params.query;
-    let start_ns = secs_to_nanos_i64(params.start);
-    let end_ns = secs_to_nanos_i64(params.end);
-    let step_ns = secs_to_nanos_i64(params.step);
-
-    // Reject NaN/Infinity in start/end/step early so callers get a clear
-    // error instead of silently querying around epoch 0 or i64::MAX.
-    if params.start.is_nan()
-        || params.start.is_infinite()
-        || params.end.is_nan()
-        || params.end.is_infinite()
-        || params.step.is_nan()
-        || params.step.is_infinite()
-    {
-        return Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some("start, end, and step must be finite numbers".into()),
-            error_type: Some("bad_data".into()),
-        });
-    }
-
-    if step_ns <= 0 {
-        return Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some("step must be positive".into()),
-            error_type: Some("bad_data".into()),
-        });
-    }
+    let (query_str, start_ns, end_ns, step_ns) = match (|| {
+        Ok::<_, ServerError>((
+            params.require("query")?.to_string(),
+            parse_required_time(&params, "start")?,
+            parse_required_time(&params, "end")?,
+            params.duration("step")?.ok_or_else(|| {
+                ServerError::BadRequest("missing required parameter: step".into())
+            })?,
+        ))
+    })() {
+        Ok(v) => v,
+        Err(e) => return prom_error("bad_data", e.to_string()),
+    };
 
     if start_ns > end_ns {
-        return Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some("end timestamp must not be before start time".into()),
-            error_type: Some("bad_data".into()),
-        });
+        return prom_error("bad_data", "end timestamp must not be before start time");
     }
 
     // Guard against excessive evaluation points that could OOM the server.
     let max_points = state.config.max_range_query_points;
-    // Use i128 to avoid i64 overflow when end_ns and start_ns span the full i64 range.
-    let span = (end_ns as i128 - start_ns as i128) as u64;
+    // i128 avoids overflow when the range spans the whole i64 domain.
+    let span = (i128::from(end_ns) - i128::from(start_ns)) as u64;
     let num_points = span.checked_div(step_ns as u64).unwrap_or(0) + 1;
     if num_points > max_points {
-        return Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some(format!(
+        return prom_error(
+            "bad_data",
+            format!(
                 "query would produce {num_points} evaluation points, exceeding limit of {max_points}"
-            )),
-            error_type: Some("bad_data".into()),
-        });
+            ),
+        );
     }
 
-    let expr = match chronix::promql::parse(query_str) {
+    let expr = match chronix::promql::parse(&query_str) {
         Ok(e) => e,
-        Err(e) => {
-            return Json(PromResponse {
-                status: "error".into(),
-                data: None,
-                error: Some(e.to_string()),
-                error_type: Some("bad_data".into()),
-            });
-        }
+        Err(e) => return prom_error("bad_data", e.to_string()),
     };
 
     let query_kind = "range";
@@ -272,6 +227,7 @@ pub async fn prom_range_query_handler(
         step: Some(step_ns),
         max_series: state.config.prom_series_limit,
         max_memory_bytes: state.config.prom_max_result_bytes,
+        max_points: usize::try_from(max_points).unwrap_or(usize::MAX),
         ..Default::default()
     };
 
@@ -284,12 +240,7 @@ pub async fn prom_range_query_handler(
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), task).await {
             Ok(r) => r,
             Err(_) => {
-                return Json(PromResponse {
-                    status: "error".into(),
-                    data: None,
-                    error: Some(format!("query timed out after {timeout_secs}s")),
-                    error_type: Some("timeout".into()),
-                });
+                return prom_error("timeout", format!("query timed out after {timeout_secs}s"));
             }
         }
     } else {
@@ -302,31 +253,72 @@ pub async fn prom_range_query_handler(
     });
 
     match result {
-        Ok(Ok(value)) => Json(prom_value_to_response(value)),
-        Ok(Err(e)) => Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some(e.to_string()),
-            error_type: Some("execution".into()),
-        }),
-        Err(e) => Json(PromResponse {
-            status: "error".into(),
-            data: None,
-            error: Some(format!("query task failed: {e}")),
-            error_type: Some("internal".into()),
-        }),
+        Ok(Ok(value)) => Json(prom_value_to_response(value)).into_response(),
+        Ok(Err(e)) => prom_error("execution", e.to_string()),
+        Err(e) => prom_error("internal", format!("query task failed: {e}")),
     }
+}
+
+/// A `start`/`end` parameter, which the range API requires.
+fn parse_required_time(params: &super::PromParams, key: &str) -> Result<i64, ServerError> {
+    params
+        .time(key)?
+        .ok_or_else(|| ServerError::BadRequest(format!("missing required parameter: {key}")))
+}
+
+/// `GET /api/v1/status/buildinfo` — what Grafana probes on connect to
+/// decide which Prometheus features to offer.
+///
+/// Grafana's datasource calls this when you press "Save & test" and when it
+/// negotiates capabilities. A 404 here does not stop queries working, but it
+/// does make the datasource report itself as unhealthy, which is the first
+/// thing a new user sees.
+pub async fn prom_buildinfo_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "success",
+        "data": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "revision": option_env!("CHRONIX_GIT_SHA").unwrap_or("unknown"),
+            "branch": "",
+            "buildUser": "",
+            "buildDate": "",
+            "goVersion": "",
+            // Chronix is not Prometheus, and says so where a client can see
+            // it without breaking the schema Grafana parses.
+            "application": "chronixd",
+        }
+    }))
+}
+
+/// `GET /api/v1/rules` — chronix has no recording or alerting rules.
+///
+/// Answered as an empty, well-formed group list rather than a 404: Grafana's
+/// rule browser treats a missing endpoint as an error and an empty list as
+/// "nothing configured", and the second is the truth.
+pub async fn prom_empty_rules_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "success", "data": {"groups": []}}))
+}
+
+/// `GET /api/v1/alerts` — chronix has no alerting rules; its triggers are a
+/// different feature with its own API.
+pub async fn prom_empty_alerts_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "success", "data": {"alerts": []}}))
+}
+
+/// `GET /api/v1/query_exemplars` — exemplars are not stored.
+pub async fn prom_empty_exemplars_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "success", "data": []}))
 }
 
 /// `GET /api/v1/prom/labels` — every label name in the window.
 pub async fn prom_labels_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    prom_params: super::PromParams,
 ) -> Result<Json<PromListResponse>, ServerError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let params = PromSeriesQuery::parse(raw_query.as_deref());
+    let params = PromSeriesQuery::from_params(&prom_params)?;
     let (start_ns, end_ns) = params.window()?;
     let selectors = parse_selectors(&params.matchers)?;
     let limit = state.config.prom_series_limit;
@@ -353,11 +345,11 @@ pub async fn prom_label_values_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Path(label_name): Path<String>,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    prom_params: super::PromParams,
 ) -> Result<Json<PromListResponse>, ServerError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let params = PromSeriesQuery::parse(raw_query.as_deref());
+    let params = PromSeriesQuery::from_params(&prom_params)?;
     let (start_ns, end_ns) = params.window()?;
     let selectors = parse_selectors(&params.matchers)?;
     let limit = state.config.prom_series_limit;
@@ -457,27 +449,34 @@ fn parse_selectors(matchers: &[String]) -> Result<Vec<Selector>, ServerError> {
 pub struct PromSeriesQuery {
     /// Label matchers in the form `metric_name{label="value"}`.
     pub matchers: Vec<String>,
-    /// Optional start time filter (seconds since epoch).
-    pub start: Option<f64>,
-    /// Optional end time filter (seconds since epoch).
-    pub end: Option<f64>,
+    /// Optional start of the window, nanoseconds.
+    pub start: Option<i64>,
+    /// Optional end of the window, nanoseconds.
+    pub end: Option<i64>,
 }
 
 impl PromSeriesQuery {
-    /// Parse from a raw `application/x-www-form-urlencoded` query string.
-    fn parse(raw: Option<&str>) -> Self {
-        let mut out = Self::default();
-        for (key, value) in form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
-            match key.as_ref() {
-                // Prometheus clients send `match[]`; accept the unbracketed
-                // spelling too, since hand-written curl calls use it.
-                "match[]" | "match" => out.matchers.push(value.into_owned()),
-                "start" => out.start = value.parse().ok(),
-                "end" => out.end = value.parse().ok(),
-                _ => {}
-            }
-        }
-        out
+    /// Read the parameters from a request, whether they arrived in the query
+    /// string or in a POST form body.
+    ///
+    /// `start` and `end` accept RFC 3339 as well as a Unix timestamp, and an
+    /// unparseable one is an **error** rather than a silent fall back to the
+    /// default window: `start=yesterday` used to widen the scan to the last
+    /// hour and answer as though it had understood.
+    fn from_params(params: &super::PromParams) -> Result<Self, ServerError> {
+        let mut matchers: Vec<String> = params
+            .get_all("match[]")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        // Prometheus clients send `match[]`; hand-written curl calls use the
+        // unbracketed spelling, and repeats of either are a union.
+        matchers.extend(params.get_all("match").into_iter().map(str::to_string));
+        Ok(Self {
+            matchers,
+            start: params.time("start")?,
+            end: params.time("end")?,
+        })
     }
 
     /// Resolve the window, defaulting to the last hour.
@@ -488,11 +487,10 @@ impl PromSeriesQuery {
     fn window(&self) -> Result<(i64, i64), ServerError> {
         let now_ns = crate::util::now_nanos()?;
         let one_hour_ns: i64 = 3_600_000_000_000;
-        let start = self
-            .start
-            .map_or(now_ns - one_hour_ns, super::types::secs_to_nanos_i64);
-        let end = self.end.map_or(now_ns, super::types::secs_to_nanos_i64);
-        Ok((start, end))
+        Ok((
+            self.start.unwrap_or(now_ns - one_hour_ns),
+            self.end.unwrap_or(now_ns),
+        ))
     }
 }
 
@@ -623,11 +621,11 @@ fn observed_labels(
 pub async fn prom_series_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
-    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    prom_params: super::PromParams,
 ) -> Result<Json<PromListResponse>, ServerError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let params = PromSeriesQuery::parse(raw_query.as_deref());
+    let params = PromSeriesQuery::from_params(&prom_params)?;
     let matchers = params.matchers;
     let series_limit = state.config.prom_series_limit;
 
@@ -640,10 +638,8 @@ pub async fn prom_series_handler(
         .unwrap_or_default()
         .as_nanos() as i64;
     let one_hour_ns: i64 = 3_600_000_000_000;
-    let start_ns = params
-        .start
-        .map_or(now_ns - one_hour_ns, |s| (s * 1_000_000_000.0) as i64);
-    let end_ns = params.end.map_or(now_ns, |e| (e * 1_000_000_000.0) as i64);
+    let start_ns = params.start.unwrap_or(now_ns - one_hour_ns);
+    let end_ns = params.end.unwrap_or(now_ns);
 
     let series_list =
         tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, ServerError> {

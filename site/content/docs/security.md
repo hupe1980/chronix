@@ -7,6 +7,23 @@ weight = 60
 This guide covers authentication, authorization, Cedar policies, and mTLS
 configuration for Chronix.
 
+
+> ### Before a multi-tenant deployment
+>
+> Each of these is permissive when omitted, so none announces itself:
+>
+> - **`namespaces` on every API key**, or a `namespaces` claim on every JWT.
+>   A credential naming none may act in every tenant; `chronixd` refuses to
+>   start with `multi_tenancy = true` and an unconfined key.
+> - **`admin` on exactly the keys that need it.** Restore, namespace
+>   management and key management require it.
+> - **An `[audit]` section.** Without one the audit trail lives only in the
+>   process log and does not survive a restart.
+>
+> A namespace is a **tag**, not a storage boundary: segments are not
+> partitioned by tenant on disk, so it stops a request from crossing tenants
+> and does nothing about read access to the data directory.
+
 ## Overview
 
 Chronix provides a layered security model:
@@ -44,85 +61,99 @@ Chronix provides a layered security model:
 
 ## Authentication
 
+Authentication is on when the config has an `[auth]` section and off when it
+does not. There is no `enabled` flag and no `method` selector: every
+configured provider is tried, strongest first, so a deployment can accept
+mTLS, JWTs and API keys at once. An `[auth]` section that configures neither
+a key nor a JWT is a startup error, because it would otherwise start
+successfully and reject every request.
+
+Credentials arrive as `Authorization: Bearer <token>` in all cases. Chronix
+tells a JWT from an API key by structure — two or more dots means a JWT, and
+a JWT that fails validation is **never** retried as an API key, which would
+be an authentication downgrade.
+
 ### JWT Authentication
 
-Chronix validates JSON Web Tokens (JWT) for API authentication:
-
 ```toml
-[auth]
-enabled = true
-method = "jwt"
-
 [auth.jwt]
+algorithm = "RS256"
 issuer = "https://auth.example.com"
 audience = "chronix"
-jwks_url = "https://auth.example.com/.well-known/jwks.json"
-# require_audience = true  # default; set false only if tokens lack aud
+public_key_pem_file = "/etc/chronix/jwt-public.pem"
+# jwks_url = "https://auth.example.com/.well-known/jwks.json"
 ```
 
-The JWT `sub` claim maps to the Chronix principal identity. Additional claims
-can be mapped to roles via configuration.
+The JWT `sub` claim maps to the Chronix principal identity. Roles come from
+`role_claim` (dot-separated paths are supported, e.g. `realm_access.roles`
+for Keycloak). Two further claims are read directly: `namespaces` (an array
+of strings, or a single string) confines the token to those tenants, and
+`admin` (a boolean) grants administrative operations.
 
-**JWKS cache staleness:** When using `jwks_url`, Chronix enforces a maximum
-stale duration of **24 hours** (configurable via `jwks_max_stale`). If the
-JWKS endpoint is unreachable for longer than this window, cached keys are
-discarded and all JWT validations fail-closed until the endpoint recovers.
+**Key material follows the algorithm's family.** `HS256`/`HS384`/`HS512`
+read `secret`; `RS*`, `PS*`, `ES256`, `ES384` and `EdDSA` read
+`public_key_pem_file`; `jwks_url` replaces the file for providers that
+publish their own keys, and is fetched once at startup, so an unreachable
+issuer fails the start rather than every subsequent token. Pairing an
+algorithm with the wrong family's material is a startup error.
 
-**Supported algorithms:** HS256, HS384, HS512, RS256, RS384, RS512, ES256,
-ES384. Configuration with an unrecognized algorithm string will cause startup
-to fail (fail-closed). When no algorithm is specified, HS256 is used as the
-default.
+**Supported algorithms:** HS256, HS384, HS512, RS256, RS384, RS512, PS256,
+PS384, PS512, ES256, ES384, EdDSA. An unrecognised algorithm string fails the
+start. With none specified, HS256 is the default.
 
-**Replay protection (jti):** When a JWT includes a `jti` (JWT ID) claim,
-Chronix tracks seen token IDs in a bounded in-memory cache keyed by expiration
-time. Tokens with a previously-seen `jti` are rejected with
-`AuthError::TokenReplayed`, preventing replay attacks. Expired entries are
-evicted automatically on each validation. The cache is bounded at 100K entries;
-if the cache is full, new tokens are **rejected** (fail-closed) to prevent
-overflow from being exploited to bypass replay protection.
-The `jti` claim is optional per RFC 7519 — tokens without it are accepted
-normally.
+**Replay protection (jti):** When a JWT includes a `jti` claim, Chronix
+tracks seen token IDs in a bounded cache keyed by expiration time and rejects
+a repeat with `AuthError::TokenReplayed`. Expired entries are evicted on each
+validation. The cache holds 100K entries; when full, new tokens are
+**rejected** rather than admitted, so overflowing it cannot bypass replay
+protection. The claim is optional per RFC 7519; tokens without it are
+accepted normally.
 
 ### API Key Authentication
 
 For service-to-service communication:
 
 ```toml
-[auth]
-enabled = true
-method = "api_key"
-
-[auth.api_key]
-header = "X-API-Key"
-# Keys stored in the MetaNode cluster, managed via admin API
+[[auth.api_keys]]
+name = "ingest"
+key = "$CHRONIX_INGEST_KEY"   # env-var reference, Argon2 PHC string, or plain text
+namespaces = ["tenant-a"]     # tenants this key may act in
+admin = false                 # restore, namespace and key management
 ```
 
-API key management endpoints (`/api/v1/admin/auth/keys`) require admin-level
-authorization and are only accessible through the admin route group.
+`key` takes three forms: `$VAR` or `${VAR}` reads the value from the
+environment at startup, a string beginning `$argon2` is a pre-hashed PHC
+string loaded as-is, and anything else is plain text hashed with Argon2 on
+load. Prefer the first, so a key never sits in a config file.
 
-**Rate limiting:** API key authentication is protected by a per-source rate
+Keys can also be minted at runtime through `/api/v1/admin/auth/keys`, which
+requires an administrative credential. Under multi-tenancy the request must
+name the namespaces the new key may act in.
+
+**`namespaces` and `admin` both fail open when omitted**, which is why each
+has a guard. A key naming no namespaces reads every tenant, so a server with
+`multi_tenancy = true` refuses to start while one exists. A key without
+`admin` cannot reach the administrative endpoints.
+
+**Rate limiting:** API key authentication is protected by a per-prefix rate
 limiter. After **20 failed attempts** within a **60-second window**, further
-authentication attempts from the same source are rejected with
-`AuthError::RateLimited` until the window expires.
+attempts against that key are rejected with `AuthError::RateLimited` until
+the window expires. The limit is per prefix rather than global, so
+brute-forcing one key cannot lock out unrelated ones.
 
-**Performance:** API key validation uses a two-stage strategy to prevent
-CPU-exhaustion denial-of-service attacks. A SHA-256 prefix index narrows
-the candidate set to ~1 entry in O(1) time before running the expensive
-Argon2 verification (~100 ms). Without this, an attacker sending invalid
-keys would trigger O(N × 100 ms) scans across all stored keys.
+**Performance:** validation uses a two-stage strategy to prevent
+CPU-exhaustion denial of service. A SHA-256 prefix index narrows the
+candidate set to ~1 entry in O(1) before running the expensive Argon2
+verification (~100 ms). Without it, an attacker sending invalid keys would
+trigger O(N × 100 ms) scans across every stored key.
 
-**Key entropy:** API keys are generated with **256-bit** (32-byte)
-cryptographic randomness via `OsRng`, base64url-encoded. This provides full
-cryptographic strength. Keys are hashed with Argon2 before storage.
+**Key entropy:** keys are generated with **256-bit** randomness via `OsRng`,
+base64url-encoded, and hashed with Argon2 before storage.
 
-### Disabling Authentication (Development)
+### Running without authentication
 
-```toml
-[auth]
-enabled = false
-```
-
-**Warning:** Never disable authentication in production.
+Omit the `[auth]` section. Every endpoint is then open, which is right for a
+laptop and wrong for anything reachable by anyone else.
 
 ## Authorization (Cedar)
 
@@ -291,14 +322,10 @@ engine.add_policy("typo-policy",
 ### Authorization Configuration
 
 ```toml
-[authz]
-enabled = true
-engine = "cedar"
-default_decision = "deny"
-
-[authz.cedar]
-policy_dir = "/etc/chronix/policies/"
-# Policies are also stored in MetaNode cluster for replication
+# Cedar authorization is on when a policy directory is set, and off when it
+# is not. There is no `enabled` flag: an empty directory would be
+# default-deny and refuse everything.
+authz_policy_dir = "/etc/chronix/policies/"
 ```
 
 ### Namespace-Level Authorization (Rust API)
@@ -380,41 +407,16 @@ The `namespace_layer` middleware in `chronixd` automatically performs
 this check on every request when the authz engine is configured,
 using the `X-Namespace` header value as the target namespace.
 
-### Storage-Layer Tenant Isolation (Defense-in-Depth)
-
-In addition to Cedar policy-based authorization, Chronix enforces tenant
-isolation at the **storage layer** itself. Every `SegmentPath` includes a
-`namespace: NamespaceId` field that physically separates tenant data on disk
-and in object stores:
-
-```
-# On-disk layout
-data_dir/
-  ns_production/
-    shard_0/
-      segment_001.csx
-    shard_1/
-      segment_002.csx
-  ns_staging/
-    shard_0/
-      segment_003.csx
-
-# Object store layout
-ns_production/shard_0/segment_001.csx
-ns_staging/shard_0/segment_003.csx
-```
-
-This defense-in-depth design means that even if a Cedar policy is
-misconfigured or bypassed, a tenant's queries can only access segments
-within their namespace's storage prefix. The `list_segments()` API requires
-an explicit `&NamespaceId` parameter, preventing accidental cross-tenant
-enumeration.
-
 ## Namespace isolation
 
 Multi-tenancy is enforced by a tag stamped on every ingested point and applied
 to every read. It is off by default; `multi_tenancy = true` turns on both
 halves at once.
+
+**It is a tag, not a storage boundary.** Segments are not partitioned by
+tenant on disk, so the tag stops a request from crossing tenants and does
+nothing about read access to the data directory. Encrypt at rest and
+restrict directory permissions if that is in your threat model.
 
 ```text
 write   X-Namespace: tenant-a  ──▶  point.tags["__namespace__"] = "tenant-a"
@@ -431,10 +433,10 @@ Reads are scoped where the data is reached, not where the request is parsed:
 
 | Surface | How it is scoped |
 |---------|------------------|
-| `/api/v1/query`, `/api/v1/delete` | Namespace filter on the query plan |
-| `/api/v1/sql`, Flight SQL, gRPC `SqlQuery` | A session context whose table providers carry a mandatory filter |
+| `/api/v1/chronix/query`, `/api/v1/delete` | Namespace filter on the query plan |
+| `/api/v1/chronix/sql`, Flight SQL, gRPC `SqlQuery` | A session context whose table providers carry a mandatory filter, **and whose catalog lists only this namespace's measurements** |
 | PromQL instant and range queries | An evaluator scoped before any selector runs |
-| `/api/v1/prom/labels`, `/label/<name>/values`, `/series`, `/metadata` | Enumerated from the namespace's own data |
+| `/api/v1/labels`, `/label/<name>/values`, `/series`, `/metadata` | Enumerated from the namespace's own data |
 | Prometheus remote read | Namespace filter on the query plan |
 | `/api/v1/measurements` | Listed from the namespace's own data |
 
@@ -446,6 +448,12 @@ Three properties follow, and each is a test:
   name it — from PromQL label sets, and from schema listings.
 - **A scoped read cannot be widened.** The scope lives in the table provider
   and the evaluator, not in the query text.
+- **A name that exists elsewhere fails exactly as one that does not.** The
+  SQL catalog answers from a per-namespace index, so
+  `SELECT * FROM another_tenants_measurement` is "table not found" rather
+  than an empty result — the difference between those two is an oracle for
+  enumerating every other tenant's measurement names, and it is what kept
+  `information_schema` (and therefore `SHOW TABLES`) switched off.
 
 **Decide before ingesting.** Points written with tenancy off carry no
 namespace and are invisible to a scoped read; points written with it on are
@@ -480,24 +488,12 @@ openssl x509 -req -in client-csr.pem -CA ca-cert.pem -CAkey ca-key.pem \
 
 ```toml
 [tls]
-enabled = true
-cert_file = "/etc/chronix/certs/server-cert.pem"
-key_file = "/etc/chronix/certs/server-key.pem"
-ca_file = "/etc/chronix/certs/ca-cert.pem"
-require_client_cert = true  # Enforce mTLS
-min_version = "1.3"
+cert = "/etc/chronix/certs/server-cert.pem"
+key = "/etc/chronix/certs/server-key.pem"
 
-[mtls]
-enabled = true
-use_cn = true          # Extract identity from Common Name
-use_san_dns = false    # Extract identity from SAN DNS entries
-use_san_email = false  # Extract identity from SAN email entries
-
-# Optional: restrict accepted Common Names (allowlist)
-allowed_cns = ["chronix-client", "ingest-pipeline", "grafana-reader"]
-
-# Optional: maximum identity string length (default: 256)
-max_identity_len = 256
+# Setting a client CA turns on mTLS: a client certificate is then required
+# and verified against it. Identity comes from the certificate's CN.
+client_ca = "/etc/chronix/certs/ca-cert.pem"
 ```
 
 > **Note:** At least one of `use_cn`, `use_san_dns`, or `use_san_email` must be
@@ -535,10 +531,9 @@ DataNode ↔ DataNode) uses mTLS:
 
 ```toml
 [cluster.tls]
-enabled = true
-cert_file = "/etc/chronix/certs/node-cert.pem"
-key_file = "/etc/chronix/certs/node-key.pem"
-ca_file = "/etc/chronix/certs/ca-cert.pem"
+cert = "/etc/chronix/certs/node-cert.pem"
+key = "/etc/chronix/certs/node-key.pem"
+ca_cert = "/etc/chronix/certs/ca-cert.pem"
 ```
 
 ### Certificate rotation
@@ -548,7 +543,7 @@ Chronix watches certificate files for changes and hot-reloads **all endpoints**
 
 ```toml
 [tls]
-cert_reload_interval_secs = 300  # Check every 5 minutes
+reload_interval_secs = 300  # 0 disables polling
 ```
 
 **Implementation:**
@@ -643,9 +638,9 @@ All authorization decisions are recorded to an immutable audit log:
 
 ```toml
 [audit]
-enabled = true
-log_file = "/var/log/chronix/audit.log"
-format = "json"  # or "text"
+path = "/var/log/chronix/audit.jsonl"   # JSON lines, append-only, fsynced
+hmac_key_env = "CHRONIX_AUDIT_KEY"      # names the env var holding the key
+sync_each = true
 ```
 
 ### Audit Log Format
@@ -864,14 +859,25 @@ strict security rules (see [Identity Validation](#identity-validation)):
 
 ### Read-Only SQL Admission Control
 
-Every network-facing SQL surface — HTTP `/api/v1/sql`, gRPC `ExecuteSql`, and
+Every network-facing SQL surface — HTTP `/api/v1/chronix/sql`, gRPC `ExecuteSql`, and
 Flight SQL `DoGet` — admits **only pure read queries**. The check lives in one
 place, `chronix::sql::readonly`, and all three handlers call it.
 
-Rejected: DDL, DML, `COPY`, `Statement` plans (`SET`, `PREPARE`, `BEGIN`),
-`EXPLAIN`, `ANALYZE` and `DESCRIBE`. The first four can mutate state; the last
-three are side-effect-free but disclose internal plan shape, catalog layout and
-statistics.
+Rejected: DDL, DML, `COPY` and `Statement` plans (`SET`, `PREPARE`,
+`BEGIN`) — everything that can mutate state.
+
+`EXPLAIN`, `EXPLAIN ANALYZE` and `DESCRIBE` are **permitted**. They were
+refused as information disclosure, which cost the only way to find out
+whether a time filter pruned — the one question worth asking about a query
+against a time-series database — and disclosed nothing: the scan node's
+display is the caller's own query echoed back (a measurement name, a time
+range, a filter count, a limit), and under multi-tenancy the catalog it
+names is already scoped to the caller's namespace.
+
+What they wrap is held to the same rules. That distinction matters:
+`verify_plan` inspects the node it is handed, and an `Explain` around an
+`Insert` is not a DML node, so verifying the wrapper would have made
+`EXPLAIN ANALYZE INSERT` — which executes — a write with a fig leaf.
 
 Two properties make this sound:
 
@@ -881,9 +887,8 @@ Two properties make this sound:
    eagerly. Inspecting the returned `DataFrame`'s plan is therefore too late.
    Because `chronixd` shares one `Arc<SessionContext>` across all requests,
    tenants and namespaces, a caller holding nothing but query access could run
-   `SET datafusion.catalog.information_schema = true` and permanently re-enable
-   the catalog introspection that `create_session_context` deliberately
-   disables — process-wide. `CREATE EXTERNAL TABLE … LOCATION '<path>'`
+   `SET` and permanently change execution settings for every other tenant
+   — process-wide. `CREATE EXTERNAL TABLE … LOCATION '<path>'`
    likewise reached the object store before rejection, and returned
    distinguishable errors for existing versus missing paths: a filesystem
    existence oracle.
@@ -911,7 +916,7 @@ resource exhaustion:
 | `sql_query_timeout_secs` | `30` | Maximum seconds for SQL query execution including result streaming |
 | `prom_query_timeout_secs` | `30` | Maximum seconds for PromQL query execution (0 = disabled) |
 | `sql_max_rows` | `100000` | Maximum rows returned by a single SQL query |
-| `prom_series_limit` | `10000` | Maximum label-sets returned by `/api/v1/prom/series` |
+| `prom_series_limit` | `10000` | Maximum label-sets returned by `/api/v1/series` |
 
 Queries exceeding the timeout are cancelled; queries exceeding the row limit
 return a truncated result set with a warning header.
@@ -978,8 +983,8 @@ This prevents misconfigured detectors from entering the model catalog.
 - [ ] Use environment variables or secrets manager for sensitive config
 - [ ] Enable encryption at rest (`storage.encryption.enabled = true`) with proper key management
 - [ ] Verify JWT `jti` replay protection is active if tokens include `jti` claims
-- [ ] Confirm webhook URLs use HTTPS (SSRF protection enabled by default)
-- [ ] Use `${ENV_VAR}` syntax for webhook `auth_header` — never embed literal tokens in config
+- [ ] Confirm webhook URLs use HTTPS (enforced; the SSRF address rule is on by default and `triggers.webhook_allow_private_targets` is the named way off)
+- [ ] Use `$VAR` syntax for connector credentials, and `CHRONIX_WEBHOOK_SIGNING_SECRET` for the webhook signing key — never embed literal secrets in config
 - [ ] Review audit event coverage (26 built-in action types)
 
 ### Namespace Security
@@ -1102,19 +1107,34 @@ Rules:
 
 ### Webhook URL SSRF Protection
 
-Webhook URLs in signal trigger `DELIVER` clauses are validated to prevent
-Server-Side Request Forgery (SSRF):
+A URL the database fetches is a request-forgery primitive pointed at your own
+network, so it is checked twice.
 
-- **HTTPS required** — webhook URLs must use `https://` (HTTP is only
-  permitted for `localhost`/`127.0.0.1`/`::1` during development)
-- **Private IP blocking** — resolved IP addresses in RFC 1918 ranges
-  (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback
-  (`127.0.0.0/8`), and link-local (`169.254.0.0/16`) are rejected
-  (with an exception for localhost)
-- **Scheme validation** — only `https` and `http` schemes are accepted;
-  `file://`, `ftp://`, etc. are blocked
+**At `CREATE TRIGGER`** — where the URL may come from a tenant:
 
-Invalid webhook URLs are rejected at SQL parse time with a descriptive error.
+- **HTTPS only.** A payload carries the alert's contents and its HMAC
+  signature; there is no localhost exception.
+- **No userinfo.** `https://evil.com@169.254.169.254/` is refused — credentials
+  belong in a header.
+- **No internal host name.** `localhost`, and anything under `.localhost`,
+  `.local`, `.internal`, `.home.arpa` or `.onion`.
+- **No non-routable IP literal.** Loopback, RFC1918, link-local (the cloud
+  metadata service), carrier-grade NAT `100.64.0.0/10`, multicast, broadcast
+  and reserved space — IPv4 and IPv6, including IPv4-mapped, IPv4-compatible
+  and 6to4 forms.
+
+URLs are parsed with the same WHATWG parser the HTTP client uses, so the host
+the check sees is the host the request reaches — including decimal, octal and
+hexadecimal IPv4 literals, and bracketed IPv6.
+
+**At the connection**, in `WebhookChannel`: the host is resolved, **every**
+resolved address is checked, and the client is pinned to exactly those
+addresses. Checking a name and then letting the client resolve it again would
+leave DNS rebinding open.
+
+`WebhookConfig::allow_private_targets` waives the address rule for an operator
+pointing a webhook at their own network. Off by default; the trigger DSL never
+sets it.
 
 ## Dashboard HTTPS Enforcement
 

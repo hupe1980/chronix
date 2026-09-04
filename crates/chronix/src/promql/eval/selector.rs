@@ -26,7 +26,9 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
-use crate::promql::ast::{Duration, Expr, LabelMatcher, MatchOp, PromQLValue, Sample, Series};
+use crate::promql::ast::{
+    AtModifier, Duration, Expr, LabelMatcher, MatchOp, PromQLValue, Sample, Series,
+};
 
 use super::{compile_post_filters, CompiledMatcher, EvalError, PromQLEvaluator, QueryParams};
 use super::{ScanKey, SCAN_CACHE_CAPACITY};
@@ -109,6 +111,7 @@ impl PromQLEvaluator {
         name: &Option<String>,
         matchers: &[LabelMatcher],
         offset: &Option<Duration>,
+        at: Option<AtModifier>,
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
         // Check for __name__ regex/not-equal matchers — they require
@@ -137,7 +140,7 @@ impl PromQLEvaluator {
                 // Evaluate with this specific measurement
                 let sub_name = Some(measurement.clone());
                 if let PromQLValue::Vector(series) =
-                    self.eval_vector_selector(&sub_name, matchers, offset, params)?
+                    self.eval_vector_selector(&sub_name, matchers, offset, at, params)?
                 {
                     all_series.extend(series);
                 }
@@ -147,7 +150,7 @@ impl PromQLEvaluator {
 
         let measurement = resolve_measurement(name, matchers, "vector selector")?;
         let offset_ns = offset.map_or(0, |d| d.as_nanos());
-        let eval_time = params.time - offset_ns;
+        let eval_time = pinned_eval_time(params, at).saturating_sub(offset_ns);
         let lookback_start = eval_time - params.lookback_delta;
 
         let (fetch_start, fetch_end) = fetch_window(
@@ -156,6 +159,7 @@ impl PromQLEvaluator {
             params.lookback_delta,
             lookback_start,
             eval_time,
+            at.is_some(),
         );
         let batches = self.fetch_scan(measurement, matchers, fetch_start, fetch_end)?;
         let post_filters = compile_post_filters(matchers)?;
@@ -193,6 +197,7 @@ impl PromQLEvaluator {
             name,
             matchers,
             offset,
+            at,
         } = vector
         else {
             return Err(EvalError("matrix selector requires vector selector".into()));
@@ -200,11 +205,17 @@ impl PromQLEvaluator {
 
         let measurement = resolve_measurement(name, matchers, "matrix selector")?;
         let offset_ns = offset.map_or(0, |d| d.as_nanos());
-        let eval_time = params.time - offset_ns;
+        let eval_time = pinned_eval_time(params, *at).saturating_sub(offset_ns);
         let range_start = eval_time - range.as_nanos();
 
-        let (fetch_start, fetch_end) =
-            fetch_window(params, offset_ns, range.as_nanos(), range_start, eval_time);
+        let (fetch_start, fetch_end) = fetch_window(
+            params,
+            offset_ns,
+            range.as_nanos(),
+            range_start,
+            eval_time,
+            at.is_some(),
+        );
         let batches = self.fetch_scan(measurement, matchers, fetch_start, fetch_end)?;
         let post_filters = compile_post_filters(matchers)?;
         let series_map =
@@ -258,7 +269,15 @@ fn fetch_window(
     reach_ns: i64,
     window_start: i64,
     eval_time: i64,
+    pinned: bool,
 ) -> (i64, i64) {
+    // A selector pinned with `@` reads one fixed window whatever the step, and
+    // that window is usually *outside* the range query's prefetch span — so
+    // widening to the prefetch window would miss the data entirely. Its own
+    // window is also the cheapest scan available, since it is read once.
+    if pinned {
+        return (window_start, eval_time.saturating_add(1));
+    }
     match (params.range_fetch_start, params.range_fetch_end) {
         // `range_fetch_start` is `query_start - lookback_delta`; recover the
         // query start so the selector's own reach can be applied instead.
@@ -272,6 +291,21 @@ fn fetch_window(
             )
         }
         _ => (window_start, eval_time + 1),
+    }
+}
+
+/// The instant a selector evaluates at, before its offset is applied.
+///
+/// `@` replaces the evaluation time outright; `@ start()` and `@ end()` take
+/// the range query's own bounds, which for an instant query are both the
+/// evaluation time — the same resolution Prometheus's engine makes.
+fn pinned_eval_time(params: &QueryParams, at: Option<AtModifier>) -> i64 {
+    match at {
+        None => params.time,
+        Some(at) => at.resolve(
+            params.start.unwrap_or(params.time),
+            params.end.unwrap_or(params.time),
+        ),
     }
 }
 

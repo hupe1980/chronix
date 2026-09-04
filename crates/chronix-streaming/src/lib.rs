@@ -5,7 +5,7 @@
 //!
 //! - [`cdc`] — change data capture: bounded broadcast event bus, filtered and
 //!   resumable subscriptions, durable event log, incrementally maintained
-//!   continuous aggregations, and (feature `flight`) Arrow Flight CDC export.
+//!   and (feature `flight`) Arrow Flight CDC export.
 //! - [`signal`] — programmable signals: trigger engine (anomaly score,
 //!   forecast deviation, thresholds, moving-average crossover, rate of
 //!   change), SQL trigger management, and delivery with retry + dead-letter

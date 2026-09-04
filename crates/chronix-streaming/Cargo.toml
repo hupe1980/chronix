@@ -48,6 +48,10 @@ fnv.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 reqwest = { workspace = true }
+# The webhook SSRF check must parse a URL exactly the way the client that
+# will make the request parses it; hand-rolled splitting is what let
+# `https://[::1]/` and `https://evil.com@169.254.169.254/` through.
+url = "2"
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
 uuid.workspace = true

@@ -139,20 +139,30 @@ fn main() {
     // ── 3. Drift Detection ────────────────────────────────────────
     println!("\n--- Drift Detection ---");
 
-    // Training distribution (normal operation)
-    let training_data: Vec<f64> = (0..500)
-        .map(|i| 50.0 + (i as f64 * 0.01).sin() * 5.0)
-        .collect();
-
-    // Current distribution (drifted — higher mean, different variance)
-    let drifted_data: Vec<f64> = (0..500)
-        .map(|i| 70.0 + (i as f64 * 0.02).cos() * 15.0)
-        .collect();
-
-    // Stable distribution (no drift)
-    let stable_data: Vec<f64> = (0..500)
-        .map(|i| 50.5 + (i as f64 * 0.01).sin() * 5.2)
-        .collect();
+    // Three samples from a deterministic pseudo-random generator, so the
+    // labels below are honest: "stable" is the *same* distribution with a
+    // different seed, "drifted" has a higher mean and a wider spread. A
+    // smooth sine sampled over a few radians is not a distribution, and two
+    // slightly different sines really are different distributions — which
+    // is what every detector correctly said when this example used them.
+    fn sample(seed: u64, mean: f64, spread: f64, n: usize) -> Vec<f64> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                // xorshift64*, then a sum of two uniforms for a bell-ish shape
+                let mut next = || {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+                };
+                mean + (next() + next() - 1.0) * spread
+            })
+            .collect()
+    }
+    let training_data = sample(0x9E37_79B9, 50.0, 10.0, 500);
+    let drifted_data = sample(0xD1B5_4A32, 70.0, 30.0, 500);
+    let stable_data = sample(0x2545_F491, 50.0, 10.0, 500);
 
     let detectors = [
         ("PSI", DriftDetector::Psi { threshold: 0.25 }),

@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -15,6 +16,11 @@ use crate::cdc::event::CdcEvent;
 use crate::cdc::event_log::DurableEventLog;
 
 /// Default channel capacity (number of events before oldest are dropped).
+///
+/// Sized for a server: at 100 K points/s this is roughly half a second of
+/// tolerance for a slow subscriber, and at a gateway's 50 points/s it is
+/// twenty-two minutes. One number cannot serve both, which is why the
+/// capacity is configurable.
 pub const DEFAULT_CAPACITY: usize = 65_536;
 
 /// Default maximum number of concurrent subscribers.
@@ -41,7 +47,14 @@ pub(crate) struct BusStats {
 /// are silently dropped and the subscriber sees a gap on its next receive.
 #[derive(Clone)]
 pub struct EventBus {
-    sender: broadcast::Sender<CdcEvent>,
+    /// The broadcast ring, created on the first subscription.
+    ///
+    /// `tokio::sync::broadcast::channel` allocates its whole ring up front, so
+    /// building it eagerly costs 7 MiB at `DEFAULT_CAPACITY` whether or not
+    /// anything ever subscribes. Deferring is semantically free: a broadcast
+    /// channel only delivers to receivers that existed before the send, so an
+    /// event published with no subscribers is dropped either way.
+    sender: OnceLock<broadcast::Sender<CdcEvent>>,
     stats: Arc<BusStats>,
     /// Serializes sequence-number assignment + publish so events arrive
     /// in monotonic order. The critical section is tiny (atomic increment
@@ -58,9 +71,8 @@ impl EventBus {
     /// Creates a new event bus with the specified capacity.
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
-        let (sender, _) = broadcast::channel(cap);
         Self {
-            sender,
+            sender: OnceLock::new(),
             stats: Arc::new(BusStats {
                 published: AtomicU64::new(0),
                 lagged: AtomicU64::new(0),
@@ -143,7 +155,9 @@ impl EventBus {
         // subscribers. The critical section is tiny (channel send only).
         let _guard = self.publish_lock.lock();
         // No active receivers → event is discarded, returns 0
-        self.sender.send(event).unwrap_or_default()
+        self.sender
+            .get()
+            .map_or(0, |s| s.send(event).unwrap_or_default())
     }
 
     /// Publishes a batch of events, coalescing durable-log flushes.
@@ -187,7 +201,10 @@ impl EventBus {
         let _guard = self.publish_lock.lock();
         let mut total = 0;
         for event in events.iter() {
-            total += self.sender.send(event.clone()).unwrap_or_default();
+            total += self
+                .sender
+                .get()
+                .map_or(0, |s| s.send(event.clone()).unwrap_or_default());
         }
         total
     }
@@ -219,16 +236,16 @@ impl EventBus {
     /// Returns `None` if the subscriber count has reached the
     /// configured maximum, preventing DoS via subscription explosion.
     pub fn try_subscribe(&self) -> Option<Subscription> {
-        if self.sender.receiver_count() >= self.max_subscribers {
+        if self.subscriber_count() >= self.max_subscribers {
             tracing::warn!(
-                current = self.sender.receiver_count(),
+                current = self.subscriber_count(),
                 max = self.max_subscribers,
                 "subscription rejected: max subscribers reached"
             );
             return None;
         }
         Some(Subscription {
-            receiver: self.sender.subscribe(),
+            receiver: self.ring().subscribe(),
             stats: Arc::clone(&self.stats),
             gaps: 0,
             last_lag_warn: None,
@@ -240,6 +257,15 @@ impl EventBus {
     /// Prefer [`try_subscribe`](Self::try_subscribe) in production code.
     pub fn subscribe(&self) -> Subscription {
         self.try_subscribe().expect("max subscribers reached")
+    }
+
+    /// The broadcast ring, allocating it on first use.
+    ///
+    /// Only a subscription reaches this; publishing without one never
+    /// allocates.
+    fn ring(&self) -> &broadcast::Sender<CdcEvent> {
+        self.sender
+            .get_or_init(|| broadcast::channel(self.capacity).0)
     }
 
     /// Returns a shared reference to the bus stats (for CDC streams).
@@ -269,7 +295,9 @@ impl EventBus {
 
     /// Returns the number of active subscribers.
     pub fn subscriber_count(&self) -> usize {
-        self.sender.receiver_count()
+        self.sender
+            .get()
+            .map_or(0, broadcast::Sender::receiver_count)
     }
 }
 

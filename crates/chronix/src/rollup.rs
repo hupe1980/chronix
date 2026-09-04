@@ -1,17 +1,24 @@
-//! Rollup configuration and incremental rollup computation.
+//! Rollup configuration, the streaming bucket accumulator, and the
+//! materialisation watermarks.
 //!
 //! Rollups downsample raw data into coarser time buckets, enabling fast
-//! long-range queries.  Rollup definitions are stored in the catalog and
-//! executed incrementally during compaction.
+//! long-range queries and a long-retention tier. A rollup is
+//! **materialised**, never computed from a segment: every bucket is
+//! aggregated exactly once, over all the data that can ever reach it, by
+//! [`Chronix::materialise_rollups`](crate::Chronix::materialise_rollups),
+//! and the registry records how far each rollup has got.
 //!
 //! ## Multi-tier chains
 //!
 //! ```text
-//! raw (10s) ──[5min rollup]──► raw_5min ──[1h rollup]──► raw_1h ──[1d rollup]──► raw_1d
+//! raw (1s) ──[1min rollup]──► raw_1m ──[15min rollup]──► raw_15m
 //! ```
+//!
+//! A tier whose source is itself a rollup target is materialised only as
+//! far as its source has been, so the chain stays consistent by
+//! construction.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +49,9 @@ pub enum RollupAggFn {
     Sum,
     /// Count of data points.
     Count,
+    /// First (oldest) value in the bucket — with `Last`, what a meter
+    /// reading needs to become consumption per bucket.
+    First,
     /// Last (most recent) value.
     Last,
 }
@@ -54,6 +64,7 @@ impl std::fmt::Display for RollupAggFn {
             Self::Max => write!(f, "max"),
             Self::Sum => write!(f, "sum"),
             Self::Count => write!(f, "count"),
+            Self::First => write!(f, "first"),
             Self::Last => write!(f, "last"),
         }
     }
@@ -208,10 +219,86 @@ impl Default for RollupBuilder {
     }
 }
 
-/// Registry of rollup configurations.
+/// The maximum number of invalidated ranges kept per rollup before they are
+/// merged into their hull.
+///
+/// A bounded log: a pathological writer scattering single points across a
+/// year cannot make the catalog grow without limit. Merging costs
+/// re-aggregation work, never correctness — the hull covers every range it
+/// replaces.
+const MAX_INVALID_RANGES: usize = 64;
+
+/// How far a rollup has been materialised, and which buckets below that
+/// watermark have to be computed again.
+///
+/// The watermark alone is not enough. A rollup bucket is aggregated when
+/// its input is final, but "final" is a statement about the *live* write
+/// path: a backfill, a delete, or an import can change a bucket's input
+/// long afterwards. Every such write records the range it touched here, and
+/// the next materialisation pass recomputes exactly those buckets before it
+/// advances the watermark.
+///
+/// This is the same shape as TimescaleDB's invalidation log, with one
+/// difference that matters: an invalidation outside Timescale's refresh
+/// window is never revisited and the bucket stays wrong for ever, whereas
+/// these are drained by the ordinary background pass. It is also what lets
+/// the watermark be *aggressive* rather than exact — a bucket that turns out
+/// not to have been final is repaired, not lost.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollupState {
+    /// Exclusive end of the newest bucket that has been materialised, or
+    /// `None` if nothing has been.
+    pub materialised_until: Option<i64>,
+    /// Half-open `[from, to)` ranges below the watermark whose buckets must
+    /// be recomputed. Disjoint and ascending.
+    #[serde(default)]
+    pub invalid: Vec<(i64, i64)>,
+}
+
+impl RollupState {
+    /// Record that `[from, to)` has to be recomputed.
+    ///
+    /// Ranges are kept disjoint, ascending and bounded in number; the parts
+    /// at or above the watermark are dropped, because the watermark has not
+    /// claimed them yet.
+    pub fn invalidate(&mut self, from: i64, to: i64) {
+        let Some(watermark) = self.materialised_until else {
+            return;
+        };
+        let to = to.min(watermark);
+        if from >= to {
+            return;
+        }
+        self.invalid.push((from, to));
+        self.invalid.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(self.invalid.len());
+        for (lo, hi) in self.invalid.drain(..) {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        if merged.len() > MAX_INVALID_RANGES {
+            let lo = merged.first().map_or(from, |r| r.0);
+            let hi = merged.last().map_or(to, |r| r.1);
+            merged = vec![(lo, hi)];
+        }
+        self.invalid = merged;
+    }
+
+    /// The ranges to recompute, and the total span they cover.
+    #[must_use]
+    pub fn pending_invalidations(&self) -> &[(i64, i64)] {
+        &self.invalid
+    }
+}
+
+/// Registry of rollup configurations and their materialisation state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RollupRegistry {
     configs: BTreeMap<String, RollupConfig>,
+    #[serde(default)]
+    state: BTreeMap<String, RollupState>,
 }
 
 impl RollupRegistry {
@@ -237,7 +324,129 @@ impl RollupRegistry {
     /// Remove a rollup configuration by name.
     #[must_use]
     pub fn remove(&mut self, name: &str) -> Option<RollupConfig> {
+        self.state.remove(name);
         self.configs.remove(name)
+    }
+
+    /// The materialisation state of a rollup.
+    #[must_use]
+    pub fn state(&self, name: &str) -> RollupState {
+        self.state.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Record that `name` has been materialised up to `until` (exclusive).
+    /// Never moves a watermark backwards.
+    pub fn set_materialised_until(&mut self, name: &str, until: i64) {
+        let entry = self.state.entry(name.to_string()).or_default();
+        if entry.materialised_until.is_none_or(|cur| until > cur) {
+            entry.materialised_until = Some(until);
+        }
+    }
+
+    /// Replace a rollup's state wholesale (used when loading a catalog).
+    pub fn set_state(&mut self, name: &str, state: RollupState) {
+        self.state.insert(name.to_string(), state);
+    }
+
+    /// Record that `[from, to)` of `measurement` changed, so every rollup
+    /// fed by it — directly or through another rollup — has to recompute
+    /// the buckets covering that range.
+    ///
+    /// Returns the names whose state changed.
+    pub fn invalidate_source_range(
+        &mut self,
+        measurement: &str,
+        from: i64,
+        to: i64,
+    ) -> Vec<String> {
+        let affected: Vec<(String, i64)> = self
+            .rollups_rooted_at(measurement)
+            .into_iter()
+            .map(|c| (c.name.clone(), c.interval_ns))
+            .collect();
+        let mut changed = Vec::new();
+        for (name, interval) in affected {
+            let lo = align_to_bucket(from, interval);
+            let hi = align_to_bucket(to.saturating_sub(1), interval).saturating_add(interval);
+            let entry = self.state.entry(name.clone()).or_default();
+            let before = entry.invalid.clone();
+            entry.invalidate(lo, hi);
+            if entry.invalid != before {
+                changed.push(name);
+            }
+        }
+        changed
+    }
+
+    /// Drop the invalidated ranges of `name` that have been recomputed.
+    pub fn clear_invalidations(&mut self, name: &str, done: &[(i64, i64)]) {
+        if let Some(state) = self.state.get_mut(name) {
+            state.invalid.retain(|r| !done.contains(r));
+        }
+    }
+
+    /// Is `measurement` the target of some rollup?
+    #[must_use]
+    pub fn is_rollup_target(&self, measurement: &str) -> bool {
+        self.configs
+            .values()
+            .any(|c| c.target_measurement == measurement)
+    }
+
+    /// Would adding `candidate` make a measurement feed itself?
+    ///
+    /// A cycle is not a theoretical worry: `a → b` plus `b → a` makes the
+    /// materialiser's chain loop write each tier from the other's output
+    /// for ever, and retention then waits on a watermark that can never
+    /// pass.
+    #[must_use]
+    pub fn would_cycle(&self, candidate: &RollupConfig) -> bool {
+        if candidate.source_measurement == candidate.target_measurement {
+            return true;
+        }
+        // Walk forward from the candidate's target: reaching its source
+        // means the new edge closes a loop.
+        let mut frontier = vec![candidate.target_measurement.as_str()];
+        let mut seen: std::collections::HashSet<&str> = frontier.iter().copied().collect();
+        while let Some(m) = frontier.pop() {
+            if m == candidate.source_measurement {
+                return true;
+            }
+            for c in self.rollups_for_source(m) {
+                if seen.insert(&c.target_measurement) {
+                    frontier.push(&c.target_measurement);
+                }
+            }
+        }
+        false
+    }
+
+    /// Every rollup fed, directly or through other rollups, by `source`.
+    ///
+    /// This is the set that must be materialised past a window before the
+    /// raw data in it may be dropped: a 1 s → 1 min → 15 min cascade whose
+    /// 15 min tier has not caught up has not yet produced the aggregate the
+    /// raw data is being traded for.
+    #[must_use]
+    pub fn rollups_rooted_at(&self, source: &str) -> Vec<&RollupConfig> {
+        let mut out: Vec<&RollupConfig> = Vec::new();
+        let mut frontier: Vec<&str> = vec![source];
+        let mut seen: std::collections::HashSet<&str> = frontier.iter().copied().collect();
+        while let Some(m) = frontier.pop() {
+            for c in self.rollups_for_source(m) {
+                if out.iter().any(|o| o.name == c.name) {
+                    continue;
+                }
+                out.push(c);
+                // `seen` bounds the walk even if a cycle reached the
+                // registry some other way; `would_cycle` refuses to create
+                // one, but a loop here would hang a background pass.
+                if seen.insert(&c.target_measurement) {
+                    frontier.push(&c.target_measurement);
+                }
+            }
+        }
+        out
     }
 
     /// List all rollup configurations.
@@ -261,65 +470,9 @@ impl RollupRegistry {
             .collect()
     }
 
-    /// Persist the registry to a JSON file at the given path.
-    ///
-    /// The file is written atomically (write to `.tmp`, then rename) to avoid
-    /// corruption on crash.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization or file I/O fails.
-    pub fn save(&self, path: &Path) -> std::result::Result<(), RollupError> {
-        let json = serde_json::to_string_pretty(self).map_err(|e| {
-            RollupError::Persistence(format!("failed to serialize rollup registry: {e}"))
-        })?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json.as_bytes()).map_err(|e| {
-            RollupError::Persistence(format!(
-                "failed to write rollup registry to {}: {e}",
-                tmp.display()
-            ))
-        })?;
-        std::fs::rename(&tmp, path).map_err(|e| {
-            RollupError::Persistence(format!(
-                "failed to rename {} -> {}: {e}",
-                tmp.display(),
-                path.display()
-            ))
-        })?;
-        Ok(())
-    }
-
-    /// Load the registry from a JSON file.
-    ///
-    /// If the file does not exist an empty registry is returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file exists but cannot be read or parsed.
-    pub fn load(path: &Path) -> std::result::Result<Self, RollupError> {
-        if !path.exists() {
-            return Ok(Self::new());
-        }
-        let data = std::fs::read_to_string(path).map_err(|e| {
-            RollupError::Persistence(format!(
-                "failed to read rollup registry from {}: {e}",
-                path.display()
-            ))
-        })?;
-        let registry: Self = serde_json::from_str(&data).map_err(|e| {
-            RollupError::Persistence(format!(
-                "failed to parse rollup registry from {}: {e}",
-                path.display()
-            ))
-        })?;
-        Ok(registry)
-    }
-
-    /// Return the canonical filename for persisted rollup registries.
-    #[must_use]
-    pub fn filename() -> &'static str {
-        "rollup_registry.json"
+    /// Every rollup's state, for persistence.
+    pub fn states(&self) -> impl Iterator<Item = (&String, &RollupState)> {
+        self.state.iter()
     }
 }
 
@@ -339,6 +492,8 @@ struct FieldStats {
     min: f64,
     max: f64,
     count: u64,
+    first_ts: i64,
+    first_value: f64,
     last_ts: i64,
     last_value: f64,
 }
@@ -350,6 +505,8 @@ impl FieldStats {
             min: f64::MAX,
             max: f64::MIN,
             count: 0,
+            first_ts: i64::MAX,
+            first_value: 0.0,
             last_ts: i64::MIN,
             last_value: 0.0,
         }
@@ -366,6 +523,10 @@ impl FieldStats {
         self.min = self.min.min(value);
         self.max = self.max.max(value);
         self.count += 1;
+        if timestamp < self.first_ts {
+            self.first_ts = timestamp;
+            self.first_value = value;
+        }
         if timestamp >= self.last_ts {
             self.last_ts = timestamp;
             self.last_value = value;
@@ -422,6 +583,7 @@ impl BucketAccumulator {
                     RollupAggFn::Sum => stats.sum,
                     #[allow(clippy::cast_precision_loss)]
                     RollupAggFn::Count => stats.count as f64,
+                    RollupAggFn::First => stats.first_value,
                     RollupAggFn::Last => stats.last_value,
                 };
                 aggs.insert(agg_fn, value);
@@ -444,48 +606,90 @@ impl BucketAccumulator {
 #[must_use]
 pub fn align_to_bucket(ts: i64, interval_ns: i64) -> i64 {
     let safe_interval = interval_ns.max(1);
-    ts - ts.rem_euclid(safe_interval)
+    // `rem_euclid` is non-negative, so this can only underflow, and only
+    // within one interval of the floor. Saturating is exactly right there:
+    // the bucket containing `i64::MIN` starts at `i64::MIN`.
+    ts.saturating_sub(ts.rem_euclid(safe_interval))
 }
 
-/// Compute rollup points from Arrow `RecordBatches`.
+/// Streaming rollup accumulator: folds time-ordered batches into buckets
+/// and emits a bucket once a later one has started.
 ///
-/// Scans batches for a timestamp column and float field columns, groups
-/// values into time buckets according to `config.interval_ns`, and emits
-/// one [`chronix_core::Point`] per bucket per tag group containing all
-/// requested aggregations as separate fields.
+/// **Rows must arrive in ascending timestamp order**, within a batch and
+/// across calls, which is what the scan iterator produces
+/// ([`Chronix::execute_iter`](crate::Chronix::execute_iter) sorts every
+/// bucket it emits). Then, when a row for bucket `B` arrives, every open
+/// bucket before `B` is complete for every tag group, and memory is one
+/// open bucket per group rather than the whole input.
 ///
-/// # Arguments
-///
-/// * `batches` — Input record batches (must contain a `"timestamp"` column).
-/// * `config` — Rollup configuration defining interval, aggregations, etc.
-///
-/// # Returns
-///
-/// Vector of rollup [`chronix_core::Point`]s to be inserted into the target
-/// measurement.
-#[must_use]
-pub fn compute_rollup_points(
-    batches: &[arrow::record_batch::RecordBatch],
-    config: &RollupConfig,
-) -> Vec<chronix_core::Point> {
-    use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+/// The precondition is checked rather than assumed: a row that goes
+/// backwards past an already-emitted bucket sets `saw_unordered_input`, and
+/// the materialiser turns that into an error instead of writing a partial
+/// aggregate. It was silently violated once — a single-segment scan came
+/// back in series-major order, so each series closed the same bucket in
+/// turn and last-write-wins kept one series' worth of a 20-series
+/// aggregate.
+pub struct RollupAccumulator<'a> {
+    config: &'a RollupConfig,
+    open: BTreeMap<(i64, BTreeMap<String, String>), BucketAccumulator>,
+    /// The newest bucket start emitted so far — nothing older may arrive.
+    closed_through: Option<i64>,
+    /// Set when a row arrived for a bucket that had already been emitted.
+    unordered: bool,
+    /// When set, `push` emits nothing and every bucket is held until
+    /// `finish` — for callers whose input is complete but unordered.
+    hold_everything: bool,
+}
 
-    // Group key = (bucket_start, tag_group_key)
-    let mut accumulators: BTreeMap<(i64, BTreeMap<String, String>), BucketAccumulator> =
-        BTreeMap::new();
+impl<'a> RollupAccumulator<'a> {
+    /// Create an accumulator for `config`.
+    #[must_use]
+    pub fn new(config: &'a RollupConfig) -> Self {
+        Self {
+            config,
+            open: BTreeMap::new(),
+            closed_through: None,
+            unordered: false,
+            hold_everything: false,
+        }
+    }
 
-    for batch in batches {
-        // Find timestamp column index
+    /// An accumulator for input that is complete but not time-ordered: no
+    /// bucket is emitted until [`finish`](Self::finish), so memory is the
+    /// whole input rather than one open bucket per group.
+    #[must_use]
+    pub fn unordered(config: &'a RollupConfig) -> Self {
+        Self {
+            hold_everything: true,
+            ..Self::new(config)
+        }
+    }
+
+    /// `true` if a row arrived for a bucket that had already been emitted,
+    /// which means the input was not time-ordered and the aggregates this
+    /// accumulator produced are partial.
+    #[must_use]
+    pub fn saw_unordered_input(&self) -> bool {
+        self.unordered
+    }
+
+    /// Fold one batch in. Returns the rollup points of every bucket that is
+    /// now provably complete.
+    pub fn push(&mut self, batch: &arrow::record_batch::RecordBatch) -> Vec<chronix_core::Point> {
+        use arrow::array::{Array, Float64Array, Int64Array, StringArray, UInt64Array};
+
         let Ok(ts_idx) = batch.schema().index_of("timestamp") else {
-            continue;
+            return Vec::new();
         };
-        let ts_array = batch.column(ts_idx).as_any().downcast_ref::<Int64Array>();
-        let Some(ts_array) = ts_array else {
-            continue;
+        let Some(ts_array) = batch.column(ts_idx).as_any().downcast_ref::<Int64Array>() else {
+            return Vec::new();
         };
 
-        // Build list of field columns (Float64 only) that aren't tags/timestamp
         let schema = batch.schema();
+        // Every numeric field, not just `Float64`: an integer meter reading
+        // is exactly the thing a rollup exists for, and skipping it used to
+        // produce no rollup, no error, and then a retention pass that
+        // dropped the raw data anyway.
         let field_indices: Vec<(usize, String)> = schema
             .fields()
             .iter()
@@ -493,24 +697,32 @@ pub fn compute_rollup_points(
             .filter(|(_, f)| {
                 f.name() != "timestamp"
                     && f.name() != "series_key_hash"
-                    && !config.group_by_tags.contains(&f.name().clone())
-                    && f.data_type() == &arrow::datatypes::DataType::Float64
+                    && !self.config.group_by_tags.contains(f.name())
+                    && matches!(
+                        f.data_type(),
+                        arrow::datatypes::DataType::Float64
+                            | arrow::datatypes::DataType::Int64
+                            | arrow::datatypes::DataType::UInt64
+                    )
             })
             .map(|(i, f)| (i, f.name().clone()))
             .collect();
-
-        // Build tag column indices
-        let tag_indices: Vec<(usize, String)> = config
+        let tag_indices: Vec<(usize, String)> = self
+            .config
             .group_by_tags
             .iter()
             .filter_map(|tag| schema.index_of(tag).ok().map(|idx| (idx, tag.clone())))
             .collect();
 
+        let mut newest_bucket = i64::MIN;
         for row in 0..batch.num_rows() {
             let ts = ts_array.value(row);
-            let bucket = align_to_bucket(ts, config.interval_ns);
+            let bucket = align_to_bucket(ts, self.config.interval_ns);
+            newest_bucket = newest_bucket.max(bucket);
+            if self.closed_through.is_some_and(|c| bucket <= c) {
+                self.unordered = true;
+            }
 
-            // Extract tag group
             let mut tag_group = BTreeMap::new();
             for (idx, name) in &tag_indices {
                 if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<StringArray>() {
@@ -519,49 +731,201 @@ pub fn compute_rollup_points(
                     }
                 }
             }
-
-            let acc = accumulators
+            let acc = self
+                .open
                 .entry((bucket, tag_group))
                 .or_insert_with(|| BucketAccumulator::new(bucket));
-
             for (idx, name) in &field_indices {
-                if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<Float64Array>() {
-                    if arr.is_valid(row) {
-                        acc.accumulate(name, arr.value(row), ts);
-                    }
+                let col = batch.column(*idx);
+                #[allow(clippy::cast_precision_loss)]
+                let value = if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+                    a.is_valid(row).then(|| a.value(row))
+                } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                    a.is_valid(row).then(|| a.value(row) as f64)
+                } else if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+                    a.is_valid(row).then(|| a.value(row) as f64)
+                } else {
+                    None
+                };
+                if let Some(v) = value {
+                    acc.accumulate(name, v, ts);
                 }
             }
         }
+
+        if self.hold_everything {
+            return Vec::new();
+        }
+
+        // Everything strictly before the newest bucket seen is complete.
+        let closed: Vec<(i64, BTreeMap<String, String>)> = self
+            .open
+            .keys()
+            .filter(|(b, _)| *b < newest_bucket)
+            .cloned()
+            .collect();
+        let mut out = Vec::with_capacity(closed.len());
+        for key in closed {
+            if let Some(acc) = self.open.remove(&key) {
+                self.closed_through = Some(self.closed_through.map_or(key.0, |c| c.max(key.0)));
+                out.extend(self.emit(key.0, &key.1, &acc));
+            }
+        }
+        out
     }
 
-    // Emit rollup points
-    let mut points = Vec::new();
-    for ((bucket, tags), acc) in &accumulators {
-        let aggregated = acc.emit(&config.aggregations);
+    /// The newest bucket start seen so far, if any.
+    #[must_use]
+    pub fn newest_bucket(&self) -> Option<i64> {
+        self.open.keys().map(|(b, _)| *b).max()
+    }
 
-        // Build fields map: each agg_fn becomes a separate field
+    /// Emit every bucket still open. Call once the input is exhausted.
+    #[must_use]
+    pub fn finish(self) -> Vec<chronix_core::Point> {
+        let mut out = Vec::with_capacity(self.open.len());
+        for ((bucket, tags), acc) in &self.open {
+            out.extend(self.emit(*bucket, tags, acc));
+        }
+        out
+    }
+
+    fn emit(
+        &self,
+        bucket: i64,
+        tags: &BTreeMap<String, String>,
+        acc: &BucketAccumulator,
+    ) -> Option<chronix_core::Point> {
+        let aggregated = acc.emit(&self.config.aggregations);
         let mut fields = BTreeMap::new();
         for (field_name, agg_values) in &aggregated {
             for (agg_fn, value) in agg_values {
-                let key = format!("{field_name}_{agg_fn}");
-                fields.insert(key, chronix_core::FieldValue::F64(*value));
+                fields.insert(
+                    format!("{field_name}_{agg_fn}"),
+                    chronix_core::FieldValue::F64(*value),
+                );
             }
         }
-
         if fields.is_empty() {
+            return None;
+        }
+        let series_key =
+            chronix_core::SeriesKey::new(self.config.target_measurement.clone(), tags.clone())
+                .ok()?;
+        chronix_core::Point::new(series_key, fields, bucket).ok()
+    }
+}
+
+/// Compute rollup points from Arrow `RecordBatches` that together hold
+/// every row of the buckets they cover, in any order.
+///
+/// A convenience over [`RollupAccumulator`] for callers holding the whole
+/// input in memory. Unlike the streaming accumulator it makes no ordering
+/// assumption: nothing is emitted until every batch has been folded in.
+#[must_use]
+pub fn compute_rollup_points(
+    batches: &[arrow::record_batch::RecordBatch],
+    config: &RollupConfig,
+) -> Vec<chronix_core::Point> {
+    let mut acc = RollupAccumulator::unordered(config);
+    for batch in batches {
+        debug_assert!(
+            acc.push(batch).is_empty(),
+            "an unordered accumulator emits nothing early"
+        );
+    }
+    let mut all = acc.finish();
+    all.sort_by(|a, b| {
+        a.timestamp().cmp(&b.timestamp()).then_with(|| {
+            a.series_key()
+                .canonical_form()
+                .cmp(b.series_key().canonical_form())
+        })
+    });
+    dedup_bucket_points(all)
+}
+
+/// Keep one point per `(series, bucket)`, the last one written.
+fn dedup_bucket_points(points: Vec<chronix_core::Point>) -> Vec<chronix_core::Point> {
+    let mut by_key: BTreeMap<(String, i64), chronix_core::Point> = BTreeMap::new();
+    for p in points {
+        by_key.insert(
+            (p.series_key().canonical_form().to_string(), p.timestamp()),
+            p,
+        );
+    }
+    by_key.into_values().collect()
+}
+
+/// Convert a `RecordBatch` of `measurement` back into points: `timestamp`,
+/// every `Utf8` column as a tag, every `Float64` column as a field.
+#[must_use]
+pub fn record_batch_to_points(
+    batch: &arrow::record_batch::RecordBatch,
+    measurement: &str,
+) -> Vec<chronix_core::Point> {
+    use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+    let schema = batch.schema();
+    let Some(ts) = batch
+        .column_by_name("timestamp")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+    else {
+        return Vec::new();
+    };
+    let tags: Vec<(&str, &StringArray)> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(|a| (f.name().as_str(), a))
+        })
+        .collect();
+    let fields: Vec<(&str, &Float64Array)> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .map(|a| (f.name().as_str(), a))
+        })
+        .collect();
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        if ts.is_null(row) {
             continue;
         }
-
-        if let Ok(series_key) =
-            chronix_core::SeriesKey::new(config.target_measurement.clone(), tags.clone())
-        {
-            if let Ok(point) = chronix_core::Point::new(series_key, fields, *bucket) {
-                points.push(point);
+        let tag_map: BTreeMap<String, String> = tags
+            .iter()
+            .filter(|(_, a)| a.is_valid(row))
+            .map(|(k, a)| ((*k).to_string(), a.value(row).to_string()))
+            .collect();
+        let field_map: BTreeMap<String, chronix_core::FieldValue> = fields
+            .iter()
+            .filter(|(_, a)| a.is_valid(row))
+            .map(|(k, a)| {
+                (
+                    (*k).to_string(),
+                    chronix_core::FieldValue::F64(a.value(row)),
+                )
+            })
+            .collect();
+        if field_map.is_empty() {
+            continue;
+        }
+        if let Ok(key) = chronix_core::SeriesKey::new(measurement, tag_map) {
+            if let Ok(p) = chronix_core::Point::new(key, field_map, ts.value(row)) {
+                out.push(p);
             }
         }
     }
-
-    points
+    out
 }
 
 /// Convert a slice of [`chronix_core::Point`] into an Arrow `RecordBatch`.
@@ -638,157 +1002,6 @@ pub fn points_to_record_batch(
     }
 
     arrow::record_batch::RecordBatch::try_new(schema, columns).ok()
-}
-
-// ── Ingest-time downsampling ────────────────────────────────────────
-
-/// Ingest-time downsampler that aggregates incoming points in memory
-/// and emits rolled-up points when a time bucket boundary is crossed.
-///
-/// Unlike compaction-time rollups which process flushed segments,
-/// ingest-time downsampling produces aggregated data immediately on
-/// write, enabling real-time low-resolution views.
-///
-/// Thread-safe: protected by `parking_lot::Mutex` internally.
-pub struct IngestDownsampler {
-    rules: Vec<RollupConfig>,
-    /// (canonical_series_key, rule_index) → current bucket accumulator
-    state: parking_lot::Mutex<std::collections::HashMap<(String, usize), IngestBucketState>>,
-}
-
-/// Per-series per-rule in-flight accumulator state.
-struct IngestBucketState {
-    bucket_start: i64,
-    acc: BucketAccumulator,
-    tags: BTreeMap<String, String>,
-}
-
-impl IngestDownsampler {
-    /// Create a new downsampler with the given rules.
-    pub fn new(rules: Vec<RollupConfig>) -> Self {
-        Self {
-            rules,
-            state: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    /// Returns true if there are any active rules.
-    pub fn has_rules(&self) -> bool {
-        !self.rules.is_empty()
-    }
-
-    /// Returns the currently registered rules.
-    pub fn rules(&self) -> &[RollupConfig] {
-        &self.rules
-    }
-
-    /// Process a point, accumulating it into the appropriate bucket.
-    /// Returns any completed (flushed) rollup points when a bucket
-    /// boundary is crossed.
-    pub fn process(&self, point: &chronix_core::Point) -> Vec<chronix_core::Point> {
-        let measurement = point.series_key().measurement();
-        let mut emitted = Vec::new();
-
-        for (rule_idx, rule) in self.rules.iter().enumerate() {
-            if rule.source_measurement != measurement {
-                continue;
-            }
-
-            let canonical = point.series_key().canonical_form().to_string();
-            let key = (canonical, rule_idx);
-            let bucket = align_to_bucket(point.timestamp(), rule.interval_ns);
-
-            // Extract tag group for this rule
-            let tag_group: BTreeMap<String, String> = rule
-                .group_by_tags
-                .iter()
-                .filter_map(|t| {
-                    point
-                        .series_key()
-                        .tag(t)
-                        .map(|v| (t.clone(), v.to_string()))
-                })
-                .collect();
-
-            let mut state = self.state.lock();
-            let entry = state.entry(key);
-
-            match entry {
-                std::collections::hash_map::Entry::Occupied(mut occ) => {
-                    let bs = occ.get_mut();
-                    if bucket != bs.bucket_start {
-                        // Bucket boundary crossed — emit completed bucket
-                        if let Some(p) = Self::emit_point(&bs.acc, &bs.tags, rule) {
-                            emitted.push(p);
-                        }
-                        // Start new bucket
-                        bs.bucket_start = bucket;
-                        bs.acc = BucketAccumulator::new(bucket);
-                        bs.tags = tag_group;
-                    }
-                    Self::accumulate_fields(&mut bs.acc, point);
-                }
-                std::collections::hash_map::Entry::Vacant(vac) => {
-                    let mut acc = BucketAccumulator::new(bucket);
-                    Self::accumulate_fields(&mut acc, point);
-                    vac.insert(IngestBucketState {
-                        bucket_start: bucket,
-                        acc,
-                        tags: tag_group,
-                    });
-                }
-            }
-        }
-
-        emitted
-    }
-
-    /// Flush all in-flight accumulators, emitting partial-bucket points.
-    /// Called on shutdown or periodic flush.
-    pub fn flush_all(&self) -> Vec<chronix_core::Point> {
-        let mut state = self.state.lock();
-        let mut emitted = Vec::new();
-
-        for ((_, rule_idx), bs) in state.drain() {
-            if let Some(rule) = self.rules.get(rule_idx) {
-                if let Some(p) = Self::emit_point(&bs.acc, &bs.tags, rule) {
-                    emitted.push(p);
-                }
-            }
-        }
-
-        emitted
-    }
-
-    fn accumulate_fields(acc: &mut BucketAccumulator, point: &chronix_core::Point) {
-        let ts = point.timestamp();
-        for (field_name, field_value) in point.fields() {
-            if let chronix_core::FieldValue::F64(v) = field_value {
-                acc.accumulate(field_name, *v, ts);
-            }
-        }
-    }
-
-    fn emit_point(
-        acc: &BucketAccumulator,
-        tags: &BTreeMap<String, String>,
-        rule: &RollupConfig,
-    ) -> Option<chronix_core::Point> {
-        let aggregated = acc.emit(&rule.aggregations);
-        let mut fields = BTreeMap::new();
-        for (field_name, agg_values) in &aggregated {
-            for (agg_fn, value) in agg_values {
-                let key = format!("{field_name}_{agg_fn}");
-                fields.insert(key, chronix_core::FieldValue::F64(*value));
-            }
-        }
-        if fields.is_empty() {
-            return None;
-        }
-        let sk =
-            chronix_core::SeriesKey::new(rule.target_measurement.clone(), tags.clone()).ok()?;
-        chronix_core::Point::new(sk, fields, acc.bucket_start_ns).ok()
-    }
 }
 
 #[cfg(test)]
@@ -1058,267 +1271,159 @@ mod tests {
         assert!(points_to_record_batch(&[]).is_none());
     }
 
+    /// The registry round-trips through the same encoding the catalog
+    /// stores, definitions and watermarks alike.
     #[test]
-    fn registry_save_load_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(RollupRegistry::filename());
-
+    fn a_registry_round_trips_through_postcard() {
         let mut registry = RollupRegistry::new();
-        let c1 = RollupBuilder::new()
-            .name("cpu_5min")
-            .source("cpu")
-            .target("cpu_5min_agg")
-            .interval_ns(300_000_000_000)
-            .aggregation(RollupAggFn::Avg)
-            .aggregation(RollupAggFn::Max)
-            .group_by("host")
-            .build()
+        registry
+            .add(
+                RollupBuilder::new()
+                    .name("cpu_5min")
+                    .source("cpu")
+                    .target("cpu_5min_agg")
+                    .interval_ns(300_000_000_000)
+                    .aggregation(RollupAggFn::Avg)
+                    .group_by("host")
+                    .retention_ns(86_400_000_000_000 * 30)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap();
-        let c2 = RollupBuilder::new()
-            .name("mem_1h")
-            .source("mem")
-            .target("mem_1h_agg")
-            .interval_ns(3_600_000_000_000)
-            .aggregation(RollupAggFn::Sum)
-            .aggregation(RollupAggFn::Count)
-            .retention_ns(86_400_000_000_000 * 30) // 30 days
-            .build()
+        registry.set_materialised_until("cpu_5min", 900_000_000_000);
+        registry.invalidate_source_range("cpu", 0, 600_000_000_000);
+
+        let config = registry.get("cpu_5min").unwrap();
+        let config_bytes = postcard::to_stdvec(config).unwrap();
+        let state_bytes = postcard::to_stdvec(&registry.state("cpu_5min")).unwrap();
+
+        let mut restored = RollupRegistry::new();
+        restored
+            .add(postcard::from_bytes::<RollupConfig>(&config_bytes).unwrap())
             .unwrap();
-        registry.add(c1).unwrap();
-        registry.add(c2).unwrap();
-        registry.save(&path).unwrap();
+        restored.set_state(
+            "cpu_5min",
+            postcard::from_bytes::<RollupState>(&state_bytes).unwrap(),
+        );
 
-        // Load into a fresh registry
-        let loaded = RollupRegistry::load(&path).unwrap();
-        assert_eq!(loaded.list().len(), 2);
-
-        let cpu = loaded.get("cpu_5min").unwrap();
-        assert_eq!(cpu.source_measurement, "cpu");
-        assert_eq!(cpu.target_measurement, "cpu_5min_agg");
-        assert_eq!(cpu.interval_ns, 300_000_000_000);
-        assert_eq!(cpu.aggregations.len(), 2);
-        assert!(cpu.aggregations.contains(&RollupAggFn::Avg));
-        assert!(cpu.aggregations.contains(&RollupAggFn::Max));
-        assert_eq!(cpu.group_by_tags, vec!["host"]);
-
-        let mem = loaded.get("mem_1h").unwrap();
-        assert_eq!(mem.source_measurement, "mem");
-        assert_eq!(mem.retention_ns, Some(86_400_000_000_000 * 30));
+        let back = restored.get("cpu_5min").unwrap();
+        assert_eq!(back.source_measurement, "cpu");
+        assert_eq!(back.interval_ns, 300_000_000_000);
+        assert_eq!(back.retention_ns, Some(86_400_000_000_000 * 30));
+        let state = restored.state("cpu_5min");
+        assert_eq!(state.materialised_until, Some(900_000_000_000));
+        assert_eq!(
+            state.pending_invalidations(),
+            &[(0, 600_000_000_000)],
+            "a pending repair must survive a restart, or the bucket stays wrong"
+        );
     }
 
+    /// Invalidated ranges are clipped to the watermark, coalesced, and
+    /// bounded in number.
     #[test]
-    fn registry_load_missing_file_returns_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nonexistent.json");
-        let registry = RollupRegistry::load(&path).unwrap();
-        assert!(registry.list().is_empty());
+    fn invalidations_are_clipped_coalesced_and_bounded() {
+        let mut state = RollupState::default();
+        // Nothing is materialised yet, so nothing needs repairing.
+        state.invalidate(0, 100);
+        assert!(state.pending_invalidations().is_empty());
+
+        state.materialised_until = Some(1_000);
+        // Clipped at the watermark: buckets above it are not claimed yet.
+        state.invalidate(900, 5_000);
+        assert_eq!(state.pending_invalidations(), &[(900, 1_000)]);
+        // Adjacent and overlapping ranges coalesce.
+        state.invalidate(800, 900);
+        assert_eq!(state.pending_invalidations(), &[(800, 1_000)]);
+        state.invalidate(100, 200);
+        assert_eq!(state.pending_invalidations(), &[(100, 200), (800, 1_000)]);
+
+        // A writer scattering points cannot grow the log without limit.
+        for i in 0..200 {
+            state.invalidate(i * 3, i * 3 + 1);
+        }
+        assert!(
+            state.pending_invalidations().len() <= MAX_INVALID_RANGES,
+            "the invalidation log must stay bounded"
+        );
+        let lo = state.pending_invalidations().first().unwrap().0;
+        let hi = state.pending_invalidations().last().unwrap().1;
+        assert!(
+            lo <= 0 && hi >= 1_000,
+            "merging must cover what it replaces"
+        );
     }
 
+    /// A range is aligned to the rollup's interval, not to the write.
     #[test]
-    fn registry_load_corrupt_file_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(RollupRegistry::filename());
-        std::fs::write(&path, b"not valid json{{{").unwrap();
-        assert!(RollupRegistry::load(&path).is_err());
-    }
-
-    #[test]
-    fn registry_save_overwrites_previous() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(RollupRegistry::filename());
-
+    fn invalidating_a_source_range_covers_whole_buckets() {
         let mut registry = RollupRegistry::new();
-        let c1 = RollupBuilder::new()
-            .name("r1")
-            .source("s1")
-            .target("t1")
-            .interval_ns(1_000_000_000)
-            .aggregation(RollupAggFn::Avg)
-            .build()
+        registry
+            .add(
+                RollupBuilder::new()
+                    .name("m_1m")
+                    .source("m")
+                    .target("m_1m")
+                    .interval_ns(60)
+                    .aggregation(RollupAggFn::Avg)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap();
-        registry.add(c1).unwrap();
-        registry.save(&path).unwrap();
-
-        // Remove and save again
-        let _ = registry.remove("r1");
-        registry.save(&path).unwrap();
-
-        let loaded = RollupRegistry::load(&path).unwrap();
-        assert!(loaded.list().is_empty());
+        registry.set_materialised_until("m_1m", 600);
+        // A single point at 125 sits in the bucket [120, 180).
+        let changed = registry.invalidate_source_range("m", 125, 126);
+        assert_eq!(changed, vec!["m_1m"]);
+        assert_eq!(
+            registry.state("m_1m").pending_invalidations(),
+            &[(120, 180)]
+        );
     }
 
+    /// A cycle is refused, and the chain walk terminates regardless.
     #[test]
-    fn ingest_downsampler_emits_on_bucket_boundary() {
-        let rule = RollupBuilder::new()
-            .name("cpu_10s")
-            .source("cpu")
-            .target("cpu_10s_agg")
-            .interval_ns(10)
-            .aggregation(RollupAggFn::Avg)
-            .aggregation(RollupAggFn::Min)
-            .aggregation(RollupAggFn::Max)
-            .aggregation(RollupAggFn::Count)
-            .group_by("host")
-            .build()
-            .unwrap();
-
-        let ds = IngestDownsampler::new(vec![rule]);
-        assert!(ds.has_rules());
-
-        let mk = |ts: i64, val: f64| -> chronix_core::Point {
-            let tags = BTreeMap::from([("host".to_string(), "srv1".to_string())]);
-            let fields =
-                BTreeMap::from([("value".to_string(), chronix_core::FieldValue::F64(val))]);
-            let sk = chronix_core::SeriesKey::new("cpu", tags).unwrap();
-            chronix_core::Point::new(sk, fields, ts).unwrap()
+    fn a_cycle_is_refused_and_the_walk_terminates() {
+        let mut registry = RollupRegistry::new();
+        let edge = |name: &str, from: &str, to: &str| {
+            RollupBuilder::new()
+                .name(name)
+                .source(from)
+                .target(to)
+                .interval_ns(60)
+                .aggregation(RollupAggFn::Avg)
+                .build()
+                .unwrap()
         };
-
-        // Insert 3 points in bucket [0..10)
-        assert!(ds.process(&mk(1, 10.0)).is_empty());
-        assert!(ds.process(&mk(5, 20.0)).is_empty());
-        assert!(ds.process(&mk(9, 30.0)).is_empty());
-
-        // Crossing to bucket [10..20) should emit bucket [0..10)
-        let emitted = ds.process(&mk(12, 40.0));
-        assert_eq!(emitted.len(), 1);
-
-        let p = &emitted[0];
-        assert_eq!(p.series_key().measurement(), "cpu_10s_agg");
-        assert_eq!(p.timestamp(), 0); // bucket start
-        assert_eq!(p.series_key().tag("host"), Some("srv1"));
-
-        // avg(10,20,30) = 20.0
-        match p.field("value_avg").unwrap() {
-            chronix_core::FieldValue::F64(v) => assert!((v - 20.0).abs() < f64::EPSILON),
-            _ => panic!("Expected F64"),
-        }
-        // min = 10.0
-        match p.field("value_min").unwrap() {
-            chronix_core::FieldValue::F64(v) => assert!((v - 10.0).abs() < f64::EPSILON),
-            _ => panic!("Expected F64"),
-        }
-        // max = 30.0
-        match p.field("value_max").unwrap() {
-            chronix_core::FieldValue::F64(v) => assert!((v - 30.0).abs() < f64::EPSILON),
-            _ => panic!("Expected F64"),
-        }
-        // count = 3
-        match p.field("value_count").unwrap() {
-            chronix_core::FieldValue::F64(v) => assert!((v - 3.0).abs() < f64::EPSILON),
-            _ => panic!("Expected F64"),
-        }
-    }
-
-    #[test]
-    fn ingest_downsampler_flush_all_emits_partial_buckets() {
-        let rule = RollupBuilder::new()
-            .name("cpu_1s")
-            .source("cpu")
-            .target("cpu_1s_agg")
-            .interval_ns(1_000_000_000) // 1 second
-            .aggregation(RollupAggFn::Sum)
-            .group_by("host")
-            .build()
-            .unwrap();
-
-        let ds = IngestDownsampler::new(vec![rule]);
-
-        let tags = BTreeMap::from([("host".to_string(), "a".to_string())]);
-        let fields = BTreeMap::from([("value".to_string(), chronix_core::FieldValue::F64(42.0))]);
-        let sk = chronix_core::SeriesKey::new("cpu", tags).unwrap();
-        let p = chronix_core::Point::new(sk, fields, 500_000_000).unwrap(); // mid-bucket
-
-        assert!(ds.process(&p).is_empty()); // still in same bucket
-
-        let flushed = ds.flush_all();
-        assert_eq!(flushed.len(), 1);
-        assert_eq!(flushed[0].series_key().measurement(), "cpu_1s_agg");
-        match flushed[0].field("value_sum").unwrap() {
-            chronix_core::FieldValue::F64(v) => assert!((v - 42.0).abs() < f64::EPSILON),
-            _ => panic!("Expected F64"),
-        }
-
-        // After flush, state should be empty
-        assert!(ds.flush_all().is_empty());
-    }
-
-    #[test]
-    fn ingest_downsampler_ignores_unmatched_measurements() {
-        let rule = RollupBuilder::new()
-            .name("cpu_rule")
-            .source("cpu")
-            .target("cpu_agg")
-            .interval_ns(100)
+        registry.add(edge("a_b", "a", "b")).unwrap();
+        registry.add(edge("b_c", "b", "c")).unwrap();
+        assert!(registry.would_cycle(&edge("c_a", "c", "a")));
+        assert!(!registry.would_cycle(&edge("c_d", "c", "d")));
+        // The builder already refuses source == target, so a self-edge
+        // cannot even be constructed; `would_cycle` covers it too for the
+        // deserialised path.
+        assert!(RollupBuilder::new()
+            .name("self")
+            .source("a")
+            .target("a")
+            .interval_ns(60)
             .aggregation(RollupAggFn::Avg)
-            .group_by("host")
             .build()
-            .unwrap();
-
-        let ds = IngestDownsampler::new(vec![rule]);
-
-        // Insert a "mem" point — should not match "cpu" rule
-        let tags = BTreeMap::from([("host".to_string(), "b".to_string())]);
-        let fields = BTreeMap::from([("value".to_string(), chronix_core::FieldValue::F64(1.0))]);
-        let sk = chronix_core::SeriesKey::new("mem", tags).unwrap();
-        let p = chronix_core::Point::new(sk, fields, 50).unwrap();
-
-        assert!(ds.process(&p).is_empty());
-        assert!(ds.flush_all().is_empty());
+            .is_err());
+        assert_eq!(registry.rollups_rooted_at("a").len(), 2);
     }
 
+    /// `align_to_bucket` must not overflow at either end of the range.
     #[test]
-    fn ingest_downsampler_no_rules() {
-        let ds = IngestDownsampler::new(Vec::new());
-        assert!(!ds.has_rules());
-        assert!(ds.rules().is_empty());
-        assert!(ds.flush_all().is_empty());
-    }
-
-    #[test]
-    fn ingest_downsampler_multiple_series() {
-        let rule = RollupBuilder::new()
-            .name("cpu_5")
-            .source("cpu")
-            .target("cpu_5_agg")
-            .interval_ns(10)
-            .aggregation(RollupAggFn::Avg)
-            .group_by("host")
-            .build()
-            .unwrap();
-
-        let ds = IngestDownsampler::new(vec![rule]);
-
-        let mk = |host: &str, ts: i64, val: f64| -> chronix_core::Point {
-            let tags = BTreeMap::from([("host".to_string(), host.to_string())]);
-            let fields =
-                BTreeMap::from([("value".to_string(), chronix_core::FieldValue::F64(val))]);
-            let sk = chronix_core::SeriesKey::new("cpu", tags).unwrap();
-            chronix_core::Point::new(sk, fields, ts).unwrap()
-        };
-
-        // Two series in same bucket
-        assert!(ds.process(&mk("a", 1, 10.0)).is_empty());
-        assert!(ds.process(&mk("b", 2, 100.0)).is_empty());
-        assert!(ds.process(&mk("a", 3, 20.0)).is_empty());
-        assert!(ds.process(&mk("b", 4, 200.0)).is_empty());
-
-        // Cross to new bucket — should emit 2 points (one per series)
-        let mut emitted = ds.process(&mk("a", 11, 50.0));
-        // "a" crosses boundary, "b" hasn't yet
-        assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].series_key().tag("host"), Some("a"));
-        match emitted[0].field("value_avg").unwrap() {
-            chronix_core::FieldValue::F64(v) => assert!((v - 15.0).abs() < f64::EPSILON), // avg(10,20)
-            _ => panic!("Expected F64"),
-        }
-
-        // Cross "b" too
-        emitted = ds.process(&mk("b", 12, 300.0));
-        assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].series_key().tag("host"), Some("b"));
-        match emitted[0].field("value_avg").unwrap() {
-            chronix_core::FieldValue::F64(v) => assert!((v - 150.0).abs() < f64::EPSILON), // avg(100,200)
-            _ => panic!("Expected F64"),
-        }
+    fn aligning_a_bucket_saturates_at_the_floor() {
+        assert_eq!(align_to_bucket(-5, 10), -10);
+        assert_eq!(align_to_bucket(0, 10), 0);
+        assert_eq!(
+            align_to_bucket(i64::MAX, 60),
+            i64::MAX - i64::MAX.rem_euclid(60)
+        );
+        // The bucket holding `i64::MIN` starts there; this used to panic in
+        // a debug build and wrap in a release one.
+        assert_eq!(align_to_bucket(i64::MIN, 60), i64::MIN);
+        assert_eq!(align_to_bucket(i64::MIN, 1), i64::MIN);
     }
 }

@@ -15,9 +15,9 @@
 //!   statement is required.
 //! - **Type safety**: If a field name already exists with a different type,
 //!   the write is rejected with [`SchemaError::TypeConflict`].
-//! - **WAL protection**: Schema changes are recorded as `WalEntry::SchemaChange`
-//!   entries (discriminant `0x03`) **before** data writes, so that crash
-//!   recovery replays the schema first and the data second.
+//! - **Durability**: the catalog manifest is the only durable record of a
+//!   schema; the database persists every action `register_batch` returns
+//!   before it writes the data that needs it
 //! - **Query-time safety**: Queries that reference a column not present in
 //!   older segments return zero rows for those segments (no panic).
 //!
@@ -360,12 +360,22 @@ pub enum SchemaAction {
 /// | Rename column      | No        | N/A                 |
 /// | Change column type | No        | Write new field     |
 ///
-/// All mutations are WAL-protected and replayed on recovery.
+/// Durability is the catalog manifest's job: the database persists every
+/// action this registry returns before it writes the data that needs it.
 #[derive(Debug, Clone)]
 pub struct SchemaRegistry {
     /// `DashMap` for per-key concurrency without
     /// global `RwLock` contention or TOCTOU races.
     schemas: Arc<DashMap<String, Arc<MeasurementSchema>>>,
+    /// Serialises schema *changes*. Reads never take it.
+    ///
+    /// A batch that adds columns to several measurements must be validated
+    /// as a whole and applied as a whole; a per-measurement entry lock
+    /// cannot express that without an ordering rule every caller has to
+    /// remember. Changes are rare — a measurement gains a column a handful
+    /// of times in its life — so one mutex costs nothing on the write path,
+    /// which takes the lock-free fast path below whenever nothing changes.
+    changes: Arc<std::sync::Mutex<()>>,
 }
 
 impl SchemaRegistry {
@@ -374,13 +384,139 @@ impl SchemaRegistry {
     pub fn new() -> Self {
         Self {
             schemas: Arc::new(DashMap::new()),
+            changes: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
-    /// Register or update a schema from a point.
+    /// Register every point of a batch, or none of them.
     ///
-    /// On first write to a measurement, creates the schema.
-    /// On subsequent writes, validates field types and adds new tags/fields.
+    /// Validates the whole batch against the current schemas *and* against
+    /// the columns earlier points of the same batch introduce, and only then
+    /// applies the additions. A type conflict anywhere in the batch rejects
+    /// it with the registry untouched — which is the property that lets the
+    /// caller persist every returned action unconditionally. Registering
+    /// point by point left the columns of the first points behind when a
+    /// later point was refused, and nothing ever persisted them.
+    ///
+    /// Returns the actions the batch caused, in application order. Empty
+    /// when the batch fits the existing schemas, which is the common case
+    /// and takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::TypeConflict`] if any field's type conflicts
+    /// with the schema, or with the type another point of the batch gives
+    /// the same field.
+    pub fn register_batch(
+        &self,
+        points: &[&crate::types::Point],
+    ) -> Result<Vec<SchemaAction>, SchemaError> {
+        // Fast path: every point fits an existing schema. Read-only.
+        let mut all_known = true;
+        for point in points {
+            match self.schemas.get(point.series_key().measurement()) {
+                Some(schema) => {
+                    if !Self::point_fits(&schema, point)? {
+                        all_known = false;
+                    }
+                }
+                None => all_known = false,
+            }
+        }
+        if all_known {
+            return Ok(Vec::new());
+        }
+
+        // Slow path: build the new schemas on private copies, validating as
+        // we go, and commit only once the whole batch has been accepted.
+        let _guard = self
+            .changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending: std::collections::BTreeMap<String, MeasurementSchema> =
+            std::collections::BTreeMap::new();
+        let mut actions = Vec::new();
+
+        for point in points {
+            let name = point.series_key().measurement();
+            let schema = match pending.get_mut(name) {
+                Some(s) => s,
+                None => {
+                    let fresh = match self.schemas.get(name) {
+                        Some(existing) => (**existing).clone(),
+                        None => {
+                            let s = MeasurementSchema::new(name);
+                            actions.push(SchemaAction::CreateMeasurement(s.clone()));
+                            s
+                        }
+                    };
+                    pending.entry(name.to_string()).or_insert(fresh)
+                }
+            };
+            for tag_key in point.series_key().tag_keys() {
+                if schema.add_tag(tag_key) {
+                    actions.push(SchemaAction::AddColumn {
+                        measurement: name.to_string(),
+                        column: ColumnDef {
+                            name: tag_key.to_string(),
+                            column_type: ColumnType::String,
+                            role: ColumnRole::Tag,
+                        },
+                    });
+                }
+            }
+            for (field_name, field_value) in point.fields() {
+                if schema.add_field(field_name.as_ref(), field_value)? {
+                    actions.push(SchemaAction::AddColumn {
+                        measurement: name.to_string(),
+                        column: ColumnDef {
+                            name: field_name.to_string(),
+                            column_type: ColumnType::from_field_value(field_value),
+                            role: ColumnRole::Field,
+                        },
+                    });
+                }
+            }
+        }
+
+        for (name, schema) in pending {
+            self.schemas.insert(name, Arc::new(schema));
+        }
+        Ok(actions)
+    }
+
+    /// Does `point` fit `schema` without any change? A type conflict is an
+    /// error; a missing column is `Ok(false)`.
+    fn point_fits(
+        schema: &MeasurementSchema,
+        point: &crate::types::Point,
+    ) -> Result<bool, SchemaError> {
+        for tag_key in point.series_key().tag_keys() {
+            if schema.column(tag_key).is_none() {
+                return Ok(false);
+            }
+        }
+        for (field_name, field_value) in point.fields() {
+            match schema.column(field_name.as_ref()) {
+                Some(existing) => {
+                    let new_type = ColumnType::from_field_value(field_value);
+                    if existing.column_type != new_type {
+                        return Err(SchemaError::TypeConflict {
+                            measurement: schema.measurement().to_string(),
+                            field: field_name.to_string(),
+                            expected: existing.column_type.to_string(),
+                            got: new_type.to_string(),
+                        });
+                    }
+                }
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Register a single point — [`register_batch`](Self::register_batch)
+    /// for one point.
     ///
     /// # Errors
     ///
@@ -390,92 +526,7 @@ impl SchemaRegistry {
         &self,
         point: &crate::types::Point,
     ) -> Result<Vec<SchemaAction>, SchemaError> {
-        let measurement_name = point.series_key().measurement();
-
-        // `DashMap` gives a lock-free read fast path.
-        // Each measurement has independent concurrency — no global lock.
-        if let Some(schema_ref) = self.schemas.get(measurement_name) {
-            let schema = schema_ref.value();
-            let mut needs_write = false;
-
-            // Check all tags exist
-            for tag_key in point.series_key().tag_keys() {
-                if schema.column(tag_key).is_none() {
-                    needs_write = true;
-                    break;
-                }
-            }
-
-            // Check all fields exist with correct types
-            if !needs_write {
-                for (field_name, field_value) in point.fields() {
-                    if let Some(existing) = schema.column(field_name.as_ref()) {
-                        let new_type = ColumnType::from_field_value(field_value);
-                        if existing.column_type != new_type {
-                            return Err(SchemaError::TypeConflict {
-                                measurement: measurement_name.to_string(),
-                                field: field_name.to_string(),
-                                expected: existing.column_type.to_string(),
-                                got: new_type.to_string(),
-                            });
-                        }
-                    } else {
-                        needs_write = true;
-                        break;
-                    }
-                }
-            }
-
-            if !needs_write {
-                return Ok(Vec::new());
-            }
-            // Drop the DashMap read ref before entering write path.
-            drop(schema_ref);
-        }
-
-        // Slow path: use DashMap entry() API for atomic check-and-insert
-        // (eliminates TOCTOU race between read and write).
-        let mut actions = Vec::new();
-
-        let mut schema_arc = self
-            .schemas
-            .entry(measurement_name.to_string())
-            .or_insert_with(|| {
-                let s = MeasurementSchema::new(measurement_name);
-                actions.push(SchemaAction::CreateMeasurement(s.clone()));
-                Arc::new(s)
-            });
-        let schema = Arc::make_mut(schema_arc.value_mut());
-
-        // Add tags
-        for tag_key in point.series_key().tag_keys() {
-            if schema.add_tag(tag_key) {
-                actions.push(SchemaAction::AddColumn {
-                    measurement: measurement_name.to_string(),
-                    column: ColumnDef {
-                        name: tag_key.to_string(),
-                        column_type: ColumnType::String,
-                        role: ColumnRole::Tag,
-                    },
-                });
-            }
-        }
-
-        // Add fields (with type validation)
-        for (field_name, field_value) in point.fields() {
-            if schema.add_field(field_name.as_ref(), field_value)? {
-                actions.push(SchemaAction::AddColumn {
-                    measurement: measurement_name.to_string(),
-                    column: ColumnDef {
-                        name: field_name.to_string(),
-                        column_type: ColumnType::from_field_value(field_value),
-                        role: ColumnRole::Field,
-                    },
-                });
-            }
-        }
-
-        Ok(actions)
+        self.register_batch(&[point])
     }
 
     /// Look up the schema for a measurement.

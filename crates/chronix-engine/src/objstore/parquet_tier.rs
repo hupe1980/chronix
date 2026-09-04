@@ -1,40 +1,33 @@
-//! Parquet re-encoding for the cold tier.
+//! Parquet encoding for the cold tier.
 //!
 //! # Why the cold tier is not `.csx`
 //!
 //! The hot tier stays `.csx` because time-series-specific encodings, row-group
 //! zone maps and series blooms measurably beat general Parquet on this
-//! workload. That advantage is real, and it is also irrelevant to data nobody
-//! queries hot. What matters about an archive is that something other than
-//! chronix can read it: Spark, DuckDB, Polars and pandas all read Parquet and
-//! none of them will ever read `.csx`.
+//! workload — and that advantage is irrelevant to data nobody queries hot.
+//! What matters about an archive is that something else can read it: Spark,
+//! DuckDB, Polars and pandas all read Parquet and none of them will ever read
+//! `.csx`.
 //!
-//! So the tiering engine **re-encodes** on the way out. A cold object is
-//! an ordinary Parquet file with an ordinary Arrow schema — `SELECT * FROM
-//! read_parquet('s3://…')` in DuckDB works with no chronix in the picture.
+//! # The writer takes query output, not a segment file
 //!
-//! # What is preserved
+//! [`ParquetArchiveWriter`] streams [`RecordBatch`]es into one object. Nothing
+//! here can open a segment, which is deliberate: a segment file is not what
+//! the database would answer — it still holds rows a tombstone masks, and two
+//! overlapping segments hold the same `(series, timestamp)` twice. The caller
+//! feeds it the read path's output, which has resolved both.
 //!
-//! The Arrow schema the `.csx` reader produces is written verbatim, so the
-//! canonical column order — timestamp, then tags sorted, then fields sorted —
-//! survives the round trip, and so do nulls: `.csx` v2 validity bitmaps become
-//! Parquet definition levels, which is the same information in the format the
-//! rest of the world uses.
+//! # What is preserved, and what is lost
 //!
-//! Tag columns are dictionary-encoded explicitly rather than left to the
-//! writer's heuristics. Tags are the low-cardinality dimension by definition,
-//! and a dictionary page is what makes an external reader's predicate pushdown
-//! work on them.
+//! The canonical column order — `_time`, then tags sorted, then fields sorted
+//! — and nulls, as Parquet definition levels. Tag columns are dictionary-
+//! encoded explicitly, which is what makes an external reader's predicate
+//! pushdown work on them; float columns are not, since there the dictionary is
+//! as large as the data.
 //!
-//! # What is lost, and why that is the trade
-//!
-//! Series blooms and the skip index do not survive: Parquet has no place to
-//! put them. Cold reads therefore prune on row-group statistics alone, which
-//! is weaker than the five-level pruning the hot tier gets
-//! than a `.csx` read. That is the price of the archive being readable, and
-//! it is charged on the data that is queried least.
-
-use std::path::Path;
+//! Series blooms and the skip index do not survive — Parquet has nowhere to
+//! put them — so a cold scan prunes on row-group statistics alone. That is the
+//! price of being readable, charged on the data queried least.
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, SchemaRef};
@@ -44,7 +37,6 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
 use crate::objstore::error::{ObjStoreError, Result};
-use crate::segment::SegmentReader;
 
 /// Zstd level for cold objects.
 ///
@@ -59,40 +51,6 @@ const COLD_ZSTD_LEVEL: i32 = 9;
 /// statistics an external reader prunes on — line up with the ones the segment
 /// was written with.
 const COLD_ROW_GROUP_ROWS: usize = 65_536;
-
-/// The on-object-store format of a tiered segment.
-///
-/// Recorded per segment rather than inferred from configuration, because the
-/// policy can change while objects written under the old policy are still in
-/// the bucket. A reader must be told what it is opening, not guess.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum ColdFormat {
-    /// Verbatim `.csx`. Smallest, and readable only by chronix.
-    Csx,
-    /// Re-encoded Parquet. Readable by any Arrow-ecosystem tool.
-    #[default]
-    Parquet,
-}
-
-impl ColdFormat {
-    /// File extension used for objects in this format.
-    #[must_use]
-    pub const fn extension(self) -> &'static str {
-        match self {
-            Self::Csx => "csx",
-            Self::Parquet => "parquet",
-        }
-    }
-}
-
-impl std::fmt::Display for ColdFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Csx => "csx",
-            Self::Parquet => "parquet",
-        })
-    }
-}
 
 /// Writer properties for a cold Parquet object.
 ///
@@ -120,66 +78,95 @@ fn cold_writer_properties(schema: &SchemaRef) -> Result<WriterProperties> {
     Ok(props.build())
 }
 
-/// Re-encode a `.csx` segment file as a Parquet object.
+/// Streams query-output [`RecordBatch`]es into one cold Parquet object.
 ///
-/// Reads one row group at a time so peak memory is a row group rather than the
-/// whole segment — the tiering task runs on the same box as the database, and
-/// on the gateway that box has 512 MB.
+/// The writer holds the encoded object in memory because the upload is a
+/// single `put` that needs the whole body; peak memory is therefore the
+/// *compressed* object plus one row group, not the scan. The caller bounds
+/// the scan by archiving one `(measurement, shard)` group at a time.
 ///
-/// # Errors
-///
-/// Returns an error if the segment cannot be opened or read, or if the Parquet
-/// writer fails.
-pub fn csx_file_to_parquet(csx_path: impl AsRef<Path>) -> Result<Vec<u8>> {
-    let reader = SegmentReader::open(csx_path).map_err(ObjStoreError::Segment)?;
-    let row_groups = reader.row_group_count();
+/// Every batch must match the schema the writer was opened with. The caller
+/// aligns batches to a single schema before writing, which is what makes a
+/// measurement whose fields were registered across separate writes produce
+/// one consistent object rather than a schema error halfway through.
+pub struct ParquetArchiveWriter {
+    writer: ArrowWriter<Vec<u8>>,
+    schema: SchemaRef,
+    rows: u64,
+}
 
-    if row_groups == 0 {
-        return Err(ObjStoreError::InvalidConfig {
-            detail: "cannot re-encode an empty segment".to_string(),
-        });
+impl ParquetArchiveWriter {
+    /// Open a writer that will encode batches of `schema`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the compression level is invalid or the Parquet
+    /// writer cannot be created for this schema.
+    pub fn new(schema: SchemaRef) -> Result<Self> {
+        let props = cold_writer_properties(&schema)?;
+        let writer = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props))
+            .map_err(|e| ObjStoreError::Parquet(e.to_string()))?;
+        Ok(Self {
+            writer,
+            schema,
+            rows: 0,
+        })
     }
 
-    // The first row group establishes the schema the writer commits to.
-    let first = reader.read_row_group(0).map_err(ObjStoreError::Segment)?;
-    let schema = first.schema();
-    let props = cold_writer_properties(&schema)?;
-
-    let mut out = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut out, schema.clone(), Some(props))
-        .map_err(|e| ObjStoreError::Parquet(e.to_string()))?;
-
-    writer
-        .write(&first)
-        .map_err(|e| ObjStoreError::Parquet(e.to_string()))?;
-    drop(first);
-
-    for rg in 1..row_groups {
-        let batch = reader.read_row_group(rg).map_err(ObjStoreError::Segment)?;
-        if batch.schema() != schema {
+    /// Append one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `batch` does not match the writer's schema, or if
+    /// the Parquet writer fails.
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        if batch.schema() != self.schema {
             return Err(ObjStoreError::InvalidConfig {
                 detail: format!(
-                    "row group {rg} has a different schema from row group 0; \
-                     the segment is not internally consistent"
+                    "cold archive batch schema {:?} does not match the object schema {:?}",
+                    batch.schema(),
+                    self.schema
                 ),
             });
         }
-        writer
-            .write(&batch)
+        self.writer
+            .write(batch)
             .map_err(|e| ObjStoreError::Parquet(e.to_string()))?;
+        self.rows += batch.num_rows() as u64;
+        Ok(())
     }
 
-    writer
-        .close()
-        .map_err(|e| ObjStoreError::Parquet(e.to_string()))?;
-    Ok(out)
+    /// Rows written so far.
+    #[must_use]
+    pub const fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Close the writer and return the encoded object and its row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Parquet footer cannot be written.
+    pub fn finish(self) -> Result<(Vec<u8>, u64)> {
+        let rows = self.rows;
+        let bytes = self
+            .writer
+            .into_inner()
+            .map_err(|e| ObjStoreError::Parquet(e.to_string()))?;
+        Ok((bytes, rows))
+    }
 }
 
 /// Read a cold Parquet object back into Arrow batches.
 ///
-/// This is the path chronix's own queries take over cold data. It reproduces
-/// the batches the `.csx` reader would have produced, so everything downstream
-/// — dedup, tombstone filtering, aggregation — is unchanged.
+/// Chronix's own SQL reads the archive through DataFusion's listing table, not
+/// through this: it exists so an embedder holding archive bytes can decode them
+/// with the same reader the round-trip tests use. Nothing further is applied —
+/// dedup and tombstones were resolved when the object was *written*, which is
+/// the whole point of building it from the read path.
 ///
 /// # Errors
 ///
@@ -193,32 +180,6 @@ pub fn parquet_to_batches(data: Vec<u8>) -> Result<Vec<RecordBatch>> {
 
     reader
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| ObjStoreError::Parquet(e.to_string()))
-}
-
-/// Read a cold Parquet object from a local file.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read or is not valid Parquet.
-pub fn parquet_file_to_batches(path: impl AsRef<Path>) -> Result<Vec<RecordBatch>> {
-    let file = std::fs::File::open(path).map_err(ObjStoreError::Io)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| ObjStoreError::Parquet(e.to_string()))?
-        .build()
-        .map_err(|e| ObjStoreError::Parquet(e.to_string()))?;
-    reader
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| ObjStoreError::Parquet(e.to_string()))
-}
-
-/// Concatenate cold batches into one, for callers that want a single batch.
-///
-/// # Errors
-///
-/// Returns an error if the batches do not share a schema.
-pub fn concat_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<RecordBatch> {
-    arrow::compute::concat_batches(schema, batches)
         .map_err(|e| ObjStoreError::Parquet(e.to_string()))
 }
 
@@ -272,7 +233,7 @@ mod tests {
         writer.close().unwrap();
 
         let back = parquet_to_batches(buf).unwrap();
-        let merged = concat_batches(&schema, &back).unwrap();
+        let merged = arrow::compute::concat_batches(&schema, &back).unwrap();
 
         assert_eq!(merged.num_rows(), 4);
         assert_eq!(
@@ -333,14 +294,44 @@ mod tests {
         );
     }
 
+    /// The writer streams several batches into one object and refuses a
+    /// batch that does not match the schema it committed to.
     #[test]
-    fn cold_format_extensions_are_distinct() {
-        assert_eq!(ColdFormat::Csx.extension(), "csx");
-        assert_eq!(ColdFormat::Parquet.extension(), "parquet");
-        assert_eq!(
-            ColdFormat::default(),
-            ColdFormat::Parquet,
-            "the archive should be readable by default"
+    fn archive_writer_streams_batches_and_pins_the_schema() {
+        let batch = sample_batch();
+        let mut w = ParquetArchiveWriter::new(batch.schema()).unwrap();
+        w.write(&batch).unwrap();
+        w.write(&batch).unwrap();
+
+        let mismatched = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "other",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        assert!(
+            w.write(&mismatched).is_err(),
+            "a batch of a different schema must be refused, not silently dropped"
         );
+
+        let (bytes, rows) = w.finish().unwrap();
+        assert_eq!(rows, 8, "both batches must be counted");
+        let back = parquet_to_batches(bytes).unwrap();
+        let total: usize = back.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 8);
+    }
+
+    /// An empty batch is a no-op, not a zero-row row group.
+    #[test]
+    fn archive_writer_ignores_empty_batches() {
+        let schema = sample_batch().schema();
+        let mut w = ParquetArchiveWriter::new(schema.clone()).unwrap();
+        w.write(&RecordBatch::new_empty(schema)).unwrap();
+        assert_eq!(w.rows(), 0);
+        let (_, rows) = w.finish().unwrap();
+        assert_eq!(rows, 0);
     }
 }

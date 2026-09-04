@@ -26,7 +26,7 @@ pub mod wal_codec;
 
 pub use config::{
     AnalyticsConfig, AnalyticsOverride, ChronixConfig, ChronixConfigBuilder, CompressionCodec,
-    FloatEncoding, FsyncPolicy, MultivariateConfig, StorageBackendConfig, WalConfig,
+    FloatEncoding, FsyncPolicy, MultivariateConfig, WalConfig,
 };
 pub use error::{ChronixError, ConfigError, SchemaError, WalError};
 pub use schema::{
@@ -35,7 +35,8 @@ pub use schema::{
 pub use types::{
     canonical_from_pairs, push_canonical, FieldValue, Fields, NamespaceId, NamespaceQuota,
     NamespaceUsage, Point, SegmentId, SegmentState, SeriesKey, ShardId, Tags, Timestamp, Tombstone,
-    TombstoneSet, WalEntry, KV_SEPARATOR, NAMESPACE_TAG, TAG_SEPARATOR,
+    TombstoneSet, WalEntry, KV_SEPARATOR, MAX_STRING_FIELD_LENGTH, NAMESPACE_TAG,
+    RESERVED_COLUMN_NAMES, TAG_SEPARATOR,
 };
 pub use wal_codec::{
     decode as wal_decode, encode as wal_encode, encode_write_point as wal_encode_write_point,

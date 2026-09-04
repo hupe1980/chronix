@@ -76,6 +76,8 @@ pub enum Token {
     GroupRight,
     /// `offset` keyword.
     Offset,
+    /// The `@` modifier.
+    At,
     /// `bool` keyword.
     Bool,
     /// `and` keyword.
@@ -125,6 +127,7 @@ impl fmt::Display for Token {
             Token::GroupLeft => write!(f, "group_left"),
             Token::GroupRight => write!(f, "group_right"),
             Token::Offset => write!(f, "offset"),
+            Token::At => write!(f, "@"),
             Token::Bool => write!(f, "bool"),
             Token::And => write!(f, "and"),
             Token::Or => write!(f, "or"),
@@ -230,6 +233,10 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             '^' => {
                 tokens.push(Token::Caret);
+                i += 1;
+            }
+            '@' => {
+                tokens.push(Token::At);
                 i += 1;
             }
             '=' => {

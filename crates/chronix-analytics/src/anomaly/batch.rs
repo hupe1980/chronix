@@ -196,54 +196,28 @@ pub fn batch_detect_iqr(
     results
 }
 
-/// Unified batch detect that dispatches to the best available path based
-/// on detector type.
+/// Detect anomalies across many series using their **fitted** detectors.
 ///
-/// - **Z-Score**: uses the SIMD fast path `batch_detect_zscore` when an
-///   engine is supplied
-/// - **IQR**: uses the parallel `batch_detect_iqr` path
-/// - **All other detectors**: uses the generic per-detector `batch_detect`
+/// # Why there is no fast path
+///
+/// [`batch_detect_zscore`] and [`batch_detect_iqr`] are not faster
+/// implementations of this — they compute a *different* statistic. Both
+/// re-derive the baseline from the series they are scoring and take the
+/// threshold from an argument, so a detector fitted on a healthy window and
+/// pointed at a series that has since shifted by 1000σ flags **nothing**:
+/// relative to itself, the shifted series is ordinary. Dispatching to them
+/// on [`AnomalyDetector::detector_type`] silently discards both the fitted
+/// state and the configured threshold.
+///
+/// Detecting against a stored baseline and detecting against the batch's own
+/// distribution are two different jobs. This function does the first (and is
+/// exactly [`batch_detect`]); [`batch_detect_zscore`] and
+/// [`batch_detect_iqr`] do the second and say so.
 pub fn batch_detect_auto<D: AnomalyDetector + Send>(
     detectors: &mut [D],
     data: &[(&[i64], &[f64])],
-    engine: Option<&Arc<CpuEngine>>,
-    threshold: Option<f64>,
 ) -> Vec<Result<Vec<AnomalyScore>, AnomalyError>> {
-    if detectors.is_empty() || data.is_empty() {
-        return Vec::new();
-    }
-
-    // Inspect the first detector to determine the type.
-    let det_type = detectors[0].detector_type();
-
-    match det_type {
-        DetectorType::ZScore if engine.is_some() => {
-            tracing::debug!(
-                detector = ?det_type,
-                series = data.len(),
-                "dispatching to SIMD Z-Score fast path"
-            );
-            batch_detect_zscore(engine.expect("guarded by is_some()"), data, threshold)
-        }
-        DetectorType::Iqr => {
-            tracing::debug!(
-                detector = ?det_type,
-                series = data.len(),
-                "dispatching to parallel IQR path"
-            );
-            let k = threshold.or(Some(1.5));
-            batch_detect_iqr(data, k)
-        }
-        _ => {
-            tracing::debug!(
-                detector = ?det_type,
-                series = data.len(),
-                "no fast path for {:?} — using generic batch_detect",
-                det_type
-            );
-            batch_detect(detectors, data)
-        }
-    }
+    batch_detect(detectors, data)
 }
 
 /// Compute z-score anomaly detection for a single series using the compute engine.
@@ -283,78 +257,21 @@ fn detect_zscore_engine(
     Ok(scores)
 }
 
-/// Compute IQR anomaly detection for a single series.
+/// Compute IQR anomaly detection for a single series, self-calibrated.
+///
+/// Delegates to [`IqrDetector`] rather than reimplementing the fences: the
+/// second copy scored constant data by absolute distance from the median
+/// (`inf` for anything off-median) while the detector scored it against a
+/// floored IQR, so the same input got two different answers from two
+/// functions documented as doing the same thing.
 fn detect_iqr_batch(
     timestamps: &[i64],
     values: &[f64],
     k: f64,
 ) -> Result<Vec<AnomalyScore>, AnomalyError> {
-    if values.len() < 4 {
-        return Err(AnomalyError::InsufficientData {
-            min: 4,
-            got: values.len(),
-        });
-    }
-
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable_by(f64::total_cmp);
-
-    let q1 = percentile(&sorted, 0.25);
-    let q3 = percentile(&sorted, 0.75);
-    let iqr = q3 - q1;
-    let lower_fence = q1 - k * iqr;
-    let upper_fence = q3 + k * iqr;
-
-    let median = percentile(&sorted, 0.5);
-    let mut scores = Vec::with_capacity(values.len());
-    for (i, &v) in values.iter().enumerate() {
-        // When IQR ≈ 0 (constant data), use absolute distance from median
-        // to determine anomaly status, matching IqrDetector behavior.
-        let (is_anomaly, raw) = if iqr < 1e-15 {
-            let dist = (v - median).abs();
-            (
-                dist >= 1e-15,
-                if dist < 1e-15 { 0.0 } else { f64::INFINITY },
-            )
-        } else {
-            let anom = v < lower_fence || v > upper_fence;
-            let r = if v < lower_fence {
-                (lower_fence - v) / iqr
-            } else if v > upper_fence {
-                (v - upper_fence) / iqr
-            } else {
-                0.0
-            };
-            (anom, r)
-        };
-        scores.push(AnomalyScore {
-            timestamp: timestamps[i],
-            value: v,
-            score: 1.0 - 1.0 / (1.0 + raw),
-            is_anomaly,
-            method: DetectorType::Iqr,
-            threshold: k,
-            details: format!("fences=[{lower_fence:.2}, {upper_fence:.2}] iqr={iqr:.4}"),
-        });
-    }
-
-    Ok(scores)
-}
-
-/// Interpolated percentile.
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = p * (sorted.len() - 1) as f64;
-    let lo = idx.floor() as usize;
-    let hi = idx.ceil() as usize;
-    if lo == hi {
-        sorted[lo]
-    } else {
-        let frac = idx - lo as f64;
-        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
-    }
+    let mut det = crate::anomaly::iqr::IqrDetector::new(Some(k));
+    det.fit(timestamps, values)?;
+    det.detect(timestamps, values)
 }
 
 /// Sigmoid normalization: maps `threshold → ~0.5`, well-above → ~1.0.

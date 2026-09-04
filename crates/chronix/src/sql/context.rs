@@ -23,29 +23,9 @@ use crate::Chronix;
 ///
 /// Reports a single schema `"public"` containing all measurements as tables.
 #[derive(Debug)]
-pub struct ChronixCatalogProvider {
+pub(crate) struct ChronixCatalogProvider {
     db: Arc<Chronix>,
     namespace: Option<String>,
-}
-
-impl ChronixCatalogProvider {
-    /// Create a new catalog provider wrapping the given database.
-    #[must_use]
-    pub fn new(db: Arc<Chronix>) -> Self {
-        Self {
-            db,
-            namespace: None,
-        }
-    }
-
-    /// Create a catalog provider whose every table is scoped to `namespace`.
-    #[must_use]
-    pub fn new_scoped(db: Arc<Chronix>, namespace: impl Into<String>) -> Self {
-        Self {
-            db,
-            namespace: Some(namespace.into()),
-        }
-    }
 }
 
 impl CatalogProvider for ChronixCatalogProvider {
@@ -70,42 +50,31 @@ impl CatalogProvider for ChronixCatalogProvider {
 /// Each Chronix measurement is surfaced as a table. Tables are resolved
 /// on demand so newly created measurements are immediately visible.
 #[derive(Debug)]
-pub struct ChronixSchemaProvider {
+pub(crate) struct ChronixSchemaProvider {
     db: Arc<Chronix>,
     namespace: Option<String>,
-}
-
-impl ChronixSchemaProvider {
-    /// Create a new schema provider.
-    #[must_use]
-    pub fn new(db: Arc<Chronix>) -> Self {
-        Self {
-            db,
-            namespace: None,
-        }
-    }
-
-    /// Create a schema provider whose tables are scoped to `namespace`.
-    #[must_use]
-    pub fn new_scoped(db: Arc<Chronix>, namespace: impl Into<String>) -> Self {
-        Self {
-            db,
-            namespace: Some(namespace.into()),
-        }
-    }
 }
 
 #[async_trait]
 impl SchemaProvider for ChronixSchemaProvider {
     fn table_names(&self) -> Vec<String> {
-        self.db.schema_registry().measurement_names()
+        self.db.measurement_names_in(self.namespace.as_deref())
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.db.schema(name).is_some()
+        // Scoped, because "the table resolves" is itself an answer. Both of
+        // these used to consult the process-wide schema registry, so
+        // `SELECT * FROM another_tenants_measurement` returned zero rows
+        // where a name that genuinely does not exist errors — an existence
+        // oracle a tenant could use to enumerate every other tenant's
+        // measurement names.
+        self.db.has_measurement_in(self.namespace.as_deref(), name)
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        if !self.table_exist(name) {
+            return Ok(None);
+        }
         match ChronixTableProvider::try_new_scoped(self.db.clone(), name, self.namespace.clone()) {
             Ok(provider) => Ok(Some(Arc::new(provider))),
             Err(_) => Ok(None),
@@ -163,12 +132,19 @@ fn build_session_context(db: &Arc<Chronix>, namespace: Option<String>) -> Sessio
         .map(std::num::NonZero::get)
         .unwrap_or(1);
 
-    // Disable information_schema to prevent internal catalog
-    // structure leakage via queries like
-    // `SELECT * FROM information_schema.tables`.
+    // `information_schema` is on, which is what makes `SHOW TABLES`,
+    // `SHOW COLUMNS` and the catalog views work — the first thing anybody
+    // types in a SQL shell, and previously an error telling them to enable a
+    // setting they cannot reach.
+    //
+    // It was off to prevent "catalog structure leakage", and that was the
+    // right call while `table_names()` answered from the process-wide schema
+    // registry: it would have listed every tenant's measurements. The
+    // catalog is now scoped to the session's namespace, so what these views
+    // enumerate is the caller's own data.
     let session_config = SessionConfig::new()
         .with_default_catalog_and_schema("chronix", "public")
-        .with_information_schema(false)
+        .with_information_schema(true)
         .with_target_partitions(target_partitions);
 
     // Configure RuntimeEnv with spill-to-disk and a bounded
@@ -188,6 +164,23 @@ fn build_session_context(db: &Arc<Chronix>, namespace: Option<String>) -> Sessio
         .with_runtime_env(runtime_env)
         .with_default_features()
         .build();
+
+    // `EpochLiteralRule` must run **before** DataFusion's `TypeCoercion`,
+    // which is what rejects `_time >= 1700000000000000000`. Appending with
+    // `with_analyzer_rule` puts it after, where the plan has already failed
+    // — so the default list is rebuilt with ours in front.
+    let state = {
+        let mut builder = SessionStateBuilder::new_from_existing(state);
+        let rules = builder
+            .analyzer_rules()
+            .take()
+            .unwrap_or_else(|| datafusion::optimizer::Analyzer::new().rules);
+        let mut with_ours: Vec<
+            std::sync::Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>,
+        > = vec![std::sync::Arc::new(super::epoch_literals::EpochLiteralRule)];
+        with_ours.extend(rules);
+        builder.with_analyzer_rules(with_ours).build()
+    };
 
     let ctx = SessionContext::from(state);
 
@@ -238,7 +231,10 @@ mod tests {
         let point = Point::new(key, crate::fields! { "usage" => 42.0_f64 }, 1_000_000_000).unwrap();
         db.insert(&point).unwrap();
 
-        let provider = ChronixSchemaProvider::new(db);
+        let provider = ChronixSchemaProvider {
+            db,
+            namespace: None,
+        };
         let names = provider.table_names();
         assert!(names.contains(&"cpu".to_string()));
         assert!(provider.table_exist("cpu"));

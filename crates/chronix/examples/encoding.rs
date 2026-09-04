@@ -10,49 +10,53 @@
 
 use chronix::chronix_core::config::FloatEncoding;
 use chronix::chronix_encoding::{
-    AdaptiveSelector, BitmapDecoder, BitmapEncoder, ChimpDecoder, ChimpEncoder, ColumnDecoder,
-    ColumnEncoder, DecodedColumn, DeltaOfDeltaDecoder, DeltaOfDeltaEncoder, DictionaryDecoder,
-    DictionaryEncoder, GorillaDecoder, GorillaEncoder, IntegerDecoder, IntegerEncoder,
+    AdaptiveSelector, AlpDecoder, AlpEncoder, BitmapDecoder, BitmapEncoder, ChimpDecoder,
+    ChimpEncoder, ColumnDecoder, ColumnEncoder, DecodedColumn, DeltaOfDeltaDecoder,
+    DeltaOfDeltaEncoder, DictionaryDecoder, DictionaryEncoder, GorillaDecoder, GorillaEncoder,
+    IntegerDecoder, IntegerEncoder,
 };
 
 fn main() {
     println!("=== Chronix Column Encoding ===\n");
 
-    // ── 1. Timestamp Compression (Delta-of-Delta) ─────────────────
-    println!("--- Timestamp Encoding (Delta-of-Delta) ---");
-    let timestamps: Vec<i64> = (0..1000)
+    // ── 1. Timestamps: pco, with delta-of-delta as the fallback ───
+    //
+    // A real 1-second sampler jitters, and that is where the two codecs
+    // part company: delta-of-delta pays a varint for every non-zero second
+    // difference, so jitter makes its output *larger* than plain, while pco
+    // entropy-codes the deltas and pays bits.
+    println!("--- Timestamp Encoding ---");
+    let regular: Vec<i64> = (0..1000)
         .map(|i| 1_700_000_000_000_000_000i64 + i * 1_000_000_000)
         .collect();
-
-    let raw_size = timestamps.len() * 8;
-    let encoded = DeltaOfDeltaEncoder::encode(&timestamps).expect("DoD encode failed");
-    let ratio = raw_size as f64 / encoded.len() as f64;
-    println!(
-        "  {} timestamps: {} bytes → {} bytes ({:.1}x compression)",
-        timestamps.len(),
-        raw_size,
-        encoded.len(),
-        ratio,
-    );
-
-    let decoded = DeltaOfDeltaDecoder::decode(&encoded).expect("DoD decode failed");
-    assert_eq!(timestamps, decoded, "Timestamp round-trip failed");
-    println!("  ✓ Round-trip verified");
-
-    // Irregular timestamps (less compressible)
-    let irregular_ts: Vec<i64> = (0..1000)
-        .map(|i| {
-            1_700_000_000_000_000_000i64 + i * 1_000_000_000 + (i * 137 % 500) * 1_000_000
-            // jitter
-        })
+    // ±250 ms of jitter around the same 1-second cadence.
+    let jittered: Vec<i64> = (0..1000)
+        .map(|i| 1_700_000_000_000_000_000i64 + i * 1_000_000_000 + (i * 137 % 500) * 1_000_000)
         .collect();
-    let irregular_encoded =
-        DeltaOfDeltaEncoder::encode(&irregular_ts).expect("DoD encode irregular failed");
-    let irregular_ratio = raw_size as f64 / irregular_encoded.len() as f64;
-    println!(
-        "  Irregular timestamps: {:.1}x (vs {:.1}x regular)",
-        irregular_ratio, ratio
-    );
+
+    let raw_size = regular.len() * 8;
+    println!("  {:<22} {:>10} {:>10}", "shape", "DoD", "pco");
+    for (label, series) in [("regular 1 s", &regular), ("1 s ± 250 ms", &jittered)] {
+        let dod = DeltaOfDeltaEncoder::encode(series).expect("DoD encode failed");
+        assert_eq!(
+            &DeltaOfDeltaDecoder::decode(&dod).expect("DoD decode failed"),
+            series,
+            "delta-of-delta round-trip failed"
+        );
+        let block = ColumnEncoder::encode_timestamps(series).expect("timestamp encode failed");
+        match ColumnDecoder::decode(&block).expect("timestamp decode failed") {
+            DecodedColumn::I64(back) => assert_eq!(&back, series, "timestamp round-trip failed"),
+            other => unreachable!("timestamps decoded to {other:?}"),
+        }
+        println!(
+            "  {:<22} {:>9.1}x {:>9.1}x  (chose {})",
+            label,
+            raw_size as f64 / dod.len() as f64,
+            raw_size as f64 / (block.payload.len() + 1) as f64,
+            block.encoding,
+        );
+    }
+    println!("  ✓ Round-trips verified for both codecs and both shapes");
 
     // ── 2. Float Compression (Gorilla vs Chimp) ───────────────────
     println!("\n--- Float Encoding ---");
@@ -107,6 +111,45 @@ fn main() {
         chimp_rand.len(),
         raw_f64_size as f64 / chimp_rand.len() as f64
     );
+
+    // ── 2b. ALP: the primary float codec ──────────────────────────
+    // Most metric values started life as decimals — a meter reporting
+    // 231.45 W — and ALP recovers that integer instead of XOR-ing bit
+    // patterns. On the same kind of data the XOR codecs manage ~1.1×.
+    println!("\n--- ALP (decimal metric data) ---");
+    let meter_data: Vec<f64> = (0..1000)
+        .map(|i| {
+            // two-decimal power readings between 200 and 250 W
+            let raw = 200.0 + ((i * 37) % 5000) as f64 / 100.0;
+            (raw * 100.0).round() / 100.0
+        })
+        .collect();
+    let alp_enc = AlpEncoder::encode(&meter_data).expect("ALP encode failed");
+    let gorilla_meter = GorillaEncoder::encode(&meter_data).expect("Gorilla encode failed");
+    let chimp_meter = ChimpEncoder::encode(&meter_data).expect("Chimp encode failed");
+    println!(
+        "Power meter, 2 dp ({} values, {} raw bytes):",
+        meter_data.len(),
+        raw_f64_size
+    );
+    println!(
+        "  ALP:     {} bytes ({:.1}x)",
+        alp_enc.len(),
+        raw_f64_size as f64 / alp_enc.len() as f64
+    );
+    println!(
+        "  Gorilla: {} bytes ({:.1}x)",
+        gorilla_meter.len(),
+        raw_f64_size as f64 / gorilla_meter.len() as f64
+    );
+    println!(
+        "  Chimp:   {} bytes ({:.1}x)",
+        chimp_meter.len(),
+        raw_f64_size as f64 / chimp_meter.len() as f64
+    );
+    let alp_dec = AlpDecoder::decode(&alp_enc).expect("ALP decode failed");
+    assert_eq!(meter_data, alp_dec, "ALP round-trip failed");
+    println!("  ✓ ALP round-trip verified (bit-exact)");
 
     // ── 3. Integer Compression ────────────────────────────────────
     println!("\n--- Integer Encoding ---");
@@ -183,28 +226,29 @@ fn main() {
     // ── 6. Unified Column Encoder ─────────────────────────────────
     println!("\n--- Unified ColumnEncoder ---");
 
-    let ts_block = ColumnEncoder::encode_timestamps(&timestamps).expect("encode_timestamps failed");
+    let ts_block = ColumnEncoder::encode_timestamps(&regular).expect("encode_timestamps failed");
     println!(
         "  Timestamps: encoding={:?}, {} bytes",
         ts_block.encoding,
         ts_block.payload.len()
     );
 
-    let f64_block =
-        ColumnEncoder::encode_f64(&slow_data, FloatEncoding::Gorilla).expect("encode_f64 failed");
-    println!(
-        "  Floats (Gorilla): encoding={:?}, {} bytes",
-        f64_block.encoding,
-        f64_block.payload.len()
-    );
-
-    let f64_chimp_block = ColumnEncoder::encode_f64(&slow_data, FloatEncoding::Chimp)
-        .expect("encode_f64 chimp failed");
-    println!(
-        "  Floats (Chimp): encoding={:?}, {} bytes",
-        f64_chimp_block.encoding,
-        f64_chimp_block.payload.len()
-    );
+    // The `FloatEncoding` argument is a *hint*: the unified encoder trials
+    // the candidates and keeps whatever is smallest, so what comes back is
+    // the codec that won, not the one that was asked for. Printing the hint
+    // as if it were the answer is how a table of "Gorilla" numbers ends up
+    // describing pco.
+    let mut f64_block = None;
+    for hint in [FloatEncoding::Gorilla, FloatEncoding::Chimp] {
+        let block = ColumnEncoder::encode_f64(&slow_data, hint).expect("encode_f64 failed");
+        println!(
+            "  Floats (hint {hint:?}): chose {:?}, {} bytes",
+            block.encoding,
+            block.payload.len()
+        );
+        f64_block = Some(block);
+    }
+    let f64_block = f64_block.expect("at least one encoding was tried");
 
     let str_block = ColumnEncoder::encode_string(&tags).expect("encode_string failed");
     println!(

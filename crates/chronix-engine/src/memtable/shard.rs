@@ -10,8 +10,8 @@
 //! 1. A new shard is created lazily on first write.
 //! 2. When a shard's memtable reaches the flush threshold, it is frozen and
 //!    flushed to a segment file.
-//! 3. Old shards beyond the tolerance window are sealed and eventually
-//!    removed.
+//! 3. Shards below the tolerance window that hold no data are retired from
+//!    the router; a backfill recreates one lazily.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -50,8 +50,6 @@ impl Default for ShardRouterConfig {
 struct ShardEntry {
     /// The flush controller for this shard's memtable.
     controller: Arc<FlushController>,
-    /// Whether this shard has been sealed (no more writes).
-    sealed: bool,
 }
 
 /// Routes writes to per-shard memtables based on point timestamps.
@@ -115,6 +113,43 @@ impl ShardRouter {
         self.insert_into_shard_with_wal_seq(shard_id, point, wal_seq)
     }
 
+    /// Admit a timestamp: decide whether a write for it may be accepted.
+    ///
+    /// This is the out-of-order tolerance check, split from the insert so a
+    /// caller can run it *before* making the write durable. A point that
+    /// fails admission never reaches the WAL, so what the caller was told
+    /// was rejected cannot come back through replay.
+    ///
+    /// Admitting a timestamp in a newer shard advances the active shard,
+    /// exactly as an insert would.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemtableError::ShardOutOfRange`] if the timestamp maps to a
+    /// shard outside the tolerance window.
+    pub fn admit(&self, timestamp: Timestamp) -> Result<ShardId> {
+        let shard_id = ShardId::from_timestamp(timestamp, self.config.shard_duration);
+        self.ensure_shard_allowed(shard_id)?;
+        Ok(shard_id)
+    }
+
+    /// Insert a point that has already passed [`admit`](Self::admit) and
+    /// been made durable.
+    ///
+    /// No tolerance check: the decision was taken before the WAL append,
+    /// and re-taking it here would let a concurrent writer that advanced
+    /// the active shard in between turn an acknowledged, durable write
+    /// into a rejected one. The WAL is the truth; what is in it is
+    /// inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shard's memtable insertion fails.
+    pub fn insert_admitted(&self, point: &Point, wal_seq: u64) -> Result<()> {
+        let shard_id = ShardId::from_timestamp(point.timestamp(), self.config.shard_duration);
+        self.insert_into_shard_with_wal_seq(shard_id, point, wal_seq)
+    }
+
     /// Insert a point during WAL replay, bypassing shard tolerance checks.
     ///
     /// During crash recovery the WAL may contain records in a different
@@ -150,66 +185,120 @@ impl ShardRouter {
 
     /// Flush a specific shard's memtable to segments.
     ///
-    /// Freezes the shard's active memtable and flushes the frozen data.
-    /// Returns one [`FlushResult`] per measurement in the shard.
+    /// Equivalent to [`flush_shard_with`](Self::flush_shard_with) with a
+    /// registration step that does nothing.
     ///
     /// # Errors
     ///
-    /// Returns an error if the shard doesn't exist or the flush fails.
+    /// See [`flush_shard_with`](Self::flush_shard_with).
     pub fn flush_shard(&self, shard_id: ShardId) -> Result<Vec<FlushResult>> {
-        let shards = self.shards.read();
-        let entry = shards
-            .get(&shard_id)
-            .ok_or(MemtableError::ShardOutOfRange {
-                target: shard_id.0,
-                min_allowed: 0,
-                max_allowed: 0,
-            })?;
-
-        entry.controller.freeze_and_swap()?;
-        entry.controller.flush_frozen()
+        self.flush_shard_with(shard_id, |_| Ok(()))
     }
 
-    /// Seal a shard, preventing further writes and flushing its data.
+    /// Freeze the shard's active memtable, write it to segments, hand the
+    /// results to `register`, and release the memtable only once
+    /// registration succeeded — see
+    /// [`FlushController::flush_frozen_with`].
+    ///
+    /// The router lock is released before the write starts: it used to be
+    /// held for the whole segment write, and parking_lot's writer-preferring
+    /// `RwLock` then queued every insert behind the first write that needed
+    /// a new shard.
     ///
     /// # Errors
     ///
     /// Returns an error if the shard doesn't exist or the flush fails.
-    pub fn seal_shard(&self, shard_id: ShardId) -> Result<Option<Vec<FlushResult>>> {
-        let mut shards = self.shards.write();
-        let entry = shards
-            .get_mut(&shard_id)
-            .ok_or(MemtableError::ShardOutOfRange {
-                target: shard_id.0,
-                min_allowed: 0,
-                max_allowed: 0,
-            })?;
+    pub fn flush_shard_with<F>(
+        &self,
+        shard_id: ShardId,
+        mut register: F,
+    ) -> Result<Vec<FlushResult>>
+    where
+        F: FnMut(&[FlushResult]) -> Result<()>,
+    {
+        let controller = {
+            let shards = self.shards.read();
+            let entry = shards
+                .get(&shard_id)
+                .ok_or(MemtableError::ShardOutOfRange {
+                    target: shard_id.0,
+                    min_allowed: 0,
+                    max_allowed: 0,
+                })?;
+            Arc::clone(&entry.controller)
+        };
 
-        entry.sealed = true;
-
-        // Freeze and flush if there's data
-        if entry.controller.active_memtable().is_empty() {
-            return Ok(None);
+        // A full frozen queue is not a reason to fail: it means earlier
+        // flushes failed, and draining it is exactly what this call is for.
+        match controller.freeze_and_swap() {
+            Ok(()) | Err(MemtableError::CapacityExceeded { .. }) => {}
+            Err(e) => return Err(e),
         }
-
-        entry.controller.freeze_and_swap()?;
-        entry.controller.flush_frozen().map(Some)
+        // Drain every frozen memtable, oldest first.
+        let mut all = Vec::new();
+        while controller.frozen_count() > 0 {
+            match controller.flush_frozen_with(&mut register) {
+                Ok(results) => all.extend(results),
+                Err(MemtableError::NoFrozenMemtable) => continue,
+                Err(e) => {
+                    if all.is_empty() {
+                        return Err(e);
+                    }
+                    // Something landed; report it and let the caller retry
+                    // the rest. The unflushed memtables still cap the floor.
+                    tracing::warn!(shard = %shard_id, error = %e, "flush stopped early");
+                    return Ok(all);
+                }
+            }
+        }
+        if all.is_empty() {
+            return Err(MemtableError::NoFrozenMemtable);
+        }
+        Ok(all)
     }
 
-    /// Get the list of active (non-sealed) shard IDs.
+    /// The newest shard a write has been admitted to, if any.
+    ///
+    /// The out-of-order window is anchored here rather than at the wall
+    /// clock: a device that was offline for days and resumes with old
+    /// timestamps is still writing "now" as far as the engine is concerned.
     #[must_use]
-    pub fn active_shard_ids(&self) -> Vec<ShardId> {
-        self.shards
-            .read()
-            .iter()
-            .filter(|(_, e)| !e.sealed)
-            .map(|(id, _)| *id)
-            .collect()
+    pub fn active_shard(&self) -> Option<ShardId> {
+        *self.active_shard.read()
     }
 
-    /// Get all shard IDs (including sealed).
+    /// Anchor the out-of-order window at `shard` if no write has anchored
+    /// it yet.
+    ///
+    /// `open()` seeds it from the newest timestamp in the catalog, so the
+    /// window a database enforces after a clean restart is the one it
+    /// enforced before — and so the rollup materialiser knows which buckets
+    /// are final without waiting for the first live write.
+    pub fn seed_active_shard(&self, shard: ShardId) {
+        let mut active = self.active_shard.write();
+        if active.is_none_or(|a| shard.0 > a.0) {
+            *active = Some(shard);
+        }
+    }
+
+    /// Drop the router entries of shards that hold no data and can no
+    /// longer receive live writes — everything below the out-of-order
+    /// window. They are recreated lazily if a backfill reaches them.
+    ///
+    /// Without this a long-running database accumulated one empty
+    /// controller per hour of uptime, forever.
+    pub fn retire_idle_shards(&self) {
+        let Some(active) = self.active_shard() else {
+            return;
+        };
+        let oldest_live = active.0.saturating_sub(self.config.ooo_shard_tolerance);
+        let mut shards = self.shards.write();
+        shards.retain(|id, entry| id.0 >= oldest_live || !entry.controller.is_idle());
+    }
+
+    /// Every shard the router currently holds a memtable for.
     #[must_use]
-    pub fn all_shard_ids(&self) -> Vec<ShardId> {
+    pub fn shard_ids(&self) -> Vec<ShardId> {
         self.shards.read().keys().copied().collect()
     }
 
@@ -223,15 +312,29 @@ impl ShardRouter {
             .sum()
     }
 
-    /// Returns the minimum WAL sequence still held in any active
-    /// (unflushed) memtable across all shards.  Returns `None` if all
-    /// active memtables are empty.
+    /// Heap bytes held by every memtable's string interner.
+    ///
+    /// Not included in [`total_memory`](Self::total_memory), which counts rows
+    /// and index entries. The interner grows with cardinality rather than with
+    /// row count, so it is worth its own number.
     #[must_use]
-    pub fn min_active_wal_seq(&self) -> Option<u64> {
+    pub fn total_interner_memory(&self) -> usize {
         self.shards
             .read()
             .values()
-            .filter_map(|e| e.controller.active_min_wal_seq())
+            .map(|e| e.controller.total_interner_memory())
+            .sum()
+    }
+
+    /// The smallest WAL sequence number held by any memtable — active or
+    /// frozen, in any shard — that is not yet in a registered segment.
+    /// `None` when every memtable is empty.
+    #[must_use]
+    pub fn min_unflushed_wal_seq(&self) -> Option<u64> {
+        self.shards
+            .read()
+            .values()
+            .filter_map(|e| e.controller.min_unflushed_wal_seq())
             .min()
     }
 
@@ -329,8 +432,6 @@ impl ShardRouter {
 
     /// Obtain a reference to the shard entry, creating it if needed.
     /// Calls `f` with the shard's `FlushController`.
-    ///
-    /// Returns `Err(ShardOutOfRange)` if the shard is sealed.
     fn with_shard<F, R>(&self, shard_id: ShardId, f: F) -> Result<R>
     where
         F: FnOnce(&FlushController) -> Result<R>,
@@ -339,13 +440,6 @@ impl ShardRouter {
         {
             let shards = self.shards.read();
             if let Some(entry) = shards.get(&shard_id) {
-                if entry.sealed {
-                    return Err(MemtableError::ShardOutOfRange {
-                        target: shard_id.0,
-                        min_allowed: 0,
-                        max_allowed: 0,
-                    });
-                }
                 return f(&entry.controller);
             }
         }
@@ -357,16 +451,8 @@ impl ShardRouter {
             config.segment_dir = config.segment_dir.join(format!("shard_{}", shard_id.0));
             ShardEntry {
                 controller: Arc::new(FlushController::new(config)),
-                sealed: false,
             }
         });
-        if entry.sealed {
-            return Err(MemtableError::ShardOutOfRange {
-                target: shard_id.0,
-                min_allowed: 0,
-                max_allowed: 0,
-            });
-        }
         f(&entry.controller)
     }
 
@@ -438,8 +524,8 @@ mod tests {
         let p1 = make_point(100, 1.0);
         router.insert(&p1).unwrap();
 
-        assert_eq!(router.all_shard_ids().len(), 1);
-        assert_eq!(router.all_shard_ids()[0], ShardId(0));
+        assert_eq!(router.shard_ids().len(), 1);
+        assert_eq!(router.shard_ids()[0], ShardId(0));
     }
 
     #[test]
@@ -452,7 +538,7 @@ mod tests {
         // Shard 1
         router.insert(&make_point(NS_PER_HOUR + 100, 2.0)).unwrap();
 
-        let shard_ids = router.all_shard_ids();
+        let shard_ids = router.shard_ids();
         assert_eq!(shard_ids.len(), 2);
     }
 
@@ -467,7 +553,7 @@ mod tests {
         // Write to shard 0 (previous — within tolerance of 1)
         router.insert(&make_point(100, 2.0)).unwrap();
 
-        assert_eq!(router.all_shard_ids().len(), 2);
+        assert_eq!(router.shard_ids().len(), 2);
     }
 
     #[test]
@@ -499,20 +585,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].measurement, "cpu");
         assert_eq!(results[0].points_flushed, 10);
-    }
-
-    #[test]
-    fn seal_shard() {
-        let dir = tempfile::tempdir().unwrap();
-        let router = ShardRouter::new(test_router_config(dir.path()));
-
-        router.insert(&make_point(100, 1.0)).unwrap();
-
-        let result = router.seal_shard(ShardId(0)).unwrap();
-        assert!(result.is_some());
-
-        let active = router.active_shard_ids();
-        assert!(active.is_empty());
     }
 
     #[test]
@@ -557,25 +629,6 @@ mod tests {
         assert_eq!(router.shard_for_timestamp(0), ShardId(0));
         assert_eq!(router.shard_for_timestamp(NS_PER_HOUR), ShardId(1));
         assert_eq!(router.shard_for_timestamp(NS_PER_HOUR - 1), ShardId(0));
-    }
-
-    #[test]
-    fn sealed_shard_rejects_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let router = ShardRouter::new(test_router_config(dir.path()));
-
-        // Write to shard 0
-        router.insert(&make_point(100, 1.0)).unwrap();
-
-        // Seal shard 0
-        router.seal_shard(ShardId(0)).ok();
-
-        // Writing to sealed shard should fail
-        let result = router.insert(&make_point(200, 2.0));
-        assert!(
-            result.is_err(),
-            "sealed shard should reject writes, but insert succeeded"
-        );
     }
 
     #[test]

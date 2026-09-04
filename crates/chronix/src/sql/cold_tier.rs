@@ -1,35 +1,38 @@
 //! Registering the Parquet cold tier with DataFusion.
 //!
-//! The tiering engine re-encodes segments to Parquet on the way to object
-//! storage ([`chronix_engine::objstore::parquet_tier`]). This module is the
-//! other half of that decision: it makes the archive queryable *from chronix*
-//! as well as from DuckDB, by pointing DataFusion at the same bucket.
+//! The archiver writes one Parquet object per `(measurement, shard)` under
+//! `measurement=<m>/shard=<n>/`. This module points DataFusion at the same
+//! bucket, so the archive is queryable from chronix as well as from DuckDB.
 //!
 //! ```sql
-//! -- after register_cold_tier(&ctx, "s3://bucket/chronix", "power_cold")
-//! SELECT date_trunc('day', timestamp) AS d, avg(watts)
+//! -- after register_cold_tier(&ctx, "s3://bucket/chronix", "power", "power_cold")
+//! SELECT date_trunc('day', _time) AS d, avg(watts)
 //! FROM power_cold
-//! WHERE timestamp >= '2024-01-01'
+//! WHERE _time >= '2024-01-01'
 //! GROUP BY d;
 //! ```
 //!
-//! # Why this is a separate table rather than a union with the hot tier
+//! # One table is one measurement
 //!
-//! Registering the cold prefix as its own table is a deliberate choice, not a
-//! missing feature. A cold object has no series bloom and no skip index —
-//! Parquet has nowhere to put them — so a cold scan prunes on row-group
-//! statistics alone. Silently unioning that into the hot table would mean a
-//! query whose time range happens to cross the tiering boundary quietly
-//! changes cost class by orders of magnitude, with nothing in the plan saying
-//! so. Naming the cold table makes the archive an explicit thing to query,
-//! which is what an archive should be.
+//! A listing table has exactly one schema and two measurements do not share
+//! one, so a registration names a measurement and points at that measurement's
+//! partition — the same shape as the hot tier. Because the archive is written
+//! from the read path with the hot tier's schema, the cold table's columns are
+//! the hot table's: `_time` typed `Timestamp(ns)`, tags, fields. A query moved
+//! from one to the other is the same query.
+//!
+//! # A separate table, not a union with the hot tier
+//!
+//! A cold object has no series bloom and no skip index, so a cold scan prunes
+//! on row-group statistics alone. Unioning that into the hot table would let a
+//! query change cost class by orders of magnitude whenever its range crossed
+//! the tiering boundary, with nothing in the plan saying so.
 //!
 //! # Credentials
 //!
 //! Taken from the process environment by the `object_store` builders
 //! (`AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`,
-//! `AZURE_STORAGE_ACCOUNT`, …). Chronix does not read, store or log them —
-//! a database that persists cloud credentials is a database that leaks them.
+//! `AZURE_STORAGE_ACCOUNT`, …). Chronix does not read, store or log them.
 
 use std::sync::Arc;
 
@@ -40,56 +43,83 @@ use datafusion::prelude::SessionContext;
 
 use crate::error::{DbError, Result};
 
-/// Register a Parquet cold-tier prefix as a queryable SQL table.
+/// Register one measurement's cold archive as a queryable SQL table.
 ///
-/// `url` is the object-store location the tiering engine writes to — the same
-/// value as [`TieringConfig::remote_url`](chronix_engine::objstore::TieringConfig::remote_url)
+/// `url` is the archive root the tiering pass writes to — the same value as
+/// [`ArchiveConfig::remote_url`](crate::cold_archive::ArchiveConfig::remote_url)
 /// — for example `s3://bucket/chronix` or `file:///var/lib/chronix/archive`.
+/// `measurement` selects the `measurement=<m>/` partition beneath it, and
 /// `table_name` is the name the table takes in SQL.
 ///
-/// The table is a Parquet listing over that prefix, so objects added by later
-/// tiering runs are picked up without re-registering.
+/// The table is a Parquet listing over that partition, so objects added by
+/// later archival passes are picked up without re-registering.
 ///
 /// # Errors
 ///
-/// Returns an error if the URL is not a supported object-store URL, if the
-/// store cannot be constructed (usually missing credentials), or if the prefix
-/// holds no Parquet objects to infer a schema from.
-pub async fn register_cold_tier(ctx: &SessionContext, url: &str, table_name: &str) -> Result<()> {
-    let parsed = url::Url::parse(url)
-        .map_err(|e| DbError::Internal(format!("cold tier URL {url} is not a URL: {e}")))?;
+/// Returns an error if `measurement` is not a usable path segment, if the URL
+/// is not a supported object-store URL, if the store cannot be constructed
+/// (usually missing credentials), or if the measurement has no archived
+/// objects to infer a schema from.
+pub async fn register_cold_tier(
+    ctx: &SessionContext,
+    url: &str,
+    measurement: &str,
+    table_name: &str,
+) -> Result<()> {
+    if measurement.is_empty()
+        || measurement.contains('/')
+        || measurement.contains('\\')
+        || measurement.contains("..")
+        || measurement.contains('=')
+    {
+        return Err(DbError::Internal(format!(
+            "cold tier measurement {measurement:?} is not a usable path segment"
+        )));
+    }
+
+    // The archive root may or may not carry a trailing slash; the partition
+    // has to be joined onto it either way, and a missing slash would otherwise
+    // splice the measurement onto the last path component of the bucket
+    // prefix.
+    let root = url.strip_suffix('/').unwrap_or(url);
+    let table_url = format!("{root}/measurement={measurement}/");
+
+    let parsed = url::Url::parse(&table_url)
+        .map_err(|e| DbError::Internal(format!("cold tier URL {table_url} is not a URL: {e}")))?;
 
     let (store, _path) = object_store::parse_url(&parsed).map_err(|e| {
         DbError::Internal(format!(
-            "cold tier URL {url} is not a supported object store: {e}"
+            "cold tier URL {table_url} is not a supported object store: {e}"
         ))
     })?;
 
-    let store_url = ObjectStoreUrl::parse(&parsed[..url::Position::BeforePath])
-        .map_err(|e| DbError::Internal(format!("cold tier URL {url} is not registrable: {e}")))?;
+    let store_url = ObjectStoreUrl::parse(&parsed[..url::Position::BeforePath]).map_err(|e| {
+        DbError::Internal(format!("cold tier URL {table_url} is not registrable: {e}"))
+    })?;
     ctx.register_object_store(store_url.as_ref(), Arc::from(store));
 
-    // The tiering engine writes `namespace=<ns>/shard=<n>/<file>.parquet`.
-    // Those are Hive-style partition directories, which DataFusion's listing
-    // treats as partitions rather than as subdirectories — so this finds the
-    // objects with `listing_table_ignore_subdirectory` left at its default,
-    // instead of mutating the shared session to relax it.
-    //
-    // Filtering on the extension also keeps `.csx` objects left by an earlier
-    // `ColdFormat::Csx` policy out of the table, rather than failing the whole
-    // registration on the first one.
+    // `shard=<n>` beneath the measurement is a Hive-style partition directory,
+    // which DataFusion's listing treats as a partition rather than as a
+    // subdirectory — so this finds the objects with
+    // `listing_table_ignore_subdirectory` left at its default, instead of
+    // mutating the shared session to relax it.
     let options =
         ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
-    ctx.register_listing_table(table_name, url, options, None, None)
+    ctx.register_listing_table(table_name, &table_url, options, None, None)
         .await
         .map_err(|e| {
             DbError::Internal(format!(
-                "failed to register cold tier {url} as `{table_name}`: {e}"
+                "failed to register cold tier {table_url} as `{table_name}`: {e}"
             ))
         })?;
 
-    tracing::info!(url, table = table_name, "cold tier registered for SQL");
+    tracing::info!(
+        url = %table_url,
+        measurement,
+        table = table_name,
+        "cold tier registered for SQL"
+    );
     Ok(())
 }
 
@@ -98,21 +128,27 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{Float64Array, RecordBatch, StringArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
 
-    /// Write a Parquet file shaped like a cold object.
+    /// Write a Parquet object shaped exactly like one the archiver produces:
+    /// the hot tier's schema, `_time` included.
     fn write_cold_object(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(
+                "_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
             Field::new("host", DataType::Utf8, true),
             Field::new("watts", DataType::Float64, true),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(TimestampNanosecondArray::from(vec![1_i64, 2, 3])),
                 Arc::new(StringArray::from(vec!["a", "a", "b"])),
                 Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
             ],
@@ -124,31 +160,48 @@ mod tests {
         w.close().unwrap();
     }
 
-    /// The exit criterion for the cold tier: cold segments queryable via SQL.
+    /// The archive root, laid out the way the archiver writes it.
+    fn archive_with(root: &std::path::Path, measurement: &str, shard: i64, name: &str) {
+        write_cold_object(
+            &root
+                .join(format!("measurement={measurement}"))
+                .join(format!("shard={shard}")),
+            name,
+        );
+    }
+
+    /// The exit criterion for the cold tier: archived data queryable via SQL,
+    /// found through the `measurement=`/`shard=` partitions the archiver
+    /// writes. DataFusion skips plain subdirectories by default, so the layout
+    /// being Hive-style is load-bearing rather than cosmetic.
     #[tokio::test]
-    async fn cold_segments_are_queryable_through_sql() {
+    async fn archived_objects_are_queryable_through_sql() {
         let tmp = tempfile::tempdir().unwrap();
-        write_cold_object(tmp.path(), "seg_0001.parquet");
-        write_cold_object(tmp.path(), "seg_0002.parquet");
+        archive_with(tmp.path(), "power", 1, "part-a.parquet");
+        archive_with(tmp.path(), "power", 2, "part-b.parquet");
 
         let ctx = SessionContext::new();
         let url = format!("file://{}/", tmp.path().display());
-        register_cold_tier(&ctx, &url, "power_cold").await.unwrap();
-
-        let df = ctx
-            .sql("SELECT count(*) AS n, avg(watts) AS a FROM power_cold")
+        register_cold_tier(&ctx, &url, "power", "power_cold")
             .await
             .unwrap();
-        let batches = df.collect().await.unwrap();
+
+        let batches = ctx
+            .sql("SELECT count(*) AS n, avg(watts) AS a FROM power_cold")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
         let batch = &batches[0];
 
         let n = batch
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<arrow::array::Int64Array>()
             .unwrap()
             .value(0);
-        assert_eq!(n, 6, "both cold objects must be in the table");
+        assert_eq!(n, 6, "both shards must be in the table");
 
         let a = batch
             .column(1)
@@ -159,24 +212,23 @@ mod tests {
         assert!((a - 20.0).abs() < 1e-9, "values must survive, got {a}");
     }
 
-    /// The tiering engine writes `namespace=<ns>/shard=<n>/<name>.parquet`.
-    /// The flat-layout test above passed while this one failed against the old
-    /// `ns_<x>/shard_<n>` layout, because DataFusion skips plain subdirectories
-    /// by default — so the layout the engine actually produces gets its own
-    /// test.
+    /// One table is one measurement. This is the property that a single
+    /// listing over the whole archive root could not have: `power` and `cpu`
+    /// do not share a schema, so each has to be its own table.
     #[tokio::test]
-    async fn cold_tier_sees_the_nested_layout_the_tiering_engine_writes() {
+    async fn a_table_sees_only_its_own_measurement() {
         let tmp = tempfile::tempdir().unwrap();
-        let nested = tmp.path().join("namespace=default").join("shard=1");
-        std::fs::create_dir_all(&nested).unwrap();
-        write_cold_object(&nested, "seg_0001.parquet");
+        archive_with(tmp.path(), "power", 1, "part-a.parquet");
+        archive_with(tmp.path(), "cpu", 1, "part-a.parquet");
 
         let ctx = SessionContext::new();
         let url = format!("file://{}/", tmp.path().display());
-        register_cold_tier(&ctx, &url, "nested").await.unwrap();
+        register_cold_tier(&ctx, &url, "power", "power_cold")
+            .await
+            .unwrap();
 
         let batches = ctx
-            .sql("SELECT count(*) AS n FROM nested")
+            .sql("SELECT count(*) AS n FROM power_cold")
             .await
             .unwrap()
             .collect()
@@ -185,25 +237,62 @@ mod tests {
         let n = batches[0]
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<arrow::array::Int64Array>()
             .unwrap()
             .value(0);
-        assert_eq!(n, 3, "objects nested under namespace/shard must be visible");
+        assert_eq!(n, 3, "another measurement's objects must not be in scope");
+    }
+
+    /// An archive root given without a trailing slash must resolve to the same
+    /// partition — the join is the caller's most likely slip.
+    #[tokio::test]
+    async fn the_root_may_omit_its_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        archive_with(tmp.path(), "power", 1, "part-a.parquet");
+
+        let ctx = SessionContext::new();
+        let url = format!("file://{}", tmp.path().display());
+        register_cold_tier(&ctx, &url, "power", "power_cold")
+            .await
+            .unwrap();
+
+        let batches = ctx
+            .sql("SELECT count(*) AS n FROM power_cold")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
     }
 
     /// Predicates must reach the table — an archive that has to be fully
-    /// scanned for every query is not a usable archive.
+    /// scanned for every query is not a usable archive — and `_time` must be a
+    /// real timestamp, so the hot tier's time predicates work unchanged.
     #[tokio::test]
-    async fn cold_tier_answers_filtered_queries() {
+    async fn cold_tier_answers_filtered_queries_on_time_and_tags() {
         let tmp = tempfile::tempdir().unwrap();
-        write_cold_object(tmp.path(), "seg_0001.parquet");
+        archive_with(tmp.path(), "power", 1, "part-a.parquet");
 
         let ctx = SessionContext::new();
         let url = format!("file://{}/", tmp.path().display());
-        register_cold_tier(&ctx, &url, "cold").await.unwrap();
+        register_cold_tier(&ctx, &url, "power", "cold")
+            .await
+            .unwrap();
 
         let batches = ctx
-            .sql("SELECT sum(watts) AS s FROM cold WHERE host = 'a'")
+            .sql(
+                "SELECT sum(watts) AS s FROM cold \
+                 WHERE host = 'a' AND _time < '1970-01-01T00:00:00.000000003Z'",
+            )
             .await
             .unwrap()
             .collect()
@@ -215,7 +304,23 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap()
             .value(0);
-        assert!((s - 30.0).abs() < 1e-9, "tag filter must apply, got {s}");
+        assert!((s - 30.0).abs() < 1e-9, "filters must apply, got {s}");
+    }
+
+    /// A measurement name that would escape its partition must be refused
+    /// before it is spliced into a URL.
+    #[tokio::test]
+    async fn a_traversing_measurement_name_is_refused() {
+        let ctx = SessionContext::new();
+        for bad in ["", "../etc", "a/b", "shard=1"] {
+            let err = register_cold_tier(&ctx, "file:///tmp/archive/", bad, "x")
+                .await
+                .expect_err("must be refused: {bad}");
+            assert!(
+                err.to_string().contains("not a usable path segment"),
+                "error should name the problem, got: {err}"
+            );
+        }
     }
 
     /// A URL that is not an object store must be refused with a clear message
@@ -223,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn an_unsupported_url_is_refused() {
         let ctx = SessionContext::new();
-        let err = register_cold_tier(&ctx, "not a url", "x")
+        let err = register_cold_tier(&ctx, "not a url", "power", "x")
             .await
             .expect_err("a malformed URL must be refused");
         assert!(

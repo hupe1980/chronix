@@ -95,6 +95,23 @@ impl ColumnStats {
         }
     }
 
+    /// `true` when these statistics say nothing about the data.
+    ///
+    /// A block with no observed value — every row null, or a block whose
+    /// statistics were deliberately suppressed because it is encrypted —
+    /// leaves `min`/`max` at their sentinels. A zone map must read that as
+    /// "unknown", never as an empty range: `min = i64::MAX` and
+    /// `max = i64::MIN` make every comparison false, so a predicate on an
+    /// encrypted column pruned every row group and the query returned no
+    /// rows at all, with the correct key configured.
+    ///
+    /// The distinction from a genuinely all-null block is `null_count`: an
+    /// all-null block *is* impossible to match, and pruning it is correct.
+    #[must_use]
+    pub fn says_nothing(&self) -> bool {
+        self.value_count == 0 && self.null_count == 0
+    }
+
     /// Update statistics with a new `i64` value.
     pub fn update_i64(&mut self, value: i64) {
         self.min_value = self.min_value.min(value);

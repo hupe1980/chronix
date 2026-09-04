@@ -21,11 +21,9 @@ use crate::segment::to_array;
 /// during encoding and merged via `merge_stats()`.  Query-time code can
 /// use these to prune entire segments without reading row-group data.
 ///
-/// Metadata here is kept proportional to the data. Columns previously also
-/// carried a fixed-size HyperLogLog sketch and an equi-depth histogram; both
-/// were removed because nothing read them — the query planner works
-/// from the exact `distinct_count` above — while they cost ~49 KiB per
-/// segment regardless of how little data the segment held.
+/// Metadata is kept proportional to the data: no fixed-size sketches or
+/// histograms, which cost ~49 KiB per segment however little it holds, and
+/// which the planner does not need — `distinct_count` above is exact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnMeta {
     /// Column name.

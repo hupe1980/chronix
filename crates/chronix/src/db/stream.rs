@@ -107,6 +107,8 @@ pub struct BatchStream<'a> {
     to_skip: usize,
     /// Set after an error so the iterator stops rather than retrying.
     done: bool,
+    /// What segment pruning did for this scan.
+    pruning_stats: chronix_query::pruning::PruningStats,
 }
 
 impl BatchStream<'_> {
@@ -153,6 +155,13 @@ impl BatchStream<'_> {
             return None;
         }
         Some(batch.slice(start, take))
+    }
+
+    /// How many segments the pruning pipeline considered and eliminated
+    /// before the first bucket was read.
+    #[must_use]
+    pub fn pruning_stats(&self) -> chronix_query::pruning::PruningStats {
+        self.pruning_stats.clone()
     }
 
     /// Number of time buckets not yet read.
@@ -230,6 +239,7 @@ impl BatchStream<'_> {
                     &self.plan,
                     &tombs,
                     tag_refs.as_deref(),
+                    None,
                 )?;
                 if filtered.num_rows() > 0 {
                     sources.push(filtered);
@@ -418,6 +428,7 @@ impl Chronix {
             remaining: None,
             to_skip: 0,
             done: false,
+            pruning_stats,
         })
     }
 }

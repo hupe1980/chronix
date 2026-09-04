@@ -42,6 +42,18 @@ pub struct SignalEvent {
     /// Additional metadata.
     #[serde(default)]
     pub metadata: HashMap<String, String>,
+    /// Channels this signal is for, from its trigger's `DELIVER` clause.
+    ///
+    /// Empty means "every registered channel", which is what a signal with no
+    /// trigger behind it — an anomaly alert — wants. A non-empty list is
+    /// matched against [`DeliveryChannel::name`](crate::signal::delivery::DeliveryChannel::name).
+    ///
+    /// Without this the `DELIVER` clause was decoration: the router fanned
+    /// every signal out to every channel it had, so two triggers could not
+    /// deliver to different places, and the parsed targets were carried as far
+    /// as the trigger definition and then dropped.
+    #[serde(default)]
+    pub delivery_targets: Vec<String>,
 }
 
 /// Severity levels for signal events.
@@ -164,6 +176,20 @@ pub enum TriggerCondition {
         /// Threshold value.
         value: f64,
     },
+    /// Fires when a tag on the series matches (or does not match) a value.
+    ///
+    /// Without this a trigger fires for **every** series of a measurement,
+    /// so "alert when cpu is high on the production hosts" could not be
+    /// expressed at all — the condition language had numbers and nothing
+    /// else.
+    TagEquals {
+        /// Tag key to inspect.
+        tag: String,
+        /// Value to compare against.
+        value: String,
+        /// `true` for `<>`, `false` for `=`.
+        negated: bool,
+    },
     /// Conjunction: both sub-conditions must hold.
     And {
         /// Left operand.
@@ -190,6 +216,7 @@ impl TriggerCondition {
             Self::MovingAverageCrossover { .. } => "moving_average_crossover",
             Self::RateOfChange { .. } => "rate_of_change",
             Self::FieldThreshold { .. } => "field_threshold",
+            Self::TagEquals { .. } => "tag_equals",
             Self::And { .. } => "and",
             Self::Or { .. } => "or",
         }
@@ -204,6 +231,8 @@ impl TriggerCondition {
             Self::ForecastDeviation { .. } => {
                 vec!["forecast_deviation", "value", "forecast"]
             }
+            // A tag is a string, so it constrains no numeric field.
+            Self::TagEquals { .. } => Vec::new(),
             Self::RateOfChange { field, .. } => field.as_deref().into_iter().collect(),
             Self::MovingAverageCrossover { field, .. } => field.as_deref().into_iter().collect(),
             Self::And { left, right } | Self::Or { left, right } => {
@@ -524,6 +553,7 @@ mod tests {
     #[test]
     fn signal_event_serde_roundtrip() {
         let event = SignalEvent {
+            delivery_targets: Vec::new(),
             event_id: uuid::Uuid::new_v4().to_string(),
             trigger_id: "t1".into(),
             trigger_name: "My Trigger".into(),

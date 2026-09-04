@@ -160,8 +160,14 @@ jobs:
       # Each connector alone, not only the pair: `all-connectors` compiles both
       # at once, so an item that one gates and the other imports builds there
       # and nowhere else.
-      - run: cargo check -p chronixd --features kafka --all-targets
-      - run: cargo check -p chronixd --features mqtt --all-targets
+      #
+      # `test` rather than `check`: the connectors' feature-gated tests cover
+      # behaviour a compile cannot — that MQTT refuses a TLS configuration it
+      # cannot honour instead of connecting in plaintext, and that a
+      # multi-tenant connector tags the default namespace. Under `check` they
+      # were compiled and never run.
+      - run: cargo test -p chronixd --features kafka
+      - run: cargo test -p chronixd --features mqtt
       - run: cargo test -p chronix-engine --features field-encryption
       - run: cargo check -p chronix-engine --features object-store --all-targets
       - run: cargo test -p chronix-engine --features object-store objstore
@@ -170,6 +176,10 @@ jobs:
       # so its ordering — verify, drop the catalog entry, delete the file — is
       # covered by an integration test rather than by the unit tests above.
       - run: cargo test -p chronix --features object-store --test cold_archive
+      # `chronixd`'s own `object-store` feature carries the periodic archiving
+      # pass. Every feature flag gets a job, or it is a feature nobody builds.
+      - run: cargo clippy -p chronixd --features object-store --all-targets -- -D warnings
+      - run: cargo test -p chronixd --features object-store
       - run: cargo check -p chronix-streaming --features flight --all-targets
       - run: cargo check -p chronix-security --no-default-features --all-targets
       - run: cargo check -p chronix-engine --no-default-features --all-targets

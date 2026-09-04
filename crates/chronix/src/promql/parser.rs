@@ -1,8 +1,8 @@
 //! `PromQL` parser — builds an AST from a token stream.
 
 use crate::promql::ast::{
-    AggregationModifier, AggregationOp, BinaryOp, Duration, Expr, LabelMatcher, MatchOp, UnaryOp,
-    VectorMatching, VectorMatchingCardinality,
+    AggregationModifier, AggregationOp, AtModifier, BinaryOp, Duration, Expr, LabelMatcher,
+    MatchOp, UnaryOp, VectorMatching, VectorMatchingCardinality,
 };
 use crate::promql::lexer::{lex, Token};
 
@@ -227,32 +227,32 @@ impl Parser {
             if matches!(self.peek(), Token::Colon) {
                 self.advance(); // consume ':'
                 let step = if matches!(self.peek(), Token::RightBracket) {
-                    None // [5m:] — use default step
+                    None // [5m:] — use the default step
                 } else {
                     Some(self.parse_duration()?) // [5m:1m]
                 };
                 self.expect(&Token::RightBracket)?;
-                let offset = self.parse_offset()?;
-                return Ok(Expr::Subquery {
+                let mut sub = Expr::Subquery {
                     expr: Box::new(expr),
                     range,
                     step,
-                    offset,
-                });
+                    offset: None,
+                    at: None,
+                };
+                self.parse_modifiers(&mut sub)?;
+                return Ok(sub);
             }
 
             self.expect(&Token::RightBracket)?;
 
-            let offset = self.parse_offset()?;
-
             // If expr was a VectorSelector, wrap it as a MatrixSelector
-            match &mut expr {
-                Expr::VectorSelector {
-                    offset: vs_offset, ..
-                } => {
-                    if let Some(off) = offset {
-                        *vs_offset = Some(off);
-                    }
+            match &expr {
+                Expr::VectorSelector { .. } => {
+                    // The modifiers bind to the *inner* selector, which is
+                    // where the evaluator reads them from — the same shape as
+                    // Prometheus, whose `MatrixSelector` delegates to its
+                    // `VectorSelector`'s offset and timestamp.
+                    self.parse_modifiers(&mut expr)?;
                     expr = Expr::MatrixSelector {
                         vector: Box::new(expr),
                         range,
@@ -261,37 +261,148 @@ impl Parser {
                 _ => {
                     // Non-vector expression with [range] but no step → subquery
                     // with default step, e.g. rate(http_requests[5m])[30m]
-                    return Ok(Expr::Subquery {
+                    let mut sub = Expr::Subquery {
                         expr: Box::new(expr),
                         range,
                         step: None,
-                        offset,
-                    });
+                        offset: None,
+                        at: None,
+                    };
+                    self.parse_modifiers(&mut sub)?;
+                    return Ok(sub);
                 }
             }
         }
 
-        // offset modifier (for vector selectors without matrix)
-        if let Some(offset) = self.parse_offset()? {
-            if let Expr::VectorSelector {
-                offset: vs_offset, ..
-            } = &mut expr
-            {
-                *vs_offset = Some(offset);
-            }
-        }
+        // `offset` / `@` on a bare selector.
+        self.parse_modifiers(&mut expr)?;
 
         Ok(expr)
     }
 
-    fn parse_offset(&mut self) -> Result<Option<Duration>, ParseError> {
-        if matches!(self.peek(), Token::Offset) {
+    /// Consume any `offset` and `@` modifiers and attach them to `expr`.
+    ///
+    /// Both modifiers attach to a **selector or a subquery** and nothing else;
+    /// `sum(m) offset 5m` is a parse error, as it is in Prometheus. Accepting
+    /// and dropping it would make `rate(m[5m]) offset 5m` run unshifted, which
+    /// is a wrong answer wearing the shape of a right one.
+    ///
+    /// Either modifier may appear at most once, in either order.
+    fn parse_modifiers(&mut self, expr: &mut Expr) -> Result<(), ParseError> {
+        let mut seen_offset = false;
+        let mut seen_at = false;
+
+        loop {
+            match self.peek() {
+                Token::Offset => {
+                    if seen_offset {
+                        return Err(ParseError {
+                            msg: "duplicate offset modifier".into(),
+                            pos: self.pos,
+                        });
+                    }
+                    seen_offset = true;
+                    self.advance();
+                    let d = self.parse_signed_duration()?;
+                    Self::attach_offset(expr, d, self.pos)?;
+                }
+                Token::At => {
+                    if seen_at {
+                        return Err(ParseError {
+                            msg: "duplicate @ modifier".into(),
+                            pos: self.pos,
+                        });
+                    }
+                    seen_at = true;
+                    self.advance();
+                    let at = self.parse_at_modifier()?;
+                    Self::attach_at(expr, at, self.pos)?;
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    fn attach_offset(expr: &mut Expr, d: Duration, pos: usize) -> Result<(), ParseError> {
+        match expr {
+            Expr::VectorSelector { offset, .. } | Expr::Subquery { offset, .. } => {
+                *offset = Some(d);
+                Ok(())
+            }
+            _ => Err(ParseError {
+                msg: "offset modifier must be preceded by an instant vector selector or range \
+                      vector selector or a subquery"
+                    .into(),
+                pos,
+            }),
+        }
+    }
+
+    fn attach_at(expr: &mut Expr, at: AtModifier, pos: usize) -> Result<(), ParseError> {
+        match expr {
+            Expr::VectorSelector { at: slot, .. } | Expr::Subquery { at: slot, .. } => {
+                *slot = Some(at);
+                Ok(())
+            }
+            _ => Err(ParseError {
+                msg: "@ modifier must be preceded by an instant vector selector or range vector \
+                      selector or a subquery"
+                    .into(),
+                pos,
+            }),
+        }
+    }
+
+    /// `@ <unix seconds>`, `@ start()` or `@ end()`.
+    fn parse_at_modifier(&mut self) -> Result<AtModifier, ParseError> {
+        match self.peek().clone() {
+            Token::Number(n) => {
+                self.advance();
+                Ok(AtModifier::Timestamp(n))
+            }
+            Token::Minus => {
+                self.advance();
+                match self.peek().clone() {
+                    Token::Number(n) => {
+                        self.advance();
+                        Ok(AtModifier::Timestamp(-n))
+                    }
+                    other => Err(ParseError {
+                        msg: format!("expected a timestamp after `@ -`, found {other}"),
+                        pos: self.pos,
+                    }),
+                }
+            }
+            Token::Ident(name) if name == "start" || name == "end" => {
+                self.advance();
+                self.expect(&Token::LeftParen)?;
+                self.expect(&Token::RightParen)?;
+                Ok(if name == "start" {
+                    AtModifier::Start
+                } else {
+                    AtModifier::End
+                })
+            }
+            other => Err(ParseError {
+                msg: format!("expected a timestamp, start() or end() after `@`, found {other}"),
+                pos: self.pos,
+            }),
+        }
+    }
+
+    /// A duration that may be negative.
+    ///
+    /// `offset -5m` shifts the window **forward**, which is how a query
+    /// compares a value against one from the future of its own evaluation
+    /// time — used by recording rules that backfill, and unconditional in
+    /// Prometheus 3.x.
+    fn parse_signed_duration(&mut self) -> Result<Duration, ParseError> {
+        if matches!(self.peek(), Token::Minus) {
             self.advance();
             let d = self.parse_duration()?;
-            Ok(Some(d))
-        } else {
-            Ok(None)
+            return Ok(Duration(-d.0));
         }
+        self.parse_duration()
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
@@ -317,6 +428,7 @@ impl Parser {
                     name: None,
                     matchers,
                     offset: None,
+                    at: None,
                 })
             }
             Token::Ident(name) => {
@@ -343,6 +455,7 @@ impl Parser {
                             name: Some(name),
                             matchers,
                             offset: None,
+                            at: None,
                         })
                     }
                     _ => {
@@ -351,6 +464,7 @@ impl Parser {
                             name: Some(name),
                             matchers: vec![],
                             offset: None,
+                            at: None,
                         })
                     }
                 }
@@ -528,6 +642,7 @@ mod tests {
                 name,
                 matchers,
                 offset,
+                at: _,
             } => {
                 assert_eq!(name, Some("http_requests_total".into()));
                 assert!(matchers.is_empty());
@@ -664,6 +779,7 @@ mod tests {
                 range,
                 step,
                 offset,
+                at: _,
             } => {
                 assert_eq!(range.as_secs(), 1800.0); // 30m
                 assert_eq!(step.unwrap().as_secs(), 60.0); // 1m
@@ -687,6 +803,7 @@ mod tests {
                 range,
                 step,
                 offset,
+                at: _,
             } => {
                 assert_eq!(range.as_secs(), 1800.0); // 30m
                 assert!(step.is_none()); // default step

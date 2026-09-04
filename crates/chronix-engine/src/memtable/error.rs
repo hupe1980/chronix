@@ -44,6 +44,10 @@ pub enum MemtableError {
     #[error("segment write error: {0}")]
     Segment(#[from] crate::segment::SegmentError),
 
+    /// Registering a flushed segment failed; the memtable stays frozen.
+    #[error("segment registration failed: {0}")]
+    Flush(String),
+
     /// No frozen memtable is available for flushing.
     #[error("no frozen memtable available for flush")]
     NoFrozenMemtable,

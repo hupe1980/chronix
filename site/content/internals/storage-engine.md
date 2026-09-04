@@ -79,7 +79,8 @@ segments coexist). Chronix mitigates this with:
   limiting the blast radius of compaction.
 - **Columnar compression** — **6.2×** end to end on 2-decimal meter readings,
   measured by `chronix/tests/segment_compression.rs`. Individual columns do far
-  better (timestamps 30–55×, decimal floats 4–9× under ALP); a segment's ratio
+  better (timestamps 2.7× jittered to 1092× regular, decimal floats 5–29× on
+  realistic data under pco); a segment's ratio
   is set by its worst column and its fixed metadata.
 
 ## Read Amplification
@@ -112,10 +113,9 @@ The complete lifecycle of a write:
    ├── Streaming anomaly engine scores the point
    └── Continuous forecast engine updates models
 6. When memtable size > threshold:
-   a. `FlushScheduler` is signalled via `Notify` (non-blocking)
-   b. Background task debounces rapid signals
-   c. Memtable is frozen (atomic swap)
-   d. New empty memtable replaces it
+   a. the maintenance thread is woken (non-blocking)
+   b. it freezes the memtable (atomic swap) and writes the segment
+   c. a new empty memtable has already replaced it for writers
    e. Frozen memtable is flushed to segment(s) via `spawn_blocking`
    f. Time index, bloom filter, tag index, zone maps are updated
    g. Segment catalog is persisted

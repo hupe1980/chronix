@@ -28,7 +28,7 @@ use crate::Chronix;
 /// Created automatically by [`ChronixSchemaProvider`](super::ChronixSchemaProvider)
 /// when `DataFusion` resolves table names. Supports predicate pushdown for
 /// time range and tag equality filters.
-pub struct ChronixTableProvider {
+pub(crate) struct ChronixTableProvider {
     db: Arc<Chronix>,
     measurement: String,
     schema: SchemaRef,
@@ -52,21 +52,12 @@ impl fmt::Debug for ChronixTableProvider {
 }
 
 impl ChronixTableProvider {
-    /// Create a new provider for the given measurement.
+    /// Create a provider for `measurement`, scoped to `namespace`.
     ///
     /// # Errors
     ///
     /// Returns an error if the measurement does not exist.
-    pub fn try_new(db: Arc<Chronix>, measurement: &str) -> Result<Self, DataFusionError> {
-        Self::try_new_scoped(db, measurement, None)
-    }
-
-    /// Create a provider scoped to `namespace`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the measurement does not exist.
-    pub fn try_new_scoped(
+    pub(crate) fn try_new_scoped(
         db: Arc<Chronix>,
         measurement: &str,
         namespace: Option<String>,
@@ -81,18 +72,6 @@ impl ChronixTableProvider {
             schema,
             namespace,
         })
-    }
-
-    /// The namespace this table is scoped to, if any.
-    #[must_use]
-    pub fn namespace(&self) -> Option<&str> {
-        self.namespace.as_deref()
-    }
-
-    /// The measurement name backing this table.
-    #[must_use]
-    pub fn measurement(&self) -> &str {
-        &self.measurement
     }
 }
 
@@ -121,10 +100,28 @@ pub fn measurement_schema_to_arrow(ms: &MeasurementSchema) -> SchemaRef {
     // appear in `SELECT *`, in `DESCRIBE`, or in the schema a client reads
     // back. Dropping it here also means no SQL text can reference it, so the
     // mandatory filter a scoped provider applies cannot be contradicted.
+    schema_to_arrow(ms, false)
+}
+
+/// The same schema, but keeping the namespace tag.
+///
+/// Used by the cold archive.
+///
+/// Used for the cold archive. A SQL session is already scoped to one tenant,
+/// so the hot table hides the tag; an archive object covers every tenant in a
+/// shard, and dropping the only column that says whose row this is would be
+/// data loss the moment two tenants share a measurement name.
+#[cfg(feature = "object-store")]
+#[must_use]
+pub(crate) fn measurement_schema_to_archive_arrow(ms: &MeasurementSchema) -> SchemaRef {
+    schema_to_arrow(ms, true)
+}
+
+fn schema_to_arrow(ms: &MeasurementSchema, keep_namespace: bool) -> SchemaRef {
     let mut columns: Vec<_> = ms
         .columns()
         .iter()
-        .filter(|col| col.name != chronix_core::NAMESPACE_TAG)
+        .filter(|col| keep_namespace || col.name != chronix_core::NAMESPACE_TAG)
         .collect();
     columns.sort_by_key(|col| {
         let group = match col.role {
@@ -241,6 +238,128 @@ fn reverse_op(
     }
 }
 
+/// What the engine can do with one `column op literal` predicate.
+///
+/// This is the **single** decision, and both the classifier DataFusion asks
+/// and the code that builds the scan read it. They used to decide
+/// separately, and disagreed: the classifier answered `Exact` for every
+/// operator on a time column and for every tag equality, while the builder
+/// applied only five operators and only `Utf8` literals. DataFusion
+/// *removes* an Exact filter from the plan, so `WHERE _time <> X` and
+/// `WHERE host = region` were dropped by the planner and never applied by
+/// anyone — the query returned rows its own predicate excluded.
+enum Pushdown {
+    /// Fully applied by the engine; DataFusion may drop the filter.
+    Exact(PushdownTerm),
+    /// Applied as a pruning hint; DataFusion must still evaluate it.
+    Hint(chronix_engine::segment::FieldPredicate),
+    /// Not applied at all.
+    None,
+}
+
+/// A predicate the engine applies exactly.
+enum PushdownTerm {
+    /// Narrow the scan's time range.
+    Time {
+        /// Inclusive lower bound, if this predicate sets one.
+        start: Option<i64>,
+        /// Inclusive upper bound, if this predicate sets one.
+        end: Option<i64>,
+    },
+    /// Require a tag to equal a value.
+    Tag(String, String),
+}
+
+/// Decide what the engine does with `col_name op scalar`.
+fn plan_predicate(
+    col_name: &str,
+    op: datafusion::logical_expr::Operator,
+    scalar: &datafusion::common::ScalarValue,
+    ms: Option<&MeasurementSchema>,
+) -> Pushdown {
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::Operator;
+
+    if col_name == "_time" || col_name == "timestamp" || col_name == "time" {
+        // Only a literal that is genuinely a nanosecond instant, and only
+        // the five range operators. `<>`, `IS DISTINCT FROM` and a
+        // non-literal right-hand side are somebody else's job.
+        let ts = match scalar {
+            ScalarValue::Int64(Some(v)) => *v,
+            ScalarValue::TimestampNanosecond(Some(v), _) => *v,
+            _ => return Pushdown::None,
+        };
+        return match op {
+            Operator::GtEq => Pushdown::Exact(PushdownTerm::Time {
+                start: Some(ts),
+                end: None,
+            }),
+            Operator::Gt => Pushdown::Exact(PushdownTerm::Time {
+                start: Some(ts.saturating_add(1)),
+                end: None,
+            }),
+            Operator::LtEq => Pushdown::Exact(PushdownTerm::Time {
+                start: None,
+                end: Some(ts),
+            }),
+            Operator::Lt => Pushdown::Exact(PushdownTerm::Time {
+                start: None,
+                end: Some(ts.saturating_sub(1)),
+            }),
+            Operator::Eq => Pushdown::Exact(PushdownTerm::Time {
+                start: Some(ts),
+                end: Some(ts),
+            }),
+            _ => Pushdown::None,
+        };
+    }
+
+    let Some(ms) = ms else {
+        return Pushdown::None;
+    };
+    let Some(column) = ms.column(col_name) else {
+        return Pushdown::None;
+    };
+
+    if column.role == ColumnRole::Tag {
+        // Tag equality against a string literal, and nothing else: the
+        // engine's tag filter is an exact string match.
+        if op == Operator::Eq {
+            if let ScalarValue::Utf8(Some(val)) = scalar {
+                return Pushdown::Exact(PushdownTerm::Tag(col_name.to_string(), val.clone()));
+            }
+        }
+        return Pushdown::None;
+    }
+
+    if column.role == ColumnRole::Field {
+        #[allow(clippy::cast_precision_loss)] // a zone-map bound, not a value
+        let value = match scalar {
+            ScalarValue::Float64(Some(v)) => *v,
+            ScalarValue::Int64(Some(v)) => *v as f64,
+            ScalarValue::UInt64(Some(v)) => *v as f64,
+            _ => return Pushdown::None,
+        };
+        let zm_op = match op {
+            Operator::Eq => chronix_engine::segment::ZoneMapOp::Eq,
+            Operator::Gt => chronix_engine::segment::ZoneMapOp::Gt,
+            Operator::GtEq => chronix_engine::segment::ZoneMapOp::GtEq,
+            Operator::Lt => chronix_engine::segment::ZoneMapOp::Lt,
+            Operator::LtEq => chronix_engine::segment::ZoneMapOp::LtEq,
+            _ => return Pushdown::None,
+        };
+        // A zone map prunes row groups; it does not filter rows, so the
+        // filter still has to be evaluated.
+        return Pushdown::Hint(chronix_engine::segment::FieldPredicate {
+            column: col_name.to_string(),
+            op: zm_op,
+            value,
+        });
+    }
+
+    Pushdown::None
+}
+
 fn apply_predicate(
     col_name: &str,
     op: datafusion::logical_expr::Operator,
@@ -248,70 +367,20 @@ fn apply_predicate(
     result: &mut PushdownPredicates,
     ms: Option<&MeasurementSchema>,
 ) {
-    use datafusion::common::ScalarValue;
-    use datafusion::logical_expr::Operator;
-
-    // Time predicates
-    if col_name == "_time" || col_name == "timestamp" || col_name == "time" {
-        let nanos = match scalar {
-            ScalarValue::Int64(Some(v)) => Some(*v),
-            ScalarValue::TimestampNanosecond(Some(v), _) => Some(*v),
-            _ => None,
-        };
-        if let Some(ts) = nanos {
-            match op {
-                Operator::GtEq => result.time_start = result.time_start.max(ts),
-                Operator::Gt => result.time_start = result.time_start.max(ts.saturating_add(1)),
-                Operator::LtEq => result.time_end = result.time_end.min(ts),
-                Operator::Lt => result.time_end = result.time_end.min(ts.saturating_sub(1)),
-                Operator::Eq => {
-                    result.time_start = result.time_start.max(ts);
-                    result.time_end = result.time_end.min(ts);
-                }
-                _ => {}
+    match plan_predicate(col_name, op, scalar, ms) {
+        Pushdown::Exact(PushdownTerm::Time { start, end }) => {
+            if let Some(s) = start {
+                result.time_start = result.time_start.max(s);
+            }
+            if let Some(e) = end {
+                result.time_end = result.time_end.min(e);
             }
         }
-    }
-    // Tag equality predicates
-    else if let Some(ms) = ms {
-        if let ScalarValue::Utf8(Some(val)) = scalar {
-            if op == Operator::Eq
-                && ms
-                    .column(col_name)
-                    .is_some_and(|c| c.role == ColumnRole::Tag)
-            {
-                result.tag_filters.push((col_name.to_string(), val.clone()));
-            }
+        Pushdown::Exact(PushdownTerm::Tag(name, value)) => {
+            result.tag_filters.push((name, value));
         }
-        // Numeric field predicates — zone-map pushdown
-        else if ms
-            .column(col_name)
-            .is_some_and(|c| c.role == ColumnRole::Field)
-        {
-            let f64_val = match scalar {
-                ScalarValue::Float64(Some(v)) => Some(*v),
-                ScalarValue::Int64(Some(v)) => Some(*v as f64),
-                ScalarValue::UInt64(Some(v)) => Some(*v as f64),
-                _ => None,
-            };
-            let zm_op = match op {
-                Operator::Eq => Some(chronix_engine::segment::ZoneMapOp::Eq),
-                Operator::Gt => Some(chronix_engine::segment::ZoneMapOp::Gt),
-                Operator::GtEq => Some(chronix_engine::segment::ZoneMapOp::GtEq),
-                Operator::Lt => Some(chronix_engine::segment::ZoneMapOp::Lt),
-                Operator::LtEq => Some(chronix_engine::segment::ZoneMapOp::LtEq),
-                _ => None,
-            };
-            if let (Some(val), Some(zop)) = (f64_val, zm_op) {
-                result
-                    .field_predicates
-                    .push(chronix_engine::segment::FieldPredicate {
-                        column: col_name.to_string(),
-                        op: zop,
-                        value: val,
-                    });
-            }
-        }
+        Pushdown::Hint(pred) => result.field_predicates.push(pred),
+        Pushdown::None => {}
     }
 }
 
@@ -334,35 +403,27 @@ fn classify_filter(expr: &Expr, ms: Option<&MeasurementSchema>) -> TableProvider
                     _ => TableProviderFilterPushDown::Inexact,
                 };
             }
-            let col = column_name(&be.left).or_else(|| column_name(&be.right));
-            if let Some(name) = col {
-                if name == "_time" || name == "timestamp" || name == "time" {
-                    return TableProviderFilterPushDown::Exact;
-                }
-                if let Some(ms) = ms {
-                    if ms.column(&name).is_some_and(|c| c.role == ColumnRole::Tag)
-                        && be.op == Operator::Eq
-                    {
-                        return TableProviderFilterPushDown::Exact;
-                    }
-                    // Zone-map pushdown for numeric field predicates.
-                    if ms
-                        .column(&name)
-                        .is_some_and(|c| c.role == ColumnRole::Field)
-                        && matches!(
-                            be.op,
-                            Operator::Eq
-                                | Operator::Gt
-                                | Operator::GtEq
-                                | Operator::Lt
-                                | Operator::LtEq
-                        )
-                    {
-                        return TableProviderFilterPushDown::Inexact;
-                    }
-                }
+            // Ask the same function the scan builder asks, with the same
+            // operands, so the answer cannot differ from what is applied.
+            let (name, op, scalar) = match (
+                column_name(&be.left),
+                scalar_value(&be.right),
+                column_name(&be.right),
+                scalar_value(&be.left),
+            ) {
+                (Some(name), Some(scalar), _, _) => (name, be.op, scalar),
+                // `literal op column` — the operator flips with the operands.
+                (_, _, Some(name), Some(scalar)) => match reverse_op(be.op) {
+                    Some(op) => (name, op, scalar),
+                    None => return TableProviderFilterPushDown::Unsupported,
+                },
+                _ => return TableProviderFilterPushDown::Unsupported,
+            };
+            match plan_predicate(&name, op, &scalar, ms) {
+                Pushdown::Exact(_) => TableProviderFilterPushDown::Exact,
+                Pushdown::Hint(_) => TableProviderFilterPushDown::Inexact,
+                Pushdown::None => TableProviderFilterPushDown::Unsupported,
             }
-            TableProviderFilterPushDown::Unsupported
         }
         _ => TableProviderFilterPushDown::Unsupported,
     }

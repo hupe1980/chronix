@@ -6,13 +6,13 @@ use tracing::info;
 
 use super::{chrono_timestamp_ms, BackupManifest, Chronix};
 use crate::error::{DbError, Result};
-use crate::rollup::RollupRegistry;
 
 impl Chronix {
     /// Create a point-in-time backup of the database.
     ///
     /// Flushes the WAL, then copies all on-disk state (`wal/`, `segments/`,
-    /// `catalog/`, `rollup_registry.json`) to `target_dir`.  A manifest
+    /// `catalog/`) to `target_dir`. Rollup definitions and watermarks are
+    /// part of the catalog, so they travel with it. A manifest
     /// file (`backup_manifest.json`) records backup metadata.
     ///
     /// The backup is *crash-consistent*: the WAL is synced before
@@ -49,15 +49,6 @@ impl Chronix {
                 file_count += files;
                 total_bytes += bytes;
             }
-        }
-
-        // 4. Copy rollup registry if present.
-        let rollup_path = self.config.data_dir.join(RollupRegistry::filename());
-        if rollup_path.exists() {
-            let dst = target_dir.join(RollupRegistry::filename());
-            let bytes = std::fs::copy(&rollup_path, &dst)?;
-            file_count += 1;
-            total_bytes += bytes;
         }
 
         // 5. Write manifest last (atomic marker that backup completed).
@@ -132,12 +123,6 @@ impl Chronix {
             if src.exists() {
                 Self::copy_dir_recursive(&src, &dst)?;
             }
-        }
-
-        // Copy rollup registry if present.
-        let rollup_file = backup_dir.join(RollupRegistry::filename());
-        if rollup_file.exists() {
-            std::fs::copy(&rollup_file, target_dir.join(RollupRegistry::filename()))?;
         }
 
         info!(target = %target_dir.display(), "Restore complete");

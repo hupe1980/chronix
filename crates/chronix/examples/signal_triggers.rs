@@ -9,13 +9,13 @@
 //! ```
 
 use chronix::chronix_core::FieldValue;
-use chronix::chronix_signal::{
+use chronix::chronix_streaming::cdc::CdcEvent;
+use chronix::chronix_streaming::signal::{
     anomaly_threshold_trigger, execute_trigger_sql, forecast_deviation_trigger,
     ma_crossover_trigger, parse_trigger_sql, rate_of_change_trigger, DeadLetter, DeadLetterQueue,
     DeliveryRouter, EventTrigger, LogChannel, MetricChannel, ThresholdOp, TriggerCatalog,
     TriggerCondition, TriggerEngine,
 };
-use chronix::chronix_stream::CdcEvent;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -192,15 +192,15 @@ fn main() {
 
     catalog.insert(
         "cpu_alert",
-        "CREATE TRIGGER cpu_alert ON cpu_usage WHEN value > 95 DELIVER TO log",
+        "CREATE TRIGGER cpu_alert ON cpu_usage WHEN value > 95 DELIVER log",
     );
     catalog.insert(
         "mem_alert",
-        "CREATE TRIGGER mem_alert ON memory_usage WHEN value > 90 DELIVER TO log",
+        "CREATE TRIGGER mem_alert ON memory_usage WHEN value > 90 DELIVER log",
     );
     catalog.insert(
         "disk_alert",
-        "CREATE TRIGGER disk_alert ON disk_usage WHEN value > 85 DELIVER TO log",
+        "CREATE TRIGGER disk_alert ON disk_usage WHEN value > 85 DELIVER log",
     );
     println!("  Catalog entries: {}", catalog.len());
 

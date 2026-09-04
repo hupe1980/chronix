@@ -63,6 +63,12 @@ pub struct MqttSubscriber {
     /// Populated by [`new_arc`] — avoids `unsafe` Arc reconstruction.
     #[cfg_attr(not(feature = "mqtt"), allow(dead_code))]
     self_ref: OnceLock<Weak<Self>>,
+    /// Whether the server enforces namespace isolation.
+    ///
+    /// Decides whether points get a namespace tag: without it a
+    /// multi-tenant deployment could not read its own connector data.
+    #[cfg_attr(not(any(feature = "kafka", feature = "mqtt")), allow(dead_code))]
+    multi_tenancy: bool,
     running: AtomicBool,
     stopped: AtomicBool,
     cancel: tokio::sync::Notify,
@@ -79,13 +85,18 @@ impl MqttSubscriber {
     /// Namespace this connector writes to.
     ///
     /// A connector carries no request, so its namespace comes from its own
-    /// configuration rather than a header. Returning `None` when the value is
-    /// the default keeps a single-tenant server's points untagged, which is
-    /// what its reads expect.
+    /// configuration rather than a header.
+    ///
+    /// The decision is **whether the server is multi-tenant**, not whether
+    /// the namespace happens to be `default`. Skipping the tag for the
+    /// default namespace left a multi-tenant deployment's connector data
+    /// untagged, and every scoped read filters on the tag — so the points
+    /// were stored and unreachable through the database's own query API.
+    /// A single-tenant server's points stay untagged, so a series does not
+    /// depend on which route wrote it.
     #[cfg(feature = "mqtt")]
     fn namespace_scope(&self) -> Option<&str> {
-        (self.config.namespace != crate::namespace::DEFAULT_NAMESPACE)
-            .then_some(self.config.namespace.as_str())
+        self.multi_tenancy.then_some(self.config.namespace.as_str())
     }
 
     /// Create a new MQTT subscriber connector wrapped in an `Arc`.
@@ -93,11 +104,17 @@ impl MqttSubscriber {
     /// This is the preferred constructor — it stores a `Weak<Self>`
     /// internally so that `start()` can safely spawn background tasks
     /// without `unsafe` Arc reconstruction.
-    pub fn new_arc(name: &str, config: MqttConfig, db: Arc<Chronix>) -> Arc<Self> {
+    pub fn new_arc(
+        name: &str,
+        config: MqttConfig,
+        db: Arc<Chronix>,
+        multi_tenancy: bool,
+    ) -> Arc<Self> {
         let arc = Arc::new(Self {
             name: name.to_string(),
             config,
             db,
+            multi_tenancy,
             self_ref: OnceLock::new(),
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -115,11 +132,12 @@ impl MqttSubscriber {
     ///
     /// Useful for unit-testing parsing logic. The `mqtt` feature-gated
     /// subscriber loop will not be available without calling `new_arc`.
-    pub fn new(name: &str, config: MqttConfig, db: Arc<Chronix>) -> Self {
+    pub fn new(name: &str, config: MqttConfig, db: Arc<Chronix>, multi_tenancy: bool) -> Self {
         Self {
             name: name.to_string(),
             config,
             db,
+            multi_tenancy,
             self_ref: OnceLock::new(),
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -217,6 +235,24 @@ mod subscriber_impl {
         /// Subscribes to all configured topics, processes incoming
         /// `Publish` events, and writes parsed points into Chronix.
         pub(super) fn spawn_subscriber(self: &Arc<Self>) -> Result<(), ServerError> {
+            // TLS is not available in this build (see the `rumqttc` note in
+            // the workspace manifest), so a configuration that names a
+            // certificate is refused rather than quietly connecting in
+            // plaintext. Silently downgrading is the worst outcome: the
+            // operator believes the link is encrypted and ships broker
+            // credentials over it in the clear.
+            if self.config.ca_cert.is_some()
+                || self.config.client_cert.is_some()
+                || self.config.client_key.is_some()
+            {
+                return Err(ServerError::BadRequest(format!(
+                    "MQTT connector `{}` configures TLS, which this build does not \
+                     support; remove `ca_cert`/`client_cert`/`client_key` to connect \
+                     in plaintext, or terminate TLS in front of the broker",
+                    self.name
+                )));
+            }
+
             let mut opts = MqttOptions::new(
                 &self.config.client_id,
                 &self.config.broker,
@@ -224,6 +260,14 @@ mod subscriber_impl {
             );
             opts.set_clean_session(true);
             opts.set_keep_alive(std::time::Duration::from_secs(30));
+
+            // Broker authentication. `effective_credentials` existed and
+            // nothing called it, so a broker that required a password
+            // refused every connection and the configured username was
+            // never sent.
+            if let Some((username, password)) = self.config.effective_credentials()? {
+                opts.set_credentials(username, password);
+            }
 
             let (client, mut eventloop) = AsyncClient::new(opts, 256);
             let qos = match self.config.qos {
@@ -275,16 +319,19 @@ mod subscriber_impl {
 
                                     match this.parse_payload(topic, payload) {
                                         Ok(points) => {
-                                            let n = points.len() as u64;
-                                            if let Err(e) = crate::util::insert_with_timeout(
+                                            match crate::util::insert_from_connector(
                                                 &this.db,
                                                 this.namespace_scope(),
                                                 points,
                                                 std::time::Duration::from_secs(30),
+                                                &this.name,
                                             ).await {
-                                                error!(name = %this.name, %e, "failed to write MQTT points");
-                                            } else {
-                                                this.points_total.fetch_add(n, Ordering::Relaxed);
+                                                Ok(n) => {
+                                                    this.points_total.fetch_add(n, Ordering::Relaxed);
+                                                }
+                                                Err(e) => {
+                                                    error!(name = %this.name, %e, "failed to write MQTT points");
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -419,7 +466,7 @@ mod tests {
             .build()
             .unwrap();
         let db = Arc::new(Chronix::open(db_config).unwrap());
-        MqttSubscriber::new("test", cfg, db)
+        MqttSubscriber::new("test", cfg, db, false)
     }
 
     #[test]
@@ -564,7 +611,7 @@ mod tests {
             .build()
             .unwrap();
         let db = Arc::new(Chronix::open(db_config).unwrap());
-        let sub = MqttSubscriber::new_arc("test", cfg, db);
+        let sub = MqttSubscriber::new_arc("test", cfg, db, false);
 
         assert_eq!(sub.name(), "test");
         assert_eq!(sub.connector_type(), "mqtt");
@@ -575,5 +622,42 @@ mod tests {
 
         sub.stop().await.unwrap();
         assert_eq!(sub.status().await, ConnectorStatus::Stopped);
+    }
+
+    /// The TLS fields were accepted and dropped, so a connector configured
+    /// with a CA certificate connected in plaintext and shipped its broker
+    /// password in the clear. A refusal is the only honest answer while
+    /// the build has no TLS transport.
+    #[cfg(feature = "mqtt")]
+    #[test]
+    fn a_tls_configuration_is_refused_rather_than_downgraded() {
+        let mut subscriber = make_subscriber(crate::connector::ConnectorFormat::Json);
+        subscriber.config.ca_cert = Some("/etc/ssl/broker-ca.pem".to_string());
+        let subscriber = std::sync::Arc::new(subscriber);
+        let err = subscriber
+            .spawn_subscriber()
+            .expect_err("TLS must not be silently ignored");
+        assert!(
+            err.to_string().contains("does not support"),
+            "the error must say why: {err}"
+        );
+    }
+
+    /// `effective_credentials` existed and nothing called it, so a broker
+    /// requiring a password refused every connection.
+    #[test]
+    fn credentials_come_from_the_file_when_one_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.json");
+        std::fs::write(&path, r#"{"username":"mqtt_user","password":"s3cret"}"#).unwrap();
+
+        let mut cfg = make_subscriber(crate::connector::ConnectorFormat::Json).config;
+        cfg.username = Some("inline".into());
+        cfg.password = Some("inline".into());
+        cfg.credential_file = Some(path.to_string_lossy().into_owned());
+
+        let (user, pass) = cfg.effective_credentials().unwrap().expect("credentials");
+        assert_eq!(user, "mqtt_user", "the file must win, so rotation works");
+        assert_eq!(pass, "s3cret");
     }
 }

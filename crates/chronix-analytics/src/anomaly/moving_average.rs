@@ -1,10 +1,26 @@
 //! Moving Average Residual anomaly detector.
 //!
-//! Computes residuals against a sliding moving average and flags
+//! Computes residuals against a **causal** sliding moving average — the mean
+//! of the `window_size` points *preceding* the one being scored — and flags
 //! points whose residual Z-Score exceeds the threshold.
+//!
+//! # One residual definition
+//!
+//! Excluding the scored point matters: for a window of `w`, including it
+//! shrinks the residual by a factor of `(w-1)/w` (25 % at `w = 5`), so a
+//! batch definition that includes it and a streaming definition that excludes
+//! it disagree on the z-score of the same point by that factor and flag
+//! different points. The causal form is the only one a streaming detector can
+//! compute, so it is the one both paths use, and [`detect`] is literally a
+//! fold of [`detect_point`].
+//!
+//! [`detect`]: AnomalyDetector::detect
+//! [`detect_point`]: AnomalyDetector::detect_point
 
 use crate::anomaly::error::AnomalyError;
-use crate::anomaly::traits::{validate_lengths, AnomalyDetector, AnomalyScore, DetectorType};
+use crate::anomaly::traits::{
+    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+};
 
 /// Detector that compares values against their moving average.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -19,6 +35,8 @@ pub struct MovingAverageResidualDetector {
     ring_sum: f64,
     ring_pos: usize,
     ring_count: usize,
+    /// Pushes since `ring_sum` was last recomputed from the ring itself.
+    since_recompute: u32,
     fitted: bool,
 }
 
@@ -37,14 +55,27 @@ impl MovingAverageResidualDetector {
             ring_sum: 0.0,
             ring_pos: 0,
             ring_count: 0,
+            since_recompute: 0,
             fitted: false,
         }
     }
 
-    fn compute_ma_residuals(values: &[f64], window: usize) -> Vec<f64> {
-        let mut residuals = Vec::with_capacity(values.len());
+    /// Causal moving-average residuals: `r_i = v_i − mean(v_{i−w..i})`, the
+    /// average of the `w` points **before** `i`.
+    ///
+    /// Returns `values.len() − 1` residuals, for `i = 1..n`. `v_0` has no
+    /// preceding window and therefore no residual at all; reporting it as
+    /// `0.0` — which is what a window that includes the scored point does at
+    /// `i = 0` — puts a fabricated exact zero into the calibration sample,
+    /// pulling the fitted mean toward zero and shrinking the fitted spread.
+    fn causal_ma_residuals(values: &[f64], window: usize) -> Vec<f64> {
+        let mut residuals = Vec::with_capacity(values.len().saturating_sub(1));
         let mut sum = 0.0;
         for (i, &v) in values.iter().enumerate() {
+            if i > 0 {
+                let count = i.min(window);
+                residuals.push(v - sum / count as f64);
+            }
             sum += v;
             if i >= window {
                 sum -= values[i - window];
@@ -64,24 +95,46 @@ impl MovingAverageResidualDetector {
                 let start = (i + 1).saturating_sub(window);
                 sum = values[start..=i].iter().sum();
             }
-            let count = (i + 1).min(window);
-            let ma = sum / count as f64;
-            residuals.push(v - ma);
         }
         residuals
     }
 
+    /// Empty the rolling window, so the next observation starts a stream.
+    fn reset_window(&mut self) {
+        self.ring = vec![0.0; self.window_size];
+        self.ring_sum = 0.0;
+        self.ring_pos = 0;
+        self.ring_count = 0;
+        self.since_recompute = 0;
+    }
+
+    /// Push one observation into the rolling window, evicting the oldest.
+    fn push(&mut self, value: f64) {
+        if self.ring_count >= self.window_size {
+            self.ring_sum -= self.ring[self.ring_pos];
+        } else {
+            self.ring_count += 1;
+        }
+        self.ring[self.ring_pos] = value;
+        self.ring_sum += value;
+        self.ring_pos = (self.ring_pos + 1) % self.window_size;
+
+        // Same count-based drift recomputation as the batch path.
+        self.since_recompute += 1;
+        if self.since_recompute >= 1024 {
+            self.since_recompute = 0;
+            self.ring_sum = self.ring[..self.ring_count.min(self.window_size)]
+                .iter()
+                .sum();
+        }
+    }
+
+    /// Absolute z-score of one residual. σ is floored relative to the
+    /// residual mean (see [`scale_floor`]) so a constant training window
+    /// scores float noise near 0 instead of at `inf`.
     #[inline]
     fn score_residual(&self, residual: f64) -> f64 {
-        if self.residual_std < 1e-15 {
-            // Residual std is zero: training residuals were constant.
-            // Any non-zero deviation is highly anomalous.
-            if (residual - self.residual_mean).abs() < 1e-15 {
-                return 0.0;
-            }
-            return f64::INFINITY;
-        }
-        ((residual - self.residual_mean) / self.residual_std).abs()
+        ((residual - self.residual_mean) / scale_floor(self.residual_std, self.residual_mean)).abs()
     }
 
     #[inline]
@@ -101,7 +154,21 @@ impl AnomalyDetector for MovingAverageResidualDetector {
             });
         }
 
-        let residuals = Self::compute_ma_residuals(values, self.window_size);
+        // Calibrate on full-window residuals only. The first `window − 1`
+        // are computed against a partial window, so they are systematically
+        // larger in absolute terms and are not comparable with the ones the
+        // detector will score. Including them made a pure linear drift look
+        // anomalous: the residual of a ramp is constant once the window is
+        // full, so the whole apparent spread came from the warm-up, and
+        // every steady-state point then sat several of those "sigmas" from
+        // the warm-up mean.
+        let all = Self::causal_ma_residuals(values, self.window_size);
+        let warm_up = self.window_size.saturating_sub(1).min(all.len());
+        let residuals = if all.len() - warm_up >= 2 {
+            &all[warm_up..]
+        } else {
+            &all[..]
+        };
         let n = residuals.len() as f64;
         self.residual_mean = residuals.iter().sum::<f64>() / n;
         // Use Bessel's correction (n-1) for consistency with simd_std_dev
@@ -114,17 +181,13 @@ impl AnomalyDetector for MovingAverageResidualDetector {
             / denom)
             .sqrt();
 
-        // Initialize ring buffer with last `window_size` values
-        self.ring = vec![0.0; self.window_size];
-        self.ring_sum = 0.0;
-        self.ring_pos = 0;
+        // Seed the streaming window with the training tail, so a
+        // `detect_point` that continues the fitted series has a full window.
+        self.reset_window();
         let start = values.len().saturating_sub(self.window_size);
         for &v in &values[start..] {
-            self.ring[self.ring_pos] = v;
-            self.ring_sum += v;
-            self.ring_pos = (self.ring_pos + 1) % self.window_size;
+            self.push(v);
         }
-        self.ring_count = values[start..].len();
         self.fitted = true;
         metrics::histogram!("chronix_anomaly_fit_duration_seconds", "method" => "moving_average")
             .record(_start.elapsed().as_secs_f64());
@@ -141,20 +204,23 @@ impl AnomalyDetector for MovingAverageResidualDetector {
         if !self.fitted {
             return Err(AnomalyError::NotFitted);
         }
-        let residuals = Self::compute_ma_residuals(values, self.window_size);
+        // The first `window_size` points of the batch come back as
+        // "warm-up" and are never anomalies; see `detect_point`.
+        //
+        // A batch is scored as **its own** causal stream: the rolling
+        // window is reset and warmed from the batch's leading points, so
+        // point `i` is compared with the points before it in this batch.
+        //
+        // Without the reset the window carried over from `fit`, so
+        // re-scoring the training data compared its first points with the
+        // *end* of the series — on any trending series that is a residual
+        // the size of the whole trend, and every early point came back an
+        // anomaly. `detect` remains a fold of `detect_point`; the reset is
+        // what makes the fold start where the batch does.
+        self.reset_window();
         let mut scores = Vec::with_capacity(values.len());
-        for (i, (&v, &r)) in values.iter().zip(residuals.iter()).enumerate() {
-            let raw = self.score_residual(r);
-            let is_anomaly = raw > self.threshold;
-            scores.push(AnomalyScore {
-                timestamp: timestamps[i],
-                value: v,
-                score: Self::normalize(raw, self.threshold),
-                is_anomaly,
-                method: DetectorType::MovingAverageResidual,
-                threshold: self.threshold,
-                details: format!("residual={r:.4} z={raw:.4}"),
-            });
+        for (i, &v) in values.iter().enumerate() {
+            scores.push(self.detect_point(timestamps[i], v)?);
         }
         let anomaly_count = scores.iter().filter(|s| s.is_anomaly).count();
         metrics::counter!("chronix_anomaly_detected_total", "method" => "moving_average")
@@ -168,13 +234,32 @@ impl AnomalyDetector for MovingAverageResidualDetector {
             return Err(AnomalyError::NotFitted);
         }
         let count = self.ring_count.min(self.window_size);
-        let ma = if count > 0 {
-            self.ring_sum / count as f64
-        } else {
-            value
-        };
-        let residual = value - ma;
+        // A point whose window is not yet full cannot be judged: its
+        // residual is computed against fewer neighbours than every residual
+        // the detector was calibrated on, so it is systematically smaller
+        // and comparing the two is a units error. The detector says
+        // "warming up" instead of inventing a verdict — which is what it
+        // used to do, flagging the first `window` points of every stream
+        // whose level was not flat.
+        if count < self.window_size {
+            self.push(value);
+            return Ok(AnomalyScore {
+                timestamp,
+                value,
+                score: 0.0,
+                is_anomaly: false,
+                method: DetectorType::MovingAverageResidual,
+                threshold: self.threshold,
+                details: format!("warm-up {count}/{}", self.window_size),
+            });
+        }
+        let residual = value - self.ring_sum / count as f64;
         let raw = self.score_residual(residual);
+        // The window has to *move*. Without this the "moving" average stayed
+        // frozen at the last training window forever, so a stream that drifted
+        // away from its training level scored a residual that grew without
+        // bound and every point after the drift was an anomaly.
+        self.push(value);
         Ok(AnomalyScore {
             timestamp,
             value,

@@ -155,7 +155,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "rate(chronix_objstore_tiering_operations_total[5m])",
+          "expr": "rate(chronix_objstore_tiering_objects_total[5m])",
           "legendFormat": "Tiering ops/s"
         }
       ]

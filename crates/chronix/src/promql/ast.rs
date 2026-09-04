@@ -288,8 +288,10 @@ pub enum Expr {
         name: Option<String>,
         /// Label matchers.
         matchers: Vec<LabelMatcher>,
-        /// Optional offset: `offset 5m`.
+        /// Optional offset: `offset 5m`. Negative shifts forward in time.
         offset: Option<Duration>,
+        /// Optional `@` modifier, pinning the evaluation instant.
+        at: Option<AtModifier>,
     },
 
     /// A matrix selector: `metric_name{...}[5m]`.
@@ -353,9 +355,44 @@ pub enum Expr {
         range: Duration,
         /// Optional step duration.
         step: Option<Duration>,
-        /// Optional offset.
+        /// Optional offset. Negative shifts forward in time.
         offset: Option<Duration>,
+        /// Optional `@` modifier, pinning the evaluation instant.
+        at: Option<AtModifier>,
     },
+}
+
+/// The `@` modifier: pins a selector's evaluation to a fixed instant.
+///
+/// `foo @ 1609746000` always reads the sample at that Unix second, whatever
+/// time the query is evaluated at, and `foo @ start()` / `@ end()` resolve to
+/// a range query's own bounds. The point of it is that one expression can
+/// compare a moving value against a fixed one —
+/// `rate(x[5m]) / rate(x[5m] @ start())` — which is otherwise not expressible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AtModifier {
+    /// An absolute instant, in Unix **seconds** as written.
+    Timestamp(f64),
+    /// The range query's start (`@ start()`); the evaluation time for an
+    /// instant query, which is what Prometheus does.
+    Start,
+    /// The range query's end (`@ end()`).
+    End,
+}
+
+impl AtModifier {
+    /// Resolve to an absolute nanosecond instant.
+    ///
+    /// `start` and `end` are the range query's bounds; for an instant query
+    /// both are the evaluation time.
+    #[must_use]
+    pub fn resolve(self, start: i64, end: i64) -> i64 {
+        match self {
+            Self::Timestamp(secs) => secs_to_nanos_safe(secs),
+            Self::Start => start,
+            Self::End => end,
+        }
+    }
 }
 
 /// Unary operators.

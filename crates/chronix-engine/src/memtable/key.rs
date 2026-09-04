@@ -12,7 +12,6 @@
 //! many points share the same series.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -125,36 +124,43 @@ impl PartialOrd for MemtableKey {
 
 /// Value stored in the memtable's skip list alongside each key.
 ///
-/// Holds the full field data for a single point, keyed by field name.
-/// Measurement names, tag keys, tag values, and field keys are stored
-/// as `Arc<str>` so that identical strings across many points share a
-/// single heap allocation via the
-/// [`StringInterner`](super::interner::StringInterner).
+/// Holds one point's fields. Measurement names, tag keys, tag values and
+/// field keys are interned `Arc<str>`s, and the whole tag set is one
+/// `Arc<[..]>` shared by every point of the series in this memtable — a
+/// series' tags do not change from point to point, so storing them per
+/// point stored the same thing a thousand times an hour.
+///
+/// Not `BTreeMap`s: a one-entry `BTreeMap` allocates a leaf node sized for
+/// eleven, which is ~800 bytes per point of tree nodes nothing uses.
+/// `memtable_estimate_tracks_real_allocation` holds the size estimate to the
+/// allocator's number within a quarter.
 #[derive(Debug, Clone)]
 pub struct MemtableEntry {
     /// Measurement name (interned).
     pub measurement: Arc<str>,
-    /// Tag key-value pairs (interned).
-    pub tags: BTreeMap<Arc<str>, Arc<str>>,
-    /// Field name (interned) → field value.
-    pub fields: BTreeMap<Arc<str>, chronix_core::FieldValue>,
+    /// Tag key-value pairs, sorted by key, shared per series.
+    pub tags: Arc<[(Arc<str>, Arc<str>)]>,
+    /// Field name (interned) → field value, sorted by name.
+    pub fields: Box<[(Arc<str>, chronix_core::FieldValue)]>,
 }
 
+/// What one skip-list node costs beyond its key and value: the node
+/// header, an average tower of two forward pointers, and the allocator's
+/// rounding. Calibrated by `memtable_estimate_tracks_real_allocation`.
+pub const NODE_OVERHEAD: usize = 12;
+
 impl MemtableEntry {
-    /// Estimated heap size of this entry in bytes.
+    /// Heap bytes this entry owns exclusively — the struct itself and its
+    /// fields slice. Interned strings and the shared tag set are accounted
+    /// for once, where they are interned, not per point.
     #[must_use]
     pub fn estimated_size(&self) -> usize {
         let mut size = std::mem::size_of::<Self>();
-        size += self.measurement.len();
-        for (k, v) in &self.tags {
-            size += k.len() + v.len();
-        }
-        for (k, v) in &self.fields {
-            size += k.len();
-            size += match v {
-                chronix_core::FieldValue::String(s) => s.len(),
-                _ => 8,
-            };
+        size += self.fields.len() * std::mem::size_of::<(Arc<str>, chronix_core::FieldValue)>();
+        for (_, v) in &self.fields {
+            if let chronix_core::FieldValue::String(s) = v {
+                size += s.len();
+            }
         }
         size
     }
@@ -209,14 +215,20 @@ mod tests {
     fn entry_estimated_size() {
         let entry = MemtableEntry {
             measurement: Arc::from("cpu"),
-            tags: [(Arc::from("host"), Arc::from("a"))].into_iter().collect(),
-            fields: [(Arc::from("value"), chronix_core::FieldValue::F64(42.0))]
-                .into_iter()
-                .collect(),
+            tags: vec![(Arc::from("host"), Arc::from("a"))].into(),
+            fields: vec![(Arc::from("value"), chronix_core::FieldValue::F64(42.0))].into(),
         };
         let size = entry.estimated_size();
-        assert!(size > 0);
-        // Should include at least struct size + string lengths
-        assert!(size >= std::mem::size_of::<MemtableEntry>() + 3 + 5 + 1 + 5);
+        assert!(size >= std::mem::size_of::<MemtableEntry>() + 16);
+        // A string field's bytes are the entry's own.
+        let with_string = MemtableEntry {
+            fields: vec![(
+                Arc::from("s"),
+                chronix_core::FieldValue::String("hello".into()),
+            )]
+            .into(),
+            ..entry
+        };
+        assert!(with_string.estimated_size() >= size + 5);
     }
 }

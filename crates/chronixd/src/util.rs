@@ -34,35 +34,111 @@ pub async fn insert_with_timeout(
 ) -> Result<(), ServerError> {
     crate::namespace::scope_points(namespace, &mut points)?;
     let db = db.clone();
+    let batch_size = points.len();
+    // Every protocol funnels through here, so this is the one place a
+    // total write rate can be counted. The per-protocol counters answer
+    // "which client", not "how much is this server taking".
+    #[allow(clippy::cast_precision_loss)]
+    metrics::histogram!("chronix_batch_size").record(batch_size as f64);
+    let started = std::time::Instant::now();
+
     let future = tokio::task::spawn_blocking(move || db.insert_batch(&points));
 
     let join_result = if timeout.is_zero() {
         future.await
     } else {
-        tokio::time::timeout(timeout, future)
-            .await
-            .map_err(|_| ServerError::WriteTimeout(timeout))?
+        tokio::time::timeout(timeout, future).await.map_err(|_| {
+            metrics::counter!("chronix_write_errors_total", "reason" => "timeout").increment(1);
+            ServerError::WriteTimeout(timeout)
+        })?
     };
+    metrics::histogram!("chronix_write_duration_seconds").record(started.elapsed().as_secs_f64());
 
+    // A cardinality rejection is **permanent**: the limit does not change on
+    // its own, so the same batch will be refused again. It used to be mapped
+    // to `Backpressure`, which is a 503, and Prometheus retries a 503 for
+    // ever — so a remote-write sender that crossed the limit spent the rest
+    // of its life resending a batch that could never be accepted. `Db`
+    // renders it as a 400, which Prometheus treats as permanent and drops.
     let insert_result = join_result
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .map_err(|e| match &e {
-            chronix::DbError::CardinalityExceeded { .. } => {
-                ServerError::Backpressure(e.to_string())
-            }
-            _ => ServerError::Db(e),
+        .map_err(|e| {
+            metrics::counter!("chronix_write_errors_total", "reason" => "panic").increment(1);
+            ServerError::Internal(e.to_string())
+        })?
+        .map_err(|e| {
+            metrics::counter!("chronix_write_errors_total", "reason" => "rejected").increment(1);
+            ServerError::Db(e)
         })?;
 
+    metrics::counter!("chronix_points_written_total").increment(insert_result.accepted as u64);
+
     if insert_result.is_partial() {
+        // Rejected points are *reported*, not only logged. A sender told
+        // "204 No Content" has no way to learn that half its batch was
+        // outside the out-of-order window, and the only place that
+        // information existed was this server's log.
+        let rejected = insert_result.rejected.len();
         tracing::warn!(
-            wal_committed = insert_result.wal_committed,
-            memtable_inserted = insert_result.memtable_inserted,
-            memtable_errors = insert_result.errors.len(),
-            "Partial insert: all points are WAL-durable but some memtable insertions failed"
+            accepted = insert_result.accepted,
+            rejected,
+            "Partial insert: some points were rejected"
         );
+        metrics::counter!("chronix_write_points_rejected_total").increment(rejected as u64);
+        let reason = insert_result
+            .rejected
+            .first()
+            .map_or_else(String::new, |(_, e)| format!(": {e}"));
+        return Err(ServerError::PartialWrite {
+            accepted: insert_result.accepted,
+            rejected,
+            reason,
+        });
     }
 
     Ok(())
+}
+
+/// Write a batch from an ingestion connector, and report what happened.
+///
+/// Connectors need a different answer from request handlers. A **partial**
+/// write is not a reason to retry: the rejected points were refused
+/// deterministically — a timestamp outside the out-of-order window will
+/// still be outside it — so redelivering the batch rejects them again, for
+/// ever, while rewriting the accepted ones each time round. Kafka's
+/// at-least-once loop turns that into an infinite redelivery.
+///
+/// So a partial write is committed with a warning and the accepted points
+/// counted; only a genuine failure asks the caller to retry.
+///
+/// # Errors
+///
+/// Returns the underlying error when nothing was written.
+pub async fn insert_from_connector(
+    db: &Arc<Chronix>,
+    namespace: Option<&str>,
+    points: Vec<Point>,
+    timeout: std::time::Duration,
+    connector: &str,
+) -> Result<u64, ServerError> {
+    let total = points.len() as u64;
+    match insert_with_timeout(db, namespace, points, timeout).await {
+        Ok(()) => Ok(total),
+        Err(ServerError::PartialWrite {
+            accepted,
+            rejected,
+            reason,
+        }) => {
+            tracing::warn!(
+                connector,
+                accepted,
+                rejected,
+                "connector batch partially written; the rejected points are \
+                 refused deterministically, so the batch is not retried{reason}"
+            );
+            Ok(accepted as u64)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Current wall-clock time as nanoseconds since the Unix epoch.

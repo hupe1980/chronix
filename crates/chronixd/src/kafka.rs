@@ -70,6 +70,12 @@ pub struct KafkaConsumer {
     /// Populated by [`new_arc`] — avoids `unsafe` Arc reconstruction.
     #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     self_ref: OnceLock<Weak<Self>>,
+    /// Whether the server enforces namespace isolation.
+    ///
+    /// Decides whether points get a namespace tag: without it a
+    /// multi-tenant deployment could not read its own connector data.
+    #[cfg_attr(not(any(feature = "kafka", feature = "mqtt")), allow(dead_code))]
+    multi_tenancy: bool,
     running: AtomicBool,
     stopped: AtomicBool,
     cancel: tokio::sync::Notify,
@@ -82,13 +88,18 @@ impl KafkaConsumer {
     /// Namespace this connector writes to.
     ///
     /// A connector carries no request, so its namespace comes from its own
-    /// configuration rather than a header. Returning `None` when the value is
-    /// the default keeps a single-tenant server's points untagged, which is
-    /// what its reads expect.
+    /// configuration rather than a header.
+    ///
+    /// The decision is **whether the server is multi-tenant**, not whether
+    /// the namespace happens to be `default`. Skipping the tag for the
+    /// default namespace left a multi-tenant deployment's connector data
+    /// untagged, and every scoped read filters on the tag — so the points
+    /// were stored and unreachable through the database's own query API.
+    /// A single-tenant server's points stay untagged, so a series does not
+    /// depend on which route wrote it.
     #[cfg(feature = "kafka")]
     fn namespace_scope(&self) -> Option<&str> {
-        (self.config.namespace != crate::namespace::DEFAULT_NAMESPACE)
-            .then_some(self.config.namespace.as_str())
+        self.multi_tenancy.then_some(self.config.namespace.as_str())
     }
 
     /// Create a new Kafka consumer connector wrapped in an `Arc`.
@@ -96,11 +107,17 @@ impl KafkaConsumer {
     /// This is the preferred constructor — it stores a `Weak<Self>`
     /// internally so that `start()` can safely spawn background tasks
     /// without `unsafe` Arc reconstruction.
-    pub fn new_arc(name: &str, config: KafkaConfig, db: Arc<Chronix>) -> Arc<Self> {
+    pub fn new_arc(
+        name: &str,
+        config: KafkaConfig,
+        db: Arc<Chronix>,
+        multi_tenancy: bool,
+    ) -> Arc<Self> {
         let arc = Arc::new(Self {
             name: name.to_string(),
             config,
             db,
+            multi_tenancy,
             self_ref: OnceLock::new(),
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -117,11 +134,12 @@ impl KafkaConsumer {
     ///
     /// Useful for unit-testing parsing logic. The `kafka` feature-gated
     /// consumer loop will not be available without calling `new_arc`.
-    pub fn new(name: &str, config: KafkaConfig, db: Arc<Chronix>) -> Self {
+    pub fn new(name: &str, config: KafkaConfig, db: Arc<Chronix>, multi_tenancy: bool) -> Self {
         Self {
             name: name.to_string(),
             config,
             db,
+            multi_tenancy,
             self_ref: OnceLock::new(),
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -350,21 +368,26 @@ mod consumer_impl {
                     }
 
                     if !points.is_empty() {
-                        let n = points.len() as u64;
-                        if let Err(e) = crate::util::insert_with_timeout(
+                        match crate::util::insert_from_connector(
                             &this.db,
                             this.namespace_scope(),
                             points,
                             INSERT_TIMEOUT,
+                            &this.name,
                         )
                         .await
                         {
-                            // Not committing is the whole retry mechanism:
-                            // the batch is redelivered instead of dropped.
-                            error!(name = %this.name, %e, "failed to write Kafka points");
-                            continue;
-                        }
-                        this.points_total.fetch_add(n, Ordering::Relaxed);
+                            Ok(n) => this.points_total.fetch_add(n, Ordering::Relaxed),
+                            Err(e) => {
+                                // Not committing is the whole retry mechanism:
+                                // the batch is redelivered instead of dropped.
+                                // A *partial* write is not routed here — it
+                                // would be redelivered for ever, since its
+                                // rejections are deterministic.
+                                error!(name = %this.name, %e, "failed to write Kafka points");
+                                continue;
+                            }
+                        };
                     }
 
                     if let Err(e) = consumer.commit().await {
@@ -491,7 +514,7 @@ mod tests {
             .build()
             .unwrap();
         let db = Arc::new(Chronix::open(db_config).unwrap());
-        KafkaConsumer::new("test", cfg, db)
+        KafkaConsumer::new("test", cfg, db, false)
     }
 
     #[test]
@@ -574,7 +597,7 @@ mod tests {
             .unwrap();
         let db = Arc::new(Chronix::open(db_config).unwrap());
 
-        let consumer = KafkaConsumer::new("test", cfg, db);
+        let consumer = KafkaConsumer::new("test", cfg, db, false);
         assert_eq!(consumer.measurement_for_topic("raw_cpu"), "cpu_metrics");
         assert_eq!(consumer.measurement_for_topic("other"), "other");
     }
@@ -602,7 +625,7 @@ mod tests {
             .build()
             .unwrap();
         let db = Arc::new(Chronix::open(db_config).unwrap());
-        let consumer = KafkaConsumer::new_arc("test", cfg, db);
+        let consumer = KafkaConsumer::new_arc("test", cfg, db, false);
 
         assert_eq!(consumer.name(), "test");
         assert_eq!(consumer.connector_type(), "kafka");
@@ -627,6 +650,35 @@ mod tests {
         assert!(
             result.is_err(),
             "unknown format variant should fail deserialization"
+        );
+    }
+
+    /// A connector's namespace tag used to be skipped whenever the value
+    /// was `default`, which is the value most deployments leave in place —
+    /// so on a multi-tenant server the connector's points were stored
+    /// untagged, and every scoped read filters on the tag. The data was in
+    /// the database and unreachable through the database's own query API.
+    #[cfg(feature = "kafka")]
+    #[test]
+    fn a_multi_tenant_connector_tags_even_the_default_namespace() {
+        let single = make_consumer(crate::connector::ConnectorFormat::LineProtocol);
+        assert_eq!(single.config.namespace, crate::namespace::DEFAULT_NAMESPACE);
+        assert_eq!(
+            single.namespace_scope(),
+            None,
+            "a single-tenant server's reads are unscoped, so tagging would \
+             make a connector's series differ from an HTTP writer's"
+        );
+
+        let multi = KafkaConsumer {
+            multi_tenancy: true,
+            ..single
+        };
+        assert_eq!(
+            multi.namespace_scope(),
+            Some("default"),
+            "a multi-tenant server filters every read on the tag, so the \
+             default namespace needs one too"
         );
     }
 }

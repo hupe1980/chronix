@@ -33,7 +33,6 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -90,6 +89,15 @@ pub enum ParsedCondition {
         /// Deviation value.
         value: f64,
     },
+    /// `<tag> = '<value>'` or `<tag> <> '<value>'`
+    TagEquals {
+        /// Tag key.
+        tag: String,
+        /// Value to compare against.
+        value: String,
+        /// `true` for `<>`.
+        negated: bool,
+    },
     /// `<field> <op> <value>`
     FieldThreshold {
         /// Field name.
@@ -106,16 +114,36 @@ pub enum ParsedCondition {
 }
 
 /// A delivery target from the DELIVER clause.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// # Why there is no `nats` or `mqtt` here
+///
+/// There were, and they parsed, and they validated, and nothing could ever
+/// deliver to them: broker delivery channels were removed long before this
+/// enum was written, so `DELIVER nats('alerts.cpu')` accepted a trigger that
+/// fired into nowhere. A DSL that accepts what the system decided not to have
+/// is worse than one that refuses it, because the refusal is the only place
+/// the user finds out.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryTarget {
-    /// `webhook('url')`
+    /// `webhook('https://…')`
     Webhook(String),
-    /// `nats('subject')`
-    Nats(String),
-    /// `mqtt('topic')`
-    Mqtt(String),
     /// `log`
     Log,
+}
+
+impl DeliveryTarget {
+    /// The channel name this target routes to.
+    ///
+    /// Matched against [`DeliveryChannel::name`](crate::signal::delivery::DeliveryChannel::name),
+    /// so a webhook is named by its URL: two triggers delivering to two
+    /// endpoints are two channels, not one.
+    #[must_use]
+    pub fn channel_name(&self) -> String {
+        match self {
+            Self::Webhook(url) => format!("webhook:{url}"),
+            Self::Log => "log".to_string(),
+        }
+    }
 }
 
 /// ALTER TRIGGER sub-command.
@@ -253,7 +281,10 @@ fn tokenize(sql: &str) -> Vec<String> {
             op.push(ch);
             chars.next();
             if let Some(&next) = chars.peek() {
-                if next == '=' {
+                // `<>` alongside `>=`, `<=`, `==` and `!=`: it is the SQL
+                // spelling of "not equal", and lexing it as two operators
+                // made it a parse error rather than a comparison.
+                if next == '=' || (ch == '<' && next == '>') {
                     op.push(next);
                     chars.next();
                 }
@@ -399,11 +430,17 @@ fn parse_create(tokens: &[String]) -> Result<TriggerStatement> {
                         i += 4; // func ( 'arg' )
                         match func.as_str() {
                             "webhook" => {
-                                validate_webhook_url(&arg)?;
+                                crate::signal::ssrf::validate_webhook_url(&arg)?;
                                 deliver.push(DeliveryTarget::Webhook(arg));
                             }
-                            "nats" => deliver.push(DeliveryTarget::Nats(arg)),
-                            "mqtt" => deliver.push(DeliveryTarget::Mqtt(arg)),
+                            broker @ ("nats" | "mqtt") => {
+                                return Err(SignalError::InvalidConfig(format!(
+                                    "delivery channel {broker:?} does not exist: broker \
+                                     delivery was removed. Subscribe to the CDC event \
+                                     bus and publish from there, or use \
+                                     webhook('https://…')"
+                                )))
+                            }
                             other => {
                                 return Err(SignalError::InvalidConfig(format!(
                                     "Unknown delivery: {other}"
@@ -412,7 +449,26 @@ fn parse_create(tokens: &[String]) -> Result<TriggerStatement> {
                         }
                         continue;
                     }
-                    i += 1;
+
+                    // Anything else is a channel that does not exist. This
+                    // used to be `i += 1` — a silent skip — so `DELIVER slack`
+                    // parsed to *no* targets, and no targets means every
+                    // channel: asking for one place delivered everywhere. A
+                    // typo (`lag` for `log`) did the same, and `DELIVER TO
+                    // log` worked by accident, which is why this crate's own
+                    // example used a spelling the grammar does not have.
+                    return Err(SignalError::InvalidConfig(format!(
+                        "unknown delivery channel {t:?}: the channels are `log` and \
+                         `webhook('https://…')`"
+                    )));
+                }
+                if deliver.is_empty() {
+                    return Err(SignalError::InvalidConfig(
+                        "DELIVER needs at least one channel: `log` or \
+                         `webhook('https://…')`. Omit the clause entirely for the \
+                         default channels."
+                            .into(),
+                    ));
                 }
             }
             "COOLDOWN" => {
@@ -559,12 +615,47 @@ fn parse_primary_condition(tokens: &[String], pos: usize) -> Result<(ParsedCondi
         )));
     }
     let op_str = get_token(tokens, pos + 1)?;
-    let value_str = get_token(tokens, pos + 2)?;
+    let raw_value = get_token(tokens, pos + 2)?;
+    // The tokenizer keeps a single-quoted string's own quotes, which is how
+    // a string value is told from a bare number here.
+    let value_quoted = raw_value.starts_with('\'') && raw_value.ends_with('\'');
+    let value_str = if value_quoted {
+        raw_value.trim_matches('\'').to_string()
+    } else {
+        raw_value.clone()
+    };
+
+    // A quoted right-hand side is a **tag** comparison, not a threshold.
+    // Without this the language had numbers and nothing else, so a trigger
+    // fired for every series of a measurement and "alert when cpu is high
+    // on the production hosts" could not be written at all.
+    if value_quoted {
+        let negated = match op_str.as_str() {
+            "==" | "=" => false,
+            "<>" | "!=" => true,
+            other => {
+                return Err(SignalError::InvalidConfig(format!(
+                    "operator {other} does not apply to the string '{value_str}'; \
+                     a tag comparison is `=` or `<>`"
+                )))
+            }
+        };
+        return Ok((
+            ParsedCondition::TagEquals {
+                tag: field,
+                value: value_str,
+                negated,
+            },
+            pos + 3,
+        ));
+    }
 
     let op = parse_op(&op_str)?;
-    let value: f64 = value_str
-        .parse()
-        .map_err(|_| SignalError::InvalidConfig(format!("Invalid number: {value_str}")))?;
+    let value: f64 = value_str.parse().map_err(|_| {
+        SignalError::InvalidConfig(format!(
+            "Invalid number: {value_str} (quote it to compare against a tag)"
+        ))
+    })?;
 
     let condition = match field.to_lowercase().as_str() {
         "anomaly_score" => ParsedCondition::AnomalyScore { op, value },
@@ -577,74 +668,6 @@ fn parse_primary_condition(tokens: &[String], pos: usize) -> Result<(ParsedCondi
     };
 
     Ok((condition, pos + 3))
-}
-
-/// Validate webhook URLs to prevent SSRF attacks.
-///
-/// Requirements:
-/// Must use `https` scheme (or `http` only for `localhost` in dev).
-/// Host must not resolve to a private/loopback/link-local IP.
-fn validate_webhook_url(raw: &str) -> Result<()> {
-    // Very basic URL parsing — extract scheme and host without adding
-    // a full `url` crate dependency.
-    let (scheme, rest) = raw.split_once("://").ok_or_else(|| {
-        SignalError::InvalidConfig("Webhook URL must include a scheme (https://)".into())
-    })?;
-
-    let scheme_lower = scheme.to_lowercase();
-    if scheme_lower != "https" && scheme_lower != "http" {
-        return Err(SignalError::InvalidConfig(
-            "Webhook URL must use https (or http for localhost)".into(),
-        ));
-    }
-
-    // Extract host (before any port or path).
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let host = authority.split(':').next().unwrap_or(authority);
-
-    if host.is_empty() {
-        return Err(SignalError::InvalidConfig(
-            "Webhook URL has empty host".into(),
-        ));
-    }
-
-    // Allow http only for localhost / 127.0.0.1.
-    if scheme_lower == "http" && host != "localhost" && host != "127.0.0.1" && host != "::1" {
-        return Err(SignalError::InvalidConfig(
-            "Webhook URL must use https for non-localhost hosts".into(),
-        ));
-    }
-
-    // Block private/reserved IP addresses (SSRF mitigation).
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(ip) && host != "127.0.0.1" && host != "::1" {
-            return Err(SignalError::InvalidConfig(format!(
-                "Webhook URL must not target private IP: {host}"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// Returns true if the IP is in a private / reserved range.
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()          // 127.0.0.0/8
-                || v4.is_private()    // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local() // 169.254/16
-                || v4.octets()[0] == 0 // 0.0.0.0/8
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()          // ::1
-                || v6.is_unspecified() // ::
-                // fc00::/7 unique-local
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                // fe80::/10 link-local
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
 }
 
 fn parse_duration(s: &str) -> Result<Duration> {
@@ -687,6 +710,15 @@ fn convert_condition(parsed: &ParsedCondition) -> TriggerCondition {
             op: *op,
             horizon: None,
         },
+        ParsedCondition::TagEquals {
+            tag,
+            value,
+            negated,
+        } => TriggerCondition::TagEquals {
+            tag: tag.clone(),
+            value: value.clone(),
+            negated: *negated,
+        },
         ParsedCondition::FieldThreshold { field, op, value } => TriggerCondition::FieldThreshold {
             field: field.clone(),
             op: *op,
@@ -718,12 +750,7 @@ pub fn execute_trigger_sql(engine: &TriggerEngine, stmt: &TriggerStatement) -> R
             let delivery_targets: Vec<String> = create
                 .deliver
                 .iter()
-                .map(|d| match d {
-                    DeliveryTarget::Webhook(url) => format!("webhook:{url}"),
-                    DeliveryTarget::Nats(subj) => format!("nats:{subj}"),
-                    DeliveryTarget::Mqtt(topic) => format!("mqtt:{topic}"),
-                    DeliveryTarget::Log => "log".to_string(),
-                })
+                .map(DeliveryTarget::channel_name)
                 .collect();
 
             let mut trigger =
@@ -1070,8 +1097,10 @@ mod tests {
     #[test]
     fn parse_create_multi_deliver() {
         let stmt = parse_trigger_sql(
-            "CREATE TRIGGER alert ON cpu WHEN anomaly_score > 2.0 DELIVER webhook('https://a.com'), nats('alerts.cpu'), mqtt('alerts/cpu')"
-        ).unwrap();
+            "CREATE TRIGGER alert ON cpu WHEN anomaly_score > 2.0 \
+             DELIVER webhook('https://a.com'), webhook('https://b.com'), log",
+        )
+        .unwrap();
 
         match stmt {
             TriggerStatement::Create(c) => {
@@ -1080,10 +1109,36 @@ mod tests {
                     c.deliver[0],
                     DeliveryTarget::Webhook("https://a.com".into())
                 );
-                assert_eq!(c.deliver[1], DeliveryTarget::Nats("alerts.cpu".into()));
-                assert_eq!(c.deliver[2], DeliveryTarget::Mqtt("alerts/cpu".into()));
+                assert_eq!(
+                    c.deliver[1],
+                    DeliveryTarget::Webhook("https://b.com".into())
+                );
+                assert_eq!(c.deliver[2], DeliveryTarget::Log);
+                // Each webhook is its own channel, named by its URL: routing
+                // on a constant "webhook" made two endpoints one channel.
+                assert_eq!(c.deliver[0].channel_name(), "webhook:https://a.com");
+                assert_eq!(c.deliver[1].channel_name(), "webhook:https://b.com");
+                assert_eq!(c.deliver[2].channel_name(), "log");
             }
             _ => panic!("Expected Create"),
+        }
+    }
+
+    /// Broker delivery was removed. Accepting the syntax meant a trigger that
+    /// fired into nowhere, with the user's only clue being that nothing
+    /// arrived.
+    #[test]
+    fn a_broker_delivery_target_is_refused_by_name() {
+        for target in ["nats('alerts.cpu')", "mqtt('alerts/cpu')"] {
+            let err = parse_trigger_sql(&format!(
+                "CREATE TRIGGER alert ON cpu WHEN value > 1.0 DELIVER {target}"
+            ))
+            .expect_err("a channel that does not exist must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not exist") && msg.contains("webhook"),
+                "the error must say what to use instead, got: {msg}"
+            );
         }
     }
 
@@ -1272,8 +1327,10 @@ mod tests {
     fn show_triggers_includes_delivery() {
         let engine = TriggerEngine::new();
         let stmt = parse_trigger_sql(
-            "CREATE TRIGGER d1 ON cpu WHEN value > 90.0 DELIVER nats('alerts.cpu'), mqtt('alerts/cpu')"
-        ).unwrap();
+            "CREATE TRIGGER d1 ON cpu WHEN value > 90.0 \
+             DELIVER webhook('https://alerts.example.com/cpu'), log",
+        )
+        .unwrap();
         execute_trigger_sql(&engine, &stmt).unwrap();
 
         let stmt = parse_trigger_sql("SHOW TRIGGERS").unwrap();
@@ -1281,8 +1338,13 @@ mod tests {
         if let SqlResult::Triggers(triggers) = result {
             assert_eq!(triggers.len(), 1);
             assert_eq!(triggers[0].delivery.len(), 2);
-            assert_eq!(triggers[0].delivery[0], "nats:alerts.cpu");
-            assert_eq!(triggers[0].delivery[1], "mqtt:alerts/cpu");
+            // The stored strings are the channel names the router matches on,
+            // so what SHOW prints is what delivery will look for.
+            assert_eq!(
+                triggers[0].delivery[0],
+                "webhook:https://alerts.example.com/cpu"
+            );
+            assert_eq!(triggers[0].delivery[1], "log");
         } else {
             panic!("Expected Triggers result");
         }
@@ -1617,5 +1679,73 @@ mod tests {
 
         let t = engine.get_trigger("t").unwrap();
         assert!(matches!(t.condition, TriggerCondition::And { .. }));
+    }
+
+    /// A trigger with only numeric comparisons fires for **every** series
+    /// of its measurement, so scoping an alert to a subset of hosts was
+    /// unexpressible. A quoted right-hand side is a tag comparison.
+    #[test]
+    fn a_quoted_value_is_a_tag_comparison() {
+        let stmt = parse_trigger_sql(
+            "CREATE TRIGGER prod_cpu ON cpu \
+             WHEN value > 90 AND env = 'production' \
+             DELIVER log",
+        )
+        .expect("a tag comparison must parse");
+        let TriggerStatement::Create(create) = stmt else {
+            panic!("expected CREATE");
+        };
+        let ParsedCondition::And(_, right) = create.condition else {
+            panic!("expected a conjunction, got {:?}", create.condition);
+        };
+        assert_eq!(
+            *right,
+            ParsedCondition::TagEquals {
+                tag: "env".to_string(),
+                value: "production".to_string(),
+                negated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_tag_comparison_may_be_negated() {
+        let stmt = parse_trigger_sql("CREATE TRIGGER t ON cpu WHEN env <> 'staging'")
+            .expect("<> must parse");
+        let TriggerStatement::Create(create) = stmt else {
+            panic!("expected CREATE");
+        };
+        assert_eq!(
+            create.condition,
+            ParsedCondition::TagEquals {
+                tag: "env".to_string(),
+                value: "staging".to_string(),
+                negated: true,
+            }
+        );
+    }
+
+    /// An ordering operator against a string is a mistake worth naming
+    /// rather than a comparison worth guessing at.
+    #[test]
+    fn an_ordering_operator_against_a_string_is_refused() {
+        let err = parse_trigger_sql("CREATE TRIGGER t ON cpu WHEN env > 'staging'")
+            .expect_err("`>` against a string must be refused");
+        assert!(
+            err.to_string().contains("does not apply"),
+            "the error must say why: {err}"
+        );
+    }
+
+    /// The old message said only "Invalid number", which is unhelpful when
+    /// the caller meant a tag and forgot the quotes.
+    #[test]
+    fn an_unquoted_string_says_how_to_fix_it() {
+        let err = parse_trigger_sql("CREATE TRIGGER t ON cpu WHEN env = production")
+            .expect_err("an unquoted string is not a number");
+        assert!(
+            err.to_string().contains("quote it"),
+            "the error must say how to fix it: {err}"
+        );
     }
 }

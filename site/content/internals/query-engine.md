@@ -75,7 +75,7 @@ Time-range predicates are pushed down to the storage layer, enabling
 range are skipped entirely:
 
 ```text
-Query: WHERE time > '2024-01-15' AND time < '2024-01-16'
+Query: WHERE _time > '2024-01-15' AND _time < '2024-01-16'
 
 Segments:
   [Jan 01 – Jan 07]  ← SKIPPED
@@ -144,7 +144,7 @@ Arrow `RecordBatch` (typically 8192 rows), not a single row.
 Time-series queries often aggregate by time buckets:
 
 ```sql
-SELECT time_bucket('5m', time) AS bucket, AVG(value)
+SELECT time_bucket('5m', _time) AS bucket, AVG(value)
 FROM metrics GROUP BY bucket ORDER BY bucket;
 ```
 

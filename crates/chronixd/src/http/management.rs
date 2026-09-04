@@ -65,8 +65,24 @@ pub async fn list_measurements_handler(
 /// `GET /api/v1/measurements/:name/schema` — measurement schema.
 pub async fn get_schema_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Path(name): Path<String>,
 ) -> Result<Json<MeasurementInfo>, ServerError> {
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
+
+    // The schema registry is process-wide, so answering from it directly
+    // told a tenant that another tenant's measurement exists — and its
+    // column names. A namespace may only see a measurement it holds data
+    // for, which is the same rule `/measurements` and `/metadata` follow.
+    if let Some(ref ns) = scope {
+        let now_ns = crate::util::now_nanos()?;
+        let visible =
+            crate::namespace::measurements_in(&state.db, Some(ns), i64::MIN, now_ns, usize::MAX);
+        if !visible.iter().any(|m| m == &name) {
+            return Err(ServerError::NotFound(name));
+        }
+    }
+
     let schema = state
         .db
         .schema(&name)
@@ -78,14 +94,40 @@ pub async fn get_schema_handler(
 /// `DELETE /api/v1/measurements/:name` — drop a measurement.
 pub async fn drop_measurement_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ServerError> {
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let db = state.db.clone();
     let measurement_name = name.clone();
-    tokio::task::spawn_blocking(move || db.drop_measurement(&measurement_name))
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .map_err(ServerError::Db)?;
+
+    // Under multi-tenancy a measurement is **shared**: every tenant writing
+    // `cpu` writes the same measurement, distinguished by the namespace tag.
+    // So "drop cpu" cannot mean `drop_measurement`, which would delete every
+    // tenant's data and the schema with it — it means "delete this
+    // namespace's series of cpu". Without a scope there is one tenant and
+    // the real drop is what was asked for.
+    match scope {
+        None => {
+            tokio::task::spawn_blocking(move || db.drop_measurement(&measurement_name))
+                .await
+                .map_err(|e| ServerError::Internal(e.to_string()))?
+                .map_err(ServerError::Db)?;
+        }
+        Some(ns) => {
+            let request = crate::namespace::scoped_delete_request(
+                &db,
+                Some(&ns),
+                &measurement_name,
+                [],
+                None,
+            )?;
+            tokio::task::spawn_blocking(move || db.execute_delete(&request))
+                .await
+                .map_err(|e| ServerError::Internal(e.to_string()))?
+                .map_err(ServerError::Db)?;
+        }
+    }
 
     tracing::info!(
         measurement = %name,
@@ -113,26 +155,42 @@ pub struct DeleteBody {
 /// `POST /api/v1/delete` — predicate-based delete.
 pub async fn delete_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    auth_ctx: Option<axum::extract::Extension<chronix_security::auth::AuthContext>>,
     Json(body): Json<DeleteBody>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let db = state.db.clone();
 
-    let deleted = tokio::task::spawn_blocking(move || {
-        let mut builder = db.delete_builder().measurement(&body.measurement);
-        for (k, v) in &body.tags {
-            builder = builder.tag(k, v);
-        }
-        if let Some(ref range) = body.range {
-            builder = builder.range(range.start, range.end);
-        }
-        let request = builder
-            .build()
-            .map_err(|e| chronix::DbError::Internal(format!("delete build error: {e}")))?;
-        db.execute_delete(&request)
-    })
-    .await
-    .map_err(|e| ServerError::Internal(e.to_string()))?
-    .map_err(ServerError::Db)?;
+    let request = crate::namespace::scoped_delete_request(
+        &db,
+        scope.as_deref(),
+        &body.measurement,
+        body.tags,
+        body.range.map(|r| (r.start, r.end)),
+    )?;
+    let deleted = tokio::task::spawn_blocking(move || db.execute_delete(&request))
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .map_err(ServerError::Db)?;
+
+    // A delete is the one operation nothing can undo, so it is recorded
+    // whether or not anyone is watching the logs.
+    let principal = auth_ctx
+        .as_ref()
+        .map_or("anonymous", |c| c.0.principal.as_str());
+    crate::audit::record(
+        &state,
+        principal,
+        chronix_security::audit::AuditAction::Delete,
+        body.measurement.clone(),
+        chronix_security::audit::AuditDecision::Allow,
+        &[
+            ("namespace", scope.clone().unwrap_or_default()),
+            ("series_tombstoned", deleted.series_tombstoned.to_string()),
+            ("complete", deleted.is_complete().to_string()),
+        ],
+    );
 
     // Surface partial deletes — a caller with an erasure obligation
     // must be able to tell a complete delete from one that skipped segments.
@@ -168,6 +226,7 @@ pub struct DeleteBatchItemResult {
 /// `POST /api/v1/delete_batch` — bulk predicate-based delete.
 pub async fn delete_batch_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Json(body): Json<DeleteBatchBody>,
 ) -> Result<Json<Vec<DeleteBatchItemResult>>, ServerError> {
     if body.deletes.is_empty() {
@@ -176,24 +235,29 @@ pub async fn delete_batch_handler(
         ));
     }
 
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let db = state.db.clone();
+
+    // Every request is built through the one scoping helper, so a batch
+    // cannot be the surface that forgets.
+    let requests: Vec<chronix::DeleteRequest> = body
+        .deletes
+        .iter()
+        .map(|item| {
+            crate::namespace::scoped_delete_request(
+                &db,
+                scope.as_deref(),
+                &item.measurement,
+                item.tags.clone(),
+                item.range.as_ref().map(|r| (r.start, r.end)),
+            )
+        })
+        .collect::<Result<_, _>>()?;
 
     let results = tokio::task::spawn_blocking(move || {
         let mut results = Vec::with_capacity(body.deletes.len());
-        for item in &body.deletes {
-            let res = (|| -> std::result::Result<chronix::DeleteOutcome, chronix::DbError> {
-                let mut builder = db.delete_builder().measurement(&item.measurement);
-                for (k, v) in &item.tags {
-                    builder = builder.tag(k, v);
-                }
-                if let Some(ref range) = item.range {
-                    builder = builder.range(range.start, range.end);
-                }
-                let request = builder
-                    .build()
-                    .map_err(|e| chronix::DbError::Internal(format!("delete build error: {e}")))?;
-                db.execute_delete(&request)
-            })();
+        for (item, request) in body.deletes.iter().zip(&requests) {
+            let res = db.execute_delete(request);
 
             match res {
                 Ok(outcome) => results.push(DeleteBatchItemResult {
@@ -233,6 +297,14 @@ pub struct RollupInfo {
     pub window_seconds: u64,
     /// Aggregation functions applied.
     pub aggregations: Vec<String>,
+    /// Exclusive end of the newest bucket materialised so far, in
+    /// nanoseconds, or `null` if nothing has been.
+    pub materialised_until: Option<i64>,
+    /// Bucket ranges below the watermark waiting to be recomputed because a
+    /// backfill or a delete changed their input, as `[from, to)` pairs. A
+    /// non-empty list means this tier does not yet agree with the raw data,
+    /// and retention will not drop that raw data until it does.
+    pub pending_repairs: Vec<(i64, i64)>,
 }
 
 /// `GET /api/v1/rollups` — list rollup configurations.
@@ -240,25 +312,42 @@ pub struct RollupInfo {
 /// Supports optional `offset` and `limit` query parameters for pagination.
 pub async fn list_rollups_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<PaginatedResponse<RollupInfo>>, ServerError> {
+    // Rollup names are namespace-qualified when multi-tenancy is on, so a
+    // tenant sees its own and the prefix is stripped from what it sees.
+    let prefix =
+        crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(|ns| format!("{ns}/"));
     let db = state.db.clone();
 
-    let rollups = tokio::task::spawn_blocking(move || db.list_rollups())
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?
-        .map_err(ServerError::Db)?;
-
-    let all_infos: Vec<RollupInfo> = rollups
-        .into_iter()
-        .map(|r| RollupInfo {
-            name: r.name.clone(),
-            source_measurement: r.source_measurement.clone(),
-            target_measurement: r.target_measurement.clone(),
-            window_seconds: (r.interval_ns / 1_000_000_000) as u64,
-            aggregations: r.aggregations.iter().map(|a| format!("{a:?}")).collect(),
-        })
-        .collect();
+    let all_infos: Vec<RollupInfo> = tokio::task::spawn_blocking(move || {
+        let rollups = db.list_rollups()?;
+        let mut infos = Vec::with_capacity(rollups.len());
+        for r in rollups {
+            let visible_name = match &prefix {
+                None => r.name.clone(),
+                Some(p) => match r.name.strip_prefix(p.as_str()) {
+                    Some(rest) => rest.to_string(),
+                    None => continue, // another tenant's rollup
+                },
+            };
+            let state = db.rollup_state(&r.name)?;
+            infos.push(RollupInfo {
+                name: visible_name,
+                source_measurement: r.source_measurement.clone(),
+                target_measurement: r.target_measurement.clone(),
+                window_seconds: (r.interval_ns / 1_000_000_000) as u64,
+                aggregations: r.aggregations.iter().map(|a| format!("{a:?}")).collect(),
+                materialised_until: state.materialised_until,
+                pending_repairs: state.pending_invalidations().to_vec(),
+            });
+        }
+        Ok::<_, chronix::DbError>(infos)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))?
+    .map_err(ServerError::Db)?;
 
     let total = all_infos.len();
     let offset = pagination.offset.unwrap_or(0);
@@ -270,6 +359,56 @@ pub async fn list_rollups_handler(
         total,
         offset,
         limit,
+    }))
+}
+
+/// Query parameters for a rollup refresh.
+#[derive(Debug, serde::Deserialize)]
+pub struct RefreshParams {
+    /// Inclusive start of the range to recompute, nanoseconds.
+    pub start: i64,
+    /// Inclusive end of the range to recompute, nanoseconds.
+    pub end: i64,
+}
+
+/// What a refresh did.
+#[derive(Debug, serde::Serialize)]
+pub struct RefreshResponse {
+    /// The rollup that was recomputed.
+    pub rollup: String,
+    /// Rollup points written by the recomputation.
+    pub points_written: usize,
+}
+
+/// `POST /api/v1/rollups/{name}/refresh?start=&end=` — recompute a range.
+///
+/// The engine already repairs the ranges a `backfill` or a delete touched,
+/// on its own schedule. This is the escape hatch for a change it could not
+/// have observed — an out-of-band restore, a corrected import — and for an
+/// operator who does not want to wait for the next maintenance pass.
+pub async fn refresh_rollup_handler(
+    State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Query(params): Query<RefreshParams>,
+) -> Result<Json<RefreshResponse>, ServerError> {
+    // Names are namespace-qualified, so a tenant can only refresh its own.
+    let name = crate::namespace::qualify_rollup(&state, ns_ctx.as_ref().map(|e| &e.0), &name);
+    if params.end < params.start {
+        return Err(ServerError::BadRequest(
+            "end must not be before start".into(),
+        ));
+    }
+    let db = state.db.clone();
+    let rollup = name.clone();
+    let points_written =
+        tokio::task::spawn_blocking(move || db.refresh_rollup(&name, params.start, params.end))
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .map_err(ServerError::Db)?;
+    Ok(Json(RefreshResponse {
+        rollup,
+        points_written,
     }))
 }
 
@@ -297,10 +436,21 @@ pub struct CreateRollupRequest {
 /// `POST /api/v1/rollups` — create a rollup configuration.
 pub async fn create_rollup_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Json(body): Json<CreateRollupRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let db = state.db.clone();
-    let rollup_name = body.name.clone();
+    // A rollup definition is global, but measurements are shared between
+    // tenants — so an unscoped rollup aggregates *every* tenant's rows into
+    // one target series, and two tenants asking for `cpu_1m` collide on the
+    // name. The name is qualified per namespace, and the namespace tag joins
+    // the group-by so each tenant's rows aggregate separately and the target
+    // stays readable through the ordinary scoped read path.
+    let rollup_name = match &scope {
+        None => body.name.clone(),
+        Some(ns) => format!("{ns}/{}", body.name),
+    };
 
     // Parse aggregation function names.
     let agg_fns: Vec<chronix::RollupAggFn> = body
@@ -312,6 +462,7 @@ pub async fn create_rollup_handler(
             "max" => Ok(chronix::RollupAggFn::Max),
             "sum" => Ok(chronix::RollupAggFn::Sum),
             "count" => Ok(chronix::RollupAggFn::Count),
+            "first" => Ok(chronix::RollupAggFn::First),
             "last" => Ok(chronix::RollupAggFn::Last),
             other => Err(ServerError::BadRequest(format!(
                 "unknown aggregation function: {other}"
@@ -325,9 +476,10 @@ pub async fn create_rollup_handler(
         .ok_or_else(|| ServerError::BadRequest("interval_seconds overflow".into()))?
         as i64;
 
+    let name_for_builder = rollup_name.clone();
     tokio::task::spawn_blocking(move || {
         let mut builder = chronix::RollupBuilder::new()
-            .name(&body.name)
+            .name(&name_for_builder)
             .source(&body.source_measurement)
             .target(&body.target_measurement)
             .interval_ns(interval_ns);
@@ -337,6 +489,9 @@ pub async fn create_rollup_handler(
         }
         for tag in &body.group_by_tags {
             builder = builder.group_by(tag);
+        }
+        if scope.is_some() {
+            builder = builder.group_by(crate::namespace::NAMESPACE_TAG);
         }
         if let Some(retention_secs) = body.retention_seconds {
             builder = builder.retention_ns(retention_secs as i64 * 1_000_000_000);
@@ -359,10 +514,12 @@ pub async fn create_rollup_handler(
 /// `DELETE /api/v1/rollups/:name` — delete a rollup configuration.
 pub async fn delete_rollup_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ServerError> {
     let db = state.db.clone();
-    let rollup_name = name.clone();
+    let rollup_name =
+        crate::namespace::qualify_rollup(&state, ns_ctx.as_ref().map(|e| &e.0), &name);
 
     let removed = tokio::task::spawn_blocking(move || db.delete_rollup(&rollup_name))
         .await
@@ -396,8 +553,10 @@ pub struct ExportRequest {
 /// Parquet file on the server's filesystem.
 pub async fn export_parquet_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Json(body): Json<ExportRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let db = state.db.clone();
 
     // Restrict export path to the database data directory to prevent path traversal.
@@ -426,7 +585,12 @@ pub async fn export_parquet_handler(
             ));
         }
 
-        let mut builder = db.query().measurement(&body.measurement);
+        // Scoped like every other read: an export used to write **every**
+        // tenant's rows into a file the caller then downloads.
+        let mut builder = db
+            .query()
+            .measurement(&body.measurement)
+            .namespace_scope(scope.as_deref());
         if let Some(ref range) = body.range {
             builder = builder.range(range.start, range.end);
         }

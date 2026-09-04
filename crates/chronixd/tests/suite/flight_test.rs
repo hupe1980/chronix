@@ -24,7 +24,18 @@ use chronix::Chronix;
 use chronixd::flight::ChronixFlightSqlService;
 
 /// Spin up a test Flight SQL server on an ephemeral port.
+/// A Flight server with namespace isolation on.
+async fn start_tenant_flight_server() -> (FlightServiceClient<Channel>, Arc<Chronix>, TempDir) {
+    start_flight_server_inner(true).await
+}
+
 async fn start_flight_server() -> (FlightServiceClient<Channel>, Arc<Chronix>, TempDir) {
+    start_flight_server_inner(false).await
+}
+
+async fn start_flight_server_inner(
+    multi_tenancy: bool,
+) -> (FlightServiceClient<Channel>, Arc<Chronix>, TempDir) {
     let tmp = TempDir::new().expect("tempdir");
     let config = ChronixConfigBuilder::default()
         .data_dir(tmp.path().to_path_buf())
@@ -32,7 +43,7 @@ async fn start_flight_server() -> (FlightServiceClient<Channel>, Arc<Chronix>, T
         .expect("chronix config");
     let db = Arc::new(Chronix::open(config).expect("open db"));
 
-    let flight_service = ChronixFlightSqlService::new(db.clone());
+    let flight_service = ChronixFlightSqlService::new(db.clone()).with_multi_tenancy(multi_tenancy);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -290,4 +301,249 @@ async fn flight_sql_do_get_statement() {
         .map(chronix::prelude::RecordBatch::num_rows)
         .sum();
     assert_eq!(total_rows, 2, "expected 2 rows");
+}
+
+/// `GetFlightInfo` must refuse a statement the read-only check refuses.
+///
+/// It used to plan through `SessionContext::sql`, which **executes** DDL,
+/// DML and `SET` rather than only planning them — and every JDBC/ADBC client
+/// calls `GetFlightInfo` before `DoGet`, so this was a complete bypass of
+/// the admission the rest of the server enforces. `CREATE EXTERNAL TABLE`
+/// registered a file that a later, checked `SELECT` could then read.
+#[tokio::test]
+async fn get_flight_info_enforces_read_only() {
+    let (mut client, db, _tmp) = start_flight_server().await;
+    write_test_data(&db);
+
+    for statement in [
+        "SET datafusion.execution.target_partitions = 999",
+        "CREATE EXTERNAL TABLE leak STORED AS CSV LOCATION '/etc/passwd'",
+        "INSERT INTO cpu VALUES (1, 'a', 1.0)",
+        "DROP TABLE cpu",
+    ] {
+        let cmd = CommandStatementQuery {
+            query: statement.to_string(),
+            transaction_id: None,
+        };
+        let result = client
+            .get_flight_info(FlightDescriptor::new_cmd(pack_any(&cmd)))
+            .await;
+        assert!(
+            result.is_err(),
+            "GetFlightInfo accepted a mutating statement: {statement}"
+        );
+    }
+
+    // The session was not mutated on the way through. The observable is the
+    // setting the refused `SET` named: `information_schema` used to serve
+    // here, and is now on by default because the catalog is scoped to the
+    // caller's namespace.
+    let cmd = CommandStatementQuery {
+        query: "SELECT value FROM information_schema.df_settings \
+                WHERE name = 'datafusion.execution.target_partitions'"
+            .to_string(),
+        transaction_id: None,
+    };
+    let info = client
+        .get_flight_info(FlightDescriptor::new_cmd(pack_any(&cmd)))
+        .await
+        .expect("reading a setting is a read")
+        .into_inner();
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    let data = collect_flight_data(
+        client
+            .do_get(tonic::Request::new(ticket))
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .await;
+    let batches = flight_data_to_batches(&data).unwrap_or_default();
+    let value = batches
+        .iter()
+        .find_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .map(|a| a.value(0).to_string())
+        })
+        .expect("a setting value");
+    assert_ne!(value, "999", "the SET took effect despite being refused");
+
+    // And an ordinary read still works.
+    let cmd = CommandStatementQuery {
+        query: "SELECT * FROM cpu".to_string(),
+        transaction_id: None,
+    };
+    assert!(client
+        .get_flight_info(FlightDescriptor::new_cmd(pack_any(&cmd)))
+        .await
+        .is_ok());
+}
+
+/// A statement handle is bytes the client sends, so it cannot be trusted to
+/// say which tenant the query runs as.
+///
+/// The handle used to be `"{namespace}\n{sql}"`, unsigned, and `DoGet`
+/// believed it — so a client edited the string and read another tenant's
+/// data. The scope now comes from the `DoGet` request's own metadata, and
+/// the handle's copy only has to agree.
+#[tokio::test]
+async fn a_forged_statement_handle_cannot_change_tenant() {
+    use arrow_flight::sql::TicketStatementQuery;
+
+    let (mut client, db, _tmp) = start_tenant_flight_server().await;
+
+    // Both tenants have a `cpu` row, so the test turns on *whose* rows come
+    // back rather than on whether the measurement resolves at all — a
+    // tenant that has never written `cpu` now gets "table not found", the
+    // same answer as for a name nobody has ever used.
+    for (namespace, usage) in [("a", 1.0), ("b", 42.0)] {
+        db.insert(
+            &Point::new(
+                SeriesKey::new(
+                    "cpu",
+                    [(
+                        chronix::chronix_core::NAMESPACE_TAG.to_string(),
+                        namespace.to_string(),
+                    )]
+                    .into(),
+                )
+                .unwrap(),
+                [("usage".to_string(), FieldValue::F64(usage))].into(),
+                1_609_459_200_000_000_000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    db.flush().unwrap();
+
+    // A ticket forged for tenant `b`, sent on a request that says `a`.
+    let forged = TicketStatementQuery {
+        statement_handle: "b\nSELECT * FROM cpu".to_string().into_bytes().into(),
+    };
+    let mut req = tonic::Request::new(arrow_flight::Ticket::new(pack_any(&forged)));
+    req.metadata_mut()
+        .insert("x-namespace", "a".parse().unwrap());
+
+    let result = client.do_get(req).await;
+    assert!(
+        result.is_err(),
+        "a ticket naming another tenant must be refused"
+    );
+    assert_eq!(
+        result.unwrap_err().code(),
+        tonic::Code::PermissionDenied,
+        "the refusal must say why"
+    );
+
+    // The same query in the client's own namespace is fine, and returns
+    // that namespace's rows — which for `a` is none of `b`'s.
+    let cmd = CommandStatementQuery {
+        query: "SELECT * FROM cpu".to_string(),
+        transaction_id: None,
+    };
+    let mut info_req = tonic::Request::new(FlightDescriptor::new_cmd(pack_any(&cmd)));
+    info_req
+        .metadata_mut()
+        .insert("x-namespace", "a".parse().unwrap());
+    let info = client.get_flight_info(info_req).await.unwrap().into_inner();
+    let ticket = info.endpoint[0].ticket.clone().unwrap();
+    let mut get_req = tonic::Request::new(ticket);
+    get_req
+        .metadata_mut()
+        .insert("x-namespace", "a".parse().unwrap());
+    let data = collect_flight_data(client.do_get(get_req).await.unwrap().into_inner()).await;
+    let batches = flight_data_to_batches(&data).unwrap_or_default();
+    assert_eq!(
+        batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum::<usize>(),
+        1,
+        "tenant a must see its own row"
+    );
+    let usage = batches
+        .iter()
+        .find_map(|b| {
+            b.column_by_name("usage")?
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .map(|a| a.value(0))
+        })
+        .expect("a usage column");
+    assert!(
+        (usage - 1.0).abs() < f64::EPSILON,
+        "tenant a must see its own row, not tenant b's 42: got {usage}"
+    );
+}
+
+/// `GetTables` over Flight lists only the caller's measurements.
+///
+/// A table listing is an enumeration oracle when it is not scoped: a tenant
+/// learns which measurement names another tenant uses, one probe at a time.
+/// The same defect was found in the SQL catalog on a surface nobody
+/// re-checked, so the metadata endpoints get their own test rather than
+/// inheriting confidence from the data path's.
+#[tokio::test]
+async fn flight_get_tables_is_namespace_scoped() {
+    use arrow_flight::sql::CommandGetTables;
+
+    let (mut client, db, _tmp) = start_tenant_flight_server().await;
+
+    // Only tenant `a` writes `secret_metric`.
+    db.insert(
+        &Point::new(
+            SeriesKey::new(
+                "secret_metric",
+                [(
+                    chronix::chronix_core::NAMESPACE_TAG.to_string(),
+                    "a".to_string(),
+                )]
+                .into(),
+            )
+            .unwrap(),
+            [("v".to_string(), FieldValue::F64(1.0))].into(),
+            1_609_459_200_000_000_000,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    db.flush().unwrap();
+
+    let tables_for = |client: &mut FlightServiceClient<Channel>, ns: &'static str| {
+        let mut c = client.clone();
+        async move {
+            let cmd = CommandGetTables {
+                catalog: None,
+                db_schema_filter_pattern: None,
+                table_name_filter_pattern: None,
+                table_types: vec![],
+                include_schema: false,
+            };
+            let mut req = tonic::Request::new(FlightDescriptor::new_cmd(pack_any(&cmd)));
+            req.metadata_mut()
+                .insert("x-namespace", ns.parse().unwrap());
+            let info = c.get_flight_info(req).await.unwrap().into_inner();
+            let ticket = info.endpoint[0].ticket.clone().unwrap();
+            let mut get = tonic::Request::new(ticket);
+            get.metadata_mut()
+                .insert("x-namespace", ns.parse().unwrap());
+            let data = collect_flight_data(c.do_get(get).await.unwrap().into_inner()).await;
+            format!("{:?}", flight_data_to_batches(&data).unwrap_or_default())
+        }
+    };
+
+    let a = tables_for(&mut client, "a").await;
+    assert!(
+        a.contains("secret_metric"),
+        "the writing tenant must see its own measurement"
+    );
+
+    let b = tables_for(&mut client, "b").await;
+    assert!(
+        !b.contains("secret_metric"),
+        "another tenant must not learn the measurement exists; got {b}"
+    );
 }

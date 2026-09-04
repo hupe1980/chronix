@@ -704,3 +704,287 @@ async fn grpc_stream_write_empty_dedup_key_no_skip() {
     let resp = client.stream_write(stream).await.unwrap().into_inner();
     assert_eq!(resp.total_written, 2);
 }
+
+// ══ Namespace isolation ═════════════════════════════════════════════════
+//
+// The gRPC surface reads `x-namespace` and scopes every RPC on it, and until
+// now nothing tested that it does: the HTTP surfaces had a tenancy suite and
+// this one had none. Namespace isolation is the property this tree has broken
+// most often — a scope each handler has to remember is a scope most of them
+// forget — so "it is scoped" is a claim, and this is the test of it.
+//
+// The shape is deliberately the same as the HTTP suite's: write as one tenant,
+// then try to reach the data as another through **every** RPC that takes a
+// scope.
+
+/// A multi-tenant gRPC server.
+async fn start_tenant_grpc_server() -> (ChronixServiceClient<Channel>, TempDir) {
+    let tmp = TempDir::new().expect("tempdir");
+    let config = ChronixConfigBuilder::default()
+        .data_dir(tmp.path().to_path_buf())
+        .build()
+        .expect("chronix config");
+    let db = Arc::new(Chronix::open(config).expect("open db"));
+
+    let grpc_service =
+        ChronixGrpcService::new(db, std::time::Instant::now()).with_multi_tenancy(true);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(proto::chronix_service_server::ChronixServiceServer::new(
+                grpc_service,
+            ))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = ChronixServiceClient::connect(format!("http://127.0.0.1:{}", addr.port()))
+        .await
+        .unwrap();
+    (client, tmp)
+}
+
+/// Tag a request with the tenant making it.
+fn as_tenant<T>(msg: T, namespace: &str) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.metadata_mut()
+        .insert("x-namespace", namespace.parse().unwrap());
+    req
+}
+
+/// Write one point of `cpu` as `namespace`.
+async fn write_as(client: &mut ChronixServiceClient<Channel>, namespace: &str, value: f64) {
+    let req = proto::WriteRequest {
+        points: vec![make_point(
+            "cpu",
+            &[("host", namespace)],
+            &[("usage", value)],
+            1_700_000_000_000_000_000,
+        )],
+    };
+    assert!(
+        client.write(as_tenant(req, namespace)).await.is_ok(),
+        "{namespace} must be able to write"
+    );
+}
+
+#[tokio::test]
+async fn grpc_query_only_sees_the_requesting_namespace() {
+    let (mut client, _tmp) = start_tenant_grpc_server().await;
+    write_as(&mut client, "tenant-a", 1.0).await;
+    write_as(&mut client, "tenant-b", 42.0).await;
+
+    for (tenant, expected) in [("tenant-a", 1.0), ("tenant-b", 42.0)] {
+        let req = proto::QueryRequest {
+            measurement: "cpu".to_string(),
+            ..Default::default()
+        };
+        let mut stream = client
+            .query(as_tenant(req, tenant))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let mut rows = 0;
+        let mut text = String::new();
+        while let Some(resp) = stream.message().await.unwrap() {
+            rows += resp.rows.len();
+            text.push_str(&format!("{:?}", resp.rows));
+        }
+        assert_eq!(rows, 1, "{tenant} must see exactly its own point");
+        assert!(
+            text.contains(&format!("{expected}")),
+            "{tenant} must see its own value {expected}; got {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_list_measurements_is_namespace_scoped() {
+    let (mut client, _tmp) = start_tenant_grpc_server().await;
+    write_as(&mut client, "tenant-a", 1.0).await;
+
+    let listed = |names: Vec<String>| names.contains(&"cpu".to_string());
+
+    let a = client
+        .list_measurements(as_tenant(
+            proto::ListMeasurementsRequest::default(),
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        listed(a.measurements.iter().map(|m| m.name.clone()).collect()),
+        "the writing tenant must see its measurement"
+    );
+
+    let b = client
+        .list_measurements(as_tenant(
+            proto::ListMeasurementsRequest::default(),
+            "tenant-b",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !listed(b.measurements.iter().map(|m| m.name.clone()).collect()),
+        "another tenant must not learn that the measurement exists"
+    );
+}
+
+/// A delete must not reach another tenant's rows. This is the one that cannot
+/// be undone if it is wrong.
+#[tokio::test]
+async fn grpc_delete_only_removes_the_requesting_namespaces_data() {
+    let (mut client, _tmp) = start_tenant_grpc_server().await;
+    write_as(&mut client, "tenant-a", 1.0).await;
+    write_as(&mut client, "tenant-b", 42.0).await;
+
+    client
+        .delete(as_tenant(
+            proto::DeleteRequest {
+                measurement: "cpu".to_string(),
+                ..Default::default()
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap();
+
+    // tenant-b's data survives.
+    let req = proto::QueryRequest {
+        measurement: "cpu".to_string(),
+        ..Default::default()
+    };
+    let mut stream = client
+        .query(as_tenant(req, "tenant-b"))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut rows = 0;
+    while let Some(resp) = stream.message().await.unwrap() {
+        rows += resp.rows.len();
+    }
+    assert_eq!(rows, 1, "tenant-a's delete must not touch tenant-b's rows");
+}
+
+/// Dropping a measurement drops the caller's series of it, not the shared
+/// measurement — the same rule the HTTP surface follows.
+#[tokio::test]
+async fn grpc_drop_measurement_only_drops_the_callers_series() {
+    let (mut client, _tmp) = start_tenant_grpc_server().await;
+    write_as(&mut client, "tenant-a", 1.0).await;
+    write_as(&mut client, "tenant-b", 42.0).await;
+
+    client
+        .drop_measurement(as_tenant(
+            proto::DropMeasurementRequest {
+                measurement: "cpu".to_string(),
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .query(as_tenant(
+            proto::QueryRequest {
+                measurement: "cpu".to_string(),
+                ..Default::default()
+            },
+            "tenant-b",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut rows = 0;
+    while let Some(resp) = stream.message().await.unwrap() {
+        rows += resp.rows.len();
+    }
+    assert_eq!(rows, 1, "tenant-b's series must survive tenant-a's drop");
+}
+
+/// SQL over gRPC is scoped too — it resolves tables through a per-namespace
+/// session context rather than a shared one.
+#[tokio::test]
+async fn grpc_sql_only_sees_the_requesting_namespace() {
+    let (mut client, _tmp) = start_tenant_grpc_server().await;
+    write_as(&mut client, "tenant-a", 1.0).await;
+    write_as(&mut client, "tenant-b", 42.0).await;
+
+    for (tenant, expected) in [("tenant-a", "1"), ("tenant-b", "42")] {
+        let resp = client
+            .execute_sql(as_tenant(
+                proto::SqlRequest {
+                    query: "SELECT sum(usage) AS s FROM cpu".to_string(),
+                },
+                tenant,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let text = format!("{resp:?}");
+        assert!(
+            text.contains(expected),
+            "{tenant} must see only its own sum; got {text}"
+        );
+    }
+}
+
+/// A request carrying no namespace reads the `default` namespace — never
+/// another tenant's data, and never everything.
+///
+/// This is the safe direction and it is chosen rather than accidental: with no
+/// credential to derive a scope from, the header is all there is, and the
+/// fallback has to be a namespace rather than the absence of one. The failure
+/// that matters is the other one — an unscoped request reading across tenants
+/// — so that is what is asserted.
+#[tokio::test]
+async fn an_unscoped_request_reads_the_default_namespace_only() {
+    let (mut client, _tmp) = start_tenant_grpc_server().await;
+    write_as(&mut client, "tenant-a", 1.0).await;
+    write_as(&mut client, "tenant-b", 42.0).await;
+
+    let mut rows = 0;
+    if let Ok(resp) = client
+        .query(tonic::Request::new(proto::QueryRequest {
+            measurement: "cpu".to_string(),
+            ..Default::default()
+        }))
+        .await
+    {
+        let mut stream = resp.into_inner();
+        while let Some(resp) = stream.message().await.unwrap() {
+            rows += resp.rows.len();
+        }
+    }
+    assert_eq!(
+        rows, 0,
+        "an unscoped request must not see either tenant's rows"
+    );
+
+    // And the `default` namespace's own data is visible to it.
+    write_as(&mut client, "default", 7.0).await;
+    let mut stream = client
+        .query(tonic::Request::new(proto::QueryRequest {
+            measurement: "cpu".to_string(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut rows = 0;
+    while let Some(resp) = stream.message().await.unwrap() {
+        rows += resp.rows.len();
+    }
+    assert_eq!(rows, 1, "it reads the default namespace, and only that");
+}

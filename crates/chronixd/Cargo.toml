@@ -92,6 +92,8 @@ clap.workspace = true
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
+regex.workspace = true
 postcard.workspace = true
 toml.workspace = true
 openraft = { workspace = true, optional = true }
@@ -130,6 +132,9 @@ rumqttc = { workspace = true, optional = true }
 
 form_urlencoded.workspace = true
 
+# Request-body decompression (Telegraf and the OTel Collector gzip by default)
+flate2 = "1"
+
 [features]
 default = []
 ## Distributed cluster mode (Meta/Data node roles, Multi-Raft replication).
@@ -138,11 +143,16 @@ cluster = ["dep:chronix-meta", "dep:chronix-cluster", "dep:openraft"]
 chaos = ["dep:chronix-chaos"]
 ## OTLP distributed-trace export (OpenTelemetry SDK + exporter).
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+## Parquet cold archive on S3/GCS/Azure, with a periodic archiving pass.
+object-store = ["chronix/object-store"]
 kafka = ["dep:krafka"]
 mqtt = ["dep:rumqttc"]
 all-connectors = ["kafka", "mqtt"]
 
 [dev-dependencies]
+# Real clients gzip their bodies; the tests that prove we accept them have to
+# produce the same bytes.
+flate2 = "1"
 tempfile.workspace = true
 proptest.workspace = true
 jsonwebtoken.workspace = true

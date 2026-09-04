@@ -23,19 +23,125 @@ use crate::error::ServerError;
 ///
 /// Returns [`ServerError::BadRequest`] if any line fails to parse.
 pub fn parse_line_protocol(input: &str) -> Result<Vec<Point>, ServerError> {
-    let mut points = Vec::new();
+    let parsed = parse_line_protocol_partial(input, Precision::Nanoseconds);
+    if let Some(first) = parsed.errors.first() {
+        return Err(ServerError::BadRequest(first.clone()));
+    }
+    Ok(parsed.points)
+}
 
+/// The timestamp unit a client says its line protocol is in.
+///
+/// InfluxDB's write API takes `precision=ns|us|ms|s`, and Telegraf sets it —
+/// its default output is `precision = "1ns"` but a configured `ms` is
+/// common, and every client that writes seconds sets it. Ignoring the
+/// parameter, as this server did, put a millisecond client's data in
+/// January 1970: `1700000000000` read as nanoseconds is 1970-01-01T00:28:20Z.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Precision {
+    /// Nanoseconds — the Line Protocol default.
+    #[default]
+    Nanoseconds,
+    /// Microseconds.
+    Microseconds,
+    /// Milliseconds.
+    Milliseconds,
+    /// Seconds.
+    Seconds,
+}
+
+impl Precision {
+    /// Parse the `precision` query parameter. InfluxDB accepts both the bare
+    /// unit (`ms`) and the v2 duration spelling (`1ms`).
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::BadRequest`] for an unknown unit.
+    pub fn parse(value: &str) -> Result<Self, ServerError> {
+        match value.trim_start_matches('1') {
+            "ns" | "" => Ok(Self::Nanoseconds),
+            "us" | "µs" | "u" => Ok(Self::Microseconds),
+            "ms" => Ok(Self::Milliseconds),
+            "s" => Ok(Self::Seconds),
+            other => Err(ServerError::BadRequest(format!(
+                "unsupported precision: {other} (expected ns, us, ms or s)"
+            ))),
+        }
+    }
+
+    /// Nanoseconds per unit.
+    #[must_use]
+    pub fn scale(self) -> i64 {
+        match self {
+            Self::Nanoseconds => 1,
+            Self::Microseconds => 1_000,
+            Self::Milliseconds => 1_000_000,
+            Self::Seconds => 1_000_000_000,
+        }
+    }
+}
+
+/// What a batch of line protocol parsed into: the good lines, and one
+/// message per bad one.
+#[derive(Debug, Default)]
+pub struct ParsedBatch {
+    /// Points from the lines that parsed.
+    pub points: Vec<Point>,
+    /// One message per line that did not, naming the line number.
+    pub errors: Vec<String>,
+}
+
+/// Parse a batch with InfluxDB's **partial write** semantics: a bad line
+/// does not discard the good ones.
+///
+/// This is not leniency, it is what the protocol's clients require. Telegraf
+/// retries a batch unless the response marks the failure permanent, and it
+/// recognises "partial write" and "unable to parse" — so failing the whole
+/// batch on one malformed line made it retry that batch for ever, and the
+/// good lines in it never landed at all.
+#[must_use]
+pub fn parse_line_protocol_partial(input: &str, precision: Precision) -> ParsedBatch {
+    let mut out = ParsedBatch::default();
     for (line_no, line) in input.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-
-        let point = parse_line(line, line_no + 1)?;
-        points.push(point);
+        match parse_line(line, line_no + 1) {
+            Ok(point) => match scale_timestamp(point, precision) {
+                Ok(p) => out.points.push(p),
+                Err(e) => out.errors.push(e),
+            },
+            Err(e) => out.errors.push(e.to_string()),
+        }
     }
+    out
+}
 
-    Ok(points)
+/// Re-stamp a point whose timestamp was read in `precision` units.
+fn scale_timestamp(point: Point, precision: Precision) -> Result<Point, String> {
+    if precision == Precision::Nanoseconds {
+        return Ok(point);
+    }
+    let scaled = point
+        .timestamp()
+        .checked_mul(precision.scale())
+        .ok_or_else(|| {
+            format!(
+                "timestamp {} overflows when scaled from {precision:?}",
+                point.timestamp()
+            )
+        })?;
+    Point::new(
+        point.series_key().clone(),
+        point
+            .fields()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+        scaled,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Parse a single line of InfluxDB Line Protocol.

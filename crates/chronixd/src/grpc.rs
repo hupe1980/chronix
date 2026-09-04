@@ -153,7 +153,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::WriteRequest>,
     ) -> GrpcResult<proto::WriteResponse> {
-        let scope = crate::namespace::scope_from_metadata(self.multi_tenancy, request.metadata());
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
         let req = request.into_inner();
         let points = req
             .points
@@ -188,11 +188,14 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<Streaming<proto::StreamWriteRequest>>,
     ) -> GrpcResult<proto::StreamWriteResponse> {
-        let scope = crate::namespace::scope_from_metadata(self.multi_tenancy, request.metadata());
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
         let mut stream = request.into_inner();
         let mut total_written: u64 = 0;
         let mut last_batch_written: u64 = 0;
         let mut buffer: Vec<Point> = Vec::with_capacity(self.stream_batch_size);
+        // Dedup keys of the messages sitting in `buffer`. They become
+        // "already written" only when that buffer reaches the database.
+        let mut pending_keys: Vec<String> = Vec::new();
 
         let mut interval = tokio::time::interval(self.stream_batch_interval);
         interval.tick().await; // consume initial immediate tick
@@ -223,11 +226,21 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
                                     }
                                 }
 
-                                if cache.contains_key(&req.dedup_key) {
+                                if cache.contains_key(&req.dedup_key)
+                                    || pending_keys.iter().any(|k| k == &req.dedup_key)
+                                {
                                     debug!(dedup_key = %req.dedup_key, "skipping duplicate stream message");
                                     continue;
                                 }
-                                cache.insert(req.dedup_key.clone(), now);
+                                // **Not committed yet.** The points go into a
+                                // buffer and are flushed later, so recording
+                                // the key here marks a write that has not
+                                // happened. If a flush then failed, the
+                                // stream errored, the client reconnected and
+                                // resent — and every resent message was
+                                // skipped as a duplicate, which turns
+                                // at-least-once delivery into never.
+                                pending_keys.push(req.dedup_key.clone());
                             }
 
                             // ── Parse points ───────────────────────────
@@ -244,6 +257,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
                                 let count = flush_point_buffer(&self.db, scope.as_deref(), &mut buffer, self.write_timeout).await?;
                                 total_written += count;
                                 last_batch_written = count;
+                                commit_dedup_keys(&self.dedup_cache, &mut pending_keys).await;
                             }
                         }
                         None => {
@@ -252,6 +266,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
                                 let count = flush_point_buffer(&self.db, scope.as_deref(), &mut buffer, self.write_timeout).await?;
                                 total_written += count;
                                 last_batch_written = count;
+                                commit_dedup_keys(&self.dedup_cache, &mut pending_keys).await;
                             }
                             break;
                         }
@@ -264,6 +279,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
                         let count = flush_point_buffer(&self.db, scope.as_deref(), &mut buffer, self.write_timeout).await?;
                         total_written += count;
                         last_batch_written = count;
+                        commit_dedup_keys(&self.dedup_cache, &mut pending_keys).await;
                     }
                 }
             }
@@ -282,7 +298,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
     type QueryStream = QueryStream;
 
     async fn query(&self, request: Request<proto::QueryRequest>) -> GrpcResult<Self::QueryStream> {
-        let scope = crate::namespace::scope_from_metadata(self.multi_tenancy, request.metadata());
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
         let req = request.into_inner();
         let db = self.db.clone();
         let measurement = req.measurement.clone();
@@ -411,10 +427,21 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         _request: Request<proto::ListMeasurementsRequest>,
     ) -> GrpcResult<proto::ListMeasurementsResponse> {
         let db = self.db.clone();
+        // The schema registry is process-wide, so listing it verbatim told
+        // every tenant what the others were writing, column names included.
+        // A namespace sees the measurements it holds data for — the same
+        // rule the HTTP and Prometheus listings follow.
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
 
         let measurements = tokio::task::spawn_blocking(move || {
             let registry = db.schema_registry();
-            let names = registry.measurement_names();
+            let names = match scope.as_deref() {
+                None => registry.measurement_names(),
+                Some(ns) => {
+                    let now_ns = crate::util::now_nanos().unwrap_or(i64::MAX);
+                    crate::namespace::measurements_in(&db, Some(ns), i64::MIN, now_ns, usize::MAX)
+                }
+            };
 
             let mut infos = Vec::new();
             for name in names {
@@ -439,7 +466,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::DeleteRequest>,
     ) -> GrpcResult<proto::DeleteResponse> {
-        let scope = crate::namespace::scope_from_metadata(self.multi_tenancy, request.metadata());
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
         let req = request.into_inner();
         let db = self.db.clone();
 
@@ -475,13 +502,30 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::DropMeasurementRequest>,
     ) -> GrpcResult<proto::DropMeasurementResponse> {
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
         let name = request.into_inner().measurement;
         let db = self.db.clone();
 
-        tokio::task::spawn_blocking(move || db.drop_measurement(&name))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(|e| ServerError::Db(e).to_grpc_status())?;
+        // A measurement is shared between tenants, so under multi-tenancy
+        // "drop" means "delete this namespace's series of it" — dropping the
+        // measurement itself would take every tenant's data and the schema.
+        match scope {
+            None => {
+                tokio::task::spawn_blocking(move || db.drop_measurement(&name))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(|e| ServerError::Db(e).to_grpc_status())?;
+            }
+            Some(ns) => {
+                let request =
+                    crate::namespace::scoped_delete_request(&db, Some(&ns), &name, [], None)
+                        .map_err(|e| e.to_grpc_status())?;
+                tokio::task::spawn_blocking(move || db.execute_delete(&request))
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .map_err(|e| ServerError::Db(e).to_grpc_status())?;
+            }
+        }
 
         Ok(Response::new(proto::DropMeasurementResponse {}))
     }
@@ -514,7 +558,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::SqlRequest>,
     ) -> GrpcResult<proto::SqlResponse> {
-        let scope = crate::namespace::scope_from_metadata(self.multi_tenancy, request.metadata());
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
         let query = request.into_inner().query;
         debug!(%query, "gRPC ExecuteSql");
 
@@ -645,6 +689,25 @@ fn arrow_to_sql_value(col: &arrow::array::ArrayRef, row: usize) -> proto::SqlVal
     proto::SqlValue {
         value,
         is_null: false,
+    }
+}
+
+/// Record the dedup keys of a batch that has just been written.
+///
+/// Called only after a successful flush: a key is a claim that a write
+/// happened, and recording one for a write still sitting in a buffer is how
+/// a reconnecting client's resent messages were skipped as duplicates.
+async fn commit_dedup_keys(
+    cache: &tokio::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    pending: &mut Vec<String>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut cache = cache.lock().await;
+    for key in pending.drain(..) {
+        cache.insert(key, now);
     }
 }
 

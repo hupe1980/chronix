@@ -24,7 +24,10 @@ use chronix_core::types::{Point, SeriesKey, Timestamp};
 
 use crate::memtable::error::{MemtableError, Result};
 use crate::memtable::interner::StringInterner;
-use crate::memtable::key::{MemtableEntry, MemtableKey};
+use crate::memtable::key::{MemtableEntry, MemtableKey, NODE_OVERHEAD};
+
+/// One series' tag set, shared by every point of the series in a memtable.
+pub type TagSet = Arc<[(Arc<str>, Arc<str>)]>;
 
 /// A concurrent in-memory write buffer for time-series data.
 ///
@@ -50,6 +53,9 @@ pub struct Memtable {
     /// global `RwLock<HashMap>` to eliminate write-lock contention on the
     /// hot insert path.
     measurement_index: DashMap<Arc<str>, HashSet<u64>>,
+    /// One interned tag set per series (keyed by canonical form), shared by
+    /// every point of the series in this memtable.
+    series_tags: DashMap<Arc<str>, TagSet>,
     /// Estimated total memory usage in bytes, excluding `measurement_index`.
     estimated_size: AtomicUsize,
     /// Estimated `measurement_index` footprint in bytes.
@@ -90,6 +96,7 @@ impl Memtable {
             data: SkipMap::new(),
             interner: StringInterner::new(),
             measurement_index: DashMap::new(),
+            series_tags: DashMap::new(),
             estimated_size: AtomicUsize::new(0),
             index_size: AtomicUsize::new(0),
             min_wal_seq: AtomicU64::new(u64::MAX),
@@ -117,12 +124,7 @@ impl Memtable {
 
         let measurement = self.interner.intern(point.series_key().measurement());
         let measurement_for_index = Arc::clone(&measurement);
-        let tags = point
-            .series_key()
-            .tags()
-            .iter()
-            .map(|(k, v)| (self.interner.intern(k), self.interner.intern(v)))
-            .collect();
+        let tags = self.series_tag_set(&key.series_canonical, point.series_key());
 
         let entry = MemtableEntry {
             measurement,
@@ -134,7 +136,8 @@ impl Memtable {
                 .collect(),
         };
 
-        let entry_size = entry.estimated_size() + std::mem::size_of::<MemtableKey>();
+        let entry_size =
+            entry.estimated_size() + std::mem::size_of::<MemtableKey>() + NODE_OVERHEAD;
 
         // If the key already exists, subtract the old entry size to avoid
         // monotonically inflating the estimate on overwrites.
@@ -144,7 +147,9 @@ impl Memtable {
         // so a separate get() is required. The two O(log N) traversals are
         // inherent to the SkipMap API.
         if let Some(existing) = self.data.get(&key) {
-            let old_size = existing.value().estimated_size() + std::mem::size_of::<MemtableKey>();
+            let old_size = existing.value().estimated_size()
+                + std::mem::size_of::<MemtableKey>()
+                + NODE_OVERHEAD;
             let _ =
                 self.estimated_size
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -222,12 +227,7 @@ impl Memtable {
             let key = MemtableKey::new(point.series_key().hash_fnv(), point.timestamp(), canonical);
 
             let measurement = self.interner.intern(point.series_key().measurement());
-            let tags = point
-                .series_key()
-                .tags()
-                .iter()
-                .map(|(k, v)| (self.interner.intern(k), self.interner.intern(v)))
-                .collect();
+            let tags = self.series_tag_set(&key.series_canonical, point.series_key());
 
             let entry = MemtableEntry {
                 measurement: Arc::clone(&measurement),
@@ -239,7 +239,8 @@ impl Memtable {
                     .collect(),
             };
 
-            let entry_size = entry.estimated_size() + std::mem::size_of::<MemtableKey>();
+            let entry_size =
+                entry.estimated_size() + std::mem::size_of::<MemtableKey>() + NODE_OVERHEAD;
 
             // Only check for overwrites when the key could collide
             // with an existing entry. For strictly increasing timestamps
@@ -251,8 +252,9 @@ impl Memtable {
 
             if may_overwrite {
                 if let Some(existing) = self.data.get(&key) {
-                    let old_size =
-                        existing.value().estimated_size() + std::mem::size_of::<MemtableKey>();
+                    let old_size = existing.value().estimated_size()
+                        + std::mem::size_of::<MemtableKey>()
+                        + NODE_OVERHEAD;
                     total_size_delta -= old_size.min(i64::MAX as usize) as i64;
                 }
             }
@@ -445,10 +447,62 @@ impl Memtable {
 
     /// Returns the estimated memory usage in bytes.
     ///
+    /// Heap bytes held by this memtable's string interner.
+    ///
+    /// Reported separately from [`estimated_size`](Self::estimated_size),
+    /// which counts rows and index entries: the interner holds the tag keys,
+    /// tag values and measurement names, so it grows with *cardinality* rather
+    /// than with row count and is the term a high-cardinality workload sees
+    /// first.
+    #[must_use]
+    pub fn interner_bytes(&self) -> usize {
+        self.interner.memory_bytes()
+    }
+
     /// Includes the `measurement_index` DashMap overhead.
     #[must_use]
     pub fn estimated_size(&self) -> usize {
         self.estimated_size.load(Ordering::Relaxed) + self.index_size.load(Ordering::Relaxed)
+    }
+
+    /// The interned tag set of a series, created on its first point.
+    ///
+    /// A new series charges its canonical form, its tag slice and the map
+    /// entry to the size estimate once; every later point of the series
+    /// shares the `Arc`.
+    fn series_tag_set(
+        &self,
+        canonical: &Arc<str>,
+        series_key: &SeriesKey,
+    ) -> Arc<[(Arc<str>, Arc<str>)]> {
+        if let Some(existing) = self.series_tags.get(canonical) {
+            return Arc::clone(existing.value());
+        }
+        let tags: Arc<[(Arc<str>, Arc<str>)]> = series_key
+            .tags()
+            .iter()
+            .map(|(k, v)| (self.interner.intern(k), self.interner.intern(v)))
+            .collect();
+        let mut charged = 0usize;
+        let stored = self
+            .series_tags
+            .entry(Arc::clone(canonical))
+            .or_insert_with(|| {
+                // Canonical form bytes (interned once), the tag slice, the
+                // strings the slice points at (interned, charged here on
+                // first sight), and the map entry.
+                charged = canonical.len()
+                    + tags.len() * std::mem::size_of::<(Arc<str>, Arc<str>)>()
+                    + tags.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                    + 2 * std::mem::size_of::<usize>()
+                    + 64;
+                tags
+            })
+            .clone();
+        if charged > 0 {
+            self.estimated_size.fetch_add(charged, Ordering::Relaxed);
+        }
+        stored
     }
 
     /// Add `hash` to the index under `measurement`, returning the bytes the
@@ -1027,5 +1081,291 @@ mod tests {
         mt.insert_batch_with_wal_seq(&points, 42).unwrap();
         assert_eq!(mt.min_wal_seq(), Some(42));
         assert_eq!(mt.max_wal_seq(), Some(42));
+    }
+}
+
+/// The size estimate against the allocator's number, not against itself.
+///
+/// This is its own module because it installs a counting global allocator
+/// for the whole test binary; that is cheap (two atomics per allocation)
+/// and it is the only way to ask what a memtable *actually* costs.
+#[cfg(test)]
+mod calibration {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chronix_core::{FieldValue, Point, SeriesKey};
+
+    use super::Memtable;
+
+    struct Counting;
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    // Bytes allocated minus freed *on this thread*, so the other tests
+    // running in parallel in this binary do not show up in the window.
+    std::thread_local! {
+        static THREAD_LIVE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn thread_live() -> isize {
+        THREAD_LIVE.with(std::cell::Cell::get)
+    }
+
+    // SAFETY: every operation is forwarded to the system allocator; the
+    // counters are the only addition. The thread-local is `const`-initialised
+    // so touching it never allocates, and `try_with` tolerates teardown.
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            let _ = THREAD_LIVE.try_with(|c| c.set(c.get() + layout.size() as isize));
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            let _ = THREAD_LIVE.try_with(|c| c.set(c.get() - layout.size() as isize));
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    /// The design partner's shape: 50 series, two fields, a few hundred
+    /// points each. The estimate must land within a quarter of what the
+    /// allocator says — it used to be eight times below it.
+    #[test]
+    fn memtable_estimate_tracks_real_allocation() {
+        let keys: Vec<SeriesKey> = (0..50)
+            .map(|m| {
+                SeriesKey::new(
+                    "power",
+                    BTreeMap::from([
+                        ("meter".to_string(), format!("m{m:02}")),
+                        ("site".to_string(), "home".to_string()),
+                    ]),
+                )
+                .unwrap()
+            })
+            .collect();
+        // Build the points first so their allocation is outside the window.
+        let points: Vec<Point> = (0..400i64)
+            .flat_map(|s| {
+                keys.iter().map(move |k| {
+                    Point::new(
+                        k.clone(),
+                        BTreeMap::from([
+                            ("w".to_string(), FieldValue::F64(230.0 + s as f64)),
+                            ("kwh".to_string(), FieldValue::F64(s as f64 / 1000.0)),
+                        ]),
+                        s * 1_000_000_000,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+
+        let before = thread_live();
+        let mt = Memtable::new();
+        for p in &points {
+            mt.insert(p).unwrap();
+        }
+        let measured = usize::try_from(thread_live() - before).unwrap_or(0);
+        let estimated = mt.estimated_size();
+        let ratio = estimated as f64 / measured as f64;
+        assert!(
+            (0.75..=1.25).contains(&ratio),
+            "estimate {estimated} B vs allocator {measured} B for {} points: ratio {ratio:.2} \
+             ({:.0} B/point measured, {:.0} B/point estimated)",
+            points.len(),
+            measured as f64 / points.len() as f64,
+            estimated as f64 / points.len() as f64,
+        );
+        drop(mt);
+    }
+}
+
+/// One measurement's rows, ready for the segment writer.
+#[derive(Debug)]
+pub struct MeasurementBatch {
+    /// The measurement.
+    pub measurement: String,
+    /// Its rows: `timestamp`, then the tag columns, then the field columns,
+    /// each group sorted by name; rows in skip-list order (series-major,
+    /// then time).
+    pub batch: arrow::record_batch::RecordBatch,
+    /// Which of the columns are tags.
+    pub tag_columns: Vec<String>,
+}
+
+/// Per-column Arrow builder for one field.
+enum FieldBuilder {
+    F64(arrow::array::Float64Builder),
+    I64(arrow::array::Int64Builder),
+    U64(arrow::array::UInt64Builder),
+    Bool(arrow::array::BooleanBuilder),
+    Str(arrow::array::StringBuilder),
+}
+
+impl FieldBuilder {
+    fn for_value(v: &chronix_core::FieldValue, rows_before: usize) -> Self {
+        use chronix_core::FieldValue as V;
+        let mut b = match v {
+            V::F64(_) => Self::F64(arrow::array::Float64Builder::new()),
+            V::I64(_) => Self::I64(arrow::array::Int64Builder::new()),
+            V::U64(_) => Self::U64(arrow::array::UInt64Builder::new()),
+            V::Bool(_) => Self::Bool(arrow::array::BooleanBuilder::new()),
+            V::String(_) => Self::Str(arrow::array::StringBuilder::new()),
+        };
+        for _ in 0..rows_before {
+            b.append_null();
+        }
+        b
+    }
+
+    fn append_null(&mut self) {
+        match self {
+            Self::F64(b) => b.append_null(),
+            Self::I64(b) => b.append_null(),
+            Self::U64(b) => b.append_null(),
+            Self::Bool(b) => b.append_null(),
+            Self::Str(b) => b.append_null(),
+        }
+    }
+
+    /// Append a value; a value of another type than the column's is a null,
+    /// because the schema registry has already refused it at write time
+    /// and this is the last line of defence, not the first.
+    fn append(&mut self, v: &chronix_core::FieldValue) {
+        use chronix_core::FieldValue as V;
+        match (self, v) {
+            (Self::F64(b), V::F64(x)) => b.append_value(*x),
+            (Self::I64(b), V::I64(x)) => b.append_value(*x),
+            (Self::U64(b), V::U64(x)) => b.append_value(*x),
+            (Self::Bool(b), V::Bool(x)) => b.append_value(*x),
+            (Self::Str(b), V::String(x)) => b.append_value(x),
+            (this, _) => this.append_null(),
+        }
+    }
+
+    fn finish(self) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
+        use arrow::datatypes::DataType;
+        match self {
+            Self::F64(mut b) => (DataType::Float64, Arc::new(b.finish())),
+            Self::I64(mut b) => (DataType::Int64, Arc::new(b.finish())),
+            Self::U64(mut b) => (DataType::UInt64, Arc::new(b.finish())),
+            Self::Bool(mut b) => (DataType::Boolean, Arc::new(b.finish())),
+            Self::Str(mut b) => (DataType::Utf8, Arc::new(b.finish())),
+        }
+    }
+}
+
+/// Builders for one measurement, growing columns as the entries reveal them.
+struct MeasurementBuilder {
+    rows: usize,
+    timestamps: arrow::array::Int64Builder,
+    tags: std::collections::BTreeMap<Arc<str>, arrow::array::StringBuilder>,
+    fields: std::collections::BTreeMap<Arc<str>, FieldBuilder>,
+}
+
+impl MeasurementBuilder {
+    fn new() -> Self {
+        Self {
+            rows: 0,
+            timestamps: arrow::array::Int64Builder::new(),
+            tags: std::collections::BTreeMap::new(),
+            fields: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn push(&mut self, key: &MemtableKey, entry: &MemtableEntry) {
+        self.timestamps.append_value(key.timestamp);
+        // Tags: every known column gets a value or a null; a new column is
+        // back-filled with nulls for the rows before it.
+        for (k, v) in entry.tags.iter() {
+            let rows = self.rows;
+            self.tags.entry(Arc::clone(k)).or_insert_with(|| {
+                let mut b = arrow::array::StringBuilder::new();
+                for _ in 0..rows {
+                    b.append_null();
+                }
+                b
+            });
+            let _ = v;
+        }
+        for (name, b) in &mut self.tags {
+            match entry.tags.iter().find(|(k, _)| k == name) {
+                Some((_, v)) => b.append_value(v),
+                None => b.append_null(),
+            }
+        }
+        for (k, v) in entry.fields.iter() {
+            let rows = self.rows;
+            self.fields
+                .entry(Arc::clone(k))
+                .or_insert_with(|| FieldBuilder::for_value(v, rows));
+        }
+        for (name, b) in &mut self.fields {
+            match entry.fields.iter().find(|(k, _)| k == name) {
+                Some((_, v)) => b.append(v),
+                None => b.append_null(),
+            }
+        }
+        self.rows += 1;
+    }
+
+    fn finish(mut self, measurement: &str) -> Option<MeasurementBatch> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        if self.rows == 0 {
+            return None;
+        }
+        let mut fields = vec![Field::new("timestamp", DataType::Int64, false)];
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(self.timestamps.finish())];
+        let tag_columns: Vec<String> = self.tags.keys().map(ToString::to_string).collect();
+        for (name, mut b) in self.tags {
+            fields.push(Field::new(name.as_ref(), DataType::Utf8, true));
+            columns.push(Arc::new(b.finish()));
+        }
+        for (name, b) in self.fields {
+            let (dt, arr) = b.finish();
+            fields.push(Field::new(name.as_ref(), dt, true));
+            columns.push(arr);
+        }
+        let batch =
+            arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                .ok()?;
+        Some(MeasurementBatch {
+            measurement: measurement.to_string(),
+            batch,
+            tag_columns,
+        })
+    }
+}
+
+impl Memtable {
+    /// Every row, as one Arrow batch per measurement, built straight from
+    /// the skip-list entries.
+    ///
+    /// This is what a flush hands the segment writer. It replaced
+    /// `to_points()` on that path: materialising a full memtable as
+    /// `Point`s — two `BTreeMap`s each — cost a kilobyte a row and made the
+    /// flush of an 8 MB memtable peak at ten times that. A batch is the
+    /// columns themselves, and the writer encodes it without another copy.
+    #[must_use]
+    pub fn to_record_batches(&self) -> Vec<MeasurementBatch> {
+        let mut builders: std::collections::BTreeMap<Arc<str>, MeasurementBuilder> =
+            std::collections::BTreeMap::new();
+        for entry in self.data.iter() {
+            let value = entry.value();
+            builders
+                .entry(Arc::clone(&value.measurement))
+                .or_insert_with(MeasurementBuilder::new)
+                .push(entry.key(), value);
+        }
+        builders
+            .into_iter()
+            .filter_map(|(m, b)| b.finish(&m))
+            .collect()
     }
 }

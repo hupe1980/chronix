@@ -279,217 +279,168 @@ impl AggregateUDFImpl for RateUdaf {
     }
 
     fn state_fields(&self, _: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
-        // O(1) streaming state instead of O(N) sample lists.
-        Ok(vec![
-            Arc::new(Field::new("first_time", DataType::Int64, true)),
-            Arc::new(Field::new("first_val", DataType::Float64, true)),
-            Arc::new(Field::new("last_time", DataType::Int64, true)),
-            Arc::new(Field::new("last_val", DataType::Float64, true)),
-            Arc::new(Field::new("prev_val", DataType::Float64, true)),
-            Arc::new(Field::new("total_increase", DataType::Float64, true)),
-            Arc::new(Field::new("count", DataType::Int64, true)),
-        ])
-    }
-}
-
-/// One contiguous run of samples, reduced to what `rate` needs from it.
-///
-/// A partial is closed under concatenation: two adjacent runs combine into one
-/// by adding their increases plus the increase across the boundary between
-/// them. That is the whole merge, and expressing it as a value rather than as
-/// mutation of the accumulator is what makes the merge order-independent.
-#[derive(Debug, Clone, Copy)]
-struct RatePartial {
-    first_time: i64,
-    first_val: f64,
-    last_time: i64,
-    last_val: f64,
-    /// Counter-reset-corrected increase *within* this run.
-    increase: f64,
-    count: u64,
-}
-
-impl RatePartial {
-    /// Increase from `prev`'s last value to `next`'s first, with Prometheus's
-    /// counter-reset rule: a drop means the counter restarted, so the new
-    /// value *is* the increase.
-    fn boundary_increase(prev_last: f64, next_first: f64) -> f64 {
-        let delta = next_first - prev_last;
-        if delta >= 0.0 {
-            delta
-        } else {
-            next_first
-        }
-    }
-
-    /// Append a run that starts at or after this one ends.
-    fn concat(self, next: Self) -> Self {
-        Self {
-            first_time: self.first_time,
-            first_val: self.first_val,
-            last_time: next.last_time,
-            last_val: next.last_val,
-            increase: self.increase
-                + next.increase
-                + Self::boundary_increase(self.last_val, next.first_val),
-            count: self.count + next.count,
-        }
+        Ok(RateAccumulator::state_fields())
     }
 }
 
 /// Streaming rate accumulator.
 ///
-/// `update_batch` folds samples into a single partial in O(1); `merge_batch`
-/// keeps the partials it is handed and they are folded on demand. Memory is
-/// therefore O(partial states), which is the number of partitions rather than
-/// the number of rows, which is what the O(1) claim was about — while the fold
-/// no longer depends on the order the states arrive in.
+/// # Why this buffers instead of folding
 ///
-/// **Why the partials are kept rather than folded on arrival.** The previous
-/// version folded each incoming state into the accumulator immediately and
-/// added the cross-partition increase only when `i > 0` *within a single
-/// call*. DataFusion calls `merge_batch` once per batch of partial states, so
-/// with more than one such batch the boundary between the last partial of one
-/// call and the first of the next was silently skipped, and `rate()` came back
-/// low by exactly that increase. Sorting inside one call also cannot order
-/// states across calls, so no in-place fold can be correct.
+/// `rate` is **order-dependent**: the counter-reset rule ("a drop means the
+/// counter restarted, so the new value *is* the increase") is defined over
+/// *adjacent* samples in time. Two earlier designs tried to summarise a
+/// partition into a fixed-size state and both were wrong:
+///
+/// - folding each incoming state on arrival skipped the boundary between the
+///   last partial of one `merge_batch` call and the first of the next, so
+///   `rate()` came back low by exactly that increase;
+/// - keeping the partials and concatenating them in `first_time` order is
+///   correct only if the runs are **disjoint**. They are not. DataFusion puts
+///   a `RoundRobinBatch(N)` repartition below the partial aggregate, so with
+///   more than `N` scan batches a partition receives batches 0, N, 2N… — its
+///   run spans the whole range with holes in it, and every other partition's
+///   run overlaps it. Concatenating two interleaved runs reads the second
+///   run's first value as a counter reset. Measured on a perfect 1 sample/s
+///   counter over 40 batches: `rate()` returned **13.5** where the answer is
+///   1.0.
+///
+/// No fixed-size summary can be right, because reconstructing adjacency needs
+/// the samples. So the samples are kept and sorted once, at `evaluate` —
+/// which is what the forecast aggregates in this module already do, and is
+/// why `size()` reports the buffer to DataFusion's memory pool.
 #[derive(Debug, Default)]
 struct RateAccumulator {
-    /// Folded from `update_batch`.
-    own: Option<RatePartial>,
-    /// Received from `merge_batch`, folded on demand.
-    received: Vec<RatePartial>,
+    timestamps: Vec<i64>,
+    values: Vec<f64>,
 }
 
 impl RateAccumulator {
-    /// Fold every partial into one, in timestamp order.
+    /// The state layout `rate` and any other sample-buffering aggregate share.
+    fn state_fields() -> Vec<FieldRef> {
+        vec![
+            Arc::new(Field::new(
+                "timestamps",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                false,
+            )),
+            Arc::new(Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+                false,
+            )),
+        ]
+    }
+
+    /// Samples in timestamp order, duplicates resolved last-write-wins to
+    /// match the read path's dedup.
+    fn ordered(&self) -> (Vec<i64>, Vec<f64>) {
+        let mut idx: Vec<usize> = (0..self.timestamps.len()).collect();
+        idx.sort_unstable_by_key(|&i| self.timestamps[i]);
+        let mut ts = Vec::with_capacity(idx.len());
+        let mut v = Vec::with_capacity(idx.len());
+        for i in idx {
+            if ts.last() == Some(&self.timestamps[i]) {
+                let n = v.len() - 1;
+                v[n] = self.values[i];
+                continue;
+            }
+            ts.push(self.timestamps[i]);
+            v.push(self.values[i]);
+        }
+        (ts, v)
+    }
+
+    /// Counter-reset-corrected total increase across the ordered samples.
     ///
-    /// Runs are ordered by `first_time` and concatenated, so the result is the
-    /// same whatever order the partials were produced or received in.
-    fn combined(&self) -> Option<RatePartial> {
-        let mut parts: Vec<RatePartial> = self
-            .own
-            .iter()
-            .copied()
-            .chain(self.received.iter().copied())
-            .filter(|p| p.count > 0)
-            .collect();
-        if parts.is_empty() {
-            return None;
-        }
-        parts.sort_by_key(|p| (p.first_time, p.last_time));
-        let mut folded = parts[0];
-        for next in &parts[1..] {
-            folded = folded.concat(*next);
-        }
-        Some(folded)
+    /// Prometheus's rule: a drop means the counter restarted, so the new value
+    /// *is* the increase since the restart.
+    fn increase(values: &[f64]) -> f64 {
+        values
+            .windows(2)
+            .map(|w| {
+                let delta = w[1] - w[0];
+                if delta >= 0.0 {
+                    delta
+                } else {
+                    w[1]
+                }
+            })
+            .sum()
     }
 }
 
 impl Accumulator for RateAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
-        let vals = values[0].as_primitive::<Float64Type>();
+        let vals = as_f64_array(&values[0])?;
         let times = extract_timestamps(&values[1])?;
 
+        self.timestamps.reserve(vals.len());
+        self.values.reserve(vals.len());
         for i in 0..vals.len() {
             if vals.is_null(i) || times.is_null(i) {
                 continue;
             }
-            let t = times.value(i);
-            let v = vals.value(i);
-
-            match &mut self.own {
-                None => {
-                    self.own = Some(RatePartial {
-                        first_time: t,
-                        first_val: v,
-                        last_time: t,
-                        last_val: v,
-                        increase: 0.0,
-                        count: 1,
-                    });
-                }
-                Some(p) => {
-                    // Counter-reset-corrected increase against the previous
-                    // sample, in arrival order — which is timestamp order for
-                    // every scan this engine produces.
-                    p.increase += RatePartial::boundary_increase(p.last_val, v);
-                    p.count += 1;
-                    if t < p.first_time {
-                        p.first_time = t;
-                        p.first_val = v;
-                    }
-                    if t >= p.last_time {
-                        p.last_time = t;
-                    }
-                    p.last_val = v;
-                }
-            }
+            self.timestamps.push(times.value(i));
+            self.values.push(vals.value(i));
         }
         Ok(())
     }
 
     fn evaluate(&mut self) -> DFResult<ScalarValue> {
-        let Some(p) = self.combined() else {
-            return Ok(ScalarValue::Float64(None));
-        };
-        if p.count < 2 || p.last_time <= p.first_time {
+        let (ts, values) = self.ordered();
+        if values.len() < 2 {
             return Ok(ScalarValue::Float64(None));
         }
-        let dt_secs = (p.last_time - p.first_time) as f64 / 1e9;
-        Ok(ScalarValue::Float64(Some(p.increase / dt_secs)))
+        let (Some(first), Some(last)) = (ts.first(), ts.last()) else {
+            return Ok(ScalarValue::Float64(None));
+        };
+        if last <= first {
+            return Ok(ScalarValue::Float64(None));
+        }
+        let dt_secs = (last - first) as f64 / 1e9;
+        Ok(ScalarValue::Float64(Some(
+            Self::increase(&values) / dt_secs,
+        )))
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.received.capacity() * std::mem::size_of::<RatePartial>()
+        std::mem::size_of::<Self>()
+            + self.timestamps.capacity() * std::mem::size_of::<i64>()
+            + self.values.capacity() * std::mem::size_of::<f64>()
     }
 
     fn state(&mut self) -> DFResult<Vec<ScalarValue>> {
-        let p = self.combined();
         Ok(vec![
-            ScalarValue::Int64(p.map(|p| p.first_time)),
-            ScalarValue::Float64(p.map(|p| p.first_val)),
-            ScalarValue::Int64(p.map(|p| p.last_time)),
-            ScalarValue::Float64(p.map(|p| p.last_val)),
-            // `prev_val` is the run's last value; kept in the state layout so
-            // the field list is unchanged.
-            ScalarValue::Float64(p.map(|p| p.last_val)),
-            ScalarValue::Float64(p.map(|p| p.increase)),
-            ScalarValue::Int64(p.map(|p| p.count as i64)),
+            ScalarValue::List(ScalarValue::new_list_nullable(
+                &self
+                    .timestamps
+                    .iter()
+                    .map(|v| ScalarValue::Int64(Some(*v)))
+                    .collect::<Vec<_>>(),
+                &DataType::Int64,
+            )),
+            ScalarValue::List(ScalarValue::new_list_nullable(
+                &self
+                    .values
+                    .iter()
+                    .copied()
+                    .map(ScalarValue::from)
+                    .collect::<Vec<_>>(),
+                &DataType::Float64,
+            )),
         ])
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
-        let int64 = |idx: usize| -> DFResult<&arrow::array::Int64Array> {
-            states[idx]
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(
-                        "RateAccumulator: expected Int64Array".to_string(),
-                    )
-                })
-        };
-        let first_times = int64(0)?;
-        let first_vals = states[1].as_primitive::<Float64Type>();
-        let last_times = int64(2)?;
-        let last_vals = states[3].as_primitive::<Float64Type>();
-        let increases = states[5].as_primitive::<Float64Type>();
-        let counts = int64(6)?;
-
-        for i in 0..first_times.len() {
-            if first_times.is_null(i) || counts.is_null(i) || counts.value(i) == 0 {
-                continue;
-            }
-            self.received.push(RatePartial {
-                first_time: first_times.value(i),
-                first_val: first_vals.value(i),
-                last_time: last_times.value(i),
-                last_val: last_vals.value(i),
-                increase: increases.value(i),
-                count: counts.value(i) as u64,
-            });
+        if states.len() < 2 {
+            return Err(datafusion::error::DataFusionError::Internal(
+                "rate: malformed aggregate state".to_string(),
+            ));
         }
+        self.timestamps
+            .extend(flatten_list::<arrow::datatypes::Int64Type>(&states[0]));
+        self.values.extend(flatten_list::<Float64Type>(&states[1]));
         Ok(())
     }
 }
@@ -553,7 +504,7 @@ struct IRateAccumulator {
 
 impl Accumulator for IRateAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> DFResult<()> {
-        let vals = values[0].as_primitive::<Float64Type>();
+        let vals = as_f64_array(&values[0])?;
         let times = extract_timestamps(&values[1])?;
 
         for i in 0..vals.len() {
@@ -728,70 +679,86 @@ mod tests {
         assert_eq!(last.evaluate().unwrap(), ScalarValue::Float64(Some(10.0)));
     }
 
-    /// Build one partial-state row set for `RateAccumulator::merge_batch`.
-    fn rate_state(
-        first_time: i64,
-        first_val: f64,
-        last_time: i64,
-        last_val: f64,
-        increase: f64,
-        count: i64,
-    ) -> Vec<ArrayRef> {
-        vec![
-            Arc::new(arrow::array::Int64Array::from(vec![first_time])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![first_val])),
-            Arc::new(arrow::array::Int64Array::from(vec![last_time])),
-            Arc::new(Float64Array::from(vec![last_val])),
-            Arc::new(Float64Array::from(vec![last_val])),
-            Arc::new(Float64Array::from(vec![increase])),
-            Arc::new(arrow::array::Int64Array::from(vec![count])),
-        ]
+    /// Build one partial-state row set for `RateAccumulator::merge_batch`:
+    /// the samples of one run, as the list state the accumulator emits.
+    fn rate_state(samples: &[(i64, f64)]) -> Vec<ArrayRef> {
+        let mut acc = RateAccumulator::default();
+        let ts = Arc::new(TimestampNanosecondArray::from(
+            samples.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let vals = Arc::new(Float64Array::from(
+            samples.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        acc.update_batch(&[vals, ts]).unwrap();
+        acc.state()
+            .unwrap()
+            .into_iter()
+            .map(|sv| sv.to_array().unwrap())
+            .collect()
     }
 
-    /// Partial states arriving in separate `merge_batch` calls must combine
-    /// exactly as if they had arrived together.
+    /// Partial states must combine to the same answer whatever order they
+    /// arrive in, and whether or not their time ranges **overlap**.
     ///
-    /// DataFusion calls `merge_batch` once per batch of partial states. The
-    /// previous fold added the cross-partition increase only for states after
-    /// the first *within one call*, so with two calls the boundary between
-    /// them was skipped and `rate()` came back low by exactly that increase.
-    /// Nothing errored; the number was simply smaller.
+    /// Overlap is the case that matters and the one two earlier designs got
+    /// wrong. DataFusion puts a `RoundRobinBatch(N)` repartition below the
+    /// partial aggregate, so a partition receives batches 0, N, 2N… — a run
+    /// spanning the whole range with holes in it, overlapping every other
+    /// partition's run. A summary state cannot be merged across that, because
+    /// the counter-reset rule is defined over *adjacent* samples and adjacency
+    /// is exactly what the interleaving destroys.
     #[test]
     fn rate_merges_across_separate_batches() {
         const SEC: i64 = 1_000_000_000;
 
-        // Three runs of a counter climbing by 10/s, split at 10 s and 20 s.
-        // Together they span 0..30 s and increase by 300.
-        let runs = [
-            rate_state(0, 0.0, 10 * SEC, 100.0, 100.0, 11),
-            rate_state(10 * SEC, 100.0, 20 * SEC, 200.0, 100.0, 11),
-            rate_state(20 * SEC, 200.0, 30 * SEC, 300.0, 100.0, 11),
-        ];
+        // A counter climbing by 10/s over 0..30 s: increase 300, rate 10/s.
+        let all: Vec<(i64, f64)> = (0..=30).map(|i| (i * SEC, (i * 10) as f64)).collect();
 
-        // One call with all three.
-        let mut together = RateAccumulator::default();
-        for r in &runs {
-            together.merge_batch(r).unwrap();
-        }
-        let expected = together.evaluate().unwrap();
+        // Split three ways *round-robin*, so every run overlaps every other —
+        // the shape the repartition actually produces.
+        let interleaved: Vec<Vec<(i64, f64)>> = (0..3)
+            .map(|p| {
+                all.iter()
+                    .enumerate()
+                    .filter(|(i, _)| i % 3 == p)
+                    .map(|(_, s)| *s)
+                    .collect()
+            })
+            .collect();
+        let runs: Vec<Vec<ArrayRef>> = interleaved.iter().map(|r| rate_state(r)).collect();
 
-        // The same three, delivered in a different order.
-        let mut shuffled = RateAccumulator::default();
-        for i in [2usize, 0, 1] {
-            shuffled.merge_batch(&runs[i]).unwrap();
-        }
+        let evaluate = |order: &[usize]| {
+            let mut acc = RateAccumulator::default();
+            for &i in order {
+                acc.merge_batch(&runs[i]).unwrap();
+            }
+            acc.evaluate().unwrap()
+        };
+
+        let expected = evaluate(&[0, 1, 2]);
         assert_eq!(
-            shuffled.evaluate().unwrap(),
+            evaluate(&[2, 0, 1]),
             expected,
             "the merge must not depend on the order partial states arrive in"
         );
 
-        // …and the value is the true slope: 300 over 30 s.
         match expected {
             ScalarValue::Float64(Some(v)) => assert!(
                 (v - 10.0).abs() < 1e-9,
-                "rate across three merged runs should be 10/s, got {v}"
+                "rate across three interleaved runs should be 10/s, got {v}"
             ),
+            other => panic!("expected a rate, got {other:?}"),
+        }
+
+        // Contiguous, non-overlapping runs must still work — that is the
+        // single-partition shape.
+        let split: Vec<Vec<ArrayRef>> = all.chunks(11).map(|c| rate_state(c)).collect();
+        let mut acc = RateAccumulator::default();
+        for r in &split {
+            acc.merge_batch(r).unwrap();
+        }
+        match acc.evaluate().unwrap() {
+            ScalarValue::Float64(Some(v)) => assert!((v - 10.0).abs() < 1e-9, "got {v}"),
             other => panic!("expected a rate, got {other:?}"),
         }
     }
@@ -927,10 +894,59 @@ impl AggregateUDFImpl for MultivariateForecastUdaf {
     }
 }
 
+// ── auto_forecast(value, timestamp, horizon) ────────────────────────────
+
+/// `auto_forecast(value, timestamp, horizon)` — `horizon` predicted values
+/// from the model that wins rolling-origin cross-validation at that
+/// horizon, as a `LIST(DOUBLE)`.
+///
+/// Same shape as [`ForecastUdaf`]; where `forecast` assumes simple
+/// exponential smoothing, this one races SES, Holt, damped Holt, linear
+/// regression, ARIMA, Holt-Winters and SARIMA on walk-forward error and
+/// fits the winner on everything — the same selection the embedded
+/// `Chronix::auto_forecast` runs. It costs `candidates × folds` fits, so it
+/// is the right call for a scheduled report and the wrong one for a
+/// dashboard refresh.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct AutoForecastUdaf {
+    signature: Signature,
+}
+
+impl AutoForecastUdaf {
+    pub(super) fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(3), Volatility::Volatile),
+        }
+    }
+}
+
+impl AggregateUDFImpl for AutoForecastUdaf {
+    fn name(&self) -> &'static str {
+        "auto_forecast"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::List(ForecastUdaf::list_field()))
+    }
+
+    fn accumulator(&self, _acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
+        Ok(Box::new(SeriesAccumulator::new(ForecastKind::Auto)))
+    }
+
+    fn state_fields(&self, _args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
+        Ok(SeriesAccumulator::state_fields())
+    }
+}
+
 /// Which model the accumulated series is fed to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForecastKind {
     Univariate,
+    Auto,
     Multivariate,
 }
 
@@ -981,7 +997,7 @@ impl SeriesAccumulator {
     /// Column index of the horizon argument.
     fn horizon_index(&self) -> usize {
         match self.kind {
-            ForecastKind::Univariate => 2,
+            ForecastKind::Univariate | ForecastKind::Auto => 2,
             ForecastKind::Multivariate => 3,
         }
     }
@@ -1060,6 +1076,20 @@ impl SeriesAccumulator {
                     .map_err(|e| datafusion::common::DataFusionError::Execution(e.to_string()))?
                     .values)
             }
+            ForecastKind::Auto => {
+                use chronix_analytics::forecast::{auto_forecast, AutoForecastOptions};
+                if values.len() < 8 {
+                    return Err(datafusion::common::DataFusionError::Plan(
+                        "auto_forecast: need at least 8 non-null rows".into(),
+                    ));
+                }
+                let chosen =
+                    auto_forecast(&ts, &values, self.horizon, &AutoForecastOptions::default())
+                        .map_err(|e| {
+                            datafusion::common::DataFusionError::Execution(e.to_string())
+                        })?;
+                Ok(chosen.result.values)
+            }
             ForecastKind::Multivariate => {
                 use chronix_analytics::multivariate::{
                     ColumnarMatrix, MultiLinearRegression, MultiSeriesContext,
@@ -1094,12 +1124,63 @@ impl SeriesAccumulator {
     }
 }
 
-/// Read a `Float64` column into a dense `Vec`, mapping NULL to `NaN`.
-fn f64_values(arr: &ArrayRef) -> Vec<f64> {
-    let f = arr.as_primitive::<Float64Type>();
-    (0..f.len())
+/// A numeric column as `Float64`, casting when it is not already.
+///
+/// `as_primitive::<Float64Type>()` **panics** on any other type, and an
+/// integer is exactly what somebody forecasts or rates — a counter. The panic
+/// happened inside a `spawn_blocking`, so it surfaced as an opaque 500 with a
+/// poisoned task rather than as an error naming the column.
+///
+/// Casting rather than refusing is the right answer here: every numeric column
+/// this engine stores has an exact or near-exact `f64` image, and a forecast
+/// over an integer counter is an ordinary thing to ask for. A non-numeric
+/// column is refused by name.
+///
+/// # Errors
+///
+/// Returns a plan error if `arr` is not numeric, or execution error if the
+/// cast fails.
+fn as_f64_array(arr: &ArrayRef) -> DFResult<arrow::array::Float64Array> {
+    use arrow::datatypes::DataType;
+
+    if let Some(f) = arr.as_any().downcast_ref::<arrow::array::Float64Array>() {
+        return Ok(f.clone());
+    }
+    if !matches!(
+        arr.data_type(),
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+    ) {
+        return Err(datafusion::error::DataFusionError::Plan(format!(
+            "expected a numeric column, found {:?}",
+            arr.data_type()
+        )));
+    }
+    let cast = arrow::compute::cast(arr, &DataType::Float64)
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    Ok(cast
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal("cast to Float64 did not".into())
+        })?
+        .clone())
+}
+
+/// Read a numeric column into a dense `Vec`, mapping NULL to `NaN`.
+fn f64_values(arr: &ArrayRef) -> DFResult<Vec<f64>> {
+    let f = as_f64_array(arr)?;
+    Ok((0..f.len())
         .map(|i| if f.is_null(i) { f64::NAN } else { f.value(i) })
-        .collect()
+        .collect())
 }
 
 /// Flatten a `ListArray` state column back into a `Vec`.
@@ -1127,9 +1208,9 @@ impl Accumulator for SeriesAccumulator {
 
         let ts_index = self.horizon_index() - 1;
         let ts = extract_timestamps(&values[ts_index])?;
-        let vals = f64_values(&values[0]);
+        let vals = f64_values(&values[0])?;
         let covs = if self.kind == ForecastKind::Multivariate {
-            f64_values(&values[1])
+            f64_values(&values[1])?
         } else {
             vec![f64::NAN; vals.len()]
         };

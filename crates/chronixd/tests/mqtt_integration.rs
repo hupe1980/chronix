@@ -126,7 +126,7 @@ async fn mqtt_json_end_to_end() {
         vec!["sensors/#".to_string()],
         ConnectorFormat::Json,
     );
-    let subscriber = MqttSubscriber::new_arc("mqtt-json-test", config, db.clone());
+    let subscriber = MqttSubscriber::new_arc("mqtt-json-test", config, db.clone(), false);
     subscriber.start().await.expect("subscriber start");
 
     // Give the subscriber time to connect and subscribe
@@ -207,7 +207,7 @@ async fn mqtt_line_protocol_end_to_end() {
         vec!["metrics/#".to_string()],
         ConnectorFormat::LineProtocol,
     );
-    let subscriber = MqttSubscriber::new_arc("mqtt-lp-test", config, db.clone());
+    let subscriber = MqttSubscriber::new_arc("mqtt-lp-test", config, db.clone(), false);
     subscriber.start().await.expect("subscriber start");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -282,7 +282,7 @@ async fn mqtt_topic_tags_applied() {
         vec!["sensors/#".to_string()],
         ConnectorFormat::Json,
     );
-    let subscriber = MqttSubscriber::new_arc("mqtt-tags-test", config, db.clone());
+    let subscriber = MqttSubscriber::new_arc("mqtt-tags-test", config, db.clone(), false);
     subscriber.start().await.expect("subscriber start");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -367,7 +367,7 @@ async fn mqtt_decode_error_resilience() {
         vec!["test/#".to_string()],
         ConnectorFormat::Json,
     );
-    let subscriber = MqttSubscriber::new_arc("mqtt-error-test", config, db.clone());
+    let subscriber = MqttSubscriber::new_arc("mqtt-error-test", config, db.clone(), false);
     subscriber.start().await.expect("subscriber start");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -452,7 +452,7 @@ async fn mqtt_connector_lifecycle_live() {
         vec!["lifecycle/#".to_string()],
         ConnectorFormat::Json,
     );
-    let subscriber = MqttSubscriber::new_arc("mqtt-lifecycle", config, db);
+    let subscriber = MqttSubscriber::new_arc("mqtt-lifecycle", config, db, false);
 
     assert_eq!(subscriber.status().await, ConnectorStatus::Stopped);
 
@@ -488,7 +488,7 @@ async fn mqtt_multi_topic_routing() {
         vec!["devices/#".to_string()],
         ConnectorFormat::Json,
     );
-    let subscriber = MqttSubscriber::new_arc("mqtt-multi-test", config, db.clone());
+    let subscriber = MqttSubscriber::new_arc("mqtt-multi-test", config, db.clone(), false);
     subscriber.start().await.expect("subscriber start");
 
     tokio::time::sleep(Duration::from_secs(2)).await;

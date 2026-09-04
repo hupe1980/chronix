@@ -208,6 +208,112 @@ impl<W: Write + Send + Sync> AuditSink for WriterSink<W> {
     }
 }
 
+// ── FileSink ────────────────────────────────────────────────────────
+
+/// An append-only audit file, one JSON event per line.
+///
+/// This is the sink that makes an audit log an audit log: `WriterSink` over
+/// a `File` writes through the same handle but never calls `sync_data`, so
+/// a power loss takes the tail of the log with it — and the tail is where
+/// the interesting events are, because an attacker's last act is what
+/// crashed the box.
+///
+/// `sync_each` trades throughput for that guarantee. Leave it on unless
+/// the log is also shipped somewhere else synchronously.
+pub struct FileSink {
+    file: parking_lot::Mutex<std::fs::File>,
+    sync_each: bool,
+}
+
+impl FileSink {
+    /// Open (or create) an audit log at `path` in append mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file or its parent directory cannot be
+    /// created or opened.
+    pub fn open(path: impl AsRef<std::path::Path>, sync_each: bool) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self {
+            file: parking_lot::Mutex::new(file),
+            sync_each,
+        })
+    }
+}
+
+impl AuditSink for FileSink {
+    fn emit(&self, event: &AuditEvent) -> Result<()> {
+        let json =
+            serde_json::to_string(event).map_err(|e| AuditError::Serialization(e.to_string()))?;
+        let mut f = self.file.lock();
+        writeln!(f, "{json}")?;
+        if self.sync_each {
+            f.sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<()> {
+        let mut f = self.file.lock();
+        f.flush()?;
+        f.sync_data()?;
+        Ok(())
+    }
+
+    fn is_durable(&self) -> bool {
+        true
+    }
+}
+
+/// The last event of an audit log, for anchoring a new chain onto it.
+///
+/// Returns `None` for a missing or empty file — a first start. A trailing
+/// partial line (a crash mid-write) is skipped: it is not a sealed event,
+/// so the chain continues from the last one that is.
+///
+/// # Errors
+///
+/// Returns an error if the file exists but cannot be read.
+pub fn last_event(path: impl AsRef<std::path::Path>) -> Result<Option<AuditEvent>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path)?;
+    Ok(content
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<AuditEvent>(line).ok()))
+}
+
+/// Read every sealed event from an audit log, oldest first.
+///
+/// Partial trailing lines are skipped, as in [`last_event`].
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read.
+pub fn read_events(path: impl AsRef<std::path::Path>) -> Result<Vec<AuditEvent>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)?;
+    Ok(content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<AuditEvent>(line).ok())
+        .collect())
+}
+
 // ── TracingSink ─────────────────────────────────────────────────────
 
 /// Emits audit events as structured tracing events.
@@ -301,6 +407,27 @@ impl AuditLogger {
         self
     }
 
+    /// Continue an existing chain instead of starting a new one.
+    ///
+    /// A restart used to reset the sequence to 1 and the previous hash to
+    /// `None`, so every restart began a fresh chain in the same file. A
+    /// verifier then could not tell a restart from a truncation: both look
+    /// like an event whose `prev_hash` is `None` in the middle of the log.
+    /// Anchoring on the last event already on disk makes the file one
+    /// chain across the whole life of the deployment.
+    #[must_use]
+    pub fn resume_from(self, last_id: u64, last_hash: Option<String>) -> Self {
+        self.sequence.store(last_id + 1, Ordering::Relaxed);
+        *self.prev_hash.lock() = last_hash;
+        self
+    }
+
+    /// Whether the chain is sealed with a key rather than a bare hash.
+    #[must_use]
+    pub fn is_keyed(&self) -> bool {
+        self.hmac_key.is_some()
+    }
+
     /// Add a sink. Can be called at any time, including after
     /// wrapping in `Arc`.
     pub fn add_sink(&self, sink: Box<dyn AuditSink>) {
@@ -342,10 +469,16 @@ impl AuditLogger {
     pub fn log(&self, mut event: AuditEvent) {
         event.id = self.sequence.fetch_add(1, Ordering::Relaxed);
 
-        // Seal the event into the hash chain
+        // Seal the event into the hash chain.
+        //
+        // With the key, when one is configured: sealing with plain SHA-256
+        // here while `log_strict` sealed with HMAC produced a file whose
+        // links were computed two different ways, so it verified under
+        // neither — and a plain hash is recomputable by anyone who can
+        // write the file, which is the whole threat the key exists for.
         {
             let mut prev = self.prev_hash.lock();
-            event.seal(prev.as_deref());
+            event.seal_with_key(prev.as_deref(), self.hmac_key.as_deref());
             *prev = event.event_hash.clone();
         }
 
@@ -960,5 +1093,109 @@ mod tests {
         let events = sink.events();
         let principals: Vec<&str> = events.iter().map(|e| e.principal.as_str()).collect();
         assert_eq!(principals, vec!["user3", "user4", "user5"]);
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::audit::model::verify_chain_from;
+    use crate::audit::{AuditAction, AuditDecision};
+
+    fn event(principal: &str) -> AuditEvent {
+        AuditEvent::new(principal, AuditAction::Delete, "cpu", AuditDecision::Allow)
+    }
+
+    #[test]
+    fn a_restart_continues_one_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        {
+            let logger = AuditLogger::new();
+            logger.add_sink(Box::new(FileSink::open(&path, true).unwrap()));
+            logger.log(event("alice"));
+            logger.log(event("bob"));
+        }
+
+        // Restart: anchor on what is already on disk.
+        let last = last_event(&path).unwrap().expect("a previous event");
+        assert_eq!(last.id, 2);
+        {
+            let logger = AuditLogger::new().resume_from(last.id, last.event_hash.clone());
+            logger.add_sink(Box::new(FileSink::open(&path, true).unwrap()));
+            logger.log(event("carol"));
+        }
+
+        let events = read_events(&path).unwrap();
+        assert_eq!(events.len(), 3, "every event survives the restart");
+        assert_eq!(
+            events.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "sequence numbers continue rather than restarting at 1"
+        );
+        verify_chain_from(&events, None, None)
+            .expect("the chain must verify straight through the restart");
+    }
+
+    /// Without the key, the chain detects corruption but not tampering:
+    /// anyone who can rewrite the file can recompute a plain SHA-256 chain.
+    /// `log` used to seal without the key while `log_strict` sealed with it,
+    /// so a mixed log verified under neither.
+    #[test]
+    fn a_keyed_chain_verifies_only_with_its_key() {
+        let key = b"seal".to_vec();
+        let logger = AuditLogger::new().with_hmac_key(key.clone());
+        let handle = std::sync::Arc::new(MemorySink::new(16));
+        logger.add_sink(Box::new(SharedMemorySink(handle.clone())));
+
+        logger.log(event("alice"));
+        logger.log_strict(event("bob")).unwrap();
+
+        let events = handle.events();
+        assert_eq!(events.len(), 2);
+        verify_chain_from(&events, None, Some(&key))
+            .expect("both `log` and `log_strict` must seal the same way");
+        assert!(
+            verify_chain_from(&events, None, None).is_err(),
+            "a keyed chain must not verify as an unkeyed one"
+        );
+    }
+
+    /// A sink that shares one buffer with the test.
+    struct SharedMemorySink(std::sync::Arc<MemorySink>);
+
+    impl AuditSink for SharedMemorySink {
+        fn emit(&self, event: &AuditEvent) -> Result<()> {
+            self.0.emit(event)
+        }
+        fn flush(&self) -> Result<()> {
+            self.0.flush()
+        }
+    }
+
+    /// A crash mid-write leaves a partial line. It is not a sealed event,
+    /// so the chain continues from the last one that is, rather than
+    /// refusing to start.
+    #[test]
+    fn a_partial_trailing_line_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        {
+            let logger = AuditLogger::new();
+            logger.add_sink(Box::new(FileSink::open(&path, true).unwrap()));
+            logger.log(event("alice"));
+        }
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            write!(f, "{{\"id\":2,\"principal\":\"tr").unwrap();
+        }
+        let last = last_event(&path).unwrap().expect("the complete event");
+        assert_eq!(last.id, 1);
+        assert_eq!(read_events(&path).unwrap().len(), 1);
     }
 }

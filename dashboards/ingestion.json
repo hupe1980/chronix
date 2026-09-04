@@ -85,7 +85,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "chronix_wal_size_bytes",
+          "expr": "chronix_wal_current_file_bytes",
           "legendFormat": "WAL bytes",
           "refId": "A"
         }
@@ -110,7 +110,7 @@
           "refId": "A"
         },
         {
-          "expr": "chronix_memtable_size_bytes",
+          "expr": "chronix_memtable_memory_bytes",
           "legendFormat": "memtable bytes",
           "refId": "B"
         }
@@ -134,7 +134,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "chronix_active_series_total",
+          "expr": "chronix_series_count",
           "legendFormat": "series",
           "refId": "A"
         }
@@ -148,7 +148,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "chronix_measurements_total",
+          "expr": "chronix_measurement_count",
           "legendFormat": "measurements",
           "refId": "A"
         }

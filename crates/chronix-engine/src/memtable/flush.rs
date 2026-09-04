@@ -83,6 +83,9 @@ pub struct FlushController {
     config: FlushConfig,
     /// Monotonically increasing segment counter for unique filenames.
     segment_counter: std::sync::atomic::AtomicU64,
+    /// Serialises `flush_frozen_with`: the head of the frozen queue must not
+    /// change between the peek that starts a flush and the pop that ends it.
+    flush_lock: parking_lot::Mutex<()>,
 }
 
 impl std::fmt::Debug for FlushController {
@@ -118,6 +121,7 @@ impl FlushController {
             frozen: Arc::new(RwLock::new(VecDeque::new())),
             config,
             segment_counter: std::sync::atomic::AtomicU64::new(0),
+            flush_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -144,16 +148,35 @@ impl FlushController {
         self.active.read().insert(point)
     }
 
-    /// Insert a point with an associated WAL sequence number.
+    /// Insert a point that is already durable in the WAL at `wal_seq`.
+    ///
+    /// **No capacity check.** Admission control runs *before* the WAL
+    /// append; what the WAL holds is inserted unconditionally, because a
+    /// record that is durable but in no memtable is a record the next
+    /// flush's WAL floor may pass — and then it is lost. The same applies
+    /// to replay at open: rejecting an acknowledged record for being over
+    /// a memory cap is silent data loss, not backpressure.
     ///
     /// # Errors
     ///
-    /// Returns [`MemtableError::CapacityExceeded`] if capacity is exceeded,
-    /// or [`MemtableError::Frozen`] if the active memtable was frozen
-    /// concurrently.
+    /// Returns [`MemtableError::Frozen`] if the active memtable was frozen
+    /// concurrently — which the freeze/insert lock order makes impossible
+    /// from this method.
     pub fn insert_with_wal_seq(&self, point: &Point, wal_seq: u64) -> Result<()> {
-        self.check_capacity()?;
         self.active.read().insert_with_wal_seq(point, wal_seq)
+    }
+
+    /// How many memtables are frozen and waiting to be flushed.
+    #[must_use]
+    pub fn frozen_count(&self) -> usize {
+        self.frozen.read().len()
+    }
+
+    /// `true` when neither the active memtable nor any frozen one holds a
+    /// point.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.active.read().is_empty() && self.frozen.read().is_empty()
     }
 
     /// Check whether the flush threshold has been reached.
@@ -172,6 +195,12 @@ impl FlushController {
     /// been flushed yet.
     pub fn freeze_and_swap(&self) -> Result<()> {
         let mut frozen_guard = self.frozen.write();
+        // Nothing to freeze: an empty memtable in the queue would only take
+        // a slot from a real one (after a failed flush, every retry used to
+        // queue one until the queue was full and the retry itself failed).
+        if self.active.read().is_empty() {
+            return Ok(());
+        }
         // Allow multiple frozen memtables up to the configured limit.
         if frozen_guard.len() >= self.config.max_frozen_memtables {
             let frozen_size: usize = frozen_guard.iter().map(|m| m.estimated_size()).sum();
@@ -196,119 +225,133 @@ impl FlushController {
         Ok(())
     }
 
-    /// Flush the frozen memtable to segment files.
+    /// Flush the oldest frozen memtable to segment files.
     ///
-    /// Groups points by measurement and writes one `.csx` segment per
-    /// measurement. This ensures each segment contains data for exactly
-    /// one measurement, enabling efficient measurement-level queries.
-    ///
-    /// Returns one [`FlushResult`] per measurement written.
+    /// Equivalent to [`flush_frozen_with`](Self::flush_frozen_with) with a
+    /// registration step that does nothing.
     ///
     /// # Errors
     ///
-    /// Returns an error if there is no frozen memtable, or if the segment
-    /// write fails.
+    /// See [`flush_frozen_with`](Self::flush_frozen_with).
     pub fn flush_frozen(&self) -> Result<Vec<FlushResult>> {
-        // FIX: Atomically pop the oldest frozen memtable to prevent a
-        // TOCTOU race where two concurrent callers both read the same front
-        // item and then each pop_front() removes a different memtable —
-        // causing the second pop to discard an unflushed memtable.
+        self.flush_frozen_with(|_| Ok(()))
+    }
+
+    /// Flush the oldest frozen memtable to segment files and hand the
+    /// results to `register` before letting the memtable go.
+    ///
+    /// Groups points by measurement and writes one `.csx` segment per
+    /// measurement, so each segment holds exactly one measurement.
+    ///
+    /// **The frozen memtable is released only after every segment is
+    /// written and `register` has returned `Ok`.** If either fails, the
+    /// files written so far are removed and the memtable stays at the head
+    /// of the frozen queue for the next attempt — otherwise a failed write
+    /// drops the only in-memory copy while the next flush raises the WAL
+    /// floor past its records. Registration is inside the same window: a
+    /// segment on disk but not in the catalog is an orphan the next open
+    /// deletes.
+    ///
+    /// One flush per controller at a time; a concurrent caller waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemtableError::NoFrozenMemtable`] if nothing is frozen or
+    /// the frozen memtable is empty (it is discarded), the segment writer's
+    /// error, or `register`'s error.
+    pub fn flush_frozen_with<F>(&self, mut register: F) -> Result<Vec<FlushResult>>
+    where
+        F: FnMut(&[FlushResult]) -> Result<()>,
+    {
+        let _one_at_a_time = self.flush_lock.lock();
+
         let frozen_mt = self
             .frozen
-            .write()
-            .pop_front()
+            .read()
+            .front()
+            .cloned()
             .ok_or(MemtableError::NoFrozenMemtable)?;
 
-        let points = frozen_mt.to_points();
-        if points.is_empty() {
+        let batches = frozen_mt.to_record_batches();
+        if batches.is_empty() {
+            // An empty memtable has nothing to flush and nothing to lose.
+            self.frozen.write().pop_front();
             return Err(MemtableError::NoFrozenMemtable);
         }
 
         let max_wal_seq = frozen_mt.max_wal_seq();
+        let flush_started = std::time::Instant::now();
 
-        // Group points by measurement for per-measurement segments
-        let mut by_measurement: std::collections::BTreeMap<String, Vec<Point>> =
-            std::collections::BTreeMap::new();
-        for p in points {
-            by_measurement
-                .entry(p.series_key().measurement().to_string())
-                .or_default()
-                .push(p);
-        }
-
-        let mut results = Vec::with_capacity(by_measurement.len());
+        let mut results = Vec::with_capacity(batches.len());
         let mut written_paths: Vec<std::path::PathBuf> = Vec::new();
-        for (measurement, measurement_points) in by_measurement {
-            // ── Size-based splitting ────────────────────────────────
-            //
-            // Estimate compressed bytes per row and derive the maximum
-            // number of rows that fit inside `target_segment_size_bytes`.
-            // If the measurement's point count exceeds this limit, split
-            // into multiple segments.
-            let max_rows_per_segment = estimate_max_rows(
-                &measurement_points,
-                self.config.segment_writer_config.target_segment_size_bytes,
-                self.config.segment_writer_config.max_row_group_size,
-            );
+        let outcome = (|| -> Result<()> {
+            for mb in batches {
+                // Estimate compressed bytes per row from the column count and
+                // derive the number of rows that fit `target_segment_size_bytes`;
+                // a measurement wider than that is written as several segments.
+                let max_rows_per_segment = estimate_max_rows(
+                    mb.batch.num_columns(),
+                    self.config.segment_writer_config.target_segment_size_bytes,
+                    self.config.segment_writer_config.max_row_group_size,
+                );
 
-            // Split into chunks that each fit within the segment size budget.
-            let chunks: Vec<&[Point]> = measurement_points.chunks(max_rows_per_segment).collect();
+                let total = mb.batch.num_rows();
+                let mut offset = 0;
+                while offset < total {
+                    let len = max_rows_per_segment.min(total - offset);
+                    let slice = mb.batch.slice(offset, len);
+                    offset += len;
 
-            for chunk in &chunks {
-                let count = chunk.len();
-
-                // Collect unique series keys for bloom filter construction.
-                // Uses canonical_form() for dedup instead of hash_fnv() to
-                // prevent hash-collision false dedup that would exclude a
-                // series from the bloom filter, causing queries to skip the
-                // segment entirely for that series.
-                let mut seen_canonicals = std::collections::HashSet::new();
-                let unique_series_keys: Vec<chronix_core::SeriesKey> = chunk
-                    .iter()
-                    .filter(|p| seen_canonicals.insert(p.series_key().canonical_form().to_string()))
-                    .map(|p| p.series_key().clone())
-                    .collect();
-
-                let segment_path = self.next_segment_path();
-                let write_result = (|| -> Result<SegmentMeta> {
+                    let segment_path = self.next_segment_path();
                     let mut writer = SegmentWriter::new(
                         &segment_path,
                         self.config.segment_writer_config.clone(),
                     )?;
-                    writer.write_rows(chunk)?;
-                    Ok(writer.finalize()?)
-                })();
-
-                match write_result {
-                    Ok(segment_meta) => {
-                        written_paths.push(segment_path);
-                        results.push(FlushResult {
-                            measurement: measurement.clone(),
-                            segment_meta,
-                            max_wal_seq,
-                            points_flushed: count,
-                            series_keys: unique_series_keys,
-                        });
-                    }
-                    Err(e) => {
-                        // Do NOT delete successfully-written
-                        // segments — they contain valid data that WAL replay
-                        // would otherwise lose. Return partial results along
-                        // with the error so the caller can register what was
-                        // written before the failure.
-                        tracing::error!(
-                            measurement = %measurement,
-                            error = %e,
-                            segments_written = written_paths.len(),
-                            "partial flush failure — keeping written segments for recovery"
-                        );
-                        return Err(e);
-                    }
+                    let segment_meta =
+                        writer.finalize_batch(&slice, &mb.measurement, &mb.tag_columns)?;
+                    written_paths.push(segment_path);
+                    results.push(FlushResult {
+                        measurement: mb.measurement.clone(),
+                        series_keys: segment_meta.series_keys.clone(),
+                        segment_meta,
+                        max_wal_seq,
+                        points_flushed: len,
+                    });
                 }
-            } // end chunk loop
-        }
+            }
+            register(&results)
+        })();
 
-        Ok(results)
+        match outcome {
+            Ok(()) => {
+                let popped = self.frozen.write().pop_front();
+                debug_assert!(
+                    popped.is_some_and(|m| Arc::ptr_eq(&m, &frozen_mt)),
+                    "the flush lock keeps the head of the frozen queue stable"
+                );
+                // How often memtables reach disk, and how long that takes,
+                // is the first thing to look at when writes stall — and
+                // only the *emergency* flush was counted, which by
+                // definition is the case that has already gone wrong.
+                metrics::counter!("chronix_memtable_flushes_total", "outcome" => "ok").increment(1);
+                metrics::histogram!("chronix_memtable_flush_duration_seconds")
+                    .record(flush_started.elapsed().as_secs_f64());
+                Ok(results)
+            }
+            Err(e) => {
+                metrics::counter!("chronix_memtable_flushes_total", "outcome" => "error")
+                    .increment(1);
+                tracing::error!(
+                    error = %e,
+                    segments_written = written_paths.len(),
+                    "flush failed — the memtable stays frozen for the next attempt"
+                );
+                for path in written_paths {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Scan both active and frozen memtables for a specific series.
@@ -382,13 +425,30 @@ impl FlushController {
         active_size + frozen_size
     }
 
-    /// Returns the minimum WAL sequence held in the active memtable.
-    ///
-    /// Returns `None` when the active memtable is empty (no WAL
-    /// sequences have been recorded).
+    /// Heap bytes held by the interners of the active and frozen memtables.
     #[must_use]
-    pub fn active_min_wal_seq(&self) -> Option<u64> {
-        self.active.read().min_wal_seq()
+    pub fn total_interner_memory(&self) -> usize {
+        let active = self.active.read().interner_bytes();
+        let frozen: usize = self.frozen.read().iter().map(|m| m.interner_bytes()).sum();
+        active + frozen
+    }
+
+    /// The smallest WAL sequence number held by a memtable that is not yet
+    /// in a segment — active **or** frozen.
+    ///
+    /// This is what the WAL floor is capped by. It used to consult the
+    /// active memtable only, so a frozen memtable still being written — or
+    /// left behind by a failed flush — was invisible, and a concurrent
+    /// flush of another shard raised the floor past its records.
+    #[must_use]
+    pub fn min_unflushed_wal_seq(&self) -> Option<u64> {
+        let frozen = self.frozen.read();
+        let active = self.active.read();
+        active
+            .min_wal_seq()
+            .into_iter()
+            .chain(frozen.iter().filter_map(|m| m.min_wal_seq()))
+            .min()
     }
 
     /// Check capacity and reject if over limit.
@@ -472,7 +532,7 @@ pub struct FlushResult {
     pub max_wal_seq: Option<u64>,
     /// Number of points flushed.
     pub points_flushed: usize,
-    /// Unique series keys in this segment (for bloom filter construction).
+    /// The distinct series in this segment, as the writer saw them.
     pub series_keys: Vec<chronix_core::SeriesKey>,
 }
 
@@ -520,26 +580,16 @@ fn merge_points(primary: Vec<Point>, secondary: Vec<Point>) -> Vec<Point> {
 /// value (4 bytes — typical for delta/Gorilla-encoded + LZ4 time-series
 /// data). The result is clamped to at least `min_rows` to avoid producing
 /// trivially small segments.
-fn estimate_max_rows(points: &[Point], target_segment_size_bytes: usize, min_rows: usize) -> usize {
-    if points.is_empty() {
-        return min_rows;
-    }
-
-    // Sample the first point for schema width.
-    let sample = &points[0];
-    let n_fields = sample.fields().len();
-    let n_tags = sample.tags().len();
-
-    // timestamp (1) + tags + fields
-    let num_columns = 1 + n_tags + n_fields;
-
+fn estimate_max_rows(
+    num_columns: usize,
+    target_segment_size_bytes: usize,
+    min_rows: usize,
+) -> usize {
     // Conservative estimate: ~4 compressed bytes per column per row.
     // Real-world compression typically achieves 2–6 bytes/column/row for
-    // numeric columns (delta + Gorilla + LZ4), 4–10 for string tags (RLE).
+    // numeric columns, 4–10 for string tags.
     let est_bytes_per_row = (num_columns * 4).max(8);
-
     let max_rows = target_segment_size_bytes / est_bytes_per_row;
-
     // At minimum one row-group worth.
     max_rows.max(min_rows)
 }
@@ -797,37 +847,85 @@ mod tests {
     }
 
     #[test]
-    fn test_active_min_wal_seq_empty() {
+    fn min_unflushed_wal_seq_empty() {
         let fc = FlushController::new(FlushConfig::default());
-        assert!(
-            fc.active_min_wal_seq().is_none(),
-            "empty active memtable should have no WAL seq"
-        );
+        assert!(fc.min_unflushed_wal_seq().is_none());
     }
 
     #[test]
-    fn test_active_min_wal_seq_after_insert() {
+    fn min_unflushed_wal_seq_after_insert() {
         let fc = FlushController::new(FlushConfig::default());
         let p = make_point("host", 100, 1.0);
         fc.insert_with_wal_seq(&p, 42).unwrap();
         fc.insert_with_wal_seq(&p, 50).unwrap();
-        assert_eq!(fc.active_min_wal_seq(), Some(42));
+        assert_eq!(fc.min_unflushed_wal_seq(), Some(42));
     }
 
+    /// A frozen memtable is unflushed until its segment is registered, so
+    /// its records must keep capping the WAL floor. This used to report
+    /// `None` after a freeze, and a concurrent flush of another shard then
+    /// truncated the WAL files holding the frozen records.
     #[test]
-    fn test_active_min_wal_seq_after_freeze() {
+    fn a_frozen_memtable_still_counts_as_unflushed() {
         let fc = FlushController::new(FlushConfig::default());
         let p = make_point("host", 100, 1.0);
         fc.insert_with_wal_seq(&p, 10).unwrap();
         fc.freeze_and_swap().unwrap();
-        // Active is now empty, frozen holds the old data
-        assert!(
-            fc.active_min_wal_seq().is_none(),
-            "fresh active after freeze should have no WAL seq"
+        assert_eq!(
+            fc.min_unflushed_wal_seq(),
+            Some(10),
+            "the frozen memtable holds seq 10 and nothing flushed it"
         );
-        // Insert new data into active
-        fc.insert_with_wal_seq(&p, 20).unwrap();
-        assert_eq!(fc.active_min_wal_seq(), Some(20));
+        fc.insert_with_wal_seq(&make_point("host", 200, 2.0), 20)
+            .unwrap();
+        assert_eq!(fc.min_unflushed_wal_seq(), Some(10));
+    }
+
+    /// A flush that fails leaves the memtable frozen for a retry and removes
+    /// the files it managed to write; it used to pop the memtable first and
+    /// drop the only copy of the data on any error.
+    #[test]
+    fn a_failed_flush_keeps_the_frozen_memtable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        // The segment directory is a regular file: every write fails.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        config.segment_dir = blocked.clone();
+        let fc = FlushController::new(config);
+
+        fc.insert_with_wal_seq(&make_point("a", 100, 1.0), 7)
+            .unwrap();
+        fc.freeze_and_swap().unwrap();
+        assert!(fc.flush_frozen().is_err());
+        assert!(
+            fc.frozen_memtable().is_some(),
+            "the memtable must survive a failed flush"
+        );
+        assert_eq!(fc.min_unflushed_wal_seq(), Some(7));
+
+        // A registration failure is the same: nothing is lost, and the
+        // segment written for the attempt is removed.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        let err = fc.flush_frozen_with(|results| {
+            assert_eq!(results.len(), 1);
+            assert!(results[0].segment_meta.path.exists());
+            Err(MemtableError::NoFrozenMemtable)
+        });
+        assert!(err.is_err());
+        assert!(fc.frozen_memtable().is_some());
+        assert_eq!(
+            std::fs::read_dir(&blocked).unwrap().count(),
+            0,
+            "a segment nothing registered is removed, not left as an orphan"
+        );
+
+        // And the retry succeeds and releases it.
+        let results = fc.flush_frozen().unwrap();
+        assert_eq!(results[0].points_flushed, 1);
+        assert!(fc.frozen_memtable().is_none());
+        assert!(fc.min_unflushed_wal_seq().is_none());
     }
 
     #[test]

@@ -169,3 +169,128 @@ async fn count_star_over_the_hot_tier_returns_the_row_count() {
         .value(0);
     assert_eq!(n, 5, "count(1) reads no column either");
 }
+
+// ─── Predicate pushdown: what is claimed must be what is applied ──────
+//
+// DataFusion *removes* a filter the provider claims to apply exactly. So a
+// claim the engine does not honour is not a missed optimisation — it is a
+// query that returns rows its own `WHERE` clause excludes.
+
+/// Build a database with three rows at 1000/2000/3000 ns, two hosts.
+fn pushdown_db(dir: &tempfile::TempDir) -> Chronix {
+    let db = Chronix::open(
+        ChronixConfig::builder()
+            .data_dir(dir.path())
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    for (i, host) in [(1_i64, "a"), (2, "a"), (3, "b")] {
+        db.insert(
+            &Point::new(
+                SeriesKey::new("m", tags! { "host" => host, "region" => "a" }).unwrap(),
+                fields! { "v" => i as f64, "n" => i },
+                i * 1000,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    db
+}
+
+fn count(db: &Chronix, sql: &str) -> usize {
+    db.sql(sql)
+        .unwrap()
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum()
+}
+
+/// `_time <> X` used to be claimed as exactly applied and then ignored, so
+/// the planner dropped the filter and the excluded row came back.
+#[test]
+fn a_time_inequality_is_actually_applied() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = pushdown_db(&dir);
+    assert_eq!(count(&db, "SELECT * FROM m"), 3);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT * FROM m WHERE _time <> arrow_cast(2000, 'Timestamp(Nanosecond, None)')"
+        ),
+        2,
+        "the excluded row came back"
+    );
+    // And with a LIMIT, where the planner pushes the limit into the scan
+    // once it believes the filters are exact.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT * FROM m WHERE _time <> arrow_cast(1000, 'Timestamp(Nanosecond, None)') \
+             ORDER BY _time LIMIT 1"
+        ),
+        1
+    );
+    let batch = &db
+        .sql(
+            "SELECT n FROM m WHERE _time <> arrow_cast(1000, 'Timestamp(Nanosecond, None)') \
+             ORDER BY _time LIMIT 1",
+        )
+        .unwrap()[0];
+    let n = batch
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(n.value(0), 2, "the limit returned the excluded row");
+    db.close().unwrap();
+}
+
+/// A tag compared with another column, not a literal, is not something the
+/// engine's tag filter can express — so it must not be claimed as exact.
+#[test]
+fn a_tag_compared_with_a_column_is_actually_applied() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = pushdown_db(&dir);
+    assert_eq!(
+        count(&db, "SELECT * FROM m WHERE host = region"),
+        2,
+        "host = region holds for the two 'a' rows only"
+    );
+    assert_eq!(count(&db, "SELECT * FROM m WHERE host <> region"), 1);
+    db.close().unwrap();
+}
+
+/// Contradictory bounds describe an empty set, which is no rows — not an
+/// error. The engine's query builder refuses an inverted range, and that
+/// refusal used to surface as a failed query.
+#[test]
+fn contradictory_time_bounds_return_no_rows() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = pushdown_db(&dir);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT * FROM m \
+             WHERE _time > arrow_cast(3000, 'Timestamp(Nanosecond, None)') \
+               AND _time < arrow_cast(1000, 'Timestamp(Nanosecond, None)')"
+        ),
+        0
+    );
+    db.close().unwrap();
+}
+
+/// A fractional bound on an integer column must not prune the row that
+/// matches it: the zone map compared `n < 1.5` as `n < 1`.
+#[test]
+fn a_fractional_bound_on_an_integer_field_keeps_its_rows() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = pushdown_db(&dir);
+    db.flush().unwrap();
+    assert_eq!(count(&db, "SELECT * FROM m WHERE n < 1.5"), 1);
+    assert_eq!(count(&db, "SELECT * FROM m WHERE n > 2.5"), 1);
+    assert_eq!(count(&db, "SELECT * FROM m WHERE n >= 1.5"), 2);
+    db.close().unwrap();
+}

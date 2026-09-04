@@ -36,12 +36,13 @@ pub struct CdcStreamParams {
 /// real-time change notifications without polling.
 pub async fn cdc_stream_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     axum::extract::Query(params): axum::extract::Query<CdcStreamParams>,
 ) -> axum::response::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
     use axum::response::sse::Event;
-    use chronix::chronix_stream::SubscriptionFilter;
+    use chronix::chronix_streaming::cdc::SubscriptionFilter;
 
     // Build the filter from query parameters
     let mut filter = SubscriptionFilter::all();
@@ -66,12 +67,22 @@ pub async fn cdc_stream_handler(
         }
     }
 
+    // The bus carries every tenant's writes, **with their field values**, so
+    // an unscoped subscription is a continuous cross-tenant data leak — the
+    // worst shape of the missing-scope class, because it needs no query.
+    // Events are matched on the namespace tag the write path stamps, and the
+    // tag itself is stripped before the event is sent: it is the server's
+    // bookkeeping, not the subscriber's data.
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let bus = state.db.event_bus();
-    let mut subscription = chronix::chronix_stream::FilteredSubscription::new(bus, filter);
+    let mut subscription = chronix::chronix_streaming::cdc::FilteredSubscription::new(bus, filter);
 
     let stream = async_stream::stream! {
         // Loop until the channel closes (bus dropped), then end the stream.
         while let Some(event) = subscription.recv().await {
+            let Some(event) = scope_cdc_event(event, scope.as_deref()) else {
+                continue;
+            };
             match serde_json::to_string(&event) {
                 Ok(json) => {
                     let sse_event = Event::default()
@@ -95,6 +106,39 @@ pub async fn cdc_stream_handler(
     )
 }
 
+/// Keep an event only if it belongs to `scope`, and strip the namespace tag
+/// from what the subscriber sees.
+///
+/// `None` means single-tenant, where every event belongs to the one tenant
+/// and the tag is absent anyway.
+fn scope_cdc_event(
+    mut event: chronix::chronix_streaming::cdc::CdcEvent,
+    scope: Option<&str>,
+) -> Option<chronix::chronix_streaming::cdc::CdcEvent> {
+    use chronix::chronix_streaming::cdc::CdcEvent;
+    let Some(ns) = scope else {
+        return Some(event);
+    };
+    let tags = match &mut event {
+        CdcEvent::PointWritten { tags, .. } | CdcEvent::SeriesDeleted { tags, .. } => tags,
+        // A measurement drop names no series, so it carries no tag to match
+        // on. Under multi-tenancy a "drop" is a scoped delete, which arrives
+        // as `SeriesDeleted`, so this variant is not reachable from a
+        // tenant's action — and forwarding it would leak the fact that
+        // another tenant dropped something.
+        CdcEvent::MeasurementDropped { .. } => return None,
+    };
+    if tags
+        .get(crate::namespace::NAMESPACE_TAG)
+        .map(String::as_str)
+        != Some(ns)
+    {
+        return None;
+    }
+    tags.remove(crate::namespace::NAMESPACE_TAG);
+    Some(event)
+}
+
 // ── Grafana annotations ────────────────────────────────────────────────
 
 /// Grafana-compatible annotation response.
@@ -111,11 +155,13 @@ pub struct GrafanaAnnotation {
 /// `GET /api/v1/annotations` — query past signal events as Grafana annotations.
 pub async fn annotations_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
 ) -> Result<Json<Vec<GrafanaAnnotation>>, ServerError> {
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let db = state.db.clone();
 
     let annotations = tokio::task::spawn_blocking(move || -> Vec<GrafanaAnnotation> {
-        collect_annotations(&db, 100)
+        collect_annotations(&db, scope.as_deref(), 100)
     })
     .await
     .map_err(|e| ServerError::Internal(e.to_string()))?;
@@ -124,7 +170,11 @@ pub async fn annotations_handler(
 }
 
 /// Collect Grafana annotations from signal/alert measurements.
-fn collect_annotations(db: &Chronix, max_per_measurement: usize) -> Vec<GrafanaAnnotation> {
+fn collect_annotations(
+    db: &Chronix,
+    scope: Option<&str>,
+    max_per_measurement: usize,
+) -> Vec<GrafanaAnnotation> {
     let mut anns = Vec::new();
     let registry = db.schema_registry();
     let names = registry.measurement_names();
@@ -133,7 +183,9 @@ fn collect_annotations(db: &Chronix, max_per_measurement: usize) -> Vec<GrafanaA
         if !name.starts_with("_signals") && !name.starts_with("_alerts") {
             continue;
         }
-        let plan = match db.query().measurement(name).build() {
+        // Scoped like every other read: a dashboard used to show every
+        // tenant's signal firings as annotations on its own panels.
+        let plan = match db.query().measurement(name).namespace_scope(scope).build() {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -178,11 +230,13 @@ fn collect_annotations(db: &Chronix, max_per_measurement: usize) -> Vec<GrafanaA
 /// cost of accepting theoretical (2⁻⁶⁴ probability) hash collisions.
 pub async fn annotations_stream_handler(
     State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
 ) -> axum::response::Sse<
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
     use axum::response::sse::Event;
 
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let db = state.db.clone();
     let bus = state.db.event_bus();
     // Use try_subscribe to avoid panic on max subscribers.
@@ -220,8 +274,9 @@ pub async fn annotations_stream_handler(
             poll_now = false;
 
             let db_ref = db.clone();
+            let scope_ref = scope.clone();
             let annotations = match tokio::task::spawn_blocking(move || {
-                collect_annotations(&db_ref, 1_000)
+                collect_annotations(&db_ref, scope_ref.as_deref(), 1_000)
             }).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -282,7 +337,7 @@ mod tests {
             .build()
             .unwrap();
         let db = Chronix::open(config).unwrap();
-        let anns = collect_annotations(&db, 100);
+        let anns = collect_annotations(&db, None, 100);
         assert!(anns.is_empty());
     }
 }

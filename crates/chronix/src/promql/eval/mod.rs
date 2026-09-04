@@ -198,6 +198,14 @@ pub struct PromQLEvaluator {
     pub(crate) scan_stats: std::cell::Cell<ScanStats>,
 }
 
+/// The step a subquery written `[range:]` evaluates at.
+///
+/// Prometheus resolves a missing subquery step to the engine's evaluation
+/// interval, whose default is one minute in every standard deployment. It is a
+/// property of the engine, not of the query, which is why it is a constant
+/// here rather than a fall-back to the caller's step.
+const DEFAULT_SUBQUERY_STEP_NS: i64 = 60_000_000_000;
+
 /// Query parameters for PromQL evaluation.
 #[derive(Debug, Clone)]
 pub struct QueryParams {
@@ -226,6 +234,14 @@ pub struct QueryParams {
     pub max_series: usize,
     /// Maximum bytes the range-query accumulator may use (0 = unlimited).
     pub max_memory_bytes: usize,
+    /// Maximum evaluation points a range query may produce (0 = unlimited).
+    ///
+    /// Prometheus's own cap is 11,000, and this defaults to the same, because
+    /// a range query costs one full evaluation of the expression *per step*.
+    /// Without it `start=0, end=now, step=1ns` is an accepted query that runs
+    /// for longer than the universe has existed, and the evaluator is a public
+    /// embedded API where no HTTP-layer guard stands in front of it.
+    pub max_points: usize,
 }
 
 impl Default for QueryParams {
@@ -240,6 +256,7 @@ impl Default for QueryParams {
             range_fetch_end: None,
             max_series: 0,
             max_memory_bytes: 0,
+            max_points: 11_000,
         }
     }
 }
@@ -315,6 +332,21 @@ impl PromQLEvaluator {
         if step <= 0 {
             return Err(EvalError("step must be positive".into()));
         }
+        if start > end {
+            return Err(EvalError("start must not be after end".into()));
+        }
+
+        // Cost the query before running it. A range query evaluates the whole
+        // expression once per step, so the step count *is* the cost, and it is
+        // knowable up front. `i128` because the span can be the whole i64
+        // domain.
+        let points = (i128::from(end) - i128::from(start)) / i128::from(step) + 1;
+        if params.max_points > 0 && points > params.max_points as i128 {
+            return Err(EvalError(format!(
+                "query would produce {points} evaluation points, exceeding the limit of {}",
+                params.max_points
+            )));
+        }
 
         // Collect results at each step
         let mut series_map: BTreeMap<Vec<(String, String)>, Vec<Sample>> = BTreeMap::new();
@@ -327,13 +359,19 @@ impl PromQLEvaluator {
         while t <= end {
             let step_params = QueryParams {
                 time: t,
+                // The query's own bounds travel with every step, because
+                // `@ start()` and `@ end()` resolve against them: a `start()`
+                // that saw only the step time would pin each step to itself,
+                // which is the one thing the modifier exists not to do.
+                start: Some(start),
+                end: Some(end),
                 step: params.step,
                 lookback_delta: params.lookback_delta,
                 range_fetch_start: Some(start - params.lookback_delta),
                 range_fetch_end: Some(end),
                 max_series,
                 max_memory_bytes: max_memory,
-                ..Default::default()
+                max_points: params.max_points,
             };
             let result = self.eval(expr, &step_params)?;
             if let PromQLValue::Vector(series_list) = result {
@@ -374,7 +412,17 @@ impl PromQLEvaluator {
                     }
                 }
             }
-            t += step;
+            // `t + step` overflows when `end` sits near `i64::MAX`. In a
+            // release build that wraps to a large negative number, `t <= end`
+            // stays true, and the loop never ends — a spinning blocking thread
+            // per query, which the caller's timeout does not reclaim. The step
+            // count guard above does not cover it: a *large* step keeps the
+            // count small, and three points is what `end = i64::MAX` with a
+            // step of `i64::MAX / 2` costs.
+            let Some(next) = t.checked_add(step) else {
+                break;
+            };
+            t = next;
         }
 
         let matrix: Vec<Series> = series_map
@@ -417,7 +465,8 @@ impl PromQLEvaluator {
                 name,
                 matchers,
                 offset,
-            } => self.eval_vector_selector(name, matchers, offset, params),
+                at,
+            } => self.eval_vector_selector(name, matchers, offset, *at, params),
 
             Expr::MatrixSelector { vector, range } => {
                 self.eval_matrix_selector(vector, range, params)
@@ -445,7 +494,8 @@ impl PromQLEvaluator {
                 range,
                 step,
                 offset,
-            } => self.eval_subquery(inner, *range, *step, *offset, params),
+                at,
+            } => self.eval_subquery(inner, *range, *step, *offset, *at, params),
         }
     }
 
@@ -460,9 +510,16 @@ impl PromQLEvaluator {
         range: Duration,
         step: Option<Duration>,
         offset: Option<Duration>,
+        at: Option<crate::promql::ast::AtModifier>,
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
-        let eval_time = params.time;
+        let eval_time = match at {
+            None => params.time,
+            Some(at) => at.resolve(
+                params.start.unwrap_or(params.time),
+                params.end.unwrap_or(params.time),
+            ),
+        };
         let offset_ns = offset.map_or(0, |o| o.as_nanos());
         let range_ns = range.as_nanos();
         let step_ns = if let Some(s) = step {
@@ -472,12 +529,34 @@ impl PromQLEvaluator {
             }
             s_ns
         } else {
-            // Default step: use the global step if available, otherwise 1 minute
-            params.step.unwrap_or(60_000_000_000)
+            // The engine's own evaluation interval, **not** the outer step.
+            //
+            // `noStepSubqueryIntervalFn` in Prometheus is a property of the
+            // engine, and it has nothing to do with the resolution the caller
+            // asked for. Inheriting the outer step made the same dashboard
+            // panel mean different things at different zoom levels — and at a
+            // one-second step, `x[5m:]` is 300 inner evaluations per outer
+            // step instead of five.
+            DEFAULT_SUBQUERY_STEP_NS
         };
 
         let window_end = eval_time - offset_ns;
         let window_start = window_end - range_ns;
+
+        // See the note on `range_fetch_start` below: inside a range query this
+        // is constant across outer steps, which is what makes the scan cache
+        // work at all for a subquery.
+        let (prefetch_start, prefetch_end) =
+            match (params.range_fetch_start, params.range_fetch_end) {
+                (Some(rs), Some(re)) => (
+                    rs.saturating_sub(range_ns).saturating_sub(offset_ns),
+                    re.saturating_sub(offset_ns),
+                ),
+                _ => (
+                    window_start.saturating_sub(params.lookback_delta),
+                    window_end,
+                ),
+            };
 
         // Collect results at each step within the subquery window
         let mut series_map: BTreeMap<Vec<(String, String)>, Vec<Sample>> = BTreeMap::new();
@@ -493,30 +572,86 @@ impl PromQLEvaluator {
             .div_euclid(step_ns)
             .checked_mul(step_ns)
             .ok_or_else(|| EvalError("subquery window overflows the step grid".into()))?;
-        if t < window_start {
-            t += step_ns;
+        // Left-**open**: a grid point landing exactly on `window_start`
+        // belongs to the previous window. Prometheus advances by one interval
+        // when the aligned start is `<=` the window start, for the same reason
+        // a range selector excludes its left boundary — otherwise an evenly
+        // sampled series yields n+1 points in some windows and n in others,
+        // and `count_over_time` flickers between the two.
+        if t <= window_start {
+            t = t
+                .checked_add(step_ns)
+                .ok_or_else(|| EvalError("subquery window overflows the step grid".into()))?;
         }
+
+        // A subquery costs one inner evaluation per inner step, and inside a
+        // range query it pays that once per *outer* step — so an unbounded
+        // inner step count is the same denial of service as an unbounded outer
+        // one, multiplied. `x[1h:1ns]` is 3.6 * 10^12 inner evaluations.
+        let points = (i128::from(window_end) - i128::from(t)) / i128::from(step_ns) + 1;
+        if params.max_points > 0 && points > params.max_points as i128 {
+            return Err(EvalError(format!(
+                "subquery would produce {points} evaluation points, exceeding the limit of {}",
+                params.max_points
+            )));
+        }
+
         while t <= window_end {
             let step_params = QueryParams {
                 time: t,
                 step: Some(step_ns),
                 lookback_delta: params.lookback_delta,
-                range_fetch_start: Some(window_start - params.lookback_delta),
-                range_fetch_end: Some(window_end),
-                ..Default::default()
+                // The prefetch window is the **outer** query's, widened by
+                // this subquery's reach — not this subquery's own window.
+                //
+                // The subquery's window moves with the outer step, so deriving
+                // the prefetch from it made every outer step ask for a
+                // different range and miss the scan cache: 138 reads of the
+                // same data for a 20-step range query, and the eight-entry cap
+                // meant the misses could not even accumulate into hits.
+                // Every inner step of every outer step falls inside
+                // `[outer_start - range - offset - lookback, outer_end -
+                // offset]`, which is the same at all of them.
+                range_fetch_start: Some(prefetch_start),
+                range_fetch_end: Some(prefetch_end),
+                // Likewise inside a subquery: a `@ start()` written under one
+                // still means the outer query's start.
+                start: params.start,
+                end: params.end,
+                // The budget belongs to the query, not to the outermost node:
+                // dropping it here made the inner evaluation of a subquery the
+                // one unbudgeted path in the evaluator.
+                max_series: params.max_series,
+                max_memory_bytes: params.max_memory_bytes,
+                max_points: params.max_points,
             };
             let result = self.eval(inner, &step_params)?;
             if let PromQLValue::Vector(series_list) = result {
                 for series in series_list {
                     for sample in &series.samples {
+                        // The **step** timestamp, not the sample's own. The
+                        // inner expression was evaluated *at* `t`, so that is
+                        // the instant its result belongs to; an instant vector
+                        // otherwise reports the raw scrape time, and adjacent
+                        // steps that see the same newest sample then emit the
+                        // same timestamp twice. A range vector with duplicate
+                        // timestamps is not one: `irate` reads `dt == 0` from
+                        // it, and the matrix handed to a client is neither
+                        // step-aligned nor strictly increasing.
                         series_map
                             .entry(series.labels.clone())
                             .or_default()
-                            .push(*sample);
+                            .push(Sample {
+                                timestamp: t,
+                                value: sample.value,
+                            });
                     }
                 }
             }
-            t += step_ns;
+            let Some(next) = t.checked_add(step_ns) else {
+                break;
+            };
+            t = next;
         }
 
         let matrix: Vec<Series> = series_map

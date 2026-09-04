@@ -7,7 +7,8 @@
 //!
 //! | Column type | Encoder | Typical ratio |
 //! |-------------|---------|---------------|
-//! | Timestamps | [`DeltaOfDeltaEncoder`] — delta-of-delta + bit-packing | 8–64× |
+//! | Timestamps | [`PcoEncoder`] — mode recovery + delta + binned ANS | 2.7–1092× |
+//! | Timestamps | [`DeltaOfDeltaEncoder`] — delta-of-delta + bit-packing | 0.9–63× |
 //! | Floats | [`AlpEncoder`] — decimal reconstruction + FOR bit-packing | 4–20× |
 //! | Floats | [`ChimpEncoder`] / [`GorillaEncoder`] — XOR-based | 1.3–4× |
 //! | Integers | [`IntegerEncoder`] — delta + ZigZag + bit-packing | 4–16× |
@@ -55,6 +56,7 @@ pub mod for_encoding;
 pub mod gorilla;
 pub mod integer;
 pub mod patas;
+pub mod pco;
 pub mod plain;
 pub mod rle;
 pub(crate) mod simd;
@@ -71,6 +73,9 @@ pub use for_encoding::{ForDecoder, ForEncoder};
 pub use gorilla::{GorillaDecoder, GorillaEncodeScratch, GorillaEncoder};
 pub use integer::{IntegerDecoder, IntegerEncoder, VarintDecoder, VarintEncoder};
 pub use patas::{PatasDecoder, PatasEncoder};
+pub use pco::{PcoDecoder, PcoEncoder};
 pub use plain::{PlainDecoder, PlainEncoder};
 pub use rle::{RleDecoder, RleEncoder};
-pub use unified::{ColumnDecoder, ColumnEncoder, DecodedColumn, EncodedBlock, EncodingType};
+pub use unified::{
+    ColumnDecoder, ColumnEncoder, DecodedColumn, EncodedBlock, EncodingType, TimestampEncoding,
+};

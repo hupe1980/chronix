@@ -452,3 +452,41 @@ fn a_ranged_delete_keeps_the_series_in_the_cardinality_budget() {
         "an unbounded delete returns the series to the budget"
     );
 }
+
+/// A point written after a delete is visible at once, even inside the
+/// deleted interval: a tombstone masks the segments the delete was issued
+/// against, never data written later. Backfilling into a deleted hour used
+/// to be accepted, acknowledged and invisible until compaction happened to
+/// reclaim the tombstone.
+#[test]
+fn a_write_after_a_delete_is_visible_inside_the_deleted_interval() {
+    let dir = TempDir::new().unwrap();
+    let db = open_db(&dir);
+    for ts in [1000, 2000, 3000] {
+        db.insert(&point("a", ts)).unwrap();
+    }
+    db.flush().unwrap();
+    db.execute_delete(&chronix::DeleteRequest {
+        measurement: "cpu".into(),
+        tag_filters: vec![("host".into(), "a".into())],
+        time_start: Some(1500),
+        time_end: Some(2500),
+    })
+    .unwrap();
+    assert_eq!(visible_timestamps(&db), vec![1000, 3000]);
+
+    // Re-write inside the deleted interval: visible from the memtable...
+    db.backfill(&[point("a", 2000)])
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(visible_timestamps(&db), vec![1000, 2000, 3000]);
+    // ...and from its own segment, before and after compaction reclaims
+    // the tombstone.
+    db.flush().unwrap();
+    assert_eq!(visible_timestamps(&db), vec![1000, 2000, 3000]);
+    db.compact().unwrap();
+    db.gc_with_grace(0).unwrap();
+    assert_eq!(visible_timestamps(&db), vec![1000, 2000, 3000]);
+    db.close().unwrap();
+}

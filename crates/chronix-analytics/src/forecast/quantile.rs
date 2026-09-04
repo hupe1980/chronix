@@ -403,9 +403,14 @@ impl QuantileForecaster {
         // 90% bound below the 50% bound at a given horizon.
         enforce_monotonicity(&mut quantiles);
 
+        // The bounds are a physical fact about the quantity, so they hold
+        // for the point forecast too: a PV forecast of −66 W at night with
+        // an interval of [0, 450] is a contradiction the reader has to
+        // resolve by hand.
+        let point = base.values.iter().map(|&v| self.config.clamp(v)).collect();
         Ok(QuantileForecast {
             timestamps: base.timestamps,
-            point: base.values,
+            point,
             levels,
             quantiles,
             calibration_counts: counts,
@@ -430,8 +435,13 @@ impl QuantileForecaster {
         let base = self.model.predict(horizon)?;
         let (lo, hi) = self.quantiles_only(&base, horizon, tail, 1.0 - tail);
 
+        // The point forecast is clamped for the same reason the bounds are:
+        // `predict` already does it, and an unclamped point inside a clamped
+        // interval is a contradiction the reader has to resolve by hand.
+        let values = base.values.iter().map(|&v| self.config.clamp(v)).collect();
+
         Ok(ForecastResult {
-            values: base.values,
+            values,
             timestamps: base.timestamps,
             confidence_lower: lo,
             confidence_upper: hi,
@@ -525,10 +535,16 @@ fn empirical_quantile(sorted: &[f64], q: f64, conformal: bool) -> f64 {
 
     let q = if conformal {
         let nf = (n + 1) as f64;
-        let adjusted = if q >= 0.5 {
+        // The correction moves a *tail* rank outward. The median is not a
+        // tail: `q >= 0.5` pushed q = 0.5 to ⌈41·0.5⌉/40 = 0.525 at n = 40,
+        // so the level advertised as the median was the 52.5 % quantile and
+        // the "median" forecast was biased high by construction.
+        let adjusted = if q > 0.5 {
             (nf * q).ceil() / n as f64
-        } else {
+        } else if q < 0.5 {
             1.0 - (nf * (1.0 - q)).ceil() / n as f64
+        } else {
+            0.5
         };
         adjusted.clamp(0.0, 1.0)
     } else {
@@ -587,6 +603,55 @@ mod tests {
         assert!((empirical_quantile(&s, 0.5, false) - 2.5).abs() < 1e-9);
         assert!((empirical_quantile(&s, 0.0, false) - 1.0).abs() < 1e-9);
         assert!((empirical_quantile(&s, 1.0, false) - 4.0).abs() < 1e-9);
+    }
+
+    /// The conformal correction is a *tail* correction; the median must be
+    /// the plain empirical median. With `sorted[i] = i + 1`, n = 40, the
+    /// type-7 median is `(sorted[19] + sorted[20]) / 2 = 20.5`. The old
+    /// `q >= 0.5` branch produced rank ⌈41·0.5⌉/40 = 0.525 → 21.475.
+    #[test]
+    fn conformal_leaves_the_median_alone() {
+        let s: Vec<f64> = (1..=40).map(f64::from).collect();
+        assert!((empirical_quantile(&s, 0.5, false) - 20.5).abs() < 1e-12);
+        assert!(
+            (empirical_quantile(&s, 0.5, true) - 20.5).abs() < 1e-12,
+            "conformal median = {}, want 20.5",
+            empirical_quantile(&s, 0.5, true)
+        );
+    }
+
+    /// `predict_interval` must clamp the point forecast to the configured
+    /// domain, exactly as `predict` does — otherwise a PV forecast prints a
+    /// negative point inside a `[0, 5000]` interval.
+    #[test]
+    fn predict_interval_clamps_the_point_forecast() {
+        let ts: Vec<i64> = (0..60).map(|i| i as i64 * 1_000_000_000).collect();
+        // A series that trends hard negative so the point forecast leaves
+        // the declared domain.
+        let vals: Vec<f64> = (0..60).map(|i| 100.0 - 4.0 * i as f64).collect();
+        let cfg = QuantileConfig {
+            levels: vec![0.1, 0.5, 0.9],
+            horizon: 3,
+            initial_window: 30,
+            step: 1,
+            strategy: CalibrationStrategy::OnlineUpdate,
+            conformal: true,
+            lower_bound: Some(0.0),
+            upper_bound: Some(5000.0),
+        };
+        let mut f = QuantileForecaster::new(
+            || Box::new(SesModel::new(Some(0.3))) as Box<dyn ForecastModel>,
+            cfg,
+        );
+        f.fit(&ts, &vals).unwrap();
+        let r = f.predict_interval(3, 0.9).unwrap();
+        for (i, &v) in r.values.iter().enumerate() {
+            assert!(
+                (0.0..=5000.0).contains(&v),
+                "point forecast {v} at h={} outside the configured [0, 5000]",
+                i + 1
+            );
+        }
     }
 
     /// The correction must widen **both** tails.

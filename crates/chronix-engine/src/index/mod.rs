@@ -6,6 +6,8 @@
 //!
 //! - [`TimeIndex`] — Sorted time-range index for O(log N) segment lookup
 //! - [`SeriesBloomFilter`] — Per-segment bloom filters for series key pruning
+//! - [`series_index`] — The per-segment series list the blooms, the tag index
+//!   and the cardinality budget are rebuilt from at open
 //! - [`SegmentCatalog`] — Segment metadata catalog with manifest persistence
 //! - [`TagInvertedIndex`] — Inverted tag index for tag-value → segment mapping
 //! - [`ZoneMapPredicate`] — Predicate pushdown using per-row-group column stats
@@ -20,6 +22,7 @@ pub mod bloom;
 pub mod catalog;
 pub mod error;
 pub mod inverted;
+pub mod series_index;
 pub mod time_index;
 pub mod zone_map;
 

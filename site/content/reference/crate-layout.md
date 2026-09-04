@@ -179,7 +179,7 @@ propagate `LockPoisoned` errors instead.
 - **No silent error swallowing.** All `Result` values are either propagated
   with `?` or logged (`warn!`/`error!`). `let _ = fallible_call()` is
   prohibited — file errors log at `warn!` level (with `NotFound` filtered
-  for optional files like bloom sidecars), catalog mutation failures always
+  for optional files like series sidecars), catalog mutation failures always
   logged.
 - **No panics in library code.** Forecast model dispatch,
   segment compression, and query deduplication all return `Result` instead

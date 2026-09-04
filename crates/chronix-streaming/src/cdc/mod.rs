@@ -1,7 +1,7 @@
 //! # Chronix Stream — CDC Event Streaming
 //!
-//! Change Data Capture (CDC) event generation, filtered subscriptions, and
-//! continuous aggregations for the Chronix time-series database.
+//! Change Data Capture (CDC) event generation and filtered subscriptions for
+//! the Chronix time-series database.
 //!
 //! ## Architecture
 //!
@@ -14,7 +14,6 @@
 //!       ├── Subscription (raw)
 //!       ├── FilteredSubscription (measurement / tag / type filters)
 //!       ├── CdcStream (async Stream<Item = CdcEvent>)
-//!       ├── ContinuousAggregationEngine (incremental materialized views)
 //!       └── CdcFlightExporter (Arrow RecordBatch export — `flight` feature)
 //! ```
 //!
@@ -49,7 +48,6 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
-mod aggregation;
 mod bus;
 mod error;
 mod event;
@@ -60,9 +58,6 @@ pub mod flight;
 mod perf;
 mod subscription;
 
-pub use aggregation::{
-    AggFunction, BucketResult, ContinuousAggregationConfig, ContinuousAggregationEngine,
-};
 pub use bus::{EventBus, PersistentSubscription, Subscription, DEFAULT_CAPACITY};
 pub use error::StreamError;
 pub use event::{CdcEvent, SequenceNumber};

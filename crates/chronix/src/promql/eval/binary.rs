@@ -55,6 +55,15 @@ impl PromQLEvaluator {
             }
             (PromQLValue::Scalar(s), PromQLValue::Vector(series)) => {
                 let drop_name = op.is_arithmetic() || (op.is_comparison() && bool_mod);
+                // A comparison **filters** the vector, and what survives keeps
+                // the *vector element's* value — whichever side the scalar was
+                // written on. `apply_binary_op` returns its left operand, which
+                // is the scalar here, so `2 < some_metric` answered `2` for
+                // every series instead of the metric's own value. Prometheus
+                // does this explicitly for the same reason
+                // (`engine.go`, `VectorscalarBinop`): "we want to always keep
+                // the vector element value as the output value".
+                let keep_vector_value = op.is_comparison() && !bool_mod;
                 let result: Vec<_> = series
                     .into_iter()
                     .map(|mut ser| {
@@ -62,8 +71,9 @@ impl PromQLEvaluator {
                             ser.labels.retain(|(k, _)| k != "__name__");
                         }
                         ser.samples.retain_mut(|sample| {
-                            let (val, keep) = apply_binary_op(op, s, sample.value, bool_mod);
-                            sample.value = val;
+                            let original = sample.value;
+                            let (val, keep) = apply_binary_op(op, s, original, bool_mod);
+                            sample.value = if keep_vector_value { original } else { val };
                             keep
                         });
                         ser
@@ -150,6 +160,31 @@ impl PromQLEvaluator {
                     // Hash-based O(N+M) matching rather than O(N×M).
                     let is_many = card == Some(VectorMatchingCardinality::ManyToOne);
                     let right_index = build_matching_index(&right, matching);
+                    if is_many {
+                        // `group_left` makes the **right** side the "one" side,
+                        // and a duplicate there is many-to-many — which
+                        // Prometheus refuses rather than expanding into a cross
+                        // product. Only the one-to-one case was checked, so
+                        // `a * on(host) group_left(dc) info` with two `info`
+                        // series per host silently returned two results per
+                        // left series, each with a different `dc`. That reads
+                        // as a plausible answer and is not one.
+                        //
+                        // `group_right` had the equivalent check already; this
+                        // is the missing half of the pair.
+                        if let Some(sig) = right_index
+                            .iter()
+                            .find(|(_, idx)| idx.len() > 1)
+                            .map(|(sig, _)| sig.clone())
+                        {
+                            return Err(EvalError(format!(
+                                "found duplicate series for the match group {} on the right \
+                                 hand-side of the operation: many-to-many matching not allowed, \
+                                 matching labels must be unique on one side",
+                                describe_signature(&sig)
+                            )));
+                        }
+                    }
                     if !is_many {
                         // One-to-one requires the match group to identify at
                         // most one series on each side. Silently taking the

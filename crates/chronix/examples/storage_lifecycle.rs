@@ -2,7 +2,7 @@
 //! # Compaction, Retention, and Rollups
 //!
 //! Demonstrates storage lifecycle management: manual flush, compaction,
-//! retention enforcement, and continuous rollup aggregation.
+//! rollup materialisation, and retention enforcement.
 //!
 //! ```sh
 //! cargo run -p chronix --example storage_lifecycle
@@ -12,13 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{
-    fields, tags, Chronix, ParquetExportConfig, RollupAggFn, RollupBuilder, WarmTierConfig,
-};
+use chronix::{fields, tags, Chronix, ParquetExportConfig, RollupAggFn, RollupBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    let warm_dir = tempfile::tempdir()?;
 
     let config = ChronixConfig::builder()
         .data_dir(dir.path())
@@ -42,10 +39,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap_or(i64::MAX);
 
-    // Three consecutive hourly shards ending at "now". Points must land
-    // within the engine's out-of-order tolerance (±2 shards), so they are
-    // seeded oldest-first.
-    let recent_start = now_ns - 3 * hour_ns;
+    // Three hourly shards: two old ones (5 h and 4 h ago) and the current
+    // one. Points must land within the engine's out-of-order tolerance
+    // (±2 shards of the newest write), so they are seeded oldest-first —
+    // and the gap is deliberate: once "now" is written, the two old shards
+    // are outside the window, which is what makes their rollup buckets
+    // final and lets retention drop them.
+    let shard_offsets = [-5, -4, 0];
+    let recent_start = now_ns - 5 * hour_ns;
 
     let key = SeriesKey::new(
         "network_traffic",
@@ -53,10 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     println!("─── 1. Seeding data across 3 hourly shards ───");
-    for shard in 0..3 {
+    for offset in shard_offsets {
         let points: Vec<Point> = (0..100)
             .map(|i| {
-                let ts = recent_start + shard * hour_ns + i * 1_000_000_000;
+                let ts = now_ns + offset * hour_ns + i * 1_000_000_000;
                 Point::new(
                     key.clone(),
                     fields! {
@@ -74,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(
             res.is_complete(),
             "seed insert was partial: {:?}",
-            res.errors
+            res.rejected
         );
     }
     println!("   300 points across 3 shards");
@@ -90,13 +91,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // ── 3. Compaction ──────────────────────────────────────────
-    println!("\n─── 3. Running compaction ───");
-    let compaction_tasks = db.compact()?;
-    println!("   Compaction tasks: {compaction_tasks}");
-
-    // ── 4. Rollups: continuous downsampled views ────────────────
-    println!("\n─── 4. Creating rollup: 1-minute aggregation ───");
+    // ── 3. Rollups: materialised downsampled tiers ──────────────
+    println!("\n─── 3. Creating rollup: 1-minute aggregation ───");
     let rollup_config = RollupBuilder::new()
         .name("net_1m")
         .source("network_traffic")
@@ -119,12 +115,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // ── 4. Compaction — and rollup materialisation ─────────────
+    // A rollup bucket is aggregated exactly once, over every row that can
+    // ever reach it, as soon as the out-of-order window has closed over
+    // it. `compact()` materialises after its pass (so does retention, and
+    // `materialise_rollups()` is the explicit call). The two old shards
+    // are final; the current one is not, so its buckets wait.
+    println!("\n─── 4. Running compaction (materialises final rollup buckets) ───");
+    let compaction_tasks = db.compact()?;
+    println!("   Compaction tasks: {compaction_tasks}");
+    let rollup_rows = db.sql(
+        "SELECT count(*) AS buckets, min(bytes_in_avg) AS lo, max(bytes_in_avg) AS hi \
+         FROM network_traffic_1m",
+    )?;
+    println!("   Materialised 1-minute buckets (two final shards):");
+    println!(
+        "{}",
+        arrow::util::pretty::pretty_format_batches(&rollup_rows)?
+    );
+
     // ── 5. Retention enforcement ───────────────────────────────
     println!("\n─── 5. Retention enforcement ───");
-    // A 2-hour window: the oldest shard falls outside it and is dropped,
-    // the two newest survive. (Retention is evaluated against the wall
-    // clock, which is why the data above is seeded relative to `now`.)
-    let retention_result = db.enforce_retention(2 * hour_ns)?;
+    // A 3-hour window: the two old shards fall outside it. They are
+    // dropped only because their rollup is materialised past them — raw
+    // data that still feeds an unmaterialised bucket is preserved.
+    // (Retention is evaluated against the wall clock, which is why the
+    // data above is seeded relative to `now`.)
+    let retention_result = db.enforce_retention(3 * hour_ns)?;
     println!("   Shards dropped   : {}", retention_result.shards_dropped);
     println!(
         "   Segments deleted  : {}",
@@ -133,24 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Bytes freed       : {}", retention_result.bytes_freed);
 
     // ── 6. Warm tier migration ─────────────────────────────────
-    println!("\n─── 6. Warm tier migration (re-compress old shards) ───");
-    let warm_config = WarmTierConfig {
-        enabled: true,
-        warm_after_ns: hour_ns, // Move shards older than 1 hour
-        warm_path: warm_dir.path().to_path_buf(),
-        zstd_level: 9,
-    };
-
-    let warm_result = db.warm_tier_migrate(&warm_config)?;
-    println!("   Shards moved      : {}", warm_result.shards_moved);
-    println!(
-        "   Segments recompressed: {}",
-        warm_result.segments_recompressed
-    );
-    println!("   Bytes saved       : {}", warm_result.bytes_saved);
-
-    // ── 7. Export to Parquet ────────────────────────────────────
-    println!("\n─── 7. Exporting query results to Parquet ───");
+    println!("\n─── 6. Exporting query results to Parquet ───");
     let plan = db
         .query()
         .measurement("network_traffic")
@@ -181,12 +181,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── 8. GC soft-deleted segments ────────────────────────────
-    println!("\n─── 8. Garbage collecting soft-deleted segments ───");
+    println!("\n─── 7. Garbage collecting soft-deleted segments ───");
     let gc_count = db.gc_with_grace(0)?; // 0ms grace for demo
     println!("   Segments cleaned: {gc_count}");
 
     // ── 9. Database stats ──────────────────────────────────────
-    println!("\n─── 9. Database introspection ───");
+    println!("\n─── 8. Database introspection ───");
     println!("   WAL sequence: {}", db.wal_sequence());
     println!("   Data dir    : {}", db.data_dir().display());
 

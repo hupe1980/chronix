@@ -13,7 +13,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -21,13 +24,18 @@
         "type": "dashboard"
       },
       {
-        "datasource": { "type": "simpod-json-datasource", "uid": "chronix-signals" },
+        "datasource": {
+          "type": "simpod-json-datasource",
+          "uid": "chronix-signals"
+        },
         "enable": true,
         "hide": false,
         "iconColor": "#FF5722",
         "name": "Chronix Signals",
         "type": "tags",
-        "target": { "url": "/api/v1/annotations" }
+        "target": {
+          "url": "/api/v1/annotations"
+        }
       }
     ]
   },
@@ -40,32 +48,61 @@
     {
       "title": "Active Signals",
       "type": "table",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": [
         {
-          "expr": "chronix_signal_active_count",
+          "expr": "chronix_signal_triggers_registered_total",
           "legendFormat": "{{channel}}",
           "refId": "A",
           "instant": true
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short" },
+        "defaults": {
+          "unit": "short"
+        },
         "overrides": []
       },
       "transformations": [
-        { "id": "sortBy", "options": { "fields": {}, "sort": [{ "field": "Value", "desc": true }] } }
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Value",
+                "desc": true
+              }
+            ]
+          }
+        }
       ]
     },
     {
       "title": "Signals Fired (rate)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": [
         {
-          "expr": "rate(chronix_signals_fired_total[5m])",
+          "expr": "rate(chronix_signal_fired_total[5m])",
           "legendFormat": "{{signal_name}} ({{severity}})",
           "refId": "A"
         }
@@ -73,7 +110,11 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15
+          }
         },
         "overrides": []
       }
@@ -81,8 +122,16 @@
     {
       "title": "Signal Delivery Latency",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, rate(chronix_signal_delivery_duration_seconds_bucket[5m]))",
@@ -103,31 +152,10 @@
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "title": "Signal Channel Health",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "targets": [
-        {
-          "expr": "chronix_signal_channels_healthy",
-          "legendFormat": "healthy",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "value": null, "color": "red" },
-              { "value": 1, "color": "green" }
-            ]
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
           }
         },
         "overrides": []
@@ -136,20 +164,34 @@
     {
       "title": "Anomaly Detections",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": [
         {
-          "expr": "rate(chronix_anomaly_detections_total[5m])",
-          "legendFormat": "{{detector}} — {{measurement}}",
+          "expr": "rate(chronix_anomaly_detected_total[5m])",
+          "legendFormat": "{{detector}} \u2014 {{measurement}}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 40 },
-          "color": { "mode": "palette-classic" }
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 40
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
         },
         "overrides": []
       }
@@ -157,32 +199,56 @@
     {
       "title": "Signal Delivery Errors",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": [
         {
-          "expr": "rate(chronix_signal_delivery_errors_total[5m])",
-          "legendFormat": "{{channel}} — {{error}}",
+          "expr": "rate(chronix_signal_delivery_failed_total[5m])",
+          "legendFormat": "{{channel}} \u2014 {{error}}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 50 },
-          "color": { "fixedColor": "dark-red", "mode": "fixed" }
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 50
+          },
+          "color": {
+            "fixedColor": "dark-red",
+            "mode": "fixed"
+          }
         },
         "overrides": []
       }
     }
   ],
   "schemaVersion": 39,
-  "tags": ["chronix", "signals", "anomaly"],
-  "templating": { "list": [] },
-  "time": { "from": "now-6h", "to": "now" },
+  "tags": [
+    "chronix",
+    "signals",
+    "anomaly"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Chronix — Signals & Anomalies",
+  "title": "Chronix \u2014 Signals & Anomalies",
   "uid": "chronix-signals",
   "version": 1
 }

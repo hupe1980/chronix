@@ -5,7 +5,7 @@
 //! `fuzz/fuzz_targets/fuzz_column_decoder.rs` covers exactly this property and
 //! covers it better — it is coverage-guided and will find inputs this file
 //! never will. It also **never runs**: there was no CI job invoking it, so the
-//! "exhaustive fuzz coverage of all 21 encodings" in the notes was a claim
+//! "exhaustive fuzz coverage of all 24 encodings" in the notes was a claim
 //! about a target nothing executed (a comment that asserts a property the
 //! build does not have).
 //!
@@ -39,6 +39,9 @@ const ENCODINGS: &[EncodingType] = &[
     EncodingType::Gorilla,
     EncodingType::Patas,
     EncodingType::Alp,
+    EncodingType::Pco,
+    EncodingType::PcoI64,
+    EncodingType::PcoU64,
     EncodingType::IntegerI64,
     EncodingType::IntegerU64,
     EncodingType::VarintI64,
@@ -62,7 +65,7 @@ const ENCODINGS: &[EncodingType] = &[
 fn every_encoding_is_covered() {
     assert_eq!(
         ENCODINGS.len(),
-        21,
+        24,
         "the encoding list must stay exhaustive — a missing entry is invisible \
          coverage loss, not a compile error"
     );

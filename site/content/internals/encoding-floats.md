@@ -24,8 +24,25 @@ observation that **consecutive values in a sensor stream change slowly**.
 
 Gorilla, Chimp and Patas all start from the same premise: a double is an
 opaque bit pattern, and consecutive values will share a prefix. **ALP**
-(Afroozeh, Kuffo & Boncz, *SIGMOD 2024*) starts from a different one, and it
-is the reason ALP is Chronix's primary float codec.
+(Afroozeh, Kuffo & Boncz, *SIGMOD 2024*) starts from a different one — and
+**Pcodec** (Loncaric, 2025, the `pco` crate) takes that premise one step
+further, which is why pco is Chronix's primary float codec and ALP the
+second candidate. Both are described below; the adaptive selector tries
+pco first, ALP second, and the XOR codecs after, per block.
+
+### Pcodec
+
+pco recovers the same latent integer ALP does ("float-multiple" mode),
+then *delta-encodes* the integers and entropy-codes the deltas with ANS
+against bins learned per chunk. Where ALP frame-of-reference bit-packs the
+integers — 13 bits each for a meter reporting 200–250 W to two decimals —
+pco spends bits only on what is unpredictable from the previous value. On
+the workloads the ratio test pins that is 85× against ALP's 4.1× on a
+power meter, 46× against 9.1× on temperatures, 16× against 5.8× on a noisy
+sensor — and it decodes faster than ALP. The wire format carries Chronix's
+own value count in front of the pco file, checked against the decode
+ceiling before a byte is decompressed; pco's headers are never trusted for
+an allocation.
 
 ### The observation
 

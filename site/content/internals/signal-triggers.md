@@ -18,11 +18,9 @@ Triggers are defined using a SQL-like DSL:
 ```sql
 CREATE TRIGGER high_cpu
 ON metrics
-WHERE metric_name = 'cpu_utilization'
-WHEN AVG(value) OVER (INTERVAL '5 minutes') > 90.0
-SEVERITY 'critical'
-COOLDOWN INTERVAL '120s'
-ACTION webhook('https://alerts.example.com/hook');
+WHEN value > 90.0 AND metric_name = 'cpu_utilization'
+DELIVER webhook('https://alerts.example.com/hook')
+COOLDOWN INTERVAL '120s';
 ```
 
 ### Components
@@ -118,8 +116,9 @@ Triggers can reference other triggers for complex logic:
 
 ```sql
 CREATE TRIGGER memory_pressure_with_high_cpu
-WHEN TRIGGER('high_cpu') AND TRIGGER('high_memory')
-SEVERITY 'emergency';
+ON metrics
+WHEN value > 90.0 AND anomaly_score > 3.0
+DELIVER webhook('https://alerts.example.com/hook');
 ```
 
 ## Flap Detection

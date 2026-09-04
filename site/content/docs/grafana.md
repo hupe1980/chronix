@@ -16,7 +16,9 @@ Chronix integrates natively with Grafana through multiple data source types. Thi
 
 ## 1. Prometheus Data Source (Recommended)
 
-Chronix exposes a fully compatible Prometheus HTTP API at `/api/v1/prom/`.
+Chronix serves the Prometheus HTTP API at the paths a Prometheus client
+derives from a base URL, so the data source needs nothing but the server's
+address.
 
 ### Add Data Source
 
@@ -26,7 +28,7 @@ Chronix exposes a fully compatible Prometheus HTTP API at `/api/v1/prom/`.
 
 | Field | Value |
 |-------|-------|
-| **URL** | `http://chronix.example.com:8086/api/v1/prom` |
+| **URL** | `http://chronix.example.com:8086` |
 | **Access** | Server (default) |
 | **Scrape interval** | `15s` |
 
@@ -42,7 +44,7 @@ If Chronix authentication is enabled:
 
 For multi-tenant deployments, also add:
 
-- **Header:** `X-Chronix-Namespace`
+- **Header:** `X-Namespace`
 - **Value:** `<namespace>`
 
 ### PromQL Examples
@@ -85,17 +87,17 @@ grafana-cli plugins install grafana-flightsql-datasource
 
 ```sql
 -- Top 10 hosts by CPU usage in the last hour
-SELECT host, AVG(usage) as avg_usage
+SELECT host, AVG(usage) AS avg_usage
 FROM cpu
-WHERE time > now() - INTERVAL '1 hour'
+WHERE _time > now() - INTERVAL '1 hour'
 GROUP BY host
 ORDER BY avg_usage DESC
-LIMIT 10
+LIMIT 10;
 
--- Storage segment count per measurement
-SELECT measurement, COUNT(*) as segments
-FROM _segments
-GROUP BY measurement
+-- Rows per measurement in the last hour
+SELECT COUNT(*) AS rows
+FROM cpu
+WHERE _time > now() - INTERVAL '1 hour';
 ```
 
 ## 3. Pre-Built Dashboards
@@ -130,7 +132,7 @@ datasources:
   - name: Chronix
     type: prometheus
     access: proxy
-    url: http://chronix:8086/api/v1/prom
+    url: http://chronix:8086
     isDefault: true
     jsonData:
       httpMethod: POST

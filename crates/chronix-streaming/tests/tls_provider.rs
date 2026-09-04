@@ -27,8 +27,11 @@ fn a_client_builds_with_no_provider_installed() {
 
     // Constructing the channel builds a `reqwest::Client`, which is where the
     // panic would happen.
+    // Loopback is a forbidden webhook target by default; this test is about
+    // the TLS provider, not about the address rule, so it says so.
     let config = WebhookConfig::new("https://127.0.0.1:1/hook", "secret")
-        .with_timeout(Duration::from_millis(200));
+        .with_timeout(Duration::from_millis(200))
+        .allow_private_targets(true);
     let channel =
         WebhookChannel::new(config).expect("a client must build without a global provider");
     let _ = &channel;

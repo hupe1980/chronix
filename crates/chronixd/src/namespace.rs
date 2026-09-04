@@ -23,6 +23,56 @@ use chronix_security::tenant::NamespaceRegistry;
 use crate::error::ServerError;
 use crate::http::AppState;
 
+/// Namespace-qualify a rollup name, so a tenant can only name its own.
+///
+/// Rollup definitions are global while measurements are shared, so the name
+/// carries the namespace: `"{ns}/{name}"`. Without a scope the name is used
+/// as given.
+#[must_use]
+pub fn qualify_rollup(state: &AppState, ctx: Option<&NamespaceContext>, name: &str) -> String {
+    match scope(state, ctx) {
+        None => name.to_string(),
+        Some(ns) => format!("{ns}/{name}"),
+    }
+}
+
+/// Build a delete request confined to `scope`.
+///
+/// **Every delete surface calls this**, for the same reason every ingestion
+/// surface calls one write function: a scope each handler has to remember
+/// is a scope most of them forget. Three of the four delete surfaces did —
+/// HTTP delete, HTTP batch delete and HTTP drop-measurement all deleted
+/// across every tenant.
+///
+/// Under multi-tenancy a "drop measurement" is therefore *not* a
+/// measurement drop: it is a delete of every series of that measurement
+/// **in this namespace**, because the measurement itself is shared.
+///
+/// # Errors
+///
+/// Returns the builder's error when the request is not well formed.
+pub fn scoped_delete_request(
+    db: &chronix::Chronix,
+    scope: Option<&str>,
+    measurement: &str,
+    tags: impl IntoIterator<Item = (String, String)>,
+    range: Option<(i64, i64)>,
+) -> Result<chronix::DeleteRequest, ServerError> {
+    let mut builder = db.delete_builder().measurement(measurement);
+    if let Some(ns) = scope {
+        builder = builder.tag(NAMESPACE_TAG, ns);
+    }
+    for (k, v) in tags {
+        builder = builder.tag(&k, &v);
+    }
+    if let Some((start, end)) = range {
+        builder = builder.range(start, end);
+    }
+    builder
+        .build()
+        .map_err(|e| ServerError::BadRequest(format!("delete build error: {e}")))
+}
+
 /// The `X-Namespace` header name.
 pub const NAMESPACE_HEADER: &str = "X-Namespace";
 
@@ -70,6 +120,45 @@ pub async fn namespace_layer(
             format!("namespace not found: {namespace}"),
         )
             .into_response();
+    }
+
+    // **The header alone is not authority.** Authentication says who is
+    // calling; the credential says whose data they may touch. Without this
+    // check any valid key read any tenant by changing one header — the
+    // registry lookup above only proves the namespace *exists*.
+    //
+    // A credential with no namespace list is unrestricted, which is right
+    // for single-tenant. `ServerConfig::validate` refuses to start
+    // multi-tenant with one, so reaching this line unrestricted means the
+    // operator asked for it.
+    if let Some(ctx) = req
+        .extensions()
+        .get::<chronix_security::auth::AuthContext>()
+    {
+        if !ctx.allows_namespace(&namespace) {
+            tracing::warn!(
+                principal = %ctx.principal,
+                %namespace,
+                "principal is not authorised for this namespace"
+            );
+            metrics::counter!("chronix_namespace_denied_total").increment(1);
+            crate::audit::record(
+                &state,
+                &ctx.principal,
+                chronix_security::audit::AuditAction::Admin,
+                format!("namespace:{namespace}"),
+                chronix_security::audit::AuditDecision::Deny,
+                &[("reason", "credential not bound to namespace".to_string())],
+            );
+            // 403, not 404: the caller authenticated, and hiding existence
+            // here would contradict the 400 above, which already tells an
+            // unauthenticated caller whether a namespace exists.
+            return (
+                StatusCode::FORBIDDEN,
+                format!("credential is not authorised for namespace: {namespace}"),
+            )
+                .into_response();
+        }
     }
 
     // Namespace-level Cedar authorization: if an authz engine is
@@ -440,6 +529,44 @@ pub fn scope_from_metadata(
     metadata: &tonic::metadata::MetadataMap,
 ) -> Option<String> {
     multi_tenancy.then(|| from_metadata(metadata))
+}
+
+/// Namespace scope for a gRPC or Flight request, checked against the
+/// credential the request authenticated with.
+///
+/// The metadata-only [`scope_from_metadata`] trusts the client's chosen
+/// namespace, which is the same defect the HTTP layer had: a valid
+/// credential could name any tenant. Prefer this everywhere a request is in
+/// hand.
+///
+/// # Errors
+///
+/// Returns `PermissionDenied` when the credential is confined to a set of
+/// namespaces that does not include the requested one.
+pub fn scope_from_request<T>(
+    multi_tenancy: bool,
+    request: &tonic::Request<T>,
+) -> Result<Option<String>, tonic::Status> {
+    let Some(namespace) = scope_from_metadata(multi_tenancy, request.metadata()) else {
+        return Ok(None);
+    };
+    if let Some(ctx) = request
+        .extensions()
+        .get::<chronix_security::auth::AuthContext>()
+    {
+        if !ctx.allows_namespace(&namespace) {
+            tracing::warn!(
+                principal = %ctx.principal,
+                %namespace,
+                "principal is not authorised for this namespace"
+            );
+            metrics::counter!("chronix_namespace_denied_total").increment(1);
+            return Err(tonic::Status::permission_denied(format!(
+                "credential is not authorised for namespace: {namespace}"
+            )));
+        }
+    }
+    Ok(Some(namespace))
 }
 
 /// gRPC / Flight metadata key carrying the namespace.

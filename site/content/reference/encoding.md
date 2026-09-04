@@ -23,7 +23,18 @@ The encoding crate provides type-specific compression for columnar data:
 | RLE               | Any        | Run-length for constant / repetitive columns         |
 | Plain             | Any        | Uncompressed fallback for all types                  |
 
-### ALP — the primary float codec
+### Pcodec — the primary numeric codec
+
+`PcoEncoder` / `PcoDecoder` wrap the `pco` crate for `f64`, `i64` and `u64`
+columns (`EncodingType::Pco`, `PcoI64`, `PcoU64`). Payload:
+`[num_values: u32 LE][pco standalone file]`. Decoding bounds `num_values`
+by the crate-wide ceiling and decompresses into a buffer of exactly that
+size (`simple_decompress_into`), so a corrupt header cannot allocate and a
+file that decodes to a different count is an error. pco leads every float
+candidate list in the adaptive selector and is trial-encoded beside the
+integer codecs, where the smallest payload wins.
+
+### ALP — the second float codec
 
 XOR codecs treat a double as an opaque bit pattern and hope consecutive
 values share a prefix. Most doubles in a time-series database never had 15
@@ -157,7 +168,7 @@ sensor data where values repeat at regular intervals.
 ### Compression
 
 - **LZ4** — default for hot data (fast decompression)
-- **Zstd** — configurable levels (default 3 for balanced, level 9 for warm tier)
+- **Zstd** — configurable level via `zstd_level` (default 3; raise it to trade CPU for space)
 - **Zstd with dictionary** — optional dictionary training from first row group
   samples for 20–40% better compression on homogeneous schemas; dictionary
   embedded in segment metadata

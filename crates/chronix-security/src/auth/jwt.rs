@@ -1,6 +1,7 @@
 //! JWT and OIDC token validation.
 //!
-//! Supports RS256, RS384, RS512, HS256, HS384, HS512 algorithms.
+//! Supports the HMAC (`HS*`), RSA (`RS*`, `PS*`), elliptic-curve (`ES*`)
+//! and Edwards-curve (`EdDSA`) families.
 //! Can fetch JWKS from an OIDC discovery endpoint or use a static secret.
 //!
 //! # Example
@@ -56,7 +57,7 @@ fn default_true() -> bool {
 
 /// JWT validation configuration.
 ///
-/// **Security:** The `secret` and `rsa_public_key_pem` fields are redacted
+/// **Security:** The `secret` and `public_key_pem` fields are redacted
 /// in `Debug` output to prevent credential leakage in logs.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct JwtConfig {
@@ -67,13 +68,18 @@ pub struct JwtConfig {
         default
     )]
     pub secret: Option<Zeroizing<String>>,
-    /// RSA public key PEM for RS256/RS384/RS512.
+    /// Public key PEM for the asymmetric families.
+    ///
+    /// RSA (`RS*`, `PS*`) and elliptic-curve (`ES*`) keys both live here:
+    /// the family comes from `algorithm`, and mixing the two used to mean
+    /// an EC key was parsed as RSA, failed, and left the validator with no
+    /// key at all — which every token then failed against.
     #[serde(
         serialize_with = "ser_zeroizing_opt",
         deserialize_with = "de_zeroizing_opt",
         default
     )]
-    pub rsa_public_key_pem: Option<Zeroizing<String>>,
+    pub public_key_pem: Option<Zeroizing<String>>,
     /// Expected issuer (`iss` claim).
     pub issuer: Option<String>,
     /// Expected audience (`aud` claim).
@@ -99,8 +105,8 @@ impl std::fmt::Debug for JwtConfig {
         f.debug_struct("JwtConfig")
             .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
             .field(
-                "rsa_public_key_pem",
-                &self.rsa_public_key_pem.as_ref().map(|_| "[REDACTED]"),
+                "public_key_pem",
+                &self.public_key_pem.as_ref().map(|_| "[REDACTED]"),
             )
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
@@ -218,28 +224,82 @@ impl JwtValidator {
         // present, the token must not be accepted before that time.
         validation.validate_nbf = true;
 
-        let decoding_key = if let Some(ref secret) = config.secret {
-            // Enforce minimum 32-byte secret for HMAC algorithms (NIST SP 800-107).
-            if matches!(
-                algorithm,
-                Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
-            ) && secret.len() < 32
-            {
-                return Err(AuthError::Config(
-                    "HMAC secret must be at least 32 bytes".into(),
-                ));
-            }
-            Some(DecodingKey::from_secret(secret.as_bytes()))
-        } else if let Some(ref pem) = config.rsa_public_key_pem {
-            match DecodingKey::from_rsa_pem(pem.as_bytes()) {
-                Ok(key) => Some(key),
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to parse RSA public key PEM");
-                    None
+        // **The key is chosen by the algorithm's family, not by which
+        // field happens to be set.** A configuration naming RS256 while a
+        // `secret` was present built an HMAC key from the secret and
+        // verified an RSA signature against it, so every token was
+        // rejected — a 401 with nothing in the log to say why. Picking the
+        // key from the algorithm makes the mismatch a startup error.
+        // **The key is chosen by the algorithm's family, not by whichever
+        // field happens to be set.** A configuration naming RS256 while a
+        // `secret` was present built an HMAC key from that secret and
+        // verified an RSA signature against it, so every token was
+        // rejected — a 401 with nothing in the log to say why.
+        //
+        // No key material at all stays `None`: a JWKS cache may be attached
+        // afterwards, and that is the whole point of an OIDC deployment.
+        // Material that cannot belong to this algorithm is a startup error,
+        // because it can never verify anything.
+        let hmac_family = matches!(
+            algorithm,
+            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512
+        );
+        if hmac_family && config.public_key_pem.is_some() {
+            return Err(AuthError::Config(format!(
+                "{algorithm:?} is an HMAC algorithm and takes `secret`, not `public_key_pem`"
+            )));
+        }
+        if !hmac_family && config.secret.is_some() && config.public_key_pem.is_none() {
+            return Err(AuthError::Config(format!(
+                "{algorithm:?} verifies with a public key; set `public_key_pem` \
+                 (a `secret` cannot verify an asymmetric signature)"
+            )));
+        }
+
+        let decoding_key = match (
+            algorithm,
+            config.secret.as_ref(),
+            config.public_key_pem.as_ref(),
+        ) {
+            (_, None, None) => None,
+            (Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512, Some(secret), _) => {
+                // NIST SP 800-107: the key is at least as long as the hash.
+                if secret.len() < 32 {
+                    return Err(AuthError::Config(
+                        "HMAC secret must be at least 32 bytes".into(),
+                    ));
                 }
+                Some(DecodingKey::from_secret(secret.as_bytes()))
             }
-        } else {
-            None
+            (
+                Algorithm::RS256
+                | Algorithm::RS384
+                | Algorithm::RS512
+                | Algorithm::PS256
+                | Algorithm::PS384
+                | Algorithm::PS512,
+                _,
+                Some(pem),
+            ) => Some(DecodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| {
+                AuthError::Config(format!(
+                    "{algorithm:?} public key is not valid RSA PEM: {e}"
+                ))
+            })?),
+            (Algorithm::ES256 | Algorithm::ES384, _, Some(pem)) => {
+                Some(DecodingKey::from_ec_pem(pem.as_bytes()).map_err(|e| {
+                    AuthError::Config(format!("{algorithm:?} public key is not valid EC PEM: {e}"))
+                })?)
+            }
+            (Algorithm::EdDSA, _, Some(pem)) => {
+                Some(DecodingKey::from_ed_pem(pem.as_bytes()).map_err(|e| {
+                    AuthError::Config(format!("EdDSA public key is not valid PEM: {e}"))
+                })?)
+            }
+            (other, _, _) => {
+                return Err(AuthError::Config(format!(
+                    "JWT algorithm {other:?} is not supported"
+                )))
+            }
         };
 
         Ok(Self {
@@ -427,6 +487,10 @@ fn parse_algorithm(s: &str) -> Result<Algorithm, AuthError> {
         "RS512" => Ok(Algorithm::RS512),
         "ES256" => Ok(Algorithm::ES256),
         "ES384" => Ok(Algorithm::ES384),
+        "PS256" => Ok(Algorithm::PS256),
+        "PS384" => Ok(Algorithm::PS384),
+        "PS512" => Ok(Algorithm::PS512),
+        "EDDSA" => Ok(Algorithm::EdDSA),
         unknown => Err(AuthError::Config(format!(
             "unrecognized JWT algorithm: {unknown}"
         ))),
@@ -838,5 +902,100 @@ mod tests {
         let token = make_token(&claims, "any-secret");
         let err = validator.validate_async(&token).await.unwrap_err();
         assert!(matches!(err, AuthError::Config(_)));
+    }
+}
+
+#[cfg(test)]
+mod algorithm_family_tests {
+    use super::*;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use std::collections::HashMap;
+    use zeroize::Zeroizing;
+
+    /// A throwaway P-256 keypair, generated for this test alone and used
+    /// nowhere else. It is in the source so the test needs no fixtures.
+    const EC_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgftsCo6PP58Bktonn\nIQQdJB0xhCZr5vaXReMirLL6vfmhRANCAATI63Cp8AxIz8oL4Sfzwp/1r5j8o5v5\nQ2O3+N41eKFkFT/bk1oF8zP6Zz6OaOU7nfw77Pcn+DZz9GFp3ISD9rJK\n-----END PRIVATE KEY-----";
+    const EC_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEyOtwqfAMSM/KC+En88Kf9a+Y/KOb\n+UNjt/jeNXihZBU/25NaBfMz+mc+jmjlO538O+z3J/g2c/RhadyEg/aySg==\n-----END PUBLIC KEY-----";
+
+    fn claims() -> JwtClaims {
+        JwtClaims {
+            sub: Some("ec-user".into()),
+            exp: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600,
+            ),
+            iss: None,
+            aud: None,
+            iat: None,
+            email: None,
+            jti: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// ES256 had no key path at all: the only asymmetric branch parsed the
+    /// PEM as RSA, an EC key failed that, and the validator was left with
+    /// no key — so every token from an ES256 issuer got a 401.
+    #[test]
+    fn es256_verifies_a_token_signed_with_its_key() {
+        let config = JwtConfig {
+            algorithm: Some("ES256".into()),
+            public_key_pem: Some(Zeroizing::new(EC_PUBLIC_PEM.to_string())),
+            ..Default::default()
+        };
+        let validator = JwtValidator::new(config).expect("ES256 config must build");
+
+        let token = encode(
+            &Header::new(Algorithm::ES256),
+            &claims(),
+            &EncodingKey::from_ec_pem(EC_PRIVATE_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let validated = validator.validate(&token).expect("a valid ES256 token");
+        assert_eq!(validated.sub, Some("ec-user".into()));
+    }
+
+    /// The shape that used to fail silently: an asymmetric algorithm with a
+    /// `secret`. It built an HMAC key and rejected every real token, so the
+    /// operator saw 401s with a configuration that looked right.
+    #[test]
+    fn an_asymmetric_algorithm_with_a_secret_is_a_startup_error() {
+        let config = JwtConfig {
+            algorithm: Some("RS256".into()),
+            secret: Some(Zeroizing::new("a-secret-that-is-at-least-32-bytes!".into())),
+            ..Default::default()
+        };
+        let err = JwtValidator::new(config).expect_err("a secret cannot verify an RSA signature");
+        assert!(
+            err.to_string().contains("public key"),
+            "the error must say what to set instead: {err}"
+        );
+    }
+
+    /// The mirror case, so neither family can be configured with the
+    /// other's key material.
+    #[test]
+    fn an_hmac_algorithm_with_a_public_key_is_a_startup_error() {
+        let config = JwtConfig {
+            algorithm: Some("HS256".into()),
+            public_key_pem: Some(Zeroizing::new(EC_PUBLIC_PEM.to_string())),
+            ..Default::default()
+        };
+        assert!(JwtValidator::new(config).is_err());
+    }
+
+    /// Neither kind of material is fine: an OIDC deployment attaches a
+    /// JWKS cache afterwards and resolves each token by its `kid`.
+    #[test]
+    fn no_key_material_is_allowed_for_jwks() {
+        let config = JwtConfig {
+            algorithm: Some("RS256".into()),
+            ..Default::default()
+        };
+        assert!(JwtValidator::new(config).is_ok());
     }
 }

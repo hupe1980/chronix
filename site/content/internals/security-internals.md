@@ -53,71 +53,85 @@ Signature: HMAC-SHA256(header + payload, secret)
 
 ### Key Rotation
 
-Signing keys are rotated on a configurable schedule (default: 90 days).
-During rotation, both old and new keys are accepted for a grace period.
+Encryption keys rotate under a `RotationPolicy`, whose default `max_age` is
+**24 hours**; a policy may also rotate on invocation count, which is what
+keeps AES-GCM below its 2^32 limit for a random nonce. During rotation the
+previous key stays available for decryption, so data written under it stays
+readable.
+
+Chronix does not issue JWTs, so it rotates no signing keys; a JWT issuer's
+rotation is its own, and Chronix follows it through JWKS.
 
 ### JWKS Cache Staleness
 
-When using an external JWKS endpoint for key discovery, Chronix caches
-the fetched key set and enforces a **maximum stale duration of 24 hours**
-(configurable via `jwks_max_stale`). If the JWKS endpoint becomes
-unreachable, cached keys continue to be used within this window. Once
-the stale duration is exceeded, cached keys are discarded and all JWT
-validations fail-closed until the endpoint recovers.
+When using an external JWKS endpoint for key discovery, Chronix caches the
+fetched key set with a **24-hour maximum stale duration**, fixed rather than
+configurable. If the endpoint becomes unreachable, cached keys continue to be
+used within that window; once it is exceeded they are discarded and JWT
+validation fails closed until the endpoint recovers.
+
+The endpoint is fetched once at startup, so an unreachable issuer or one
+publishing no keys fails the start. Accepting the URL and never fetching it —
+which is what happened before — produced a server that authenticated nobody
+and gave no reason.
 
 ### API Key Rate Limiting
 
-API key authentication is protected by a per-source rate limiter to
-mitigate brute-force attacks. After **20 failed authentication attempts**
-within a **60-second sliding window**, subsequent attempts from the same
-source are immediately rejected with `AuthError::RateLimited`. The
-window resets after 60 seconds of no failures.
+API key authentication is protected by a **per-key-prefix** rate limiter to
+mitigate brute-force attacks. After **20 failed attempts** within a
+**60-second sliding window**, further attempts against that key are rejected
+with `AuthError::RateLimited`, and the window resets after 60 seconds without
+a failure. A global counter runs alongside it as a backstop against a
+distributed attempt. Limiting per prefix rather than per source is what stops
+one targeted key from locking out every other one.
 
 ## Authorization
 
-### Role-Based Access Control (RBAC)
+### Two layers, no built-in role table
 
-Permissions are grouped into roles:
+Roles are **names in a policy**, not a fixed set with fixed permissions.
+There is no `viewer`/`writer`/`admin` hierarchy.
 
-| Role | Read | Write | Admin | Query | Manage |
-|------|------|-------|-------|-------|--------|
-| `viewer` | ✓ | ✗ | ✗ | ✓ | ✗ |
-| `writer` | ✓ | ✓ | ✗ | ✓ | ✗ |
-| `analyst` | ✓ | ✗ | ✗ | ✓ | ✗ |
-| `admin` | ✓ | ✓ | ✓ | ✓ | ✓ |
+- **Cedar policies**, when `authz_policy_dir` is configured. A principal
+  carries whatever roles its JWT's `role_claim` names, and the policies
+  decide. Cedar is default-deny, so a role no policy mentions grants nothing.
+- **Capabilities on the credential**, which apply whether or not Cedar is
+  configured: the namespaces a credential may act in, and whether it may
+  perform administrative operations.
 
-### Namespace-Scoped Roles
+The second layer exists because the first is optional. An authorization
+model enforced only when an optional component is present is not an
+authorization model.
 
-Roles are scoped to **namespaces** (tenants). A user can be `admin`
-in namespace `development` but only `viewer` in `production`:
-
-```text
-user: alice
-  ├── development: admin
-  ├── staging: writer
-  └── production: viewer
-```
-
-### Policy Evaluation
+### Policy evaluation
 
 ```text
-Request: { user: "alice", action: "write", namespace: "production" }
+Request: alice, write, namespace "production"
 
-1. Lookup user's roles for namespace "production" → ["viewer"]
-2. Check if any role grants "write" permission → No
-3. Decision: DENY
+1. Is alice's credential allowed to act in "production"?   ← always checked
+2. If a Cedar policy directory is configured, does a policy
+   permit (alice + her roles, Write, production)?          ← default-deny
+3. Otherwise: allowed, unless the endpoint is administrative,
+   which requires the admin capability.
 ```
 
 ## Tenant Isolation
 
-### Data-Level Isolation
+### Data-level isolation
 
-Every data point is tagged with a **namespace ID**. The storage layer
-enforces isolation:
+Every data point carries a **namespace tag**, applied by the one write
+function every ingestion surface goes through, and every read is scoped where
+the data is reached rather than where the request is parsed.
 
-- Segment files are partitioned by namespace
-- Queries are automatically scoped to the authenticated namespace
-- Cross-namespace access requires explicit `admin` permission
+Segment files are **not** partitioned by namespace on disk: a tenant's
+segments sit alongside every other tenant's, named by flush time.
+`SegmentPath` carries a `NamespaceId`, but only the object-store tiering
+path constructs one and always with the default namespace, so it is not a
+second line of defence.
+
+So the tag stops a *request* from crossing tenants and does nothing about
+read access to the data directory. Encryption at rest and filesystem
+permissions cover that.
 
 ### Resource Isolation
 

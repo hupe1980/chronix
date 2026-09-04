@@ -111,7 +111,7 @@ import adbc_driver_flightsql.dbapi
 uri = ChronixClient.flight_sql_uri("localhost", 8817)
 conn = adbc_driver_flightsql.dbapi.connect(uri)
 cursor = conn.cursor()
-cursor.execute("SELECT * FROM cpu WHERE time > now() - INTERVAL '1 hour'")
+cursor.execute("SELECT * FROM cpu WHERE _time > now() - INTERVAL '1 hour'")
 table = cursor.fetch_arrow_table()
 df = table.to_pandas()
 ```
@@ -150,7 +150,7 @@ Chronix supports industry-standard protocols, enabling any client that speaks th
 Any InfluxDB v1/v2 client library can write to Chronix:
 
 ```
-POST /api/v1/write/influx
+POST /write
 Content-Type: text/plain
 
 cpu,host=a usage=42.5 1700000000000000000

@@ -252,6 +252,7 @@ pub fn filter_tombstoned(
     measurement: &str,
     tombstones: &TombstoneSet,
     tag_col_names: Option<&[&str]>,
+    segment_id: u64,
 ) -> Result<RecordBatch> {
     if tombstones.is_empty() || batch.num_rows() == 0 {
         return Ok(batch.clone());
@@ -285,7 +286,7 @@ pub fn filter_tombstoned(
         .map(|row| {
             let canonical = compute_series_canonical(measurement, &tag_columns, batch, row);
             let ts = ts_col.map_or(0, |a| a.value(row));
-            !tombstones.is_tombstoned(&canonical, ts)
+            !tombstones.is_tombstoned_in(&canonical, ts, segment_id)
         })
         .collect();
 
@@ -541,11 +542,15 @@ mod tests {
 
         // Tombstone for the canonical form of cpu{host=host-a}
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(chronix_core::Tombstone::all_time(
-            chronix_core::canonical_from_pairs("cpu", [("host", "host-a")]),
-        ));
+        tombstones.insert(
+            chronix_core::Tombstone::all_time(chronix_core::canonical_from_pairs(
+                "cpu",
+                [("host", "host-a")],
+            ))
+            .with_segments([1]),
+        );
 
-        let result = filter_tombstoned(&batch, "cpu", &tombstones, Some(&["host"])).unwrap();
+        let result = filter_tombstoned(&batch, "cpu", &tombstones, Some(&["host"]), 1).unwrap();
         // Only "host-b" rows should survive
         assert_eq!(result.num_rows(), 1);
     }
@@ -571,11 +576,15 @@ mod tests {
 
         // Use heuristic (no explicit tag_col_names)
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(chronix_core::Tombstone::all_time(
-            chronix_core::canonical_from_pairs("cpu", [("host", "host-x")]),
-        ));
+        tombstones.insert(
+            chronix_core::Tombstone::all_time(chronix_core::canonical_from_pairs(
+                "cpu",
+                [("host", "host-x")],
+            ))
+            .with_segments([1]),
+        );
 
-        let result = filter_tombstoned(&batch, "cpu", &tombstones, None).unwrap();
+        let result = filter_tombstoned(&batch, "cpu", &tombstones, None, 1).unwrap();
         assert_eq!(result.num_rows(), 1);
     }
 }

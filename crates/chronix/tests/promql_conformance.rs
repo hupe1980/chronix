@@ -823,3 +823,750 @@ fn date_functions_reject_extra_arguments() {
     };
     assert!(ev.instant_query(&expr, &params).is_err());
 }
+
+// ── Range-query step arithmetic ─────────────────────────────────────────
+//
+// The step loop was `t += step` on an `i64`. A range whose `end` sits near
+// `i64::MAX` overflows it: in a debug build that panics, and in a **release**
+// build it wraps to a large negative number, `t <= end` stays true, and the
+// loop never terminates. The evaluation runs inside `spawn_blocking`, so the
+// caller's timeout returns to the client while the blocking thread spins for
+// ever — a handful of such queries retires every blocking thread the server
+// has.
+//
+// The server's point-count guard does not catch it. A *large* step keeps the
+// point count small: `end = i64::MAX` with a step of `i64::MAX / 2` is three
+// evaluation points, which every limit admits.
+
+/// A range whose last step would overflow must terminate.
+#[test]
+fn a_range_query_near_the_end_of_time_terminates() {
+    let key = SeriesKey::new("up", tags! { "job" => "j" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 1.0 }, 0).unwrap()]);
+    let expr = promql::parse("up").unwrap();
+    let evaluator = PromQLEvaluator::new(db);
+
+    let params = promql::eval::QueryParams {
+        time: i64::MAX,
+        start: Some(0),
+        end: Some(i64::MAX),
+        step: Some(i64::MAX / 2),
+        ..Default::default()
+    };
+
+    // The property is termination. A wrong answer here would be a different
+    // bug; an answer at all is the one being asserted.
+    let result = evaluator.range_query(&expr, &params);
+    assert!(
+        result.is_ok(),
+        "a range query at the end of the i64 domain must answer, got {result:?}"
+    );
+}
+
+/// A step count beyond the budget is refused, rather than evaluated.
+#[test]
+fn an_unbounded_step_count_is_refused() {
+    let key = SeriesKey::new("up", tags! { "job" => "j" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 1.0 }, 0).unwrap()]);
+    let expr = promql::parse("up").unwrap();
+    let evaluator = PromQLEvaluator::new(db);
+
+    let params = promql::eval::QueryParams {
+        time: 0,
+        start: Some(0),
+        end: Some(1_000_000_000_000_000),
+        step: Some(1), // one nanosecond: 10^15 steps
+        ..Default::default()
+    };
+
+    let err = evaluator
+        .range_query(&expr, &params)
+        .expect_err("10^15 evaluation points must be refused, not attempted");
+    assert!(
+        err.to_string().contains("evaluation points"),
+        "the error must name the limit, got: {err}"
+    );
+}
+
+// ══ Deviations from Prometheus, each derived from the upstream source ══
+//
+// Every test below states the upstream rule it encodes and where it comes
+// from in `prometheus/promql`. A backlog entry is not evidence: one of these
+// claims turned out to describe behaviour this evaluator already had right.
+
+/// `scalar < vector` keeps the **vector element's** value, not the scalar's.
+///
+/// `engine.go`, `VectorscalarBinop`: "Catch cases where the scalar is the LHS
+/// in a scalar-vector comparison operation. We want to always keep the vector
+/// element value as the output value, even if it's on the RHS."
+#[test]
+fn a_scalar_on_the_left_of_a_comparison_keeps_the_vectors_value() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 42.0 }, 10 * SEC).unwrap()]);
+
+    // The vector is on the right: 2 < 42 is true, and the result is 42.
+    assert_eq!(one_value(&db, "2 < m", 10 * SEC), 42.0);
+    // And on the left, for the same reason.
+    assert_eq!(one_value(&db, "m > 2", 10 * SEC), 42.0);
+    // A false comparison drops the sample from either side.
+    assert!(instant(&db, "100 < m", 10 * SEC).is_empty());
+    assert!(instant(&db, "m > 100", 10 * SEC).is_empty());
+
+    // With `bool`, the value is 1 or 0 whichever side the scalar is on.
+    assert_eq!(one_value(&db, "2 < bool m", 10 * SEC), 1.0);
+    assert_eq!(one_value(&db, "100 < bool m", 10 * SEC), 0.0);
+    assert_eq!(one_value(&db, "m > bool 2", 10 * SEC), 1.0);
+}
+
+/// Arithmetic with a scalar on the left applies in the written order.
+#[test]
+fn a_scalar_on_the_left_of_arithmetic_is_not_commuted() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 4.0 }, 10 * SEC).unwrap()]);
+    assert_eq!(one_value(&db, "10 - m", 10 * SEC), 6.0);
+    assert_eq!(one_value(&db, "m - 10", 10 * SEC), -6.0);
+    assert_eq!(one_value(&db, "10 / m", 10 * SEC), 2.5);
+}
+
+/// A duplicate on the "one" side of a `group_left` is an error.
+///
+/// `engine.go`, `VectorBinop`: "found duplicate series for the match group
+/// … on the right hand-side of the operation". Silently doing many-to-many
+/// instead produces a cross product, which is a wrong answer rather than a
+/// missing feature.
+#[test]
+fn a_duplicate_on_the_one_side_of_group_left_is_rejected() {
+    let many = |host: &str| {
+        SeriesKey::new("http_requests", tags! { "host" => host, "code" => "200" }).unwrap()
+    };
+    // Two `info` series that collapse to the same label set on `host` — the
+    // duplicate the "one" side must not have.
+    let one_a = SeriesKey::new("info", tags! { "host" => "a", "dc" => "east" }).unwrap();
+    let one_b = SeriesKey::new("info", tags! { "host" => "a", "dc" => "west" }).unwrap();
+
+    let db = db_with(&[
+        Point::new(many("a"), fields! { "value" => 1.0 }, 10 * SEC).unwrap(),
+        Point::new(one_a, fields! { "value" => 1.0 }, 10 * SEC).unwrap(),
+        Point::new(one_b, fields! { "value" => 1.0 }, 10 * SEC).unwrap(),
+    ]);
+
+    let expr = promql::parse("http_requests * on(host) group_left(dc) info").unwrap();
+    let ev = PromQLEvaluator::new(db);
+    let params = promql::eval::QueryParams {
+        time: 10 * SEC,
+        ..Default::default()
+    };
+    let err = ev
+        .instant_query(&expr, &params)
+        .expect_err("a duplicate on the `one` side must be an error, not a cross product");
+    assert!(
+        err.to_string().contains("duplicate"),
+        "the error must name the problem, got: {err}"
+    );
+}
+
+/// `deriv` and `idelta` drop a series they cannot compute, rather than
+/// emitting NaN.
+///
+/// `functions.go`: `funcDeriv` returns `enh.Out` unchanged when
+/// `len(samples.Floats) < 2`, and `funcIdelta` likewise — an absent sample,
+/// not a NaN one. A NaN reaches a dashboard as a gap *with* a series in the
+/// legend, which reads as "broken" rather than "no data".
+#[test]
+fn deriv_and_idelta_drop_a_series_they_cannot_compute() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    // One sample in the range: neither function has two points to work with.
+    let db = db_with(&[Point::new(key, fields! { "value" => 1.0 }, 100 * SEC).unwrap()]);
+
+    for q in ["deriv(m[30s])", "idelta(m[30s])"] {
+        let r = instant(&db, q, 100 * SEC);
+        assert!(r.is_empty(), "{q} must drop the series, got {r:?}");
+    }
+}
+
+/// `last_over_time` keeps `__name__`; every other `_over_time` drops it.
+///
+/// `functions.go`: the `_over_time` family calls `dropSeriesName` through
+/// `aggrOverTime`, but `funcLastOverTime` is registered without it — it is
+/// the one that returns an actual sample of the original series.
+#[test]
+fn last_over_time_keeps_the_metric_name_and_the_others_drop_it() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[
+        Point::new(key.clone(), fields! { "value" => 1.0 }, 10 * SEC).unwrap(),
+        Point::new(key, fields! { "value" => 2.0 }, 20 * SEC).unwrap(),
+    ]);
+
+    let has_name = |q: &str| {
+        instant(&db, q, 30 * SEC)
+            .first()
+            .is_some_and(|(labels, _)| labels.iter().any(|(k, _)| k == "__name__"))
+    };
+
+    assert!(
+        has_name("last_over_time(m[30s])"),
+        "last_over_time keeps it"
+    );
+    for q in [
+        "avg_over_time(m[30s])",
+        "max_over_time(m[30s])",
+        "sum_over_time(m[30s])",
+        "count_over_time(m[30s])",
+    ] {
+        assert!(!has_name(q), "{q} must drop __name__");
+    }
+}
+
+/// `timestamp()` drops `__name__`.
+///
+/// `functions.go`, `funcTimestamp`: it builds `enh.DropMetricName(el.Metric)`.
+/// The value is a timestamp, not a measurement of the original metric, so
+/// keeping the name would let `timestamp(m)` and `m` collide in a binary op.
+#[test]
+fn timestamp_drops_the_metric_name() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 5.0 }, 10 * SEC).unwrap()]);
+    let r = instant(&db, "timestamp(m)", 10 * SEC);
+    assert_eq!(r.len(), 1);
+    assert!(
+        !r[0].0.iter().any(|(k, _)| k == "__name__"),
+        "timestamp() must drop __name__, got {:?}",
+        r[0].0
+    );
+    assert_eq!(r[0].1, 10.0, "the value is the sample's time in seconds");
+}
+
+/// `offset` after anything but a selector is a parse error.
+///
+/// Prometheus's grammar attaches `offset` to a `VectorSelector`,
+/// `MatrixSelector` or `SubqueryExpr` only; `sum(m) offset 5m` fails with
+/// "offset modifier must be preceded by an instant vector selector or range
+/// vector selector or a subquery". Parsing and discarding it is worse than
+/// refusing: the query looks like it shifted and did not.
+#[test]
+fn an_offset_after_a_non_selector_is_a_parse_error() {
+    for q in [
+        "sum(m) offset 5m",
+        "(m + 1) offset 5m",
+        "rate(m[5m]) offset 5m",
+    ] {
+        assert!(
+            promql::parse(q).is_err(),
+            "{q} must be refused: offset only follows a selector or a subquery"
+        );
+    }
+    // Where it is allowed, it still parses.
+    for q in ["m offset 5m", "rate(m[5m] offset 5m)", "m[5m:1m] offset 5m"] {
+        assert!(promql::parse(q).is_ok(), "{q} must parse");
+    }
+}
+
+/// A negative offset shifts forward in time.
+///
+/// Prometheus 2.26+ with `--enable-feature=promql-negative-offset`, and
+/// unconditional in 3.x.
+#[test]
+fn a_negative_offset_shifts_forward() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[
+        Point::new(key.clone(), fields! { "value" => 1.0 }, 10 * SEC).unwrap(),
+        Point::new(key, fields! { "value" => 2.0 }, 20 * SEC).unwrap(),
+    ]);
+    // At t=10s, `offset -10s` looks at t=20s.
+    assert_eq!(one_value(&db, "m offset -10s", 10 * SEC), 2.0);
+    assert_eq!(one_value(&db, "m offset 10s", 20 * SEC), 1.0);
+}
+
+/// `@` pins an evaluation to an absolute timestamp.
+///
+/// Prometheus 2.25+; `@ start()` and `@ end()` resolve to the range query's
+/// bounds. The point of it is that a query can compare a live value against a
+/// fixed one.
+#[test]
+fn the_at_modifier_pins_an_evaluation_time() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[
+        Point::new(key.clone(), fields! { "value" => 1.0 }, 10 * SEC).unwrap(),
+        Point::new(key, fields! { "value" => 2.0 }, 20 * SEC).unwrap(),
+    ]);
+    // Whatever the evaluation time, `@ 10` reads the sample at t=10s.
+    assert_eq!(one_value(&db, "m @ 10", 20 * SEC), 1.0);
+    assert_eq!(one_value(&db, "m @ 20", 10 * SEC), 2.0);
+}
+
+/// A subquery with no step uses the 1-minute default, not the outer step.
+///
+/// `parser`: `SubqueryExpr.Step == 0` means "use the default evaluation
+/// interval", which the engine fills from its own configuration (1m in every
+/// standard deployment). Resolving it against the *outer* step makes the same
+/// query mean different things at different resolutions.
+#[test]
+fn a_step_less_subquery_uses_the_default_step() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    // One sample per 30s over 10 minutes.
+    let points: Vec<Point> = (0..20)
+        .map(|i| Point::new(key.clone(), fields! { "value" => 1.0 }, i * 30 * SEC).unwrap())
+        .collect();
+    let db = db_with(&points);
+
+    // `m[5m:]` over a 5-minute window at a 1-minute default step is 5 or 6
+    // points, never the ~300 an outer step of 1s would give.
+    let n = one_value(&db, "count_over_time(m[5m:])", 600 * SEC);
+    assert!(
+        (5.0..=6.0).contains(&n),
+        "a step-less subquery must use the 1m default; got {n} points"
+    );
+}
+
+// ══ Subqueries ══════════════════════════════════════════════════════════
+//
+// A subquery `expr[range:step]` evaluates `expr` as an instant query at each
+// point of an absolute step grid and hands the results up as a range vector.
+// Four properties of that follow from `engine.go`'s `evalSubquery` and the
+// `*parser.SubqueryExpr` case of `eval`, and each was wrong here.
+
+/// Every sample of a subquery carries its **step** timestamp.
+///
+/// The inner expression is evaluated *at* each grid point, so that is the
+/// instant its result belongs to. Chronix pushed the inner sample through
+/// unchanged, which carries the raw scrape time — so two adjacent steps that
+/// saw the same newest sample emitted the same timestamp twice. A range vector
+/// with duplicate timestamps is not one, and `irate` over it sees `dt == 0`.
+#[test]
+fn subquery_samples_carry_step_timestamps() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    // Samples every 60s, so a 10s subquery step re-reads the same sample six
+    // times in a row — the case that produced duplicates.
+    let points: Vec<Point> = (0..6)
+        .map(|i| {
+            Point::new(
+                key.clone(),
+                fields! { "value" => (i * 10) as f64 },
+                i * 60 * SEC,
+            )
+            .unwrap()
+        })
+        .collect();
+    let db = db_with(&points);
+
+    let expr = promql::parse("m[100s:10s]").unwrap();
+    let ev = PromQLEvaluator::new(db);
+    let params = promql::eval::QueryParams {
+        time: 300 * SEC,
+        ..Default::default()
+    };
+    let promql::PromQLValue::Matrix(series) = ev.instant_query(&expr, &params).unwrap() else {
+        panic!("a subquery is a range vector");
+    };
+    assert_eq!(series.len(), 1);
+    let ts: Vec<i64> = series[0].samples.iter().map(|s| s.timestamp).collect();
+
+    let mut sorted = ts.clone();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        ts.len(),
+        "a range vector must not have duplicate timestamps, got {ts:?}"
+    );
+    assert!(
+        ts.windows(2).all(|w| w[1] - w[0] == 10 * SEC),
+        "samples must land on the 10s step grid, got {ts:?}"
+    );
+}
+
+/// `irate` over a subquery still works, which it cannot with duplicate
+/// timestamps: the last two samples would be `dt == 0` apart.
+#[test]
+fn irate_over_a_subquery_answers() {
+    let key = SeriesKey::new("c", tags! { "host" => "a" }).unwrap();
+    // A counter climbing by 1 per second, scraped every 15s.
+    let points: Vec<Point> = (0..40)
+        .map(|i| {
+            Point::new(
+                key.clone(),
+                fields! { "value" => (i * 15) as f64 },
+                i * 15 * SEC,
+            )
+            .unwrap()
+        })
+        .collect();
+    let db = db_with(&points);
+
+    let v = one_value(&db, "irate(c[5m:30s])", 500 * SEC);
+    assert!(
+        (v - 1.0).abs() < 1e-6,
+        "irate over a subquery of a 1/s counter must be 1.0, got {v}"
+    );
+}
+
+/// `rate` over a subquery extrapolates, exactly as over a range selector.
+///
+/// The range comes from the subquery's own `[range:...]`. Chronix's
+/// `extract_range_ns` matched only `MatrixSelector`, so a subquery got no
+/// range and therefore no extrapolation — the same query over `[5m]` and
+/// `[5m:15s]` gave different answers for the same data.
+#[test]
+fn rate_over_a_subquery_extrapolates_like_a_range_selector() {
+    let key = SeriesKey::new("c", tags! { "host" => "a" }).unwrap();
+    let points: Vec<Point> = (0..60)
+        .map(|i| {
+            Point::new(
+                key.clone(),
+                fields! { "value" => (i * 15) as f64 },
+                i * 15 * SEC,
+            )
+            .unwrap()
+        })
+        .collect();
+    let db = db_with(&points);
+
+    let direct = one_value(&db, "rate(c[5m])", 600 * SEC);
+    let sub = one_value(&db, "rate(c[5m:15s])", 600 * SEC);
+    assert!(
+        (direct - 1.0).abs() < 1e-6,
+        "the range-selector form must be 1.0/s, got {direct}"
+    );
+    assert!(
+        (sub - direct).abs() < 0.05,
+        "the subquery form must agree with the range-selector form: {sub} vs {direct}"
+    );
+}
+
+/// The subquery window is **left-open** on the step grid.
+///
+/// `engine.go`: the start is advanced by one interval when it lands exactly on
+/// `start - offset - range`, so a point on the older boundary belongs to the
+/// previous window. Left-closed instead makes an evenly-sampled series produce
+/// n+1 points in some windows and n in others.
+#[test]
+fn a_subquery_window_excludes_its_left_boundary() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let points: Vec<Point> = (0..40)
+        .map(|i| Point::new(key.clone(), fields! { "value" => 1.0 }, i * 10 * SEC).unwrap())
+        .collect();
+    let db = db_with(&points);
+
+    // A 100s window on a 10s grid ending at 300s covers (200s, 300s] — ten
+    // points, not eleven.
+    let n = one_value(&db, "count_over_time(m[100s:10s])", 300 * SEC);
+    assert_eq!(
+        n, 10.0,
+        "a 100s window at a 10s step is 10 points, not 11 — the left edge is open"
+    );
+}
+
+/// In a **range** query, a step-less subquery still uses the 1-minute default
+/// rather than the outer step.
+///
+/// `noStepSubqueryIntervalFn` is the engine's own evaluation interval, which
+/// has nothing to do with the resolution the caller asked for. Resolving it
+/// against the outer step makes the same dashboard panel mean different things
+/// at different zoom levels — and at a 1-second step it is 300 inner
+/// evaluations per outer step instead of 5.
+#[test]
+fn a_step_less_subquery_in_a_range_query_uses_the_default_step() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let points: Vec<Point> = (0..40)
+        .map(|i| Point::new(key.clone(), fields! { "value" => 1.0 }, i * 30 * SEC).unwrap())
+        .collect();
+    let db = db_with(&points);
+
+    // A range query at a 30s step. If the subquery inherited it, a 5m window
+    // would hold ~10 points; at the 1m default it holds 5.
+    let series = range(
+        &db,
+        "count_over_time(m[5m:])",
+        900 * SEC,
+        1_000 * SEC,
+        30 * SEC,
+    );
+    assert_eq!(series.len(), 1);
+    for (_, v) in &series[0] {
+        assert!(
+            (5.0..=6.0).contains(v),
+            "the subquery must use the 1m default step, not the outer 30s one; got {v}"
+        );
+    }
+}
+
+/// A range query containing a subquery reads storage once, not once per step.
+///
+/// The subquery derived its inner selectors' prefetch window from its **own**
+/// per-step window, which moves with the outer step — so every outer step
+/// missed the scan cache, and the eight-entry cap meant the misses could not
+/// even accumulate into hits. `max_over_time(rate(x[5m])[1h:1m])` over 200
+/// outer steps did 200 widening scans of the same data, each of them the whole
+/// hour. The window the *outer* query already prefetches covers every inner
+/// step, and is the same at all of them.
+#[test]
+fn a_range_query_with_a_subquery_reads_its_window_once() {
+    let key = SeriesKey::new("cpu", tags! { "host" => "a" }).unwrap();
+    let points: Vec<Point> = (0..400)
+        .map(|i| {
+            Point::new(
+                key.clone(),
+                fields! { "value" => f64::from(i) },
+                i64::from(i) * 15 * SEC,
+            )
+            .unwrap()
+        })
+        .collect();
+    let db = db_with(&points);
+
+    for query in [
+        "max_over_time(cpu[10m:1m])",
+        "max_over_time(rate(cpu[5m])[10m:1m])",
+    ] {
+        let expr = promql::parse(query).unwrap();
+        let ev = PromQLEvaluator::new(db.clone());
+        let params = promql::eval::QueryParams {
+            time: 0,
+            start: Some(3_000 * SEC),
+            end: Some(4_200 * SEC),
+            step: Some(60 * SEC),
+            ..Default::default()
+        };
+        ev.range_query(&expr, &params).unwrap();
+
+        let stats = ev.scan_stats();
+        assert_eq!(
+            stats.scans, 1,
+            "{query}: the whole range query must read storage once, not {} times",
+            stats.scans
+        );
+    }
+}
+
+/// `sort` and `sort_desc` both put NaN **last**.
+///
+/// `functions.go` comments it twice — "NaN should sort to the bottom" — and
+/// implements it by sorting NaN-first and reversing, in both directions. The
+/// backlog claimed Prometheus sorts NaN first; it does not, and this
+/// evaluator already agreed with the real behaviour. Pinned so the claim
+/// cannot come back.
+#[test]
+fn both_sorts_put_nan_last() {
+    // The write path refuses a non-finite field, so the NaN is produced the
+    // way a query produces one: `0 / 0` for host b.
+    let mk = |m: &str, host: &str, v: f64| {
+        Point::new(
+            SeriesKey::new(m, tags! { "host" => host }).unwrap(),
+            fields! { "value" => v },
+            10 * SEC,
+        )
+        .unwrap()
+    };
+    let db = db_with(&[
+        mk("load", "a", 2.0),
+        mk("load", "b", 0.0),
+        mk("load", "c", 1.0),
+        mk("d", "a", 1.0),
+        mk("d", "b", 0.0),
+        mk("d", "c", 1.0),
+    ]);
+    let m = "load / on(host) d";
+
+    for query in [format!("sort({m})"), format!("sort_desc({m})")] {
+        let query = query.as_str();
+        let r = instant(&db, query, 10 * SEC);
+        assert_eq!(r.len(), 3, "{query}");
+        assert!(
+            r.last().unwrap().1.is_nan(),
+            "{query}: NaN must sort last, got {:?}",
+            r.iter().map(|(_, v)| *v).collect::<Vec<_>>()
+        );
+    }
+    // …and the finite values are ordered in each direction.
+    let asc: Vec<f64> = instant(&db, &format!("sort({m})"), 10 * SEC)
+        .iter()
+        .map(|(_, v)| *v)
+        .take(2)
+        .collect();
+    assert_eq!(asc, vec![1.0, 2.0]);
+    let desc: Vec<f64> = instant(&db, &format!("sort_desc({m})"), 10 * SEC)
+        .iter()
+        .map(|(_, v)| *v)
+        .take(2)
+        .collect();
+    assert_eq!(desc, vec![2.0, 1.0]);
+}
+
+/// IEEE-754 arithmetic reaches the result, unchanged.
+///
+/// Prometheus does no special-casing here: `1/0` is `+Inf`, `0/0` is NaN, and
+/// `%` follows Go's `math.Mod`. A database that "helpfully" errors or zeroes
+/// these disagrees with every recording rule written against Prometheus.
+#[test]
+fn division_and_modulo_follow_ieee_754() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 1.0 }, 10 * SEC).unwrap()]);
+
+    assert_eq!(one_value(&db, "m / 0", 10 * SEC), f64::INFINITY);
+    assert_eq!(one_value(&db, "-m / 0", 10 * SEC), f64::NEG_INFINITY);
+    assert!(one_value(&db, "(m - m) / 0", 10 * SEC).is_nan());
+    assert!(one_value(&db, "m % 0", 10 * SEC).is_nan());
+    assert_eq!(one_value(&db, "m ^ 0", 10 * SEC), 1.0);
+}
+
+/// `clamp` family: NaN input stays NaN, and `clamp` with min > max is empty.
+///
+/// `functions.go`, `funcClamp`: "if min > max, return an empty vector".
+#[test]
+fn clamp_follows_the_upstream_edge_cases() {
+    let mk = |m: &str, host: &str, v: f64| {
+        Point::new(
+            SeriesKey::new(m, tags! { "host" => host }).unwrap(),
+            fields! { "value" => v },
+            10 * SEC,
+        )
+        .unwrap()
+    };
+    // host a is 5, host b is 0/0 = NaN.
+    let db = db_with(&[
+        mk("load", "a", 5.0),
+        mk("load", "b", 0.0),
+        mk("d", "a", 1.0),
+        mk("d", "b", 0.0),
+    ]);
+    let m = "load / on(host) d";
+
+    let clamped = instant(&db, &format!("clamp({m}, 0, 3)"), 10 * SEC);
+    assert_eq!(clamped.len(), 2);
+    let finite: Vec<f64> = clamped
+        .iter()
+        .map(|(_, v)| *v)
+        .filter(|v| !v.is_nan())
+        .collect();
+    assert_eq!(finite, vec![3.0], "5 clamps to the maximum");
+    assert!(
+        clamped.iter().any(|(_, v)| v.is_nan()),
+        "a NaN sample stays NaN rather than clamping to a bound"
+    );
+
+    assert!(
+        instant(&db, &format!("clamp({m}, 10, 3)"), 10 * SEC).is_empty(),
+        "min > max is an empty vector"
+    );
+}
+
+/// `round` rounds ties **up**, and a zero step yields NaN.
+///
+/// `functions.go`, `funcRound`, computes `Floor(f/toNearest + 0.5) *
+/// toNearest`, so a `toNearest` of zero is `Floor(Inf)/Inf` — NaN. That is a
+/// quirk of the arithmetic rather than a decision, and it is pinned here
+/// because "fall back to 1" is the plausible-looking answer that would
+/// disagree with every Prometheus deployment.
+#[test]
+fn round_rounds_ties_up_and_a_zero_step_is_nan() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 2.5 }, 10 * SEC).unwrap()]);
+    // Ties go toward +Inf, not away from zero: 2.5 rounds to 3, not to 2.
+    assert_eq!(one_value(&db, "round(m)", 10 * SEC), 3.0);
+    assert_eq!(one_value(&db, "round(m, 0.5)", 10 * SEC), 2.5);
+    assert!(one_value(&db, "round(m, 0)", 10 * SEC).is_nan());
+}
+
+/// `quantile` outside `[0, 1]` yields ±Inf, not an error.
+///
+/// `aggregations.go`: `q < 0` gives `-Inf`, `q > 1` gives `+Inf`, both with a
+/// warning annotation. Erroring instead breaks a dashboard whose variable
+/// briefly holds a bad value.
+#[test]
+fn an_out_of_range_quantile_is_infinite_not_an_error() {
+    let s = |host: &str| SeriesKey::new("m", tags! { "host" => host }).unwrap();
+    let db = db_with(&[
+        Point::new(s("a"), fields! { "value" => 1.0 }, 10 * SEC).unwrap(),
+        Point::new(s("b"), fields! { "value" => 2.0 }, 10 * SEC).unwrap(),
+    ]);
+    assert_eq!(one_value(&db, "quantile(1.5, m)", 10 * SEC), f64::INFINITY);
+    assert_eq!(
+        one_value(&db, "quantile(-0.5, m)", 10 * SEC),
+        f64::NEG_INFINITY
+    );
+    assert_eq!(one_value(&db, "quantile(0.5, m)", 10 * SEC), 1.5);
+}
+
+/// `label_replace` with an invalid destination label is an error; a
+/// non-matching regex leaves the series untouched.
+#[test]
+fn label_replace_validates_its_destination() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let db = db_with(&[Point::new(key, fields! { "value" => 1.0 }, 10 * SEC).unwrap()]);
+
+    let expr = promql::parse(r#"label_replace(m, "1bad", "$1", "host", "(.*)")"#).unwrap();
+    let ev = PromQLEvaluator::new(db.clone());
+    let params = promql::eval::QueryParams {
+        time: 10 * SEC,
+        ..Default::default()
+    };
+    assert!(
+        ev.instant_query(&expr, &params).is_err(),
+        "an invalid label name must be refused"
+    );
+
+    // A regex that does not match leaves the series as it was.
+    let r = instant(
+        &db,
+        r#"label_replace(m, "dc", "$1", "host", "zzz(.*)")"#,
+        10 * SEC,
+    );
+    assert_eq!(r.len(), 1);
+    assert!(
+        !r[0].0.iter().any(|(k, _)| k == "dc"),
+        "a non-matching regex must not add the destination label"
+    );
+}
+
+/// `@ start()` and `@ end()` resolve to the **range query's** bounds at every
+/// step, not to the step's own time.
+///
+/// That is the entire point of them: `rate(x[5m]) / rate(x[5m] @ start())`
+/// compares each step against one fixed baseline, and a `start()` that
+/// resolved per step would compare every step against itself and return 1.
+#[test]
+fn at_start_and_end_resolve_to_the_range_querys_bounds() {
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    // A ramp: value == t in seconds.
+    let points: Vec<Point> = (0..30)
+        .map(|i| {
+            Point::new(
+                key.clone(),
+                fields! { "value" => (i * 10) as f64 },
+                i * 10 * SEC,
+            )
+            .unwrap()
+        })
+        .collect();
+    let db = db_with(&points);
+
+    // `m @ start()` must be the same value at every step — the sample at the
+    // query's start — while `m` itself climbs.
+    let pinned = range(&db, "m @ start()", 100 * SEC, 200 * SEC, 20 * SEC);
+    assert_eq!(pinned.len(), 1);
+    let values: Vec<f64> = pinned[0].iter().map(|(_, v)| *v).collect();
+    assert!(
+        values
+            .windows(2)
+            .all(|w| (w[0] - w[1]).abs() < f64::EPSILON),
+        "`@ start()` must be constant across steps, got {values:?}"
+    );
+    assert!(
+        (values[0] - 100.0).abs() < f64::EPSILON,
+        "`@ start()` must read the sample at the query start (100), got {}",
+        values[0]
+    );
+
+    // `@ end()` likewise, at the query's end.
+    let pinned = range(&db, "m @ end()", 100 * SEC, 200 * SEC, 20 * SEC);
+    let values: Vec<f64> = pinned[0].iter().map(|(_, v)| *v).collect();
+    assert!(
+        values.iter().all(|v| (v - 200.0).abs() < f64::EPSILON),
+        "`@ end()` must read the sample at the query end (200), got {values:?}"
+    );
+
+    // Without the modifier the same selector climbs, which is what makes the
+    // assertion above mean something.
+    let moving = range(&db, "m", 100 * SEC, 200 * SEC, 20 * SEC);
+    let values: Vec<f64> = moving[0].iter().map(|(_, v)| *v).collect();
+    assert_eq!(values, vec![100.0, 120.0, 140.0, 160.0, 180.0, 200.0]);
+}

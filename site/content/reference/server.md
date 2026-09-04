@@ -27,8 +27,8 @@ embedded `Chronix` database with multi-protocol network access.
 │               └────────┬────────┘                                    │
 │                        │                                             │
 │  ┌─────────────────────┼────────────────────────┐                    │
-│  │ CompactionScheduler │ Prometheus Metrics      │                   │
-│  │ (background Tokio)  │ (metrics-exporter-prom) │                   │
+│  │ chronix maintenance │ Prometheus Metrics      │                   │
+│  │ thread (built in)   │ (metrics-exporter-prom) │                   │
 │  └─────────────────────┴────────────────────────┘                    │
 │                                                                     │
 │  ┌──────────────── ConnectorManager ────────────────┐               │
@@ -277,7 +277,9 @@ Common parsing and conversion utilities shared across HTTP, Kafka, and MQTT:
 
 ### OpenTelemetry OTLP
 
-- `POST /api/v1/otlp/metrics` — Accepts OTLP metrics (protobuf + JSON).
+- `POST /v1/metrics` — the path the OpenTelemetry Collector's `otlphttp`
+  exporter derives from its endpoint. Accepts OTLP metrics (protobuf and
+  JSON), gzipped or not. `POST /api/v1/otlp/metrics` is an alias.
   Maps gauge, sum, histogram, summary → Chronix measurements + fields.
   Resource attributes → tags.
 ## Metrics / Observability
@@ -290,14 +292,22 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | Metric | Type | Emitted From | Description |
 |--------|------|--------------|-------------|
 | `chronix_compaction_backpressure_active` | Gauge | `apply_backpressure()` | 1.0 when write throttling is active, 0.0 otherwise |
+| `chronix_memtable_memory_bytes` | Gauge | `statistics()` | Memtable rows and index entries |
+| `chronix_interner_memory_bytes` | Gauge | `statistics()` | String interners — grows with cardinality, not row count |
+| `chronix_wal_buffer_bytes` | Gauge | `statistics()` | WAL writer's buffer; fixed size |
+| `chronix_catalog_memory_bytes` | Gauge | `statistics()` | Segment catalog, schema registry and tombstones |
 | `chronix_retention_shards_dropped_total` | Counter | `enforce_retention()` | Number of shards dropped by retention enforcement |
 | `chronix_gc_segments_deleted_total` | Counter | `gc_with_grace()` | Number of segments hard-deleted by garbage collection |
-| `chronix_rollup_computations_total` | Counter | `compact()` | Number of rollup computations performed during compaction |
+| `chronix_rollup_invalidations_total` | Counter | `backfill()`, `execute_delete()` | Rollups whose buckets were marked for recomputation by a late write or a delete |
+| `chronix_rollup_ranges_recomputed_total` | Counter | `materialise_rollups()` | Invalidated ranges recomputed |
+| `chronix_rollup_failures_total` | Counter | `materialise_rollups()` | Rollups whose materialisation failed this pass (the others still run) |
+| `chronix_cold_archive_groups_awaiting_rollup_total` | Counter | `archive_cold_segments()` | `(measurement, shard)` groups kept hot because a rollup has not caught up |
+| `chronix_cold_archive_groups_incomplete_total` | Counter | `archive_cold_segments()` | Groups kept hot because another segment or an unflushed row overlaps their range |
+| `chronix_cold_archive_objects_total` | Counter | `archive_cold_segments()` | Archive objects uploaded and verified |
+| `chronix_cold_archive_rows_total` | Counter | `archive_cold_segments()` | Rows written to the archive, after dedup and tombstones |
+| `chronix_rollup_points_written_total` | Counter | `materialise_rollups()` | Rollup points written by materialisation |
+| `chronix_retention_segments_awaiting_rollup_total` | Counter | `enforce_retention()` | Expired segments preserved because a rollup they feed is not yet materialised past them |
 | `chronix_rollup_rows_processed_total` | Counter | `compact()` | Number of input rows processed for rollup aggregation |
-| `chronix_warm_tier_shards_moved_total` | Counter | `warm_tier_migrate()` | Number of shards moved to warm tier |
-| `chronix_warm_tier_bytes_saved_total` | Counter | `warm_tier_migrate()` | Bytes saved by warm-tier re-compression |
-| `chronix_warm_tier_recompression_duration_seconds` | Histogram | `warm_tier_migrate()` | Duration of warm-tier re-compression per shard |
-| `chronix_compaction_cycle_duration_seconds` | Histogram | `CompactionScheduler` | Duration of each background compaction cycle |
 | `chronix_forecast_fit_duration_seconds` | Histogram | `chronix-analytics::forecast` | Duration of model fit operations |
 | `chronix_forecast_predict_duration_seconds` | Histogram | `chronix-analytics::forecast` | Duration of model predict operations |
 | `chronix_anomaly_fit_duration_seconds` | Histogram | `chronix-analytics::anomaly` | Duration of anomaly detector fit |

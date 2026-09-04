@@ -28,6 +28,23 @@ pub enum ServerError {
     #[error("server busy: {0}")]
     Backpressure(String),
 
+    /// Some points of a batch were accepted and some rejected.
+    ///
+    /// Reported as a 400, which every wire client treats as permanent —
+    /// which is right, because the rejection is deterministic: a timestamp
+    /// outside the out-of-order window will still be outside it on a retry.
+    /// Answering `204` and logging the loss, as this server did, means the
+    /// sender never learns that half its batch is missing.
+    #[error("partial write: {accepted} accepted, {rejected} rejected{reason}")]
+    PartialWrite {
+        /// Points stored.
+        accepted: usize,
+        /// Points refused.
+        rejected: usize,
+        /// The first rejection's reason, prefixed with `": "`, or empty.
+        reason: String,
+    },
+
     /// TLS configuration error.
     #[error("TLS error: {0}")]
     Tls(#[from] crate::tls::TlsError),
@@ -68,6 +85,7 @@ impl IntoResponse for ServerError {
             ServerError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
             ServerError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             ServerError::Backpressure(_) => (StatusCode::SERVICE_UNAVAILABLE, "BACKPRESSURE"),
+            ServerError::PartialWrite { .. } => (StatusCode::BAD_REQUEST, "PARTIAL_WRITE"),
             ServerError::Db(e) => match e {
                 chronix::DbError::CardinalityExceeded { .. } => {
                     (StatusCode::BAD_REQUEST, "CARDINALITY_EXCEEDED")
@@ -114,6 +132,7 @@ impl ServerError {
             ServerError::BadRequest(msg) => tonic::Status::invalid_argument(msg),
             ServerError::NotFound(msg) => tonic::Status::not_found(msg),
             ServerError::Backpressure(msg) => tonic::Status::resource_exhausted(msg),
+            ServerError::PartialWrite { .. } => tonic::Status::invalid_argument(self.to_string()),
             ServerError::Db(e) => match e {
                 chronix::DbError::CardinalityExceeded { .. } => {
                     tonic::Status::resource_exhausted(e.to_string())

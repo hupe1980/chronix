@@ -54,6 +54,7 @@ async fn start_test_server() -> (String, TempDir) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -140,7 +141,7 @@ async fn write_and_query_json() {
     });
 
     let resp = c
-        .post(format!("{base}/api/v1/query"))
+        .post(format!("{base}/api/v1/chronix/query"))
         .json(&query_body)
         .send()
         .await
@@ -185,7 +186,7 @@ async fn write_batch() {
         "measurement": "cpu"
     });
     let resp = c
-        .post(format!("{base}/api/v1/query"))
+        .post(format!("{base}/api/v1/chronix/query"))
         .json(&query_body)
         .send()
         .await
@@ -217,7 +218,7 @@ async fn write_influx_line_protocol() {
     // Query it back
     let query_body = json!({"measurement": "mem"});
     let resp = c
-        .post(format!("{base}/api/v1/query"))
+        .post(format!("{base}/api/v1/chronix/query"))
         .json(&query_body)
         .send()
         .await
@@ -366,7 +367,7 @@ async fn query_nonexistent_measurement() {
 
     let query_body = json!({"measurement": "nonexistent"});
     let resp = c
-        .post(format!("{base}/api/v1/query"))
+        .post(format!("{base}/api/v1/chronix/query"))
         .json(&query_body)
         .send()
         .await
@@ -423,6 +424,83 @@ async fn list_rollups_empty() {
     assert!(rollups.is_empty());
 }
 
+/// A rollup's listing reports its watermark and any pending repair, and
+/// `POST /rollups/{name}/refresh` recomputes a range on demand.
+///
+/// The state matters operationally: a non-empty `pending_repairs` is why
+/// retention is holding raw data, and without it in the API an operator
+/// watching disk fill up has no way to see the reason.
+#[tokio::test]
+async fn rollup_state_is_reported_and_a_range_can_be_refreshed() {
+    let (base, _tmp) = start_test_server().await;
+    let c = client();
+
+    let created = c
+        .post(format!("{base}/api/v1/rollups"))
+        .json(&serde_json::json!({
+            "name": "cpu_1m",
+            "source_measurement": "cpu",
+            "target_measurement": "cpu_1m",
+            "interval_seconds": 60,
+            "aggregations": ["avg"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "creating the rollup failed: {}",
+        created.text().await.unwrap()
+    );
+
+    let body: Value = c
+        .get(format!("{base}/api/v1/rollups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rollup = &body["items"][0];
+    assert_eq!(rollup["name"], "cpu_1m");
+    // Nothing has been aggregated and nothing needs repairing yet.
+    assert!(rollup["materialised_until"].is_null());
+    assert_eq!(
+        rollup["pending_repairs"].as_array().map(Vec::len),
+        Some(0),
+        "a fresh rollup has no pending repairs"
+    );
+
+    // Refreshing an empty range is a no-op, not an error.
+    let resp = c
+        .post(format!("{base}/api/v1/rollups/cpu_1m/refresh"))
+        .query(&[("start", "0"), ("end", "60000000000")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let refreshed: Value = resp.json().await.unwrap();
+    assert_eq!(refreshed["rollup"], "cpu_1m");
+    assert_eq!(refreshed["points_written"], 0);
+
+    // An inverted range is rejected, and an unknown rollup is an error.
+    let resp = c
+        .post(format!("{base}/api/v1/rollups/cpu_1m/refresh"))
+        .query(&[("start", "100"), ("end", "0")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = c
+        .post(format!("{base}/api/v1/rollups/nope/refresh"))
+        .query(&[("start", "0"), ("end", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert!(!resp.status().is_success());
+}
+
 // ── Metrics endpoint ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -467,7 +545,7 @@ async fn query_with_limit_and_offset() {
         "offset": 2
     });
     let resp = c
-        .post(format!("{base}/api/v1/query"))
+        .post(format!("{base}/api/v1/chronix/query"))
         .json(&query_body)
         .send()
         .await
@@ -479,7 +557,7 @@ async fn query_with_limit_and_offset() {
 
 // ── read-only SQL admission control ────────────────────────────
 
-/// `POST /api/v1/sql` must reject mutating statements *without applying
+/// `POST /api/v1/chronix/sql` must reject mutating statements *without applying
 /// them*. Regression test for the pre-execution admission check: the old
 /// code called `SessionContext::sql()` (which eagerly applies DDL and `SET`
 /// side effects to the process-wide shared session) and only inspected the
@@ -494,7 +572,7 @@ async fn sql_endpoint_rejects_mutations_without_side_effects() {
         let base = base.clone();
         let q = q.to_string();
         async move {
-            c.post(format!("{base}/api/v1/sql"))
+            c.post(format!("{base}/api/v1/chronix/sql"))
                 .json(&json!({ "query": q }))
                 .send()
                 .await
@@ -502,20 +580,29 @@ async fn sql_endpoint_rejects_mutations_without_side_effects() {
         }
     };
 
-    // `information_schema` is disabled at context construction.
-    let before = sql("SELECT * FROM information_schema.tables").await;
-    assert_ne!(
+    // The observable for "the shared session was not mutated" is the setting
+    // the refused `SET` names. It used to be `information_schema`, which is
+    // now on by default — the SQL catalog is scoped to the caller's
+    // namespace, so its views enumerate the caller's own measurements.
+    let setting = "SELECT value FROM information_schema.df_settings \
+                   WHERE name = 'datafusion.execution.target_partitions'";
+    let before = sql(setting).await;
+    assert_eq!(
         before.status(),
         StatusCode::OK,
-        "information_schema must be disabled to begin with"
+        "reading a setting is an ordinary read"
+    );
+    let before = before.text().await.unwrap();
+    assert!(
+        !before.contains("999"),
+        "the fixture must not already be 999: {before}"
     );
 
     for stmt in [
-        "SET datafusion.catalog.information_schema = true",
+        "SET datafusion.execution.target_partitions = 999",
         "CREATE VIEW pwned AS SELECT 1",
         "CREATE TABLE t (x INT)",
         "CREATE EXTERNAL TABLE ext STORED AS CSV LOCATION '/etc/passwd'",
-        "EXPLAIN SELECT 1",
         "PREPARE p AS SELECT 1",
     ] {
         let resp = sql(stmt).await;
@@ -529,15 +616,23 @@ async fn sql_endpoint_rejects_mutations_without_side_effects() {
     // The decisive assertion: the rejected `SET` did not mutate the shared
     // session. Repeated twice to also cover the plan-cache path.
     for _ in 0..2 {
-        let after = sql("SELECT * FROM information_schema.tables").await;
-        assert_ne!(
-            after.status(),
-            StatusCode::OK,
-            "a rejected SET re-enabled information_schema process-wide"
+        let after = sql(setting).await;
+        assert_eq!(after.status(), StatusCode::OK);
+        let body = after.text().await.unwrap();
+        assert!(
+            !body.contains("999"),
+            "a rejected SET mutated the shared session: {body}"
         );
     }
 
-    // Ordinary reads still work.
+    // Ordinary reads still work, and so does explaining one — refusing
+    // EXPLAIN left no way to see whether a time filter pushed down.
     let ok = sql("SELECT 1 AS x").await;
     assert_eq!(ok.status(), StatusCode::OK);
+    let explained = sql("EXPLAIN SELECT 1 AS x").await;
+    assert_eq!(
+        explained.status(),
+        StatusCode::OK,
+        "EXPLAIN of a read is a read"
+    );
 }

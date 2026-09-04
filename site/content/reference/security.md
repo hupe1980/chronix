@@ -12,7 +12,9 @@ weight = 80
 Request → AuthMiddleware → [mTLS → JWT → API Key] → AuthContext
                                                       ├── principal
                                                       ├── method
-                                                      └── claims
+                                                      ├── claims
+                                                      ├── namespaces
+                                                      └── admin
 ```
 
 ### API Key Authentication
@@ -20,9 +22,9 @@ Request → AuthMiddleware → [mTLS → JWT → API Key] → AuthContext
 - Keys stored as Argon2 hashes with optional expiry.
 - **Input validation:** key names are trimmed and must be 1–128 characters.
 - Runtime key management via REST endpoints:
-  - `POST /api/v1/auth/keys` — create new key (validates name)
-  - `GET /api/v1/auth/keys` — list keys
-  - `DELETE /api/v1/auth/keys/{name}` — revoke key
+  - `POST /api/v1/admin/auth/keys` — create new key (validates name)
+  - `GET /api/v1/admin/auth/keys` — list keys
+  - `DELETE /api/v1/admin/auth/keys/{name}` — revoke key
 - Multiple keys valid simultaneously for rotation.
 - **Rate limiting:** a sliding-window limiter rejects validation attempts after
   20 failures within a 60-second window, returning `AuthError::RateLimited`.
@@ -31,7 +33,12 @@ Request → AuthMiddleware → [mTLS → JWT → API Key] → AuthContext
 
 ### JWT/OIDC Authentication
 
-- Validates RS256/HS256/ES256 JWT tokens.
+- Validates the HMAC (`HS256`/`384`/`512`), RSA (`RS*`, `PS*`),
+  elliptic-curve (`ES256`, `ES384`) and Edwards-curve (`EdDSA`) families.
+  **The verification key is chosen by the algorithm's family**, not by
+  whichever key field is set: HMAC reads `secret`, the rest read
+  `public_key_pem_file`, and pairing them the other way is a startup error
+  rather than a token that can never verify.
 - **OIDC discovery:** fetches JWKS from `{issuer}/.well-known/openid-configuration`
   with a **10-second HTTP timeout** to prevent hanging on unresponsive providers.
 - **JWKS caching:** `JwksCache` stores parsed `DecodingKey`s with configurable TTL.
@@ -43,13 +50,19 @@ Request → AuthMiddleware → [mTLS → JWT → API Key] → AuthContext
   the cache continues to serve the stale keys (with a warning log) instead of
   failing open or rejecting all tokens. A **max stale duration** (default 24 h)
   prevents serving indefinitely stale keys — if keys are older than
-  `max_stale`, the refresh error is propagated to callers.
+  `max_stale`, the refresh error is propagated to callers. The 24-hour bound
+  is fixed, not configurable.
 - **Bearer token extraction** is case-insensitive per RFC 6750 (`Bearer`, `bearer`,
   `BEARER`, etc.).
 - `validate_async()` checks keys in order: static key → JWKS cache (by `kid`) →
   try all cached keys.
 - Configurable: issuer, audience, JWKS URL, claim mappings (`sub`, `email`,
-  custom claims).
+  custom claims). `jwks_url` is fetched **at startup**, so an unreachable
+  issuer or one publishing no keys fails the start rather than every
+  subsequent token.
+- Two claims are read as capabilities: `namespaces` (an array of strings, or
+  a single string) confines the token to those tenants, and `admin` (a
+  boolean) permits administrative operations.
 
 ### mTLS Authentication
 
@@ -63,7 +76,11 @@ Request → AuthMiddleware → [mTLS → JWT → API Key] → AuthContext
 
 ### Encryption at Rest
 
-- AES-256-GCM authenticated encryption for segment data blocks.
+- AES-256-GCM authenticated encryption for segment data blocks, with each
+  block's **column name and segment creation timestamp as associated data**.
+  Without that binding, an encrypted block decrypts correctly in any other
+  block's place under the same key and its authentication tag still verifies
+  — GCM proves who wrote a ciphertext, never which ciphertext it is.
 - Per-entry nonce for WAL encryption.
 - HMAC-SHA256 manifest integrity verification.
 - Key rotation: new segments use latest key; old segments readable with previous keys.
@@ -106,8 +123,25 @@ trait and can be added at runtime (including after wrapping in `Arc`).
 | Sink          | Output                                          |
 |---------------|-------------------------------------------------|
 | `MemorySink`  | In-memory `Vec` — queryable in tests             |
+| `FileSink`    | JSON-lines to an append-only file, `fsync`ed     |
 | `WriterSink`  | JSON-lines to any `std::io::Write` (file/stdout) |
 | `TracingSink` | Structured `tracing` events                       |
+
+Three properties make the chain worth having, and each was missing:
+
+- **`FileSink` is the durable one.** `WriterSink` over a `File` writes through
+  the same handle and never calls `sync_data`, so a power loss takes the tail
+  of the log — which is where the interesting events are, since an attacker's
+  last act is what crashed the box.
+- **The chain continues across restarts.** `last_event()` reads the file's
+  last sealed record and `resume_from()` anchors the new logger on it. A chain
+  that restarts at `None` each process is indistinguishable, to a verifier,
+  from a truncation. `verify_chain_from()` verifies a tail against the link it
+  hangs from.
+- **`log()` seals with the configured HMAC key**, as `log_strict()` always
+  did. Sealing one way in one method and another way in the other produced a
+  file that verified under neither, and a bare SHA-256 is recomputable by
+  anyone who can write it.
 ## Multi-Tenancy (`chronix-security::tenant`)
 
 ### Namespace Isolation
@@ -116,8 +150,11 @@ Each tenant gets an isolated namespace with independent:
 - Series, measurements, schemas
 - Resource quotas (series count, storage, ingestion rate)
 
-**Data-level isolation** sits behind the storage-path isolation as defence in
-depth: `chronixd` injects a hidden `__namespace__` tag into every written point
+**Data-level isolation is the whole of it.** There is no storage-path
+isolation behind it — segments are not partitioned by tenant on disk, so the
+tag stops a *request* from crossing tenants and does nothing about read access
+to the data directory. `chronixd` injects a hidden `__namespace__` tag into
+every written point
 and a matching tag filter into every query. That means **every** server query
 is a tag-filtered query, which is a code path the embedded API only reaches
 when a caller supplies tags — and it is why a defect in tag-filter pruning was
@@ -130,7 +167,7 @@ that level is skipped rather than probed with a key it cannot match.
 
 | Component | Purpose |
 |-----------|---------|
-| `NamespaceRegistry` | Thread-safe registry (DashMap) for namespace CRUD; optionally persisted to `namespaces.json` via `open(dir)` |
+| `NamespaceRegistry` | Thread-safe registry (DashMap) for namespace CRUD, persisted to `namespaces.json`. `chronixd` always opens it from `<data_dir>/namespaces`, and a failure to do so is fatal rather than a silent fall back to an empty in-memory registry — which answered `400` for every non-default tenant after a restart |
 | `QuotaEnforcer` | Validates operations against namespace quotas |
 | `NamespaceQuota` | Configurable limits: max_series, max_storage_bytes, max_ingestion_rate, max_measurements |
 | `NamespaceUsage` | Real-time counters: series_count, storage_bytes, ingestion_rate |
@@ -158,6 +195,9 @@ Write Request → QuotaEnforcer::check_and_increment_write()
   namespaces are restored; if no snapshot exists, the default namespace is
   created and an initial snapshot is written
 - **Mutation persistence** — `create_namespace()`, `delete_namespace()`, and
-  `update_quota()` automatically save a new snapshot after each change
+  `update_quota()` save a new snapshot after each change. A delete saves
+  synchronously and joins any in-flight background snapshot first, so a
+  destructive change is durable before the call returns and cannot be undone
+  by a stale write landing after it
 
 ---

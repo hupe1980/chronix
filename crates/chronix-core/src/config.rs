@@ -79,23 +79,6 @@ impl fmt::Display for FloatEncoding {
     }
 }
 
-/// Storage backend configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub enum StorageBackendConfig {
-    /// Local filesystem (default for embedded and dev).
-    #[default]
-    LocalFs,
-    /// Amazon S3.
-    S3 {
-        /// S3 bucket name.
-        bucket: String,
-        /// AWS region.
-        region: String,
-        /// Custom endpoint (for MinIO/localstack).
-        endpoint: Option<String>,
-    },
-}
-
 /// WAL configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +97,15 @@ pub struct WalConfig {
     /// Controls how long a waiter blocks before promoting itself to sync leader.
     #[serde(default = "default_group_sync_timeout_secs")]
     pub group_sync_timeout_secs: u64,
+}
+
+/// Default CDC event-bus capacity, in events.
+const fn default_cdc_capacity() -> usize {
+    65_536
+}
+
+fn default_maintenance_interval() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn default_compress_wal() -> bool {
@@ -162,9 +154,6 @@ pub struct AnalyticsConfig {
     /// Default anomaly detection threshold (standard deviations).
     #[serde(default = "default_anomaly_threshold")]
     pub default_anomaly_threshold: f64,
-    /// CPU compute thread count (0 = number of logical CPUs).
-    #[serde(default)]
-    pub compute_threads: usize,
 }
 
 fn default_forecast_model() -> String {
@@ -194,8 +183,8 @@ fn default_per_query_memory_limit() -> usize {
 fn default_query_timeout() -> Duration {
     Duration::from_secs(60)
 }
-fn default_wal_file_threshold() -> usize {
-    16
+fn default_future_write_tolerance() -> Duration {
+    Duration::from_secs(3600)
 }
 
 impl Default for AnalyticsConfig {
@@ -207,7 +196,6 @@ impl Default for AnalyticsConfig {
             max_forecast_horizon: default_max_horizon(),
             max_training_points: default_max_training(),
             default_anomaly_threshold: default_anomaly_threshold(),
-            compute_threads: 0,
         }
     }
 }
@@ -313,7 +301,12 @@ pub struct ChronixConfig {
     pub shard_duration: Duration,
     /// Out-of-order tolerance in shard units (default: 2).
     pub ooo_shard_tolerance: u32,
-    /// Retention period (default: 30 days, None = infinite).
+    /// Retention period, enforced by the background compaction pass.
+    ///
+    /// `None` — the default — keeps data forever. A database that deletes
+    /// data by default is a database that deletes data nobody asked it to;
+    /// retention is opt-in, exactly as it is in InfluxDB and SQLite-shaped
+    /// stores, and unlike a scrape server.
     pub retention: Option<Duration>,
     /// Per-measurement retention overrides.
     pub measurement_retention: HashMap<String, Duration>,
@@ -322,7 +315,7 @@ pub struct ChronixConfig {
     /// Zstd compression level for new segments (1–22, default: 3).
     ///
     /// Only meaningful when `compression` is `Zstd`. Higher is smaller and
-    /// slower; the warm tier re-compresses at 9.
+    /// slower; cold-tier re-compression uses 9.
     #[serde(default = "default_zstd_level")]
     pub zstd_level: i32,
     /// Train a Zstd dictionary from the first row group of each segment
@@ -339,10 +332,17 @@ pub struct ChronixConfig {
     pub zstd_dict_training: bool,
     /// Float encoding algorithm (default: Chimp).
     pub float_encoding: FloatEncoding,
-    /// Storage backend configuration.
-    pub storage_backend: StorageBackendConfig,
     /// Segment cache size in bytes (default: 512 MB).
     pub segment_cache_size: usize,
+    /// CDC event-bus capacity — events buffered before the oldest are dropped
+    /// for a slow subscriber (default: 65 536).
+    ///
+    /// The ring costs `capacity` × ~112 bytes and is allocated on the first
+    /// subscription, so a deployment that never reads the CDC stream pays
+    /// nothing. The default is ~7 MiB, sized for a server;
+    /// [`ChronixConfig::small`] sets 4 096.
+    #[serde(default = "default_cdc_capacity")]
+    pub cdc_capacity: usize,
     /// Enable Last Value Cache (default: false).
     pub enable_last_value_cache: bool,
     /// Per-measurement LVC opt-in. When `Some`, only listed measurements
@@ -351,7 +351,16 @@ pub struct ChronixConfig {
     pub lvc_measurements: Option<HashSet<String>>,
     /// Maximum concurrent compaction tasks (default: 2).
     pub compaction_concurrency: usize,
-    /// Maximum series cardinality per shard (default: 1M).
+    /// How often the built-in maintenance thread compacts, materialises
+    /// rollups, collects garbage and enforces retention (default: 30 s).
+    ///
+    /// Flushes are not on this schedule — the thread flushes as soon as a
+    /// memtable crosses its threshold. `Duration::ZERO` disables the
+    /// periodic passes (flush-on-demand stays), for a caller that runs
+    /// `compact()` and `enforce_retention()` on its own schedule.
+    #[serde(default = "default_maintenance_interval")]
+    pub maintenance_interval: Duration,
+    /// Maximum number of distinct series in the database (default: 1M).
     pub max_series_cardinality: usize,
     /// Maximum query result size in bytes (default: 256 MB, 0 = unlimited).
     /// Queries whose intermediate batches exceed this are aborted early.
@@ -371,8 +380,6 @@ pub struct ChronixConfig {
     /// `QueryTimeout` error to prevent runaway scans.
     #[serde(default = "default_query_timeout")]
     pub query_timeout: Duration,
-    /// Graceful shutdown timeout (default: 30s).
-    pub shutdown_timeout: Duration,
     /// Analytics engine configuration.
     #[serde(default)]
     pub analytics: AnalyticsConfig,
@@ -393,14 +400,17 @@ pub struct ChronixConfig {
     /// Default: `None` (immediate hard-delete, original behaviour).
     #[serde(default)]
     pub soft_delete_ttl: Option<Duration>,
-    /// WAL file count threshold for write admission control (default: 16).
+    /// How far ahead of the wall clock a point's timestamp may be
+    /// (default: 1 hour).
     ///
-    /// When the number of WAL files exceeds this threshold, new writes
-    /// are rejected with `DbError::Overloaded` to prevent unbounded
-    /// WAL growth. Tune upward for bursty write workloads, downward
-    /// for I/O-constrained systems.
-    #[serde(default = "default_wal_file_threshold")]
-    pub wal_file_threshold: usize,
+    /// A point beyond this is rejected before admission, on every write
+    /// path including `backfill`. The out-of-order window is anchored on
+    /// the newest *admitted* timestamp, so without this bound one point
+    /// from a device with a broken clock would move the window years into
+    /// the future and every real write after it would be rejected until
+    /// the next restart.
+    #[serde(default = "default_future_write_tolerance")]
+    pub future_write_tolerance: Duration,
 }
 
 impl ChronixConfig {
@@ -427,7 +437,12 @@ impl ChronixConfig {
             .memtable_flush_threshold(8 * 1024 * 1024) // 8 MB
             .max_memtable_memory(24 * 1024 * 1024) // 24 MB
             .segment_cache_size(16 * 1024 * 1024) // 16 MB
+            // 4 096 events ≈ 450 KiB, and at the design partner's 50 points/s
+            // still eighty seconds of tolerance for a slow subscriber. The
+            // 65 536 default is a server's number.
+            .cdc_capacity(4_096)
             .compaction_concurrency(1)
+            .maintenance_interval(Duration::from_secs(60))
             .wal_fsync_policy(FsyncPolicy::Periodic(Duration::from_secs(5)))
             .wal_max_file_size(8 * 1024 * 1024) // 8 MB — bounded replay on tiny devices
             .build()
@@ -463,7 +478,6 @@ impl ChronixConfig {
                     .unwrap_or(base.default_anomaly_threshold),
                 max_forecast_horizon: ov.max_forecast_horizon.unwrap_or(base.max_forecast_horizon),
                 max_training_points: base.max_training_points,
-                compute_threads: base.compute_threads,
             },
         }
     }
@@ -546,11 +560,6 @@ impl ChronixConfig {
 
         // Validate compaction and analytics settings at startup
         // to surface misconfigurations early.
-        if self.shutdown_timeout.is_zero() {
-            return Err(ConfigError::Validation {
-                message: "shutdown_timeout must be > 0".into(),
-            });
-        }
         if self.analytics.max_forecast_horizon == 0 {
             return Err(ConfigError::Validation {
                 message: "analytics.max_forecast_horizon must be > 0".into(),
@@ -603,21 +612,21 @@ pub struct ChronixConfigBuilder {
     zstd_level: i32,
     zstd_dict_training: bool,
     float_encoding: FloatEncoding,
-    storage_backend: StorageBackendConfig,
     segment_cache_size: usize,
+    cdc_capacity: usize,
     enable_last_value_cache: bool,
     lvc_measurements: Option<HashSet<String>>,
     compaction_concurrency: usize,
+    maintenance_interval: Duration,
     max_series_cardinality: usize,
     max_query_result_bytes: usize,
     per_query_memory_limit: usize,
     query_timeout: Duration,
-    shutdown_timeout: Duration,
     analytics: AnalyticsConfig,
     multivariate: MultivariateConfig,
     measurement_analytics: HashMap<String, AnalyticsOverride>,
     soft_delete_ttl: Option<Duration>,
-    wal_file_threshold: usize,
+    future_write_tolerance: Duration,
 }
 
 impl Default for ChronixConfigBuilder {
@@ -629,27 +638,27 @@ impl Default for ChronixConfigBuilder {
             max_memtable_memory: 256 * 1024 * 1024,     // 256 MB
             shard_duration: Duration::from_secs(3600),  // 1 hour
             ooo_shard_tolerance: 2,
-            retention: Some(Duration::from_secs(30 * 24 * 3600)), // 30 days
+            retention: None,
             measurement_retention: HashMap::new(),
             compression: CompressionCodec::default(),
             zstd_level: default_zstd_level(),
             zstd_dict_training: false,
             float_encoding: FloatEncoding::default(),
-            storage_backend: StorageBackendConfig::default(),
             segment_cache_size: 512 * 1024 * 1024, // 512 MB
+            cdc_capacity: default_cdc_capacity(),
             enable_last_value_cache: false,
             lvc_measurements: None,
             compaction_concurrency: 2,
+            maintenance_interval: default_maintenance_interval(),
             max_series_cardinality: 1_000_000,
             max_query_result_bytes: default_max_query_result_bytes(),
             per_query_memory_limit: default_per_query_memory_limit(),
             query_timeout: default_query_timeout(),
-            shutdown_timeout: Duration::from_secs(30),
             analytics: AnalyticsConfig::default(),
             multivariate: MultivariateConfig::default(),
             measurement_analytics: HashMap::new(),
             soft_delete_ttl: None,
-            wal_file_threshold: default_wal_file_threshold(),
+            future_write_tolerance: default_future_write_tolerance(),
         }
     }
 }
@@ -758,17 +767,19 @@ impl ChronixConfigBuilder {
         self
     }
 
-    /// Set the storage backend.
-    #[must_use]
-    pub fn storage_backend(mut self, backend: StorageBackendConfig) -> Self {
-        self.storage_backend = backend;
-        self
-    }
-
     /// Set the maximum concurrent compaction tasks.
     #[must_use]
     pub fn compaction_concurrency(mut self, concurrency: usize) -> Self {
         self.compaction_concurrency = concurrency;
+        self
+    }
+
+    /// Set how often the built-in maintenance thread compacts, materialises
+    /// rollups and enforces retention. `Duration::ZERO` disables the
+    /// periodic passes.
+    #[must_use]
+    pub fn maintenance_interval(mut self, interval: Duration) -> Self {
+        self.maintenance_interval = interval;
         self
     }
 
@@ -786,6 +797,16 @@ impl ChronixConfigBuilder {
     #[must_use]
     pub fn lvc_measurements(mut self, measurements: HashSet<String>) -> Self {
         self.lvc_measurements = Some(measurements);
+        self
+    }
+
+    /// CDC event-bus capacity, in events.
+    ///
+    /// The ring is allocated on the first subscription; a deployment that
+    /// never reads the CDC stream pays nothing for this.
+    #[must_use]
+    pub fn cdc_capacity(mut self, events: usize) -> Self {
+        self.cdc_capacity = events;
         self
     }
 
@@ -824,13 +845,6 @@ impl ChronixConfigBuilder {
         self
     }
 
-    /// Set the graceful shutdown timeout.
-    #[must_use]
-    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
-        self.shutdown_timeout = timeout;
-        self
-    }
-
     /// Set the analytics engine configuration.
     #[must_use]
     pub fn analytics(mut self, config: AnalyticsConfig) -> Self {
@@ -855,10 +869,10 @@ impl ChronixConfigBuilder {
         self
     }
 
-    /// Set the WAL file count admission threshold (default: 16).
+    /// Set how far ahead of the wall clock a timestamp may be (default: 1 h).
     #[must_use]
-    pub fn wal_file_threshold(mut self, count: usize) -> Self {
-        self.wal_file_threshold = count;
+    pub fn future_write_tolerance(mut self, tolerance: Duration) -> Self {
+        self.future_write_tolerance = tolerance;
         self
     }
 
@@ -917,21 +931,21 @@ impl ChronixConfigBuilder {
             zstd_level: self.zstd_level,
             zstd_dict_training: self.zstd_dict_training,
             float_encoding: self.float_encoding,
-            storage_backend: self.storage_backend,
             segment_cache_size: self.segment_cache_size,
+            cdc_capacity: self.cdc_capacity,
             enable_last_value_cache: self.enable_last_value_cache,
             lvc_measurements: self.lvc_measurements,
             compaction_concurrency: self.compaction_concurrency,
+            maintenance_interval: self.maintenance_interval,
             max_series_cardinality: self.max_series_cardinality,
             max_query_result_bytes: self.max_query_result_bytes,
             per_query_memory_limit: self.per_query_memory_limit,
             query_timeout: self.query_timeout,
-            shutdown_timeout: self.shutdown_timeout,
             analytics: self.analytics,
             multivariate: self.multivariate,
             measurement_analytics: self.measurement_analytics,
             soft_delete_ttl: self.soft_delete_ttl,
-            wal_file_threshold: self.wal_file_threshold,
+            future_write_tolerance: self.future_write_tolerance,
         };
 
         // Shared structural validation (same checks as from_toml path).
@@ -1218,18 +1232,6 @@ mod tests {
         assert_eq!(config, back);
     }
 
-    #[test]
-    fn storage_backend_s3_serde_roundtrip() {
-        let config = StorageBackendConfig::S3 {
-            bucket: "my-bucket".into(),
-            region: "us-east-1".into(),
-            endpoint: Some("http://localhost:9000".into()),
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let back: StorageBackendConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config, back);
-    }
-
     // ── MultivariateConfig tests ────────────────────────────────────────
 
     #[test]
@@ -1316,16 +1318,6 @@ mod tests {
     // ── Compaction / analytics / multivariate validation tests ────
 
     #[test]
-    fn validate_zero_shutdown_timeout() {
-        let err = ChronixConfig::builder()
-            .data_dir("./data")
-            .shutdown_timeout(Duration::ZERO)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("shutdown_timeout"));
-    }
-
-    #[test]
     fn validate_zero_max_forecast_horizon() {
         let analytics = AnalyticsConfig {
             max_forecast_horizon: 0,
@@ -1407,22 +1399,6 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("var_max_lag"));
-    }
-
-    #[test]
-    fn wal_file_threshold_default_is_16() {
-        let config = ChronixConfig::builder().data_dir("./data").build().unwrap();
-        assert_eq!(config.wal_file_threshold, 16);
-    }
-
-    #[test]
-    fn wal_file_threshold_configurable() {
-        let config = ChronixConfig::builder()
-            .data_dir("./data")
-            .wal_file_threshold(32)
-            .build()
-            .unwrap();
-        assert_eq!(config.wal_file_threshold, 32);
     }
 
     #[test]

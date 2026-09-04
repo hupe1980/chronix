@@ -43,6 +43,34 @@ pub struct WriteDedupCache {
     max_entries: usize,
 }
 
+/// A claimed idempotency key, released on drop unless committed.
+///
+/// The guard exists so that *every* early return from a write handler —
+/// including the `?` on a database error — releases the key. A handler that
+/// had to remember to release it is a handler that will forget on the path
+/// that matters, which is the failing one.
+#[derive(Debug)]
+pub struct WriteClaim<'a> {
+    cache: &'a WriteDedupCache,
+    key: String,
+    committed: bool,
+}
+
+impl WriteClaim<'_> {
+    /// The write succeeded: keep the key for the dedup window.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WriteClaim<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cache.release(&self.key);
+        }
+    }
+}
+
 /// Internal state for [`WriteDedupCache`].
 #[derive(Debug)]
 struct DedupInner {
@@ -70,11 +98,37 @@ impl WriteDedupCache {
         })
     }
 
-    /// Check-and-insert an idempotency key.
+    /// Claim `key` for a write that has not happened yet.
     ///
-    /// Returns `true` if the key is a **duplicate** (already seen within
-    /// the window). Returns `false` if the key is new (and was inserted).
-    pub fn check_duplicate(&self, key: &str) -> bool {
+    /// Returns `None` when the key is already claimed or committed — the
+    /// caller answers `409`. Otherwise returns a guard that **releases the
+    /// key again unless `WriteClaim::commit` is called**, because an
+    /// idempotency key is a promise about a write that *succeeded*: keeping
+    /// one for a failed write turns the client's retry into a `409` and the
+    /// data is stored never.
+    ///
+    /// The claim is taken before the write so that two concurrent requests
+    /// with the same key resolve to one — check and insert are a single
+    /// critical section.
+    pub fn claim<'a>(&'a self, key: &str) -> Option<WriteClaim<'a>> {
+        if self.check_duplicate(key) {
+            return None;
+        }
+        Some(WriteClaim {
+            cache: self,
+            key: key.to_string(),
+            committed: false,
+        })
+    }
+
+    /// Forget a key, so a retry may claim it again.
+    fn release(&self, key: &str) {
+        let mut inner = self.inner.lock();
+        inner.map.remove(key);
+        inner.order.retain(|(k, _)| k != key);
+    }
+
+    fn check_duplicate(&self, key: &str) -> bool {
         let now = std::time::Instant::now();
         let mut inner = self.inner.lock();
 
@@ -149,20 +203,16 @@ pub(super) use crate::namespace::resolve as resolve_namespace;
 
 // ─── Safe numeric helpers ────────────────────────────────────────────
 
-/// Convert seconds (f64) to nanoseconds (i64) with clamping.
+/// The wall clock in nanoseconds since the epoch, clamped.
 #[inline]
-pub(super) fn secs_to_nanos_i64(secs: f64) -> i64 {
-    let ns = secs * 1_000_000_000.0;
-    #[allow(clippy::cast_possible_truncation)]
-    if ns.is_nan() {
-        0
-    } else if ns >= i64::MAX as f64 {
-        i64::MAX
-    } else if ns <= i64::MIN as f64 {
-        i64::MIN
-    } else {
-        ns as i64
-    }
+pub(super) fn now_nanos_i64() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 // ── Shared state types ─────────────────────────────────────────────────
@@ -217,6 +267,13 @@ pub struct SharedState {
     pub namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter,
     /// Optional write deduplication cache for idempotency keys.
     pub write_dedup_cache: Option<WriteDedupCache>,
+    /// Signal-trigger pipeline, when `[triggers]` is configured.
+    ///
+    /// `None` means the trigger endpoints answer 404. Absent for the whole
+    /// life of the subsystem before now: the trigger engine, the delivery
+    /// router and the signal store all worked, and no protocol surface could
+    /// reach any of them.
+    pub pipeline: Option<Arc<chronix::Pipeline>>,
     /// Memoized OpenAPI JSON document.
     ///
     /// Per server rather than per process: the document embeds this server's
@@ -470,8 +527,29 @@ mod tests {
     #[test]
     fn dedup_cache_detects_duplicate() {
         let cache = WriteDedupCache::new(60, 100).unwrap();
-        assert!(!cache.check_duplicate("key-1")); // first insert
-        assert!(cache.check_duplicate("key-1")); // duplicate
+        let claim = cache.claim("key-1").expect("first claim");
+        assert!(cache.claim("key-1").is_none(), "concurrent duplicate");
+        claim.commit();
+        assert!(cache.claim("key-1").is_none(), "committed duplicate");
+    }
+
+    /// A write that fails must not poison its idempotency key: the client's
+    /// retry is the whole reason it sent one. The key used to be recorded
+    /// before the write and kept regardless, so a 503 turned every retry
+    /// into a 409 and the data was stored never.
+    #[test]
+    fn a_failed_write_releases_its_key() {
+        let cache = WriteDedupCache::new(60, 100).unwrap();
+        {
+            let _claim = cache.claim("key-1").expect("first claim");
+            // dropped without commit — the write failed
+        }
+        let retry = cache.claim("key-1").expect("the retry must be allowed");
+        retry.commit();
+        assert!(
+            cache.claim("key-1").is_none(),
+            "and once it succeeds, it deduplicates"
+        );
     }
 
     #[test]

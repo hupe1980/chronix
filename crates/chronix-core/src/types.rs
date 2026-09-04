@@ -455,7 +455,26 @@ pub const MAX_FIELDS_PER_POINT: usize = 1024;
 /// Maximum length of a string field value in bytes.
 ///
 /// Prevents WAL record bloat and encoding OOM from oversized string payloads.
-pub const MAX_STRING_FIELD_LENGTH: usize = 65_536; // 64 KB
+///
+/// **This is `u16::MAX`, not 64 KiB, and the difference is load-bearing.**
+/// The string encoders in `chronix-encoding` store each value's length as a
+/// `u16` (`coding::checked_string_len`), so 65 536 is one byte more than the
+/// segment format can represent. Accepting it at ingest made it a poison
+/// pill: the point is validated, written to the WAL, and admitted to the
+/// memtable, and then every flush of that memtable fails at encode — forever,
+/// because a failed flush leaves the memtable in place with the bad value
+/// still in it. Ingest must not accept what flush cannot store.
+/// Pinned from the encoder's side by
+/// `chronix-encoding/tests/string_length_boundary.rs`.
+pub const MAX_STRING_FIELD_LENGTH: usize = u16::MAX as usize; // 65_535
+
+/// Column names the engine owns: a field or tag may not use them.
+///
+/// `timestamp` is the storage layer's time column, `_time` is its SQL name,
+/// and `series_key_hash` is the routing column the read path adds. `time`
+/// is reserved as well because the SQL layer accepts it as an alias for the
+/// time column.
+pub const RESERVED_COLUMN_NAMES: &[&str] = &["time", "timestamp", "_time", "series_key_hash"];
 
 /// A unique series identifier: measurement name + sorted tag set.
 ///
@@ -824,6 +843,16 @@ impl SeriesKey {
                 value: name.to_string(),
             });
         }
+        // A tag called `timestamp` collides with the storage layer's own
+        // column exactly as a field of that name does. The server's
+        // `__namespace__` tag is deliberately not on the list: the engine
+        // injects it and every scoped read filters on it.
+        if RESERVED_COLUMN_NAMES.contains(&name) {
+            return Err(SchemaError::InvalidFieldValue {
+                field: name.to_string(),
+                reason: format!("'{name}' is a reserved column name"),
+            });
+        }
         Ok(())
     }
 }
@@ -840,18 +869,15 @@ impl fmt::Display for SeriesKey {
 
 /// A tombstone: a masked `[min, max]` timestamp interval of one series.
 ///
-/// Two fields, and each of them is load-bearing for a defect this type used to
-/// have.
-///
-/// **Every tombstone carries a time range**. There is no "delete the
-/// series forever" variant, because a time-series delete is a statement about data
-/// that exists, not a standing order against data that does not exist yet.
-/// The unranged form used to mask every future write to the same series as
-/// well, so re-provisioning a device under an identifier that had once been
-/// deleted silently discarded everything it sent. `delete_series` now resolves
-/// its upper bound to the newest timestamp actually stored for that series, so
-/// later points re-create it. This is also what Prometheus and InfluxDB do: a
-/// delete names an interval, and re-ingesting *into* a deleted interval stays
+/// **Every tombstone carries a time range.** There is no "delete the series
+/// forever" variant: a time-series delete is a statement about data that
+/// exists, not a standing order against data that does not exist yet. An
+/// unranged form would mask every future write to the same series, so
+/// re-provisioning a device under a previously deleted identifier would
+/// discard everything it sends. `delete_series` resolves its upper bound to
+/// the newest timestamp stored for that series, so later points re-create
+/// it. Prometheus and InfluxDB do the same: a delete names an interval, and
+/// re-ingesting *into* a deleted interval stays
 /// masked until compaction materialises the delete.
 ///
 /// **`segments` records the segments the delete was issued against** — every
@@ -870,10 +896,18 @@ pub struct Tombstone {
     pub series_canonical: String,
     /// Inclusive time range that this tombstone masks.
     pub time_range: (i64, i64),
-    /// Ids of the segments that were active when the delete was issued.
+    /// Ids of the segments the tombstone applies to: those active when the
+    /// delete was issued, plus every compaction output those were merged
+    /// into since.
     ///
-    /// Used only to decide when the tombstone may be reclaimed — never on the
-    /// read path, so a row never needs to know which segment it came from.
+    /// This is the tombstone's *scope*, on the read path as much as for
+    /// reclaiming it. A row is masked only if it comes from one of these
+    /// segments, so a point written after the delete — into the memtable,
+    /// hence into a newer segment — is visible at once. It used to mask by
+    /// `(series, time)` alone, so re-provisioning a device under the same
+    /// identifier, or backfilling into a deleted interval, wrote points
+    /// that were accepted, acknowledged, and invisible until a compaction
+    /// happened to reclaim the tombstone.
     pub segments: std::collections::BTreeSet<u64>,
 }
 
@@ -907,12 +941,20 @@ impl Tombstone {
         self
     }
 
-    /// Check whether a (`series_canonical`, timestamp) pair is tombstoned.
+    /// Check whether a (`series_canonical`, timestamp) pair is inside the
+    /// tombstone's series and time range, regardless of segment.
     #[must_use]
     pub fn matches(&self, canonical: &str, timestamp: i64) -> bool {
         self.series_canonical == canonical
             && timestamp >= self.time_range.0
             && timestamp <= self.time_range.1
+    }
+
+    /// Check whether a row from `segment` at `timestamp` of `canonical` is
+    /// masked by this tombstone.
+    #[must_use]
+    pub fn masks(&self, canonical: &str, timestamp: i64, segment: u64) -> bool {
+        self.segments.contains(&segment) && self.matches(canonical, timestamp)
     }
 }
 
@@ -953,26 +995,62 @@ impl TombstoneSet {
         }
     }
 
-    /// Check whether a (canonical, timestamp) pair is tombstoned.
+    /// Is a row of `canonical` at `timestamp`, read from `segment`, masked?
     ///
-    /// This is the **only** admissible tombstone test on a read path. A
-    /// series-only variant used to sit beside it, and the two disagreed: the
-    /// segment scan and compaction asked this question, while the memtable
-    /// scan, `last_value` and the streaming scan asked "does this series have
-    /// any tombstone at all", so a delete of one hour of one series removed
-    /// that series entirely from three of the five read paths.
+    /// This is the **only** admissible tombstone test on a read path, and
+    /// it is asked of segment rows only: memtable rows were written after
+    /// every tombstone that exists (a delete flushes before it scans), so
+    /// they are never masked. A series-only variant used to sit beside it,
+    /// and the two disagreed: the segment scan and compaction asked this
+    /// question, while the memtable scan, `last_value` and the streaming
+    /// scan asked "does this series have any tombstone at all", so a delete
+    /// of one hour of one series removed that series entirely from three of
+    /// the five read paths.
     #[must_use]
-    pub fn is_tombstoned(&self, canonical: &str, timestamp: i64) -> bool {
+    pub fn is_tombstoned_in(&self, canonical: &str, timestamp: i64, segment: u64) -> bool {
+        self.inner.get(canonical).is_some_and(|tombstones| {
+            tombstones
+                .iter()
+                .any(|t| t.masks(canonical, timestamp, segment))
+        })
+    }
+
+    /// Does any tombstone cover `(canonical, timestamp)` in any segment?
+    ///
+    /// For bookkeeping — deciding whether a re-materialised rollup bucket
+    /// needs its own delete — never for filtering rows.
+    #[must_use]
+    pub fn covers(&self, canonical: &str, timestamp: i64) -> bool {
         self.inner
             .get(canonical)
             .is_some_and(|tombstones| tombstones.iter().any(|t| t.matches(canonical, timestamp)))
+    }
+
+    /// Extend the scope of every tombstone that names any of `inputs` to
+    /// `output` — the segment compaction merged them into.
+    ///
+    /// The rows a tombstone masks move with the merge unless the merge
+    /// applied it, and a tombstone recorded while a compaction was in flight
+    /// was not in the snapshot the merge applied. Extending the scope keeps
+    /// those rows masked and keeps the tombstone alive until the output is
+    /// itself rewritten. Returns the number of tombstones extended.
+    pub fn extend_to_compaction_output(&mut self, inputs: &[u64], output: u64) -> usize {
+        let mut n = 0;
+        for tombstone in self.inner.values_mut().flatten() {
+            if inputs.iter().any(|id| tombstone.segments.contains(id))
+                && tombstone.segments.insert(output)
+            {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Whether any tombstone exists for a series, at any timestamp.
     ///
     /// For bookkeeping only — reclaiming tombstones, reporting, tests. Using
     /// it to filter rows is the bug described on
-    /// [`is_tombstoned`](Self::is_tombstoned).
+    /// [`is_tombstoned_in`](Self::is_tombstoned_in).
     #[must_use]
     pub fn contains_series(&self, canonical: &str) -> bool {
         self.inner.contains_key(canonical)
@@ -1067,14 +1145,6 @@ pub enum WalEntry {
         /// The tombstones the delete resolved to.
         tombstones: Vec<Tombstone>,
     },
-    /// A schema evolution action (create measurement or add column).
-    ///
-    /// Logged to WAL **before** the point that triggers the schema change,
-    /// ensuring crash recovery can rebuild the schema from the log alone.
-    SchemaChange {
-        /// The schema actions to apply (create measurement and/or add columns).
-        actions: Vec<crate::schema::SchemaAction>,
-    },
 }
 
 /// Lifecycle state for a segment file.
@@ -1153,11 +1223,19 @@ impl Point {
         for (key, value) in &fields {
             SeriesKey::validate_name(key, "field name")?;
 
-            // FINDING-27: Reject the reserved field name "time".
-            if key == "time" {
+            // The columns the storage and query layers own. A field named
+            // `timestamp` produced *two* `timestamp` columns in the
+            // memtable batch: the segment writer skipped one silently, the
+            // SQL layer renamed both to `_time` and kept whichever came
+            // last, so `SELECT _time` returned the field's values and
+            // `SELECT timestamp` returned nulls. Reserving the names is the
+            // only way to make that unrepresentable.
+            if RESERVED_COLUMN_NAMES.contains(&key.as_str()) {
                 return Err(SchemaError::InvalidFieldValue {
                     field: key.clone(),
-                    reason: "'time' is a reserved column name and cannot be used as a field".into(),
+                    reason: format!(
+                        "'{key}' is a reserved column name and cannot be used as a field"
+                    ),
                 });
             }
 
@@ -1410,6 +1488,33 @@ mod tests {
     }
 
     /// Both separators are reserved and must be rejected in user data.
+    /// The engine's own column names are unusable as fields or tags. A
+    /// field named `timestamp` used to produce two `timestamp` columns in
+    /// one batch, and the SQL layer then answered `SELECT _time` with the
+    /// field's values.
+    #[test]
+    fn reserved_column_names_are_rejected() {
+        for name in RESERVED_COLUMN_NAMES {
+            let key = SeriesKey::new("m", BTreeMap::new()).unwrap();
+            let fields: BTreeMap<String, FieldValue> =
+                [((*name).to_string(), FieldValue::F64(1.0))].into();
+            assert!(
+                Point::new(key, fields, 0).is_err(),
+                "a field named {name} must be refused"
+            );
+
+            let tags: BTreeMap<String, String> = [((*name).to_string(), "x".to_string())].into();
+            assert!(
+                SeriesKey::new("m", tags).is_err(),
+                "a tag named {name} must be refused"
+            );
+        }
+        // The namespace tag the server injects stays legal.
+        let tags: BTreeMap<String, String> =
+            [(NAMESPACE_TAG.to_string(), "tenant-a".to_string())].into();
+        assert!(SeriesKey::new("m", tags).is_ok());
+    }
+
     #[test]
     fn reserved_separators_are_rejected() {
         for bad in ["a\0b", "a\x01b"] {
@@ -1769,10 +1874,42 @@ mod proptests {
             !set.contains_series("cpu\0host=b"),
             "empty series entries are dropped"
         );
-        assert!(set.is_tombstoned("cpu\0host=a", 25));
+        // The survivor was issued against segment 2 and masks rows from it.
+        assert!(set.is_tombstoned_in("cpu\0host=a", 25, 2));
         assert!(
-            !set.is_tombstoned("cpu\0host=a", 5),
+            !set.is_tombstoned_in("cpu\0host=a", 25, 9),
+            "a segment the delete was not issued against is never masked"
+        );
+        assert!(
+            !set.is_tombstoned_in("cpu\0host=a", 5, 2),
             "the reclaimed range no longer masks"
         );
+    }
+
+    /// Compaction moves rows into a new segment. A tombstone the merge did
+    /// not apply — one recorded while the merge was already running — has to
+    /// follow them, or the rows come back the moment the inputs are
+    /// garbage-collected and the tombstone is reclaimed.
+    #[test]
+    fn a_tombstone_follows_its_rows_into_a_compaction_output() {
+        let mut set = TombstoneSet::new();
+        set.insert(Tombstone::ranged("cpu\0host=a", 0, 10).with_segments([1, 2]));
+        set.insert(Tombstone::ranged("cpu\0host=b", 0, 10).with_segments([7]));
+
+        assert_eq!(set.extend_to_compaction_output(&[1, 2], 9), 1);
+        assert!(
+            set.is_tombstoned_in("cpu\0host=a", 5, 9),
+            "the output segment carries the masked rows"
+        );
+        assert!(
+            set.is_tombstoned_in("cpu\0host=a", 5, 1),
+            "the inputs stay masked until they leave the catalog"
+        );
+        assert!(
+            !set.is_tombstoned_in("cpu\0host=b", 5, 9),
+            "an unrelated tombstone is not widened"
+        );
+        // Idempotent: a replayed manifest entry changes nothing.
+        assert_eq!(set.extend_to_compaction_output(&[1, 2], 9), 0);
     }
 }

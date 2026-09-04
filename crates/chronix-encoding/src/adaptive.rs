@@ -269,11 +269,13 @@ impl AdaptiveSelector {
                 EncodingType::Chimp,
                 EncodingType::Gorilla,
             ],
-            // ALP leads every non-constant list: values that started life as
-            // decimals — which is most metric data — compress several times
-            // better under it than under any XOR codec, and on the data it is
-            // not for it simply loses the trial and costs one sample encode.
+            // pco leads every non-constant list, ALP second: both recover
+            // the decimal most metric data started life as, and pco then
+            // entropy-codes the deltas, which is 3–20× smaller again on the
+            // measured workloads (`tests/codec_field_check.rs`). A candidate
+            // that loses the trial costs one sample encode and nothing else.
             FloatPattern::Periodic => &[
+                EncodingType::Pco,
                 EncodingType::Alp,
                 EncodingType::Chimp128,
                 EncodingType::Patas,
@@ -281,6 +283,7 @@ impl AdaptiveSelector {
                 EncodingType::Gorilla,
             ],
             FloatPattern::SlowlyVarying => &[
+                EncodingType::Pco,
                 EncodingType::Alp,
                 EncodingType::Patas,
                 EncodingType::Chimp128,
@@ -288,6 +291,7 @@ impl AdaptiveSelector {
                 EncodingType::Gorilla,
             ],
             FloatPattern::Random => &[
+                EncodingType::Pco,
                 EncodingType::Alp,
                 EncodingType::Gorilla,
                 EncodingType::Patas,
@@ -301,6 +305,7 @@ impl AdaptiveSelector {
         for &enc in candidates {
             let trial = match enc {
                 EncodingType::Rle => crate::rle::RleEncoder::encode_f64(&sample),
+                EncodingType::Pco => crate::pco::PcoEncoder::encode_f64(&sample),
                 EncodingType::Alp => AlpEncoder::encode(&sample),
                 EncodingType::Chimp128 => Chimp128Encoder::encode(&sample),
                 EncodingType::Patas => PatasEncoder::encode(&sample),
@@ -331,6 +336,7 @@ impl AdaptiveSelector {
             .map_or(EncodingType::PlainF64, |(enc, _)| enc);
         let payload = match winner {
             EncodingType::Rle => crate::rle::RleEncoder::encode_f64(values)?,
+            EncodingType::Pco => crate::pco::PcoEncoder::encode_f64(values)?,
             EncodingType::Alp => AlpEncoder::encode(values)?,
             EncodingType::Chimp128 => Chimp128Encoder::encode(values)?,
             EncodingType::Patas => PatasEncoder::encode(values)?,
@@ -376,6 +382,13 @@ impl AdaptiveSelector {
                 }
             }
             FloatPattern::Periodic | FloatPattern::SlowlyVarying => {
+                let pco_payload = crate::pco::PcoEncoder::encode_f64(values)?;
+                if should_use_specialized(&pco_payload, raw_size) {
+                    return Ok(EncodedBlock {
+                        encoding: EncodingType::Pco,
+                        payload: pco_payload,
+                    });
+                }
                 let chimp128_payload = Chimp128Encoder::encode(values)?;
                 if should_use_specialized(&chimp128_payload, raw_size) {
                     return Ok(EncodedBlock {
@@ -395,9 +408,15 @@ impl AdaptiveSelector {
             FloatPattern::Random => {}
         }
 
-        // Common fallback chain: ALP → Chimp → Patas → Gorilla → Plain.
-        // ALP goes first for the same reason it leads the sampled candidate
-        // lists above.
+        // Common fallback chain: pco → ALP → Chimp → Patas → Gorilla → Plain,
+        // in the order the sampled candidate lists above use.
+        let pco_payload = crate::pco::PcoEncoder::encode_f64(values)?;
+        if should_use_specialized(&pco_payload, raw_size) {
+            return Ok(EncodedBlock {
+                encoding: EncodingType::Pco,
+                payload: pco_payload,
+            });
+        }
         let alp_payload = AlpEncoder::encode(values)?;
         if should_use_specialized(&alp_payload, raw_size) {
             return Ok(EncodedBlock {
@@ -484,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_f64_adaptive_selects_alp_for_slowly_varying_decimals() {
+    fn encode_f64_adaptive_selects_pco_for_slowly_varying_decimals() {
         let selector = AdaptiveSelector::new();
         // Two-decimal values — what a meter or sensor actually emits, and
         // what ALP reconstructs as scaled integers.
@@ -492,8 +511,8 @@ mod tests {
         let block = selector.encode_f64_adaptive(&values).unwrap();
         assert_eq!(
             block.encoding,
-            EncodingType::Alp,
-            "decimal data should select ALP over the XOR codecs, got {}",
+            EncodingType::Pco,
+            "decimal data should select pco over ALP and the XOR codecs, got {}",
             block.encoding,
         );
         // Verify correctness regardless of which encoding was chosen
@@ -569,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn periodic_data_dispatches_chimp128() {
+    fn periodic_data_dispatches_pco() {
         let selector = AdaptiveSelector::new();
         // Periodic sensor data: 64 distinct values cycling many times (>1024 to
         // exercise the sample path, and >30% ring-buffer hits).
@@ -581,8 +600,8 @@ mod tests {
         let block = selector.encode_f64_adaptive(&values).unwrap();
         assert_eq!(
             block.encoding,
-            EncodingType::Chimp128,
-            "Periodic data should use Chimp128, got {}",
+            EncodingType::Pco,
+            "Periodic data should use pco, got {}",
             block.encoding,
         );
 
@@ -607,7 +626,8 @@ mod tests {
 
         let block = selector.encode_f64_adaptive(&values).unwrap();
         assert!(
-            block.encoding == EncodingType::Alp
+            block.encoding == EncodingType::Pco
+                || block.encoding == EncodingType::Alp
                 || block.encoding == EncodingType::Chimp128
                 || block.encoding == EncodingType::Chimp
                 || block.encoding == EncodingType::Gorilla,

@@ -92,9 +92,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 2. Archive everything older than 30 days ────────────────────────
     //
-    // Upload, verify, drop the catalog entry, delete the file — in that
-    // order, so a failure at any step leaves the segment hot rather than
-    // leaving the catalog pointing at a file that is gone.
+    // Each (measurement, shard) is read back through the *read path* —
+    // deduplicated, tombstones applied — encoded as one Parquet object,
+    // uploaded, verified, and only then dropped. In that order, so a failure
+    // at any step leaves the data hot rather than leaving the catalog
+    // pointing at a file that is gone.
     let archive_url = format!("file://{}/", archive_dir.display());
     let outcome = db
         .archive_cold_segments(&ArchiveConfig {
@@ -105,8 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!(
-        "archived     : {} segment(s), {} bytes, {} left hot after a failure",
-        outcome.segments, outcome.bytes, outcome.failed
+        "archived     : {} object(s) from {} segment(s), {} rows, {} bytes, {} left hot",
+        outcome.objects, outcome.segments, outcome.rows, outcome.bytes, outcome.failed
     );
     println!(
         "hot tier     : {} rows (archived rows have left)",
@@ -154,7 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // query that silently crossed the boundary would change cost class with
     // nothing in the plan saying so.
     let ctx = datafusion::prelude::SessionContext::new();
-    chronix::sql::cold_tier::register_cold_tier(&ctx, &archive_url, "power_archive").await?;
+    chronix::sql::cold_tier::register_cold_tier(&ctx, &archive_url, "power", "power_archive")
+        .await?;
 
     println!("\nSELECT host, count(*), avg(watts) FROM power_archive GROUP BY host:");
     ctx.sql(

@@ -48,7 +48,7 @@ async def main():
             print(row)
 
         # SQL
-        result = await client.sql("SELECT * FROM cpu ORDER BY time DESC LIMIT 10")
+        result = await client.sql("SELECT * FROM cpu ORDER BY _time DESC LIMIT 10")
         df = result.to_dataframe()  # requires pandas extra
 
 asyncio.run(main())
@@ -92,7 +92,7 @@ import adbc_driver_flightsql.dbapi
 uri = ChronixClient.flight_sql_uri("localhost", 5557)
 conn = adbc_driver_flightsql.dbapi.connect(uri)
 cursor = conn.cursor()
-cursor.execute("SELECT * FROM cpu WHERE time > now() - INTERVAL '1 hour'")
+cursor.execute("SELECT * FROM cpu WHERE _time > now() - INTERVAL '1 hour'")
 table = cursor.fetch_arrow_table()
 df = table.to_pandas()
 ```

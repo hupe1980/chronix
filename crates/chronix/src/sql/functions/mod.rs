@@ -94,6 +94,9 @@ pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udaf(AggregateUDF::new_from_impl(aggregates::IRateUdaf::new()));
     ctx.register_udaf(AggregateUDF::new_from_impl(aggregates::ForecastUdaf::new()));
     ctx.register_udaf(AggregateUDF::new_from_impl(
+        aggregates::AutoForecastUdaf::new(),
+    ));
+    ctx.register_udaf(AggregateUDF::new_from_impl(
         aggregates::MultivariateForecastUdaf::new(),
     ));
 }

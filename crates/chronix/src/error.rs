@@ -56,6 +56,14 @@ pub enum DbError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// SQL planning or execution error.
+    #[error("SQL error: {0}")]
+    Sql(#[from] datafusion::error::DataFusionError),
+
+    /// PromQL parse or evaluation error.
+    #[error("PromQL error: {0}")]
+    PromQl(String),
+
     /// Database is closed.
     #[error("Database is closed")]
     Closed,
@@ -86,6 +94,19 @@ pub enum DbError {
     /// Query execution exceeded the configured timeout.
     #[error("Query timeout: execution exceeded {0:?}")]
     QueryTimeout(std::time::Duration),
+
+    /// A point's timestamp is further ahead of the wall clock than
+    /// `future_write_tolerance` allows.
+    ///
+    /// Rejected before admission so it cannot anchor the out-of-order
+    /// window in the future and lock every real write out.
+    #[error("timestamp {timestamp} is beyond the future-write limit {limit}")]
+    FutureTimestamp {
+        /// The rejected timestamp, nanoseconds since the epoch.
+        timestamp: i64,
+        /// The newest timestamp accepted at the time of the write.
+        limit: i64,
+    },
 
     /// Write admission denied — transient overload.
     ///
@@ -132,60 +153,55 @@ impl DbError {
     }
 }
 
-/// Result of a batch insert where WAL commit succeeded but some
-/// memtable insertions may have failed.
-///
-/// Pre-WAL failures (closed, backpressure, cardinality, WAL write) always
-/// return `Err(DbError)` — the entire batch failed and nothing is durable.
-/// Once the WAL has committed, any subsequent memtable insertion failures are
-/// captured in [`InsertResult::errors`] while the data remains durable in the
-/// WAL and will be recovered on restart.
 /// Outcome of a batch insert.
 ///
-/// A batch insert returns `Ok` even when **some or all** points were rejected
-/// by the memtable — for example a point more than ±2 shards out of order.
-/// The per-point errors live in [`errors`](Self::errors), so discarding this
-/// value silently discards those rejections; `#[must_use]` makes that a
-/// compiler warning rather than a lost write.
-#[must_use = "an insert can be partial — check `is_complete()` or `errors`"]
-#[derive(Debug)]
+/// Admission is decided per point **before** anything is made durable, so
+/// a batch splits cleanly into the points that were accepted — all of them
+/// in one WAL record, all of them in the memtable — and the points that
+/// were rejected, each with its reason. The only per-point rejection is a
+/// timestamp outside the out-of-order window.
+///
+/// Everything that fails the batch as a whole — a closed database,
+/// overload, the cardinality budget, a schema type conflict, a WAL error —
+/// returns `Err`, and then nothing from the batch is durable.
+///
+/// Discarding this value silently discards the rejections; `#[must_use]`
+/// makes that a compiler warning rather than a lost write.
+#[must_use = "an insert can be partial — check `is_complete()` or `rejected`"]
+#[derive(Debug, Default)]
 pub struct InsertResult {
-    /// Number of points durably committed to WAL.
-    pub wal_committed: usize,
-    /// Number of points successfully inserted into the memtable.
-    pub memtable_inserted: usize,
-    /// Per-point errors (index into original batch → error).
-    /// Empty when all points succeeded.
-    pub errors: Vec<(usize, DbError)>,
+    /// Number of points accepted: durable in the WAL and visible to reads.
+    pub accepted: usize,
+    /// Rejected points, as `(index into the batch, reason)`.
+    pub rejected: Vec<(usize, DbError)>,
 }
 
 impl InsertResult {
-    /// Returns `true` when all points were inserted into the memtable.
+    /// Returns `true` when every point was accepted.
     pub fn is_complete(&self) -> bool {
-        self.errors.is_empty()
+        self.rejected.is_empty()
     }
 
-    /// Returns `true` when at least one memtable insertion failed.
+    /// Returns `true` when at least one point was rejected.
     pub fn is_partial(&self) -> bool {
-        !self.errors.is_empty()
+        !self.rejected.is_empty()
     }
 
     /// Convert a partial insert into an error.
     ///
     /// For callers that want "all or nothing" semantics rather than
-    /// inspecting per-point errors. Returns the number of points inserted.
+    /// inspecting per-point rejections. Returns the number of points
+    /// accepted.
     ///
     /// # Errors
     ///
-    /// Returns [`DbError::Internal`] naming the first rejection if any point
-    /// was rejected.
+    /// Returns the first rejection's error if any point was rejected. The
+    /// accepted points stay written — admission is per point, and the
+    /// caller asked for the strict *report*, not a rollback.
     pub fn into_complete(self) -> Result<usize> {
-        match self.errors.into_iter().next() {
-            None => Ok(self.memtable_inserted),
-            Some((idx, err)) => Err(DbError::Internal(format!(
-                "insert was partial: {} of {} points rejected; first at index {idx}: {err}",
-                self.memtable_inserted, self.wal_committed
-            ))),
+        match self.rejected.into_iter().next() {
+            None => Ok(self.accepted),
+            Some((_, err)) => Err(err),
         }
     }
 }

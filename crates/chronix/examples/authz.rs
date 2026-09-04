@@ -9,7 +9,9 @@
 //! cargo run -p chronix --example authz
 //! ```
 
-use chronix::chronix_authz::{AuthzEngine, ChronixAction, ChronixPrincipal, ChronixResource};
+use chronix::chronix_security::authz::{
+    AuthzEngine, ChronixAction, ChronixPrincipal, ChronixResource,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = AuthzEngine::new();

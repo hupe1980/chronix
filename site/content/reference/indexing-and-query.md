@@ -35,11 +35,12 @@ produce *k* derived positions) with FNV-1a as the hash function:
   duplicate); the count is only incremented for new keys
 - `might_contain(&str)` operates on UTF-8 string keys
 - Target FP rate of 1% — tests verify ≤ 5× target rate
-- **Persistence:** `to_bytes()` / `from_bytes()` serialise the bloom filter to a
-  compact binary format. During flush, the bloom filter is persisted as a
-  `.bloom` sidecar file alongside the `.csx` segment file. On `open()`, all
-  `.bloom` files are loaded via `load_catalog_state()`, restoring bloom-based
-  pruning across restarts without rebuilding from segment data.
+- **Persistence:** the bloom filter itself is not stored. Every segment has a
+  `.series` sidecar — its distinct series keys, LZ4-compressed postcard with
+  a CRC-32C (`chronix_engine::index::series_index`) — and on `open()`
+  `load_catalog_state()` rebuilds the bloom, the tag-index entries and the
+  exact series set from it, without decoding the segment. A missing or
+  corrupt sidecar is rebuilt once from the segment's tag columns.
 
 ### Segment Catalog
 
@@ -314,8 +315,9 @@ decoding), or `Decode` (must decode). Batch evaluation via `evaluate_batch()`
 for vectorized processing of multiple row groups.
 ## SQL Query Engine (DataFusion Integration)
 
-Chronix integrates [Apache DataFusion](https://datafusion.apache.org/) v45 as its
-SQL query engine, exposing all measurements as SQL tables via a dynamic catalog.
+Chronix integrates [Apache DataFusion](https://datafusion.apache.org/) v55 as
+its SQL query engine, exposing measurements as SQL tables via a dynamic
+catalog scoped to the session's namespace.
 
 **Runtime Environment:** `create_session_context()` configures DataFusion's
 `RuntimeEnv` with:
@@ -333,10 +335,32 @@ incremental pipeline processing. Downstream operators (filter, project,
 aggregate, sort) process data chunk-by-chunk instead of waiting for the entire
 result set.
 
-**Security**: The HTTP SQL endpoint (`POST /api/v1/sql`) enforces **read-only
-access** — only `SELECT` queries are permitted. DDL (`CREATE`, `DROP`), DML
-(`INSERT`, `DELETE`), and `COPY` statements are rejected at the logical plan
-level before execution.
+**Epoch literals:** an `EpochLiteralRule` runs **before** DataFusion's
+`TypeCoercion`, rewriting an integer literal compared against a
+timestamp-typed expression into a timestamp literal in that column's unit.
+Without it `WHERE _time >= 1700000000000000000` — the predicate every other
+Chronix surface's values invite — is a planning error, and `BETWEEN` fails
+with an internal DataFusion bug message. Ordering matters: appending the
+rule with `with_analyzer_rule` places it *after* coercion, where the plan
+has already failed, so the default rule list is rebuilt with this one in
+front.
+
+**Catalog scoping:** `table_names()` and `table_exist()` answer from a
+namespace → measurements index derived from the canonical series keys the
+engine already keeps, so the planner's per-reference lookup is a hash
+lookup. Scoping the rows was not enough on its own: a measurement resolving
+to an empty table is distinguishable from one that does not resolve, and
+that difference enumerates other tenants' measurement names. With the
+catalog scoped, `information_schema` is enabled — which is what makes
+`SHOW TABLES` and `SHOW COLUMNS` work.
+
+**Security**: The HTTP SQL endpoint (`POST /api/v1/chronix/sql`) enforces
+**read-only access**. DDL (`CREATE`, `DROP`), DML (`INSERT`, `DELETE`),
+`COPY` and `Statement` plans (`SET`, `PREPARE`) are rejected at the logical
+plan level before execution. `EXPLAIN`, `EXPLAIN ANALYZE` and `DESCRIBE` are
+permitted, and the plan they wrap is verified by the same rules — the
+wrapper is not what gets checked, because an `Explain` around an `Insert` is
+not a DML node.
 
 ### Architecture
 
@@ -357,7 +381,7 @@ SQL string → DataFusion Parser → LogicalPlan → Optimizer → PhysicalPlan
 - **`ChronixCatalogProvider`** — Implements `CatalogProvider`, reports a single
   `"public"` schema containing all Chronix measurements as tables.
 - **`ChronixSchemaProvider`** — Implements `SchemaProvider`, dynamically
-  discovers measurements via `db.measurements()` and wraps each in a
+  discovers measurements via `db.schema_registry().measurement_names()` and wraps each in a
   `ChronixTableProvider`.
 - **`ChronixTableProvider`** — Implements `TableProvider` with full predicate
   pushdown (time range + tag filters) and column projection.
@@ -418,12 +442,18 @@ All standard SQL window functions are supported via DataFusion's built-in engine
 
 ### ASOF JOIN
 
-Cross-series temporal alignment via a custom DataFusion `ExecutionPlan`:
+Cross-series temporal alignment via a custom DataFusion `ExecutionPlan`.
 
-```sql
--- Programmatic API (custom plan, not SQL syntax)
-execute_asof_join(left_stream, right_stream,
-    time_col="_time", tag_cols=["host"], tolerance_ns=5_000_000_000)
+> **A Rust API, not SQL syntax.** DataFusion's parser has no `ASOF JOIN` and
+> chronix adds none. The entry point is `chronix::sql::execute_asof_join`,
+> taking the two physical plans `DataFrame::create_physical_plan` gives you.
+
+```rust
+let left = ctx.table("cpu").await?.create_physical_plan().await?;
+let right = ctx.table("mem").await?.create_physical_plan().await?;
+let joined = chronix::sql::execute_asof_join(
+    left, right, "_time", vec!["host".into()], 5_000_000_000, ctx.task_ctx(),
+).await?;
 ```
 
 - `AsofJoinExec` implements `ExecutionPlan` with sort-merge nearest-timestamp
@@ -434,7 +464,11 @@ execute_asof_join(left_stream, right_stream,
   row —  avoiding repeated `schema.index_of()` and downcast overhead.
 - Tie-breaking: earlier timestamp wins.
 - Materializes the right side; streams the left side.
-- Negative tolerance values rejected at plan creation time.
+- Rejected at plan creation: a negative tolerance, and a join key that is
+  absent from either side or is not a string.
+- Both inputs require a single partition (`required_input_distribution`), so
+  DataFusion inserts the coalesce.
+
 ## PromQL Engine
 
 Chronix includes a built-in PromQL parser and evaluator for Prometheus
@@ -458,7 +492,7 @@ PromQL string → Lexer → Tokens → Parser → AST (Expr) → Evaluator → P
   
   Matchers are compiled once into `CompiledMatcher` structs at evaluation
   time and applied as post-filters after label set construction.
-- **Range vectors:** `metric[5m]`, offset modifier
+- **Range vectors:** `metric[5m]`
 - **Functions:** `rate()`, `irate()`, `increase()`, `delta()`, `deriv()`,
   `predict_linear()`, `abs()`, `ceil()`, `floor()`, `round()`, `clamp()`,
   `label_replace()`, `label_join()`, `histogram_quantile()`
@@ -468,7 +502,40 @@ PromQL string → Lexer → Tokens → Parser → AST (Expr) → Evaluator → P
   modifier
 - **Vector matching:** `on()`, `ignoring()`, `group_left()`, `group_right()`
   with include label lists
-- **Subqueries:** `metric[5m:1m]`
+- **Subqueries:** `metric[5m:1m]`, and `metric[5m:]` at the engine's 1-minute
+  default step
+- **Modifiers:** `offset 5m`, `offset -5m` (forward), `@ 1609746000`,
+  `@ start()`, `@ end()`
+
+### Modifiers
+
+`offset` and `@` attach to a **selector or a subquery** and to nothing else, so
+`sum(m) offset 5m` is a parse error — as it is in Prometheus.
+
+`@` replaces the evaluation instant and the offset is then subtracted, in that
+order. `@ start()` and `@ end()` take a range query's own bounds; for an instant
+query both are the evaluation time. A pinned selector reads one fixed window
+whatever the step, so it is fetched directly rather than through the range
+query's prefetch span.
+
+### Subqueries
+
+`expr[range:step]` evaluates `expr` as an instant query at each point of an
+**absolute** step grid — aligned to multiples of the step rather than to the
+evaluation time, so a subquery inside a range query samples the same points at
+every outer step instead of jittering underneath it.
+
+- Every sample carries its **step** timestamp, so the result is step-aligned
+  and strictly increasing.
+- The window is **left-open** on the grid, as range selectors are.
+- A step-less `[5m:]` uses the engine's 1-minute interval, **not** the outer
+  step, so a panel means the same thing at every zoom level.
+- A subquery is a range vector, so `rate(x[5m:15s])` extrapolates over five
+  minutes exactly as `rate(x[5m])` does.
+
+Inner selectors prefetch over the **outer** query's window widened by the
+subquery's reach, which is constant across steps — so a range query containing
+a subquery reads storage once.
 
 ### Counter functions and extrapolation
 
@@ -500,9 +567,27 @@ non-positive bound is returned as-is, and everything else interpolates
 linearly within the containing bucket. Bucket counts are made monotonic first
 to absorb scrape artifacts.
 
-Both are covered end to end in `chronix/tests/promql_conformance.rs`, which
-drives parse → select → evaluate against stored samples rather than calling
-the compute helpers directly.
+### Conformance details that are easy to get subtly wrong
+
+Each is pinned by a test naming the upstream rule it encodes:
+
+- A comparison keeps the **vector element's** value whichever side the scalar
+  is written on, so `2 < some_metric` is the metric's value, not `2`.
+- A duplicate on the "one" side of `group_left` is an **error**, not a cross
+  product.
+- `last_over_time` keeps `__name__` (it returns an actual sample of the
+  series); every other `_over_time` drops it, and so does `timestamp()`.
+- `deriv` and `idelta` **drop** a series with fewer than two points rather than
+  emitting `NaN`.
+- `clamp(v, min, max)` with `max < min` is an empty vector.
+- `label_replace` refuses a destination that is not a legal label name.
+- `NaN` sorts **last** in `sort`, `sort_desc`, `topk` and `bottomk`.
+- `quantile` outside `[0, 1]` yields ±Inf rather than erroring; `round(v, 0)`
+  is `NaN`, which falls out of `Floor(v/0 + 0.5) * 0`.
+
+All of the above are covered in `chronix/tests/promql_conformance.rs`, which
+drives parse → select → evaluate against stored samples rather than calling the
+compute helpers directly.
 
 ### API Endpoints (Prometheus-compatible)
 

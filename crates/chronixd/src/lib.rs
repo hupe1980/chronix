@@ -19,6 +19,7 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod audit;
 pub mod auth;
 #[cfg(feature = "cluster")]
 pub mod cluster;

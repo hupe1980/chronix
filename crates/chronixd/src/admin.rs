@@ -1015,13 +1015,37 @@ pub async fn chaos_clear_all_handler(
 
 // ── Backup / Restore ──────────────────────────────────────────────────
 
-/// Validate that a user-supplied path does not escape the
-/// allowed base directory via `..`, symlinks, or other traversal tricks.
-fn validate_admin_path(user_path: &str) -> Result<std::path::PathBuf, ServerError> {
-    let path = std::path::PathBuf::from(user_path);
+/// The directory every admin filesystem path is confined to.
+///
+/// Configurable, because a backup usually belongs on a different volume
+/// from the data. Defaults to `backups/` beside the data.
+fn admin_root(state: &AppState) -> std::path::PathBuf {
+    state
+        .config
+        .backup_root
+        .clone()
+        .unwrap_or_else(|| state.db.data_dir().join("backups"))
+}
 
-    // Reject paths containing parent traversal components.
-    for component in path.components() {
+/// Resolve a caller-supplied backup path inside `root`.
+///
+/// The old check rejected `..` and demanded an absolute path, and an
+/// absolute path was then accepted **anywhere on the filesystem** — so a
+/// restore read any directory the server user could read, and a backup
+/// wrote over any directory it could write. Rejecting `..` is not
+/// confinement; a root is.
+///
+/// A relative path is taken as relative to `root`. An absolute path is
+/// accepted only when it is already inside `root`. Either way the deepest
+/// existing ancestor is canonicalised before the check, so a symlink
+/// planted inside `root` cannot point out of it.
+fn confine_to_root(
+    user_path: &str,
+    root: &std::path::Path,
+) -> Result<std::path::PathBuf, ServerError> {
+    let requested = std::path::PathBuf::from(user_path);
+
+    for component in requested.components() {
         if matches!(component, std::path::Component::ParentDir) {
             return Err(ServerError::BadRequest(
                 "path must not contain '..' components".into(),
@@ -1029,14 +1053,60 @@ fn validate_admin_path(user_path: &str) -> Result<std::path::PathBuf, ServerErro
         }
     }
 
-    // Must be absolute to prevent relative-path ambiguity.
-    if !path.is_absolute() {
-        return Err(ServerError::BadRequest(
-            "backup/restore paths must be absolute".into(),
-        ));
+    // The root has to exist before it can anchor anything; creating it is
+    // part of serving the endpoint, not a caller's job.
+    std::fs::create_dir_all(root).map_err(|e| {
+        ServerError::Internal(format!(
+            "cannot create the backup root {}: {e}",
+            root.display()
+        ))
+    })?;
+    let canonical_root = root.canonicalize().map_err(|e| {
+        ServerError::Internal(format!(
+            "cannot resolve the backup root {}: {e}",
+            root.display()
+        ))
+    })?;
+
+    let candidate = if requested.is_absolute() {
+        requested
+    } else {
+        canonical_root.join(&requested)
+    };
+
+    // Canonicalise the deepest ancestor that exists — the leaf usually does
+    // not yet, since a restore target must be new — then re-attach the
+    // remainder. Checking the string alone would miss a symlink.
+    let mut existing = candidate.as_path();
+    let mut tail = std::path::PathBuf::new();
+    let resolved = loop {
+        match existing.canonicalize() {
+            Ok(base) => break base.join(&tail),
+            Err(_) => match existing.parent() {
+                Some(parent) => {
+                    let name = existing
+                        .file_name()
+                        .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
+                    tail = std::path::PathBuf::from(name).join(&tail);
+                    existing = parent;
+                }
+                None => {
+                    return Err(ServerError::BadRequest(
+                        "path does not resolve inside the backup root".into(),
+                    ))
+                }
+            },
+        }
+    };
+
+    if !resolved.starts_with(&canonical_root) {
+        return Err(ServerError::BadRequest(format!(
+            "path must stay inside the backup root {}",
+            canonical_root.display()
+        )));
     }
 
-    Ok(path)
+    Ok(resolved)
 }
 
 /// Request body for `POST /api/v1/admin/backup`.
@@ -1060,7 +1130,7 @@ pub async fn backup_handler(
     State(state): State<AppState>,
     Json(body): Json<BackupRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let target = validate_admin_path(&body.target_dir)?;
+    let target = confine_to_root(&body.target_dir, &admin_root(&state))?;
     let manifest = tokio::task::spawn_blocking({
         let db = Arc::clone(&state.db);
         move || db.backup(&target)
@@ -1076,16 +1146,26 @@ pub async fn backup_handler(
         wal_seq = manifest.wal_sequence,
         "audit: backup created"
     );
+    crate::audit::record(
+        &state,
+        "admin",
+        chronix_security::audit::AuditAction::Admin,
+        format!("backup:{}", body.target_dir),
+        chronix_security::audit::AuditDecision::Allow,
+        &[("files", manifest.file_count.to_string())],
+    );
 
     Ok((StatusCode::OK, Json(manifest)))
 }
 
 /// `POST /api/v1/admin/restore` — restore a database from backup.
 pub async fn restore_handler(
+    State(state): State<AppState>,
     Json(body): Json<RestoreRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let backup_dir = validate_admin_path(&body.backup_dir)?;
-    let target_dir = validate_admin_path(&body.target_dir)?;
+    let root = admin_root(&state);
+    let backup_dir = confine_to_root(&body.backup_dir, &root)?;
+    let target_dir = confine_to_root(&body.target_dir, &root)?;
     let manifest =
         tokio::task::spawn_blocking(move || chronix::Chronix::restore(&backup_dir, &target_dir))
             .await
@@ -1097,6 +1177,17 @@ pub async fn restore_handler(
         target_dir = %body.target_dir,
         wal_seq = manifest.wal_sequence,
         "audit: restore completed"
+    );
+    crate::audit::record(
+        &state,
+        "admin",
+        chronix_security::audit::AuditAction::Admin,
+        format!("restore:{}", body.target_dir),
+        chronix_security::audit::AuditDecision::Allow,
+        &[
+            ("backup_dir", body.backup_dir.clone()),
+            ("wal_sequence", manifest.wal_sequence.to_string()),
+        ],
     );
 
     Ok((StatusCode::OK, Json(manifest)))
@@ -1126,15 +1217,17 @@ pub struct PitrRestoreResponse {
 
 /// `POST /api/v1/admin/restore/pitr` — point-in-time recovery.
 pub async fn pitr_restore_handler(
+    State(state): State<AppState>,
     Json(body): Json<PitrRestoreRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let backup_dir = validate_admin_path(&body.backup_dir)?;
-    let target_dir = validate_admin_path(&body.target_dir)?;
+    let root = admin_root(&state);
+    let backup_dir = confine_to_root(&body.backup_dir, &root)?;
+    let target_dir = confine_to_root(&body.target_dir, &root)?;
     let target_seq = body.target_sequence;
     let archive_dir = body
         .wal_archive_dir
         .as_deref()
-        .map(validate_admin_path)
+        .map(|d| confine_to_root(d, &root))
         .transpose()?;
 
     let (manifest, replayed) = tokio::task::spawn_blocking(move || {
@@ -1516,5 +1609,62 @@ mod tests {
         let cpu_models = catalog.list_models("cpu");
         assert_eq!(cpu_models.len(), 1);
         assert_eq!(cpu_models[0].model_name, "ses1");
+    }
+}
+
+#[cfg(test)]
+mod path_confinement_tests {
+    use super::confine_to_root;
+
+    /// The old check rejected `..` and required an absolute path, which
+    /// meant *any* absolute path was accepted: restore read whatever the
+    /// server user could read, and backup wrote wherever it could write.
+    #[test]
+    fn an_absolute_path_outside_the_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("backups");
+        let err =
+            confine_to_root("/etc", &root).expect_err("a path outside the root must be refused");
+        assert!(
+            err.to_string().contains("backup root"),
+            "the error must say why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_resolves_inside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("backups");
+        let resolved = confine_to_root("nightly/2026-09-03", &root).unwrap();
+        assert!(
+            resolved.starts_with(root.canonicalize().unwrap()),
+            "{} must be inside the root",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn parent_traversal_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("backups");
+        assert!(confine_to_root("../../etc", &root).is_err());
+    }
+
+    /// Rejecting `..` in the string is not confinement. A symlink planted
+    /// inside the root points out of it without any `..` anywhere, so the
+    /// deepest existing ancestor is canonicalised before the check.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("backups");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let err = confine_to_root("escape/loot", &root)
+            .expect_err("a symlink leaving the root must be refused");
+        assert!(err.to_string().contains("backup root"), "{err}");
     }
 }

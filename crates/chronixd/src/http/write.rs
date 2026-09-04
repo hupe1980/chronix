@@ -48,17 +48,26 @@ pub async fn write_handler(
     ns_ctx: Option<axum::extract::Extension<NamespaceContext>>,
     Json(body): Json<WriteBody>,
 ) -> Result<impl IntoResponse, ServerError> {
-    // Idempotency-Key deduplication — reject duplicate writes.
-    if let Some(ref dedup) = state.write_dedup_cache {
-        if let Some(idem_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
-            if dedup.check_duplicate(idem_key) {
-                metrics::counter!("chronix_write_dedup_rejected_total").increment(1);
-                return Err(ServerError::Conflict(
-                    "duplicate write: Idempotency-Key already seen".into(),
-                ));
+    // Idempotency-Key deduplication. The claim is released automatically
+    // unless the write succeeds, so a failed write does not turn the
+    // client's retry into a 409.
+    let claim = match (&state.write_dedup_cache, headers.get("idempotency-key")) {
+        (Some(dedup), Some(key)) => {
+            let key = key.to_str().map_err(|_| {
+                ServerError::BadRequest("Idempotency-Key is not valid UTF-8".into())
+            })?;
+            match dedup.claim(key) {
+                Some(c) => Some(c),
+                None => {
+                    metrics::counter!("chronix_write_dedup_rejected_total").increment(1);
+                    return Err(ServerError::Conflict(
+                        "duplicate write: Idempotency-Key already seen".into(),
+                    ));
+                }
             }
         }
-    }
+        _ => None,
+    };
 
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let points_raw = match body {
@@ -93,6 +102,10 @@ pub async fn write_handler(
 
     debug!(count, "wrote points via REST");
     metrics::counter!("chronix_http_points_written_total").increment(count as u64);
+    // The write landed, so the key now means "already done".
+    if let Some(claim) = claim {
+        claim.commit();
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -101,43 +114,107 @@ pub async fn write_influx_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     ns_ctx: Option<axum::extract::Extension<NamespaceContext>>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     body: String,
-) -> Result<impl IntoResponse, ServerError> {
-    // Idempotency-Key deduplication — reject duplicate writes.
-    if let Some(ref dedup) = state.write_dedup_cache {
-        if let Some(idem_key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
-            if dedup.check_duplicate(idem_key) {
-                metrics::counter!("chronix_write_dedup_rejected_total").increment(1);
-                return Err(ServerError::Conflict(
-                    "duplicate write: Idempotency-Key already seen".into(),
-                ));
+) -> Result<axum::response::Response, ServerError> {
+    // `precision` applies to every timestamp in the body. Telegraf and the
+    // InfluxDB clients set it; ignoring it put a millisecond client's data
+    // in 1970. `db`, `bucket`, `org`, `rp` and `u`/`p` are accepted and
+    // ignored: chronix has one database per process and scopes by namespace
+    // header, and rejecting them would break a client that always sends them.
+    let precision = {
+        let mut p = influx::Precision::Nanoseconds;
+        for (k, v) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+            if k == "precision" {
+                p = influx::Precision::parse(&v)?;
             }
         }
-    }
+        p
+    };
+    // Idempotency-Key deduplication. The claim is released automatically
+    // unless the write succeeds, so a failed write does not turn the
+    // client's retry into a 409.
+    let claim = match (&state.write_dedup_cache, headers.get("idempotency-key")) {
+        (Some(dedup), Some(key)) => {
+            let key = key.to_str().map_err(|_| {
+                ServerError::BadRequest("Idempotency-Key is not valid UTF-8".into())
+            })?;
+            match dedup.claim(key) {
+                Some(c) => Some(c),
+                None => {
+                    metrics::counter!("chronix_write_dedup_rejected_total").increment(1);
+                    return Err(ServerError::Conflict(
+                        "duplicate write: Idempotency-Key already seen".into(),
+                    ));
+                }
+            }
+        }
+        _ => None,
+    };
 
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let points = influx::parse_line_protocol(&body)?;
+    let parsed = influx::parse_line_protocol_partial(&body, precision);
 
-    if points.is_empty() {
-        return Err(ServerError::BadRequest("empty line protocol body".into()));
+    if parsed.points.is_empty() {
+        return if parsed.errors.is_empty() {
+            Err(ServerError::BadRequest("empty line protocol body".into()))
+        } else {
+            // Nothing usable: a plain 400, whose message names the first
+            // failure so an operator can find the line.
+            Err(ServerError::BadRequest(format!(
+                "unable to parse: {}",
+                parsed.errors.join("; ")
+            )))
+        };
     }
 
     let max_batch = state.config.max_write_batch_size;
-    if points.len() > max_batch {
+    if parsed.points.len() > max_batch {
         return Err(ServerError::BadRequest(format!(
             "batch size {} exceeds limit of {max_batch}",
-            points.len()
+            parsed.points.len()
         )));
     }
 
-    let count = points.len();
+    let count = parsed.points.len();
 
-    crate::util::insert_with_timeout(&state.db, scope.as_deref(), points, state.write_timeout)
-        .await?;
+    crate::util::insert_with_timeout(
+        &state.db,
+        scope.as_deref(),
+        parsed.points,
+        state.write_timeout,
+    )
+    .await?;
 
     debug!(count, "wrote points via InfluxDB Line Protocol");
     metrics::counter!("chronix_influx_points_written_total").increment(count as u64);
-    Ok(StatusCode::NO_CONTENT)
+
+    // InfluxDB's partial-write semantics: the good lines are stored and the
+    // response says which were not, with a message clients recognise as
+    // permanent. Failing the whole batch made Telegraf retry it for ever.
+    if parsed.errors.is_empty() {
+        if let Some(claim) = claim {
+            claim.commit();
+        }
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        metrics::counter!("chronix_influx_lines_rejected_total")
+            .increment(parsed.errors.len() as u64);
+        // The accepted lines *were* stored, so the key is spent: a retry of
+        // the identical body must not write them a second time.
+        if let Some(claim) = claim {
+            claim.commit();
+        }
+        Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("partial write: {}", parsed.errors.join("; ")),
+                "written": count,
+                "rejected": parsed.errors.len(),
+            })),
+        )
+            .into_response())
+    }
 }
 
 fn convert_write_point(req: WritePointRequest) -> Result<Point, ServerError> {

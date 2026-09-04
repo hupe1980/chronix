@@ -418,7 +418,7 @@ CDC PointWritten events
 ## CDC & Event Streaming (`chronix-streaming::cdc`)
 
 Change Data Capture generates events on every data mutation. Events flow through
-a bounded MPMC broadcast bus to subscribers and continuous aggregation engines.
+a bounded MPMC broadcast bus to subscribers.
 
 ```text
 Write Path (WAL + Memtable)
@@ -429,7 +429,6 @@ Write Path (WAL + Memtable)
       ├── Subscription (raw)
       ├── FilteredSubscription (measurement / tag / type filters)
       ├── CdcStream (async Stream<Item = CdcEvent>, backed by BroadcastStream)
-      ├── ContinuousAggregationEngine (incremental materialized views)
       └── BusStats { published, lag, filtered_count }
 ```
 
@@ -441,17 +440,14 @@ Write Path (WAL + Memtable)
 | `SeriesDeleted`      | `delete_series()`            | measurement, tags, hash, seq    |
 | `MeasurementDropped` | `drop_measurement()`         | measurement, seq                |
 
-### Continuous Aggregations
+### Aggregation over time
 
-`ContinuousAggregationEngine` maintains incremental per-bucket state (sum, count,
-min, max) and finalises buckets when time advances past the boundary. Supports
-late-arriving data within a configurable `late_arrival_window`. Construction is
-fallible — `new()` returns `Result<Self, StreamError>`, rejecting zero or negative
-intervals that would cause `rem_euclid(0)` panics. Bucket assignment
-uses overflow-safe `rem_euclid` subtraction for correct rounding with negative
-timestamps (before epoch) without `i64` overflow for far-future timestamps.
-Series eviction properly cleans up all three caches (`buckets`, `series_last_ts`,
-`series_key_cache`) to prevent memory leaks.
+There is no aggregation engine on the CDC bus. Bucketed aggregates are
+**rollups**, materialised once per final bucket by the storage layer with a
+persisted watermark, and read — including the not-yet-final tail, computed
+on the fly — through `Chronix::rollup`. A second aggregate implementation
+on the event stream was cut: two implementations of one aggregate disagree,
+and this one had no watermark.
 
 ### Event Log Durability
 

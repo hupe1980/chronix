@@ -123,7 +123,16 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # HTTP
 axum = { version = "0.8", features = ["json"] }
 tower = { version = "0.5" }
-tower-http = { version = "0.7", features = ["cors", "trace", "limit"] }
+# `decompression-gzip`: the OpenTelemetry Collector and Telegraf both gzip
+# their request bodies by default, and without this layer every one of their
+# batches was a protobuf/line-protocol parse error — a permanent failure the
+# client does not retry, so the data was simply dropped.
+tower-http = { version = "0.7", features = [
+    "cors",
+    "trace",
+    "limit",
+    "decompression-gzip",
+] }
 utoipa = { version = "5", features = ["axum_extras"] }
 
 # gRPC

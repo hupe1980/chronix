@@ -67,24 +67,54 @@ Data is partitioned into **shards** by time — one hour by default. A shard is
 the unit of retention, compaction and tiering, which has two consequences worth
 knowing before you tune anything:
 
-- **Out-of-order writes are accepted within ±2 shards** of the current one.
-  Beyond that they are rejected, and the rejection is *reported* rather than
-  swallowed: `insert_batch` returns an `InsertResult` that is `#[must_use]`, and
-  `into_complete()` turns a partial batch into an error if you want strictness.
+- **Out-of-order writes are accepted within ±2 shards** of the newest write
+  (not of the clock — a device that resumes after days offline is still
+  "now"). Beyond that they are rejected *before* anything is made durable,
+  and the rejection is *reported* rather than swallowed: `insert_batch`
+  returns an `InsertResult { accepted, rejected }` that is `#[must_use]`, and
+  `into_complete()` turns a partial batch into an error if you want
+  strictness.
+- **Writing outside the window is `backfill`.** Importing history is a
+  different operation with a different cost — the shards it touches are
+  opened, flushed and compacted like any other — so it has its own name.
 - **Shard duration is a memory parameter, not only a compaction one.** Scans
   merge one shard-sized bucket at a time, so peak query memory tracks the shard
   size rather than the size of the result.
 
 ## Retention and rollups
 
-Retention drops whole shards once every shard is older than the window.
-Rollups pre-aggregate raw data into coarser tiers — 1&nbsp;s → 1&nbsp;min →
-15&nbsp;min — computed during compaction.
+Retention drops data older than its window. Rollups pre-aggregate raw data
+into coarser tiers — 1&nbsp;s → 1&nbsp;min → 15&nbsp;min — and are
+**materialised**: every bucket is aggregated over every row that reaches it,
+once the out-of-order window has closed over it.
+`db.materialise_rollups()` does the work; `compact()` and
+`enforce_retention()` call it, and a persisted watermark per rollup records
+how far it has got, so a restart neither repeats nor forgets. A tier fed by
+another tier advances exactly as far as its source has, so a cascade is
+consistent by construction.
 
-Retention is **rollup-aware**: raw data is not dropped until every rollup tier
-derived from it has actually been materialised. A retention pass that ran ahead
-of the rollup chain would trade a year of raw readings for an aggregate that
-was never built.
+**And rollups are repaired, because "the window has closed" is not a proof
+of finality.** A backfill, a delete or an import can change a bucket's input
+long after the watermark passed it. Each of those records the range it
+touched, and the next materialisation pass recomputes exactly those buckets:
+
+```rust
+// A device was offline for a day; its backlog arrives now.
+db.backfill(&points)?.into_complete()?;
+// The next pass recomputes the buckets that backlog changed —
+// or do it immediately:
+db.refresh_rollup("energy_15m", start_ns, end_ns)?;
+```
+
+Deleting raw data reaches the derived tiers the same way: the aggregate of a
+deleted series is removed on the next pass, so an erasure request does not
+leave a summary of the erased rows behind.
+
+Retention is **rollup-aware**: data is dropped only once every rollup it
+feeds — the whole chain — has been materialised past it *and* has no repair
+pending. A retention pass that ran ahead of the rollup chain would trade a
+year of raw readings for an aggregate that was never built; a segment still
+needed is preserved and counted, and the next pass tries again.
 
 See [Operations](@/docs/operations.md) for configuration.
 

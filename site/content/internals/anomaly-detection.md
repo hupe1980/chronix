@@ -80,11 +80,11 @@ In operations, **precision** matters most — too many false alerts cause
 Anomaly detection is available through the query engine:
 
 ```sql
-SELECT time, value, ANOMALY_SCORE(value) AS score
+SELECT _time, value,
+       anomaly_score(value, 3.0) OVER (ORDER BY _time) AS score
 FROM metrics
 WHERE metric_name = 'latency_p99'
-AND time > now() - INTERVAL '24 hours'
-HAVING score > 3.0;
+  AND _time > now() - INTERVAL '24 hours';
 ```
 
 The `ANOMALY_SCORE` function returns a normalized score (typically a

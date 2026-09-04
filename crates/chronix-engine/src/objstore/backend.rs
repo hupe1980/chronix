@@ -360,6 +360,30 @@ impl ObjectStoreBackend {
         }
     }
 
+    /// Return the size of an arbitrary object via a HEAD request.
+    ///
+    /// `None` means the object is not there. Used to verify an upload landed
+    /// intact before the caller deletes the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HEAD request fails for any reason other than
+    /// `NotFound`.
+    pub async fn object_size(&self, key: &str) -> Result<Option<usize>> {
+        let obj_path = ObjPath::from(key);
+        let store = &self.store;
+        match retry_with_backoff("object_size", &self.backoff, || {
+            let op = obj_path.clone();
+            async move { store.head(&op).await }
+        })
+        .await
+        {
+            Ok(meta) => Ok(Some(usize::try_from(meta.size).unwrap_or(usize::MAX))),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(ObjStoreError::Store(e)),
+        }
+    }
+
     /// Put an object into the store.
     ///
     /// # Errors

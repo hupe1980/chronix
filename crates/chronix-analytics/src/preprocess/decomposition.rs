@@ -177,37 +177,48 @@ pub fn stl_decompose(
     let mut seasonal = vec![0.0; n];
     let mut trend = vec![0.0; n];
 
+    // The inner loop of Cleveland et al. (1990), steps 1–6, without the
+    // robustness weights. The step that matters is the low-pass filter: the
+    // cycle-subseries smoother produces a nearly periodic series `C`, and
+    // the seasonal component is `C` minus the *low-frequency* part of `C`,
+    // so that any drift the subseries smoother absorbed goes back to the
+    // trend. What stood here before centred each subseries on its own mean
+    // across cycles — which is zero for exactly the series STL exists for,
+    // a stable seasonal pattern — and printed a seasonal component of 1e-16
+    // for a clean 24-period sine.
     for _ in 0..config.n_iter {
-        // Step 1: Detrend
+        // Step 1: detrend.
         let detrended: Vec<f64> = values
             .iter()
             .zip(trend.iter())
             .map(|(y, t)| y - t)
             .collect();
 
-        // Step 2: Subseries smoothing — average each season-offset across cycles
+        // Step 2: cycle-subseries smoothing. Each season offset is smoothed
+        // across its cycles, and the result is scattered back in place.
+        let mut cycle = vec![0.0; n];
         for s in 0..period {
-            // Collect subseries indices
-            let mut sub: Vec<f64> = Vec::new();
-            let mut indices: Vec<usize> = Vec::new();
-            let mut idx = s;
-            while idx < n {
-                sub.push(detrended[idx]);
-                indices.push(idx);
-                idx += period;
-            }
-
-            // Configurable seasonal subseries smoothing window
+            let indices: Vec<usize> = (s..n).step_by(period).collect();
+            let sub: Vec<f64> = indices.iter().map(|&i| detrended[i]).collect();
             let smoothed = loess_smooth(&sub, seasonal_w);
-
-            // Center the smoothed seasonal: subtract its mean so seasonal is zero-mean
-            let mean = smoothed.iter().sum::<f64>() / smoothed.len() as f64;
-            for (j, &idx) in indices.iter().enumerate() {
-                seasonal[idx] = smoothed[j] - mean;
+            for (&i, &v) in indices.iter().zip(smoothed.iter()) {
+                cycle[i] = v;
             }
         }
 
-        // Step 3: Trend = MA(y - seasonal, trend_window)
+        // Step 3: low-pass filter of the cycle-subseries — a centred moving
+        // average of one period (two, for an even period, to stay centred)
+        // and one of three. The full algorithm extends each subseries by a
+        // cycle at either end before filtering; padding with the adjacent
+        // cycle is the same idea for a series that is nearly periodic.
+        let low_pass = low_pass_filter(&cycle, period);
+
+        // Step 4: the seasonal is what the low-pass filter removed.
+        for i in 0..n {
+            seasonal[i] = cycle[i] - low_pass[i];
+        }
+
+        // Steps 5–6: deseasonalise and smooth the trend.
         let deseasoned: Vec<f64> = values
             .iter()
             .zip(seasonal.iter())
@@ -351,6 +362,48 @@ fn detrend(values: &[f64]) -> Vec<f64> {
 /// least squares.  The tricube kernel `w(u) = (1 - |u|³)³` for `|u| < 1`
 /// downweights points far from the center, producing better edge
 /// behaviour and outlier resistance than a uniform moving average.
+/// The low-pass filter of STL step 3: pad by one cycle at each end with the
+/// adjacent cycle, apply a `period`-point centred moving average (a 2×MA for
+/// an even period), then a 3-point one, and cut the padding off again.
+fn low_pass_filter(cycle: &[f64], period: usize) -> Vec<f64> {
+    let n = cycle.len();
+    let mut padded = Vec::with_capacity(n + 2 * period);
+    padded.extend_from_slice(&cycle[..period]);
+    padded.extend_from_slice(cycle);
+    padded.extend_from_slice(&cycle[n - period..]);
+
+    let mut filtered = centered_moving_average(&padded, period);
+    if period.is_multiple_of(2) {
+        filtered = centered_moving_average(&filtered, 2);
+    }
+    let filtered = centered_moving_average(&filtered, 3);
+    filtered[period..period + n].to_vec()
+}
+
+/// A centred moving average of `w` points. For an even `w` the window is
+/// `[i - w/2, i + w/2 - 1]`, so two passes (`w`, then `2`) give the classic
+/// `2×m`-MA; the window shrinks symmetrically at the ends.
+fn centered_moving_average(x: &[f64], w: usize) -> Vec<f64> {
+    let n = x.len();
+    if w <= 1 || n == 0 {
+        return x.to_vec();
+    }
+    let before = w / 2;
+    let after = if w.is_multiple_of(2) {
+        w / 2 - 1
+    } else {
+        w / 2
+    };
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(before);
+            let hi = (i + after).min(n - 1);
+            let slice = &x[lo..=hi];
+            slice.iter().sum::<f64>() / slice.len() as f64
+        })
+        .collect()
+}
+
 fn loess_smooth(values: &[f64], window: usize) -> Vec<f64> {
     let n = values.len();
     if window == 0 {
@@ -409,46 +462,76 @@ mod tests {
         (a - b).abs() < eps
     }
 
+    /// `y = 0.5·i + 10·sin(2πi/12)`: the seasonal component must *be* the
+    /// sine and the trend must be the line. The previous version of this
+    /// test asserted only that the three components summed to the input,
+    /// which the residual guarantees by definition — and the seasonal
+    /// component it accepted was identically zero.
     #[test]
-    fn test_stl_basic_trend_plus_seasonal() {
-        // Construct y = trend + seasonal + 0
+    fn stl_recovers_the_trend_and_the_seasonal_pattern() {
         let n = 120;
         let period = 12;
-        let mut values = Vec::with_capacity(n);
-        for i in 0..n {
-            let trend = 0.5 * i as f64;
-            let seasonal = 10.0 * ((2.0 * std::f64::consts::PI * i as f64 / period as f64).sin());
-            values.push(trend + seasonal);
+        let seasonal_of = |i: usize| 10.0 * (2.0 * std::f64::consts::PI * i as f64 / 12.0).sin();
+        let values: Vec<f64> = (0..n).map(|i| 0.5 * i as f64 + seasonal_of(i)).collect();
+
+        let dec = stl_decompose(&values, &StlConfig::new(period).with_iterations(5)).unwrap();
+
+        let amplitude = dec.seasonal.iter().copied().fold(f64::MIN, f64::max)
+            - dec.seasonal.iter().copied().fold(f64::MAX, f64::min);
+        assert!(
+            amplitude > 18.0,
+            "seasonal amplitude collapsed: {amplitude}"
+        );
+
+        // Away from the ends the recovery is tight; the ends see a shorter
+        // smoother window and are allowed a little more.
+        for i in period..n - period {
+            assert!(
+                approx(dec.seasonal[i], seasonal_of(i), 0.6),
+                "seasonal at {i}: {} vs {}",
+                dec.seasonal[i],
+                seasonal_of(i)
+            );
+            assert!(
+                approx(dec.trend[i], 0.5 * i as f64, 0.6),
+                "trend at {i}: {} vs {}",
+                dec.trend[i],
+                0.5 * i as f64
+            );
+            assert!(
+                dec.residual[i].abs() < 0.6,
+                "residual at {i}: {}",
+                dec.residual[i]
+            );
         }
-
-        let config = StlConfig::new(period).with_iterations(5);
-        let dec = stl_decompose(&values, &config).unwrap();
-
-        // Verify: original ≈ trend + seasonal + residual
         for i in 0..n {
             let recon = dec.trend[i] + dec.seasonal[i] + dec.residual[i];
-            assert!(
-                approx(recon, values[i], 1e-9),
-                "sum mismatch at {i}: {recon} vs {}",
-                values[i]
-            );
+            assert!(approx(recon, values[i], 1e-9));
         }
     }
 
+    /// An even period is centred with the classic 2×m moving average.
     #[test]
-    fn test_stl_residual_small_for_clean_signal() {
+    fn stl_handles_an_even_period_without_bias() {
         let n = 96;
         let period = 24;
-        let mut values = Vec::with_capacity(n);
-        for i in 0..n {
-            let seasonal = 5.0 * ((2.0 * std::f64::consts::PI * i as f64 / period as f64).sin());
-            values.push(100.0 + seasonal);
-        }
+        let seasonal_of = |i: usize| 5.0 * (2.0 * std::f64::consts::PI * i as f64 / 24.0).sin();
+        let values: Vec<f64> = (0..n).map(|i| 100.0 + seasonal_of(i)).collect();
 
         let dec = stl_decompose(&values, &StlConfig::new(period).with_iterations(3)).unwrap();
-
+        for i in period..n - period {
+            assert!(
+                approx(dec.seasonal[i], seasonal_of(i), 0.4),
+                "seasonal at {i}"
+            );
+            assert!(
+                approx(dec.trend[i], 100.0, 0.4),
+                "trend at {i}: {}",
+                dec.trend[i]
+            );
+        }
         let max_residual = dec.residual.iter().map(|r| r.abs()).fold(0.0_f64, f64::max);
-        assert!(max_residual < 6.0, "residual too large: {max_residual}");
+        assert!(max_residual < 0.8, "residual too large: {max_residual}");
     }
 
     #[test]

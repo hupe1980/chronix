@@ -16,6 +16,12 @@ pub struct LinearRegressionModel {
     sum_xy: f64,
     sum_xx: f64,
     sum_yy: f64,
+    /// The real last training timestamp. Reconstructing it as
+    /// `start_ts + (n-1)*interval` puts the forecasts *inside* the observed
+    /// window whenever the series has gaps, because the median interval is
+    /// shorter than the average one. `SesModel` and the rest of the models
+    /// keep the actual timestamp; so does this one.
+    last_ts: i64,
     fitted: bool,
 }
 
@@ -37,6 +43,7 @@ impl LinearRegressionModel {
             sum_xy: 0.0,
             sum_xx: 0.0,
             sum_yy: 0.0,
+            last_ts: 0,
             fitted: false,
         }
     }
@@ -128,6 +135,7 @@ impl ForecastModel for LinearRegressionModel {
             self.sum_yy += y * y;
         }
 
+        self.last_ts = timestamps[timestamps.len() - 1];
         self.recompute_params(values, start_ts, interval_ns);
         self.fitted = true;
         metrics::histogram!("chronix_forecast_fit_duration_seconds", "model_type" => "linear_regression").record(_start.elapsed().as_secs_f64());
@@ -144,7 +152,6 @@ impl ForecastModel for LinearRegressionModel {
             slope,
             intercept,
             residual_std,
-            start_ts,
             interval_ns,
             ..
         } = &self.params
@@ -155,8 +162,7 @@ impl ForecastModel for LinearRegressionModel {
         };
 
         let z = 1.96;
-        let last_ts =
-            start_ts.saturating_add((self.n_points as i64 - 1).saturating_mul(*interval_ns));
+        let last_ts = self.last_ts;
         let mut values = Vec::with_capacity(horizon);
         let mut timestamps = Vec::with_capacity(horizon);
         let mut lower = Vec::with_capacity(horizon);
@@ -189,10 +195,11 @@ impl ForecastModel for LinearRegressionModel {
         })
     }
 
-    fn update(&mut self, _timestamp: i64, value: f64) -> Result<(), ForecastError> {
+    fn update(&mut self, timestamp: i64, value: f64) -> Result<(), ForecastError> {
         if !self.fitted {
             return Err(ForecastError::NotFitted);
         }
+        self.last_ts = timestamp;
 
         let x = self.n_points as f64;
         self.sum_x += x;
@@ -270,6 +277,34 @@ impl crate::forecast::storage::ModelStore for LinearRegressionModel {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With gaps in the series the median interval is shorter than the mean
+    /// one, so `start_ts + (n-1)*median` lands *before* the last observation
+    /// and every forecast timestamp falls inside the observed window.
+    /// Timestamps: 0, 1, 2, 3, 4, 104 (seconds). median interval = 1 s, so
+    /// the reconstructed "last" was 5 s while the real last is 104 s.
+    #[test]
+    fn forecast_timestamps_start_after_the_last_observation() {
+        const S: i64 = 1_000_000_000;
+        let ts: Vec<i64> = vec![0, S, 2 * S, 3 * S, 4 * S, 104 * S];
+        let vals: Vec<f64> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut model = LinearRegressionModel::new();
+        model.fit(&ts, &vals).unwrap();
+        let r = model.predict(3).unwrap();
+        assert_eq!(r.timestamps, vec![105 * S, 106 * S, 107 * S]);
+    }
+
+    /// `update` must carry the timestamp forward too.
+    #[test]
+    fn update_advances_the_forecast_origin() {
+        const S: i64 = 1_000_000_000;
+        let ts: Vec<i64> = (0..10).map(|i| i * S).collect();
+        let vals: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let mut model = LinearRegressionModel::new();
+        model.fit(&ts, &vals).unwrap();
+        model.update(50 * S, 50.0).unwrap();
+        assert_eq!(model.predict(1).unwrap().timestamps, vec![51 * S]);
+    }
 
     #[test]
     fn perfectly_linear() {

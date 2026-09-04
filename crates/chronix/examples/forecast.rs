@@ -32,8 +32,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..n {
         let t = i as f64;
-        // trend + seasonal pattern + slight noise
-        let value = 200.0 + t * 0.5 + (t * 2.0 * std::f64::consts::PI / period as f64).sin() * 40.0;
+        // trend + seasonal pattern + deterministic "noise" (a fast, incommensurate
+        // oscillation) — without it every seasonal model fits exactly and the
+        // prediction intervals collapse to zero width, which is not a showcase
+        let noise = (t * 1.7).sin() * 3.0 + (t * 0.37).cos() * 2.0;
+        let value =
+            200.0 + t * 0.5 + (t * 2.0 * std::f64::consts::PI / period as f64).sin() * 40.0 + noise;
         points.push(Point::new(
             key.clone(),
             fields! { "kwh" => value },

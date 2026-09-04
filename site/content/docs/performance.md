@@ -10,89 +10,114 @@ cluster-level optimizations.
 
 ## Workload Profiles
 
-### Ingestion-Heavy
+Every engine knob lives under `[database]`. The defaults suit a workstation;
+these are the two directions worth moving in.
 
-High write throughput with periodic batch queries (e.g., IoT, infrastructure monitoring).
+### Ingestion-heavy
 
-```toml
-[data.storage]
-wal_sync_mode = "async"          # Trade durability for throughput
-memtable_size = "128MB"          # Larger memtable → fewer flushes
-segment_max_size = "512MB"       # Larger segments → fewer compactions
-
-[data.compaction]
-strategy = "leveled"
-max_concurrent = 4               # More parallel compaction workers
-level0_file_limit = 8
-
-[compute]
-backend = "cpu"                   # CPU is faster for small writes
-cpu_threads = 0                   # Auto (all cores)
-
-[cluster]
-default_replication_factor = 3
-```
-
-### Query-Heavy
-
-Complex analytical queries on large datasets (e.g., ML training, dashboards).
+High write throughput with periodic batch queries — IoT, infrastructure
+monitoring.
 
 ```toml
-[data.storage]
-wal_sync_mode = "sync"           # Full durability
-memtable_size = "64MB"           # Standard size
-segment_max_size = "256MB"
-
-[data.cache]
-block_cache_size = "4GB"          # Large block cache for hot reads
-series_cache_size = "2GB"         # Cache frequently queried series
-
-[compute]
-
-[query]
-max_concurrent = 32               # Higher query parallelism
-scatter_timeout_ms = 30000        # Generous timeout for complex queries
+[database]
+wal_fsync_policy = "periodic"    # Trade durability for throughput
+memtable_flush_threshold = 200000  # Rows; fewer, larger flushes
+max_memtable_memory = 268435456    # 256 MiB across all shards
+compaction_concurrency = 4         # More parallel compaction
+compression = "lz4"                # Cheapest to write
 ```
+
+`wal_fsync_policy` is the one with a real trade: `per_write` survives a
+power cut with no loss, `per_batch` loses at most one in-flight batch, and
+`periodic` bounds the fsync *rate* — which on flash is the wear rate — at
+the cost of a bounded window of unsynced writes.
+
+### Query-heavy
+
+Analytical queries over large ranges — dashboards, model training.
+
+```toml
+[database]
+wal_fsync_policy = "per_batch"
+segment_cache_size = 512           # Decoded segments held in memory
+enable_last_value_cache = true     # Sub-100 µs "latest value" reads
+compression = "zstd"               # Smaller segments, less I/O per scan
+zstd_level = 6
+float_encoding = "pco"             # Best ratio on real metric data
+```
+
+### Constrained gateway
+
+`Chronix::open_small()` presets all of this for a 512 MB box; the
+`gateway_footprint` example measures the result. See **Memory Tuning**
+below for what the budget actually contains.
 
 ## Memory Tuning
 
-### Write Path Memory
+### What the engine holds
+
+`DatabaseStatistics::resident_memory_bytes()` is the sum of four terms, each
+reported separately and each exported as a gauge:
+
+| Term | Gauge | Grows with |
+|---|---|---|
+| Memtables | `chronix_memtable_memory_bytes` | Unflushed rows; bounded by `max_memtable_memory` |
+| String interners | `chronix_interner_memory_bytes` | **Cardinality** — tag keys, tag values, measurement names |
+| WAL writer buffer | `chronix_wal_buffer_bytes` | Fixed |
+| Catalog, schemas, tombstones | `chronix_catalog_memory_bytes` | Segment count; reclaimed by compaction |
+
+Two things are deliberately *not* in that sum, because they are not the
+engine's to hold:
+
+- **A query's working set.** DataFusion allocates against its own pool,
+  bounded by `per_query_memory_limit` (256 MiB by default). On a small box
+  this is the term that dominates, and it is the one to lower first.
+- **The CDC event bus.** Its broadcast ring is allocated on the first
+  subscription and sized by `cdc_capacity` — 65 536 events (~7 MiB) by
+  default, 4 096 under `open_small`. A deployment that never reads the CDC
+  stream pays nothing for it.
+
+### A constrained gateway, measured
+
+`examples/gateway_footprint.rs` runs the design partner's workload — 50 series
+at 1 Hz for an hour, a 1 s → 1 min → 15 min rollup cascade, then the SQL and
+PromQL a dashboard would issue:
 
 ```text
-Write Budget = WAL Buffer + Memtable + Compaction Buffers
+step                                     heap  memtable interner    WAL  catalog
+open_small                                0.1       0.0     0.00   0.06     0.00
+180 000 points written                   10.3       8.0     0.01   0.06     0.00
+flushed                                   0.2       0.0     0.00   0.06     0.00
+3300 rollup points materialised           1.4       0.8     0.02   0.06     0.00
+SQL group-by, 15-minute view, PromQL      1.6       0.8     0.02   0.06     0.00
 
-Recommended:
-  WAL Buffer:        32 MB (default)
-  Memtable:          64–256 MB (depends on cardinality)
-  Compaction:        128 MB per concurrent worker
-  Total write path:  ~500 MB per DataNode
+peak heap under 25 MiB
 ```
 
-### Read Path Memory
+The peak is the flush's Arrow batch plus the encoder's scratch, both
+transient. What settles is 1.6 MiB.
+
+### Server-side budgets
 
 ```text
-Read Budget = Block Cache + Series Cache + Query Buffers
+Write path  = memtable + WAL buffer + compaction buffers
+  max_memtable_memory      64–256 MB, depending on cardinality
+  compaction               ~128 MB per concurrent worker
 
-Recommended:
-  Block Cache:       1–8 GB (larger = fewer disk reads)
-  Series Cache:      512 MB – 4 GB (frequently queried series)
-  Query Buffers:     64 MB per concurrent query
-  Total read path:   ~2–12 GB per DataNode
+Read path   = segment cache + per-query pool
+  segment_cache_size       1–8 GB — larger means fewer disk reads
+  per_query_memory_limit   64–256 MB per concurrent query
 ```
 
 ## Object Store Tiering
 
 ### Cache Configuration
 
-```toml
-[objstore]
-url = "s3://my-bucket/chronix/"
-
-[objstore.cache]
-local_cache_dir = "/var/lib/chronix/cache"
-cache_size = "10GB"                # Local disk cache for remote objects
-eviction_policy = "lru"            # Objects larger than cache_size bypass LRU tracking
-```
+Object storage is configured on the embedded API rather than in
+`chronixd.toml` — `ObjectStoreConfig { url, cache, .. }`, with
+`CacheConfig { cache_dir, max_size_bytes }` for the local read cache.
+Objects larger than the cache bypass LRU tracking rather than evicting
+everything else.
 
 ### Cold archiving
 
@@ -127,27 +152,9 @@ compaction efficiency and query latency on large ingestion bursts.
 
 ### Replication Tuning
 
-```toml
-[cluster]
-default_replication_factor = 3     # RF=3 for production
-
-[cluster.autoscale]
-disk_deviation_threshold = 0.20    # Rebalance at 20% deviation
-max_concurrent_migrations = 2      # Limit migration impact
-```
-
-### Network Tuning
-
-```toml
-[cluster.health]
-heartbeat_interval_ms = 500        # Faster detection (default: 500)
-suspect_timeout_ms = 5000          # 10× heartbeat interval
-dead_timeout_ms = 15000            # 30× heartbeat interval
-
-[cluster.grpc]
-max_message_size_mb = 16           # For large scatter-gather results
-keepalive_interval_secs = 30       # Prevent idle connection drops
-```
+The distributed tier is **frozen** and not part of the default build, so
+its tuning is out of scope here — see the
+[cluster guide](@/docs/cluster.md) for what exists and its status.
 
 ## Numerical Precision
 
@@ -260,9 +267,9 @@ the trained dictionary, typically achieving **20–40% better compression** on
 homogeneous schemas compared to standard Zstd.
 
 ```toml
-[data.storage]
-compression_codec = "zstd"
-zstd_dict_training = true          # Train dictionary from first row group
+[database]
+compression = "zstd"
+zstd_dict_training = true          # Train a dictionary from the first row group
 ```
 
 Key implementation details:
@@ -327,8 +334,9 @@ chronixd bench query --concurrent 16 --queries queries.sql --duration 60s
 
 1. Check WAL sync mode — `async` is faster but less durable
 2. Increase `memtable_size` to reduce flush frequency
-3. The `FlushScheduler` runs flushes in the background with configurable
-   debounce — writes are never blocked by flush I/O
+3. Flushes run on the database's own maintenance thread as soon as a
+   memtable crosses `memtable_flush_threshold` — writes are never blocked
+   by flush I/O, and nothing has to be started
 4. Monitor compaction backlog — increase `max_concurrent` compaction workers
 5. Check `chronix_cluster_write_latency_seconds` histogram for outliers
 6. Zero-copy WAL encoding via `encode_write_point(&Point)` serialises

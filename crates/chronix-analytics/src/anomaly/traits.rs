@@ -78,3 +78,29 @@ pub fn validate_lengths(timestamps: &[i64], values: &[f64]) -> Result<(), Anomal
     }
     Ok(())
 }
+
+/// A numerically and dimensionally sound floor for a dispersion estimate.
+///
+/// # Why a bare epsilon is not enough
+///
+/// Every z-score detector divides by a fitted σ. On a baseline with no
+/// variation — a quantised sensor, a gauge pinned at its limit, a counter
+/// that has not moved — σ is 0 and the quotient is `inf`, so a value one ULP
+/// away from the mean scores `inf` and is reported as an anomaly with
+/// `z=inf` in the details string. Substituting a fixed `1e-12` instead is
+/// dimensionally wrong: on a series measured in nanoseconds it is a
+/// perfectly ordinary spread, and on one measured in watts it makes 1e-13 of
+/// float noise a 0.1-σ event *or* a 10-σ one depending only on the unit.
+///
+/// The floor here is **relative to the level being measured**:
+/// `max(scale, |level|·1e-9, 1e-12)`. A billionth of the level is far below
+/// any real signal and far above f64 rounding noise (which is ~1e-16 of the
+/// level), so genuine shifts still score large while representation noise
+/// scores ~0. The absolute `1e-12` term keeps a level of exactly 0 finite.
+#[inline]
+#[must_use]
+pub fn scale_floor(scale: f64, level: f64) -> f64 {
+    const RELATIVE: f64 = 1e-9;
+    const ABSOLUTE: f64 = 1e-12;
+    scale.max(level.abs() * RELATIVE).max(ABSOLUTE)
+}

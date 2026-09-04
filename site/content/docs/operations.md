@@ -100,7 +100,7 @@ observable form of the setting.
 | `prom_query_timeout_secs` | `30` | PromQL execution deadline |
 | `sql_max_rows` | `100000` | Maximum rows a SQL query returns |
 | `max_range_query_points` | `11000` | Point budget for a PromQL range query |
-| `prom_series_limit` | `10000` | Maximum label-sets from `/api/v1/prom/series` |
+| `prom_series_limit` | `10000` | Maximum label-sets from `/api/v1/series` |
 | `prom_max_result_bytes` | `268435456` | Byte budget for an accumulated range-query result; `0` disables |
 
 ### Write limits
@@ -114,7 +114,7 @@ observable form of the setting.
 | `dedup_window_secs` | `300` | `StreamWrite` deduplication window; `0` disables |
 | `max_dedup_entries` | `1000000` | Dedup cache ceiling (~24 bytes/entry) |
 
-Both `/api/v1/write` and `/api/v1/write/influx` enforce `max_write_batch_size`
+The JSON and Line Protocol write routes all enforce `max_write_batch_size`
 and reject an oversized request with `400`. Every write path — REST, Line
 Protocol, OTLP, Prometheus remote write, gRPC, Flight SQL `DoPut`, and the
 Kafka and MQTT connectors — is wrapped in `write_timeout_secs` and answers
@@ -175,15 +175,32 @@ reload_interval_secs = 0            # >0 polls the files and hot-reloads
 [[auth.api_keys]]
 name = "ingest"
 key = "$CHRONIX_INGEST_KEY"   # env-var reference, Argon2 PHC string, or plain text
+namespaces = ["tenant-a"]     # required when multi_tenancy = true
+admin = false                 # required for restore, namespace and key management
 
 [auth.jwt]
-# issuer, audience, JWKS URL or static key
+# issuer, audience, and either a secret (HS*), public_key_pem_file, or jwks_url
 
 authz_policy_dir = "/etc/chronix/policies"   # Cedar policies; absent = open mode
+
+[audit]
+path = "/var/log/chronix/audit.jsonl"
+hmac_key_env = "CHRONIX_AUDIT_KEY"
 ```
 
 `auth.exempt_paths` defaults to the health endpoints. Cedar is default-deny
 once `authz_policy_dir` is set.
+
+Two settings fail **open** if left out, so check them before going live:
+
+- A key with no `namespaces` under `multi_tenancy = true` reads every
+  tenant. The server refuses to start rather than allow it.
+- A key with no `admin` cannot reach restore, namespace management or key
+  management. Grant it deliberately, to the one key that needs it.
+
+Without an `[audit]` section the audit trail lives only in the process log.
+With one it is `fsync`ed, and its hash chain continues across restarts —
+a chain that restarts looks exactly like one that was truncated.
 
 ### Cluster — `[cluster]`
 
@@ -201,10 +218,14 @@ build.
 ### Cold archive
 
 Archiving is an embedded API call — `Chronix::archive_cold_segments` behind the
-`object-store` feature — not a server setting. It uploads segments older than a
-threshold to object storage as Parquet, verifies each object, and then removes
-them from the hot database. The archive is queried as its own SQL table via
-`register_cold_tier`, or directly with DuckDB, Polars or Spark. See
+`object-store` feature — not a server setting. It reads each cold
+`(measurement, shard)` group **through the read path** — deduplicated, with
+tombstones applied — writes it to object storage as one Parquet object under
+`measurement=<m>/shard=<n>/`, verifies it, and only then removes the source
+segments from the hot database. The object carries the hot tier's schema,
+`_time` included, so a query moved to the archive is the same query. It is
+queried as its own SQL table via `register_cold_tier` (one table per
+measurement), or directly with DuckDB, Polars or Spark. See
 [Object Storage](/reference/object-storage/).
 
 ### Parquet export
@@ -274,27 +295,48 @@ carries no information, since an instant query has one step.
 
 ### Retention and Rollups
 
-**Metric:** `chronix_retention_unreadable_segments_total` counter.
+Retention (`retention_secs`, and `measurement_retention` per measurement) is
+enforced by the database's own maintenance thread every
+`maintenance_interval` (30 s by default). It is opt-in: with no retention
+configured, nothing is ever deleted.
 
-Rollup-aware retention trades raw data for its aggregates, so a segment is only
-dropped once **every** tier of its rollup chain has been materialised. Two
-conditions preserve a segment instead of dropping it:
+Rollups are materialised, never computed as a by-product of compaction or
+retention. A bucket is aggregated once, over a deduplicated scan of its
+source, as soon as its input is final: for a raw measurement, once the
+out-of-order window (±2 shards of the newest write) has closed over it; for
+a tier fed by another rollup, as far as that rollup has been materialised.
+`compact()` — which the maintenance thread runs every `maintenance_interval`
+— materialises after each pass, `enforce_retention()` materialises before
+it drops, and `db.materialise_rollups()` is the explicit call. Definitions
+and watermarks live in the **catalog**, which is fsynced per append and
+carried forward by every snapshot, so a rollup cannot be lost by a
+half-written file beside the data directory.
 
-- the segment cannot be opened or read, so its rollup could not be computed;
-- any tier in the cascade (e.g. 1 s→1 min→**15 min**) failed to materialise.
+**Late writes are repaired, not ignored.** A `backfill` or a delete into a
+range a rollup has already aggregated records an *invalidation*; the next
+pass deletes the stale aggregates over that range, recomputes them, and
+cascades the repair to any tier downstream. `refresh_rollup(name, start,
+end)` does the same immediately, for a change the engine could not have
+observed — an out-of-band restore, say. `chronix_rollup_invalidations_total`
+counts what has been marked, `chronix_rollup_ranges_recomputed_total` what
+has been repaired, and `chronix_rollup_failures_total` any rollup whose pass
+failed — the others still run.
 
-A rising counter means expired data is accumulating on disk because it cannot
-be summarised — investigate the segment before it fills the device:
+Rollup-aware retention trades raw data for its aggregates, so a segment is
+only dropped once **every** tier of its rollup chain has been materialised
+past it and has no repair pending — for the per-measurement rules as well as
+the global one. A segment that is still needed is preserved and counted in
+`chronix_retention_segments_awaiting_rollup_total`; a segment that cannot be
+read fails the materialisation that needs it, so it is preserved too.
+`chronix_rollup_points_written_total` counts what materialisation wrote.
+Cold archiving removes a segment from the hot database, so it waits on the
+same gate (`chronix_cold_archive_groups_awaiting_rollup_total`).
 
-```yaml
-- alert: ChronixRetentionBlocked
-  expr: increase(chronix_retention_unreadable_segments_total[1h]) > 0
-  annotations:
-    summary: "Retention is preserving segments it cannot roll up"
-```
+Retention runs whenever **any** rule is configured — global,
+per-measurement, or a rollup's own `retention_secs`.
 
-`chronix_rollup_chain_truncated_total` counts cascades that hit the depth
-limit (4 tiers).
+A rollup's `retention_secs` (`retention_ns` in the Rust API) is the
+retention of its *target* measurement, applied by the same pass.
 
 ### Region Auto-Split Process
 
@@ -605,7 +647,7 @@ container stack.
 | TLS `failed to configure` | Invalid certs/keys | Check file paths and cert/key pairing; server starts without TLS on failure |
 | `ADMISSION_REJECTED` (503) | System overloaded | Check ingestion rate; increase `admission.max_pending_bytes` or scale out |
 | Circuit breaker open | Unhealthy DataNode | Check target node health; breaker auto-recovers after `recovery_timeout_secs` |
-| Warm tier `warn` logs | Bloom sidecar copy failed | Verify target directory permissions; bloom rebuilt on next compaction |
+| `retention: rollups not yet materialised` | A rollup fed by this data has not caught up, or has a repair pending | Expected and self-healing: the next maintenance pass materialises and the pass after it drops the data. Persisting means a rollup is failing — check for `rollup materialisation failed` |
 
 ### API Key Rate Limiting
 

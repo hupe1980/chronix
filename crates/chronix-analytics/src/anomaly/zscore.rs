@@ -3,7 +3,9 @@
 use crate::compute::{simd_mean, simd_variance};
 
 use crate::anomaly::error::AnomalyError;
-use crate::anomaly::traits::{validate_lengths, AnomalyDetector, AnomalyScore, DetectorType};
+use crate::anomaly::traits::{
+    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+};
 
 /// Flags points whose absolute Z-Score exceeds a configurable threshold.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -25,19 +27,16 @@ impl ZScoreDetector {
         }
     }
 
-    /// For near-constant data (std_dev < ε), returns `INFINITY`
-    /// when the value differs from the mean, so outliers are still detected.
+    /// Absolute z-score against the fitted baseline.
+    ///
+    /// σ is floored *relative to the fitted mean* (see [`scale_floor`]), so a
+    /// zero-variance baseline scores a value 1e-13 away from the mean at
+    /// ~1e-4 σ rather than at `inf`. The returned score is always finite for
+    /// a finite input, which is what keeps `inf` out of the details string
+    /// and out of the alert payloads built from it.
     #[inline]
     fn score_value(&self, value: f64) -> f64 {
-        if self.std_dev < 1e-15 {
-            // If value differs from mean, treat as extreme outlier.
-            return if (value - self.mean).abs() < 1e-15 {
-                0.0
-            } else {
-                f64::INFINITY
-            };
-        }
-        ((value - self.mean) / self.std_dev).abs()
+        ((value - self.mean) / scale_floor(self.std_dev, self.mean)).abs()
     }
 
     /// Normalize a raw z-score into `[0, 1]` using a sigmoid mapping.

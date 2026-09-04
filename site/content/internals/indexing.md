@@ -12,7 +12,7 @@ decoding occurs.
 ## Time-Range Index
 
 The simplest index: each segment records its `[time_min, time_max]` range.
-A query with a time predicate `WHERE time BETWEEN t₁ AND t₂` skips any
+A query with a time predicate `WHERE _time BETWEEN t₁ AND t₂` skips any
 segment whose range does not overlap `[t₁, t₂]`.
 
 The index is stored sorted by `time_min`, enabling **O(log N) binary search**
@@ -74,8 +74,10 @@ query execution, the filter answers: "does this segment contain any data for
 `measurement=cpu, host=web-01`?" If the answer is "no" (definitively), the
 segment is skipped entirely.
 
-Bloom filters are persisted as `.bloom` sidecar files alongside segments and
-reloaded into memory on database open.
+Bloom filters are rebuilt on database open from each segment's `.series`
+sidecar — the segment's list of series keys, which is also what the tag
+index and the cardinality budget are restored from. Nothing decodes a
+segment at open.
 
 ## Tag Inverted Index
 

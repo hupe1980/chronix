@@ -298,6 +298,7 @@ impl ConnectorManager {
                     "kafka-default",
                     kafka_cfg.clone(),
                     self.db.clone(),
+                    config.multi_tenancy,
                 );
                 info!(name = "kafka-default", "registering new Kafka connector");
                 connectors.push(consumer.clone());
@@ -311,6 +312,7 @@ impl ConnectorManager {
                     "mqtt-default",
                     mqtt_cfg.clone(),
                     self.db.clone(),
+                    config.multi_tenancy,
                 );
                 info!(name = "mqtt-default", "registering new MQTT connector");
                 connectors.push(subscriber.clone());
@@ -512,7 +514,7 @@ impl KafkaConfig {
             return Ok(Some((creds.username, creds.password)));
         }
         match (&self.sasl_username, &self.sasl_password) {
-            (Some(u), Some(p)) => Ok(Some((u.clone(), p.clone()))),
+            (Some(u), Some(p)) => Ok(Some((resolve_secret(u)?, resolve_secret(p)?))),
             _ => Ok(None),
         }
     }
@@ -527,10 +529,26 @@ impl MqttConfig {
             return Ok(Some((creds.username, creds.password)));
         }
         match (&self.username, &self.password) {
-            (Some(u), Some(p)) => Ok(Some((u.clone(), p.clone()))),
+            (Some(u), Some(p)) => Ok(Some((resolve_secret(u)?, resolve_secret(p)?))),
             _ => Ok(None),
         }
     }
+}
+
+/// Resolve a `${VAR}` or `$VAR` reference in a connector credential.
+///
+/// The published configuration has shown `password = "$CHRONIX_MQTT_PASSWORD"`
+/// since connectors existed, and nothing resolved it: the connector
+/// authenticated with the literal string `$CHRONIX_MQTT_PASSWORD` and the
+/// broker refused it with an error that named nothing. Keeping a broker
+/// password out of the config file is the whole reason the syntax is
+/// documented, so the syntax now works.
+fn resolve_secret(value: &str) -> Result<String, ServerError> {
+    crate::config::resolve_env_reference(value).map_err(|var| {
+        ServerError::Config(crate::config::ServerConfigError::Invalid(format!(
+            "connector credential references ${{{var}}}, which is not set"
+        )))
+    })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────

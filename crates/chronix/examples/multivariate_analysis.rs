@@ -199,7 +199,7 @@ fn main() {
     mlr.fit(&ctx, 0).expect("MLR fit failed");
     let mlr_result = mlr.predict(10).expect("MLR predict failed");
     println!(
-        "Multi-Linear Regression: predicted {} future timestamps",
+        "Multi-Linear Regression: predicted {} future timestamps (predictors held at their last values)",
         mlr_result.timestamps.len()
     );
     println!("  Predictor importance:");

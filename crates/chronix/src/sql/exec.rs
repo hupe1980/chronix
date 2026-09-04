@@ -15,16 +15,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::compute;
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, ScalarValue};
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::physical_plan::{
     ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
@@ -35,6 +38,7 @@ use futures::Stream;
 use chronix_engine::segment::metadata::data_types;
 use chronix_engine::segment::stats::ordered_i64_to_f64;
 
+use crate::sql::batch::{align_batch_to_schema, convert_timestamp_column};
 use crate::Chronix;
 
 /// A `DataFusion` `ExecutionPlan` that scans a Chronix measurement.
@@ -56,6 +60,14 @@ pub struct ChronixExec {
     field_predicates: Vec<chronix_engine::segment::FieldPredicate>,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
+    /// Execution metrics, so `EXPLAIN ANALYZE` says what the scan did.
+    ///
+    /// Without these the scan was a black box in an analysed plan: DataFusion
+    /// printed timings for every operator above it and nothing for the one
+    /// doing the I/O. `rows_scanned` is the count the storage engine handed
+    /// up, *before* the limit and the projection, which is the number that
+    /// says whether pruning and limit pushdown actually did anything.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl ChronixExec {
@@ -98,8 +110,14 @@ impl ChronixExec {
             field_predicates,
             limit,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+}
+
+/// A chronix error crossing into DataFusion.
+fn to_df_error(e: crate::error::DbError) -> DataFusionError {
+    DataFusionError::External(Box::new(e))
 }
 
 impl DisplayAs for ChronixExec {
@@ -139,6 +157,10 @@ impl ExecutionPlan for ChronixExec {
         Ok(TreeNodeRecursion::Continue)
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -146,10 +168,20 @@ impl ExecutionPlan for ChronixExec {
         Ok(self)
     }
 
+    /// Stream the scan.
+    ///
+    /// The scan runs on the blocking pool and pushes batches through a bounded
+    /// channel, so the first batch reaches DataFusion while the rest of the
+    /// range is still being read, and a consumer that stops early stops the
+    /// scan with it.
+    ///
+    /// The `LIMIT` is part of the chronix plan rather than applied to the
+    /// result, which is what makes `execute_iter` stop reading buckets; and
+    /// what the operator holds is reserved from the task's memory pool.
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
+        partition: usize,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         let db = self.db.clone();
         let measurement = self.measurement.clone();
@@ -161,28 +193,83 @@ impl ExecutionPlan for ChronixExec {
         let schema = self.projected_schema.clone();
         let stream_schema = self.projected_schema.clone();
 
-        // Phase 1 : Use execute_stream which returns
-        // chunked, deduped 64K-row batches via sort_merge_dedup_chunked,
-        // enabling DataFusion's incremental pipeline processing instead of
-        // materializing one giant RecordBatch.
-        let stream = async_stream::try_stream! {
-            let batches = tokio::task::spawn_blocking(move || {
-                let mut builder = db.query().measurement(&measurement);
-                for (key, value) in &tag_filters {
-                    builder = builder.tag(key, value);
-                }
-                builder = builder.range(time_start, time_end);
-                let mut plan = builder.build()?;
-                // Inject zone-map field predicates from SQL pushdown.
-                chronix_query::plan::set_field_predicates(&mut plan, field_predicates);
-                db.execute_stream(&plan)
-            })
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Contradictory bounds — `_time > X AND _time < Y` with `Y <= X` —
+        // describe an empty set, which in SQL is no rows rather than an
+        // error. The query builder rejects an inverted range, so the
+        // emptiness is answered here instead of surfacing as a failure.
+        if time_start > time_end {
+            let empty = arrow::record_batch::RecordBatch::new_empty(schema.clone());
+            return Ok(Box::pin(ChronixStream {
+                schema,
+                inner: Box::pin(futures::stream::once(async move { Ok(empty) })),
+            }));
+        }
 
-            let mut rows_yielded: usize = 0;
-            for batch in batches {
+        // Two in flight: one being consumed downstream, one being read. Deeper
+        // buys nothing — the reader is I/O-bound and the consumer is not — and
+        // costs a batch of memory per slot.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, DataFusionError>>(2);
+
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let rows_scanned: Count =
+            MetricBuilder::new(&self.metrics).counter("rows_scanned", partition);
+        let scan_rows = rows_scanned.clone();
+
+        let scan = move || {
+            let mut builder = db.query().measurement(&measurement);
+            for (key, value) in &tag_filters {
+                builder = builder.tag(key, value);
+            }
+            builder = builder.range(time_start, time_end);
+            let mut plan = builder.build()?;
+            // Inject zone-map field predicates from SQL pushdown.
+            chronix_query::plan::set_field_predicates(&mut plan, field_predicates);
+
+            // The limit belongs *in* the plan: that is what stops
+            // `execute_iter` materialising the buckets past it.
+            if let Some(lim) = limit {
+                plan = chronix_query::plan::QueryPlan::Limit {
+                    source: Box::new(plan),
+                    limit: lim,
+                    offset: 0,
+                };
+            }
+
+            for batch in db.execute_iter(&plan)? {
+                if let Ok(b) = &batch {
+                    scan_rows.add(b.num_rows());
+                }
+                // A closed receiver means the consumer is gone — a LIMIT
+                // satisfied upstream, or a cancelled query. Stop reading.
+                if tx.blocking_send(batch.map_err(to_df_error)).is_err() {
+                    break;
+                }
+            }
+            Ok::<(), crate::error::DbError>(())
+        };
+
+        let reservation = MemoryConsumer::new(format!("ChronixExec[{}]", self.measurement))
+            .register(context.memory_pool());
+
+        let stream = async_stream::try_stream! {
+            let handle = tokio::task::spawn_blocking(scan);
+            let _timer = baseline.elapsed_compute().timer();
+
+            let mut held = 0usize;
+            while let Some(batch) = rx.recv().await {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+
+                // Account for what this operator is holding before it is
+                // handed on, so a scan that outruns the pool is refused here
+                // rather than silently allocated.
+                let size = batch.get_array_memory_size();
+                reservation.try_grow(size)?;
+                reservation.shrink(held);
+                held = size;
+
                 let batch = convert_timestamp_column(batch)?;
 
                 // Project by NAME, not by index.
@@ -198,26 +285,18 @@ impl ExecutionPlan for ChronixExec {
                 // batch match `projected_schema` by construction.
                 let batch = align_batch_to_schema(&batch, &stream_schema)?;
 
-                if batch.num_rows() == 0 {
-                    continue;
-                }
+                baseline.record_output(batch.num_rows());
+                yield batch;
+            }
+            reservation.free();
+            baseline.done();
 
-                // Apply limit with early termination across chunks
-                if let Some(lim) = limit {
-                    let remaining = lim.saturating_sub(rows_yielded);
-                    if remaining == 0 {
-                        break;
-                    }
-                    let batch = if batch.num_rows() > remaining {
-                        batch.slice(0, remaining)
-                    } else {
-                        batch
-                    };
-                    rows_yielded += batch.num_rows();
-                    yield batch;
-                } else {
-                    yield batch;
-                }
+            // The reader finished or failed; a build error never reached the
+            // channel, so it is surfaced here.
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => Err(to_df_error(e))?,
+                Err(e) => Err(DataFusionError::External(Box::new(e)))?,
             }
         };
 
@@ -386,113 +465,6 @@ impl ExecutionPlan for ChronixExec {
             column_statistics,
         }))
     }
-}
-
-/// Convert the "timestamp" / "time" Int64 column to `_time` Timestamp(Nanosecond).
-fn convert_timestamp_column(batch: RecordBatch) -> Result<RecordBatch, DataFusionError> {
-    if batch.num_rows() == 0 {
-        // Return empty batch — avoid schema mismatches.
-        return Ok(batch);
-    }
-
-    let schema = batch.schema();
-    let mut new_fields = Vec::with_capacity(schema.fields().len());
-    let mut new_columns = Vec::with_capacity(batch.num_columns());
-
-    for (i, field) in schema.fields().iter().enumerate() {
-        let col = batch.column(i);
-        if (field.name() == "timestamp" || field.name() == "time")
-            && *field.data_type() == DataType::Int64
-        {
-            let ts = compute::cast(col, &DataType::Timestamp(TimeUnit::Nanosecond, None))
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            new_fields.push(
-                arrow::datatypes::Field::new(
-                    "_time",
-                    DataType::Timestamp(TimeUnit::Nanosecond, None),
-                    false,
-                )
-                .into(),
-            );
-            new_columns.push(ts);
-        } else {
-            new_fields.push(field.clone());
-            new_columns.push(col.clone());
-        }
-    }
-
-    let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, new_columns)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-}
-
-/// Reorder/select `batch`'s columns so the result matches `target` exactly,
-/// resolving columns **by name**.
-///
-/// Columns present in `target` but absent from `batch` become all-null arrays
-/// of the target type — this is the correct reading for a measurement whose
-/// schema has gained a field that this particular segment predates.
-///
-/// This replaces an index-based `RecordBatch::project`, which assumed
-/// the storage batch and the DataFusion table schema agreed on column order.
-/// They do not: storage emits `timestamp, tags…, fields…` each sorted by name,
-/// while the table schema follows schema-registration order.
-fn align_batch_to_schema(
-    batch: &RecordBatch,
-    target: &SchemaRef,
-) -> Result<RecordBatch, DataFusionError> {
-    let src = batch.schema();
-
-    // Fast path: already identical, no work to do.
-    if src.fields().len() == target.fields().len()
-        && src
-            .fields()
-            .iter()
-            .zip(target.fields())
-            .all(|(a, b)| a.name() == b.name())
-    {
-        return Ok(batch.clone());
-    }
-
-    let index: HashMap<&str, usize> = src
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (f.name().as_str(), i))
-        .collect();
-
-    let mut columns = Vec::with_capacity(target.fields().len());
-    for field in target.fields() {
-        match index.get(field.name().as_str()) {
-            Some(&i) => {
-                let col = batch.column(i);
-                // Storage may hand back a narrower/wider numeric type than the
-                // table schema advertises; cast rather than fail the query.
-                if col.data_type() == field.data_type() {
-                    columns.push(Arc::clone(col));
-                } else {
-                    columns.push(
-                        compute::cast(col, field.data_type())
-                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
-                    );
-                }
-            }
-            None => columns.push(arrow::array::new_null_array(
-                field.data_type(),
-                batch.num_rows(),
-            )),
-        }
-    }
-
-    // The row count is carried explicitly rather than inferred from the
-    // columns, because an aggregate that reads no column — `count(*)` — pushes
-    // an **empty** projection down, and Arrow refuses a zero-column batch
-    // unless it is told how many rows it stands for. Inferring it made the
-    // most ordinary SQL query there is fail with "must either specify a row
-    // count or at least one column".
-    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    RecordBatch::try_new_with_options(Arc::clone(target), columns, &options)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 // ── Stream adapter ──────────────────────────────────────────────────────

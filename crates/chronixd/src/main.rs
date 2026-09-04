@@ -115,6 +115,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ServerConfig::default()
     };
 
+    // Environment overrides sit between the file and the CLI: a container
+    // image carries the file, the deployment overrides what differs, and an
+    // operator debugging by hand still wins with a flag.
+    config.apply_env_overrides()?;
+
     // CLI overrides
     if let Some(ref data_dir) = cli.data_dir {
         config.database.data_dir = data_dir.clone();
@@ -186,6 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.validate_ports()?;
     // Validate CORS configuration
     config.validate_cors()?;
+    // Refuse to serve multiple tenants with keys that are confined to none
+    config.validate_tenancy()?;
+    // Refuse to start with an [auth] section that authenticates nobody
+    config.validate_auth()?;
 
     // Setup logging
     setup_logging(&config);

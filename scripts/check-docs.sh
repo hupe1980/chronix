@@ -105,6 +105,33 @@ if grep -rniE '\b(wgpu|WGSL|wasmtime|GPU acceleration|GPU compute)\b' site/conte
   note "documentation describes a subsystem that was removed"
 fi
 
+# The warm tier was cut (D77). The pages may explain that it is gone; they may
+# not describe it as something an operator can configure or call.
+if grep -rniE 'warm_tier_migrate|WarmTierConfig|warm_after|shards_to_warm' \
+     site/content 2>/dev/null; then
+  note "documentation describes the warm tier, which was removed"
+fi
+
+# Every public facade method the docs name in prose must exist. The docs have
+# outlived an API twice: `warm_tier_migrate` survived its own deletion in three
+# pages, and a `rollup_registry.json` that is no longer written was still
+# documented as where the watermark lives.
+echo "checking documented facade methods…"
+facade_methods=$(
+  grep -rhoE '^\s*pub (async )?fn [a-z_0-9]+' crates/chronix/src/db/*.rs crates/chronix/src/*.rs \
+    | sed -E 's/.*fn //' | sort -u
+)
+for m in $(grep -rhoE 'db\.[a-z_0-9]+\(' site/content concepts README.md 2>/dev/null \
+             | sed -E 's/^db\.//; s/\($//' | sort -u); do
+  case "$m" in
+    # Builder and iterator chains, not facade methods.
+    query|iter|next|collect|unwrap|clone|schema|sql|promql) continue ;;
+  esac
+  if ! printf '%s\n' "$facade_methods" | grep -qx "$m"; then
+    note "documentation calls db.$m(), which is not a public method"
+  fi
+done
+
 
 # ── 6. Documented configuration keys must exist ─────────────────────────
 # The whole "Configuration Reference" was fiction: `[storage.objstore]`,
@@ -117,20 +144,23 @@ fi
 # Scope: TOML blocks on the pages that document configuration. Keys elsewhere
 # are illustrative payloads, not settings.
 echo "checking documented configuration keys…"
+# Every `pub` field in the tree, so a setting on a nested struct in any
+# crate resolves. A documented key that matches none of them is a key an
+# operator would copy into a config that does nothing.
 config_fields=$(
-  grep -hoE '^[[:space:]]+pub [a-z_0-9]+:' \
-    crates/chronixd/src/config.rs \
-    crates/chronix-core/src/config.rs \
-    crates/chronixd/src/connector.rs \
-    crates/chronixd/src/otel/config.rs \
-    crates/chronix-security/src/auth/jwt.rs \
+  grep -rhoE '^[[:space:]]+pub [a-z_0-9]+:' crates/ \
     | sed -E 's/^[[:space:]]+pub //; s/://' | sort -u
 )
 
-for page in site/content/docs/operations.md site/content/docs/configuration.md; do
+# The cluster tier is frozen and its guide documents the frozen design;
+# `api-reference.md` shows Telegraf's own output config, which is not ours.
+for page in site/content/docs/*.md; do
+  case "$page" in
+    */cluster.md|*/api-reference.md) continue ;;
+  esac
   [ -f "$page" ] || continue
   keys=$(awk '/^```toml/ {t=1; next} /^```/ {t=0} t' "$page" \
-         | grep -oE '^[a-z_0-9.]+[[:space:]]*=' \
+         | { grep -oE '^[a-z_0-9.]+[[:space:]]*=' || true; } \
          | sed -E 's/[[:space:]]*=$//' | sort -u)
   for key in $keys; do
     # Section prefixes are stripped: `auth.jwt.issuer` is `issuer`.

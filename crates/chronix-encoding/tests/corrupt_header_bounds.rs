@@ -149,3 +149,59 @@ fn realistic_blocks_still_round_trip() {
     assert_eq!(decoded.len(), values.len());
     assert_eq!(decoded, values);
 }
+
+/// pco carries its own count in our 4-byte header ahead of the pco file.
+/// That count is checked against the ceiling before the output buffer is
+/// allocated, and the pco file's own chunk headers are never trusted for an
+/// allocation — a body that decodes to a different count is an error. This
+/// covers all three pco tags through the unified decoder, and the nullable
+/// wrapper around them, so a corrupt count can reach no allocation anywhere.
+#[test]
+fn pco_rejects_an_absurd_value_count_on_every_entry_point() {
+    let mut block = Vec::new();
+    block.extend_from_slice(&ABSURD.to_le_bytes());
+    block.extend_from_slice(&[0u8; 16]); // whatever follows is irrelevant
+
+    for enc in [
+        EncodingType::Pco,
+        EncodingType::PcoI64,
+        EncodingType::PcoU64,
+    ] {
+        let err = ColumnDecoder::decode(&EncodedBlock {
+            encoding: enc,
+            payload: block.clone(),
+        })
+        .expect_err("a pco block claiming u32::MAX values must be refused");
+        assert!(
+            err.to_string().contains("ceiling"),
+            "{enc}: the error should name the ceiling, got: {err}"
+        );
+
+        // Nullable wrapper: a bitmap of one valid value, inner pco block
+        // declaring the absurd count.
+        let mut nullable = vec![enc.tag()];
+        nullable.extend_from_slice(&1u32.to_le_bytes());
+        nullable.push(0b1);
+        nullable.extend_from_slice(&block);
+        let err = ColumnDecoder::decode(&EncodedBlock {
+            encoding: EncodingType::Nullable,
+            payload: nullable,
+        })
+        .expect_err("a nullable pco block claiming u32::MAX values must be refused");
+        assert!(
+            err.to_string().contains("ceiling"),
+            "nullable {enc}: the error should name the ceiling, got: {err}"
+        );
+    }
+
+    // A pco file whose own header disagrees with ours is also refused: the
+    // declared count is what sizes the buffer, so the file must fill it
+    // exactly — no more, no less.
+    let values: Vec<i64> = (0..100).collect();
+    let mut enc = PcoEncoder::encode_i64(&values).unwrap();
+    enc[..4].copy_from_slice(&(CEILING as u32).to_le_bytes());
+    assert!(
+        PcoDecoder::decode_i64(&enc).is_err(),
+        "a count inside the ceiling that the body does not fill is a count mismatch"
+    );
+}

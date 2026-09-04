@@ -80,7 +80,7 @@ pub struct SqlResponse {
 
 // ── Handlers ───────────────────────────────────────────────────────────
 
-/// `POST /api/v1/query` — query time-series data.
+/// `POST /api/v1/chronix/query` — query time-series data.
 pub async fn query_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<NamespaceContext>>,
@@ -163,7 +163,7 @@ pub async fn query_handler(
     Ok(Json(result))
 }
 
-/// `POST /api/v1/sql` — execute a SQL query.
+/// `POST /api/v1/chronix/sql` — execute a read-only SQL query.
 pub async fn sql_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<NamespaceContext>>,
@@ -330,7 +330,7 @@ pub async fn sql_handler(
     }))
 }
 
-/// `POST /api/v1/query/explain` — return the query execution plan without running it.
+/// `POST /api/v1/chronix/query/explain` — return the query plan without running it.
 pub async fn query_explain_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<NamespaceContext>>,

@@ -14,7 +14,9 @@
 //! Discriminants:
 //! - `0x00` → `WalEntry::Write { point }`
 //! - `0x01` → `WalEntry::Delete { tombstones }`
-//! - `0x02` → `WalEntry::SchemaChange { actions }`
+//!
+//! Schema changes are not WAL entries: the catalog manifest is their
+//! durable record, and it is written before the data that needs them.
 
 use crate::types::{Point, WalEntry};
 use std::fmt;
@@ -25,7 +27,6 @@ const WAL_BINARY_V1: u8 = 0x01;
 // Variant discriminants.
 const DISC_WRITE: u8 = 0x00;
 const DISC_DELETE: u8 = 0x01;
-const DISC_SCHEMA_CHANGE: u8 = 0x02;
 
 /// Errors produced by the WAL codec.
 #[derive(Debug)]
@@ -89,11 +90,6 @@ pub fn encode(entry: &WalEntry) -> Result<Vec<u8>, CodecError> {
             let data = postcard::to_stdvec(tombstones)?;
             buf.extend_from_slice(&data);
         }
-        WalEntry::SchemaChange { actions } => {
-            buf.push(DISC_SCHEMA_CHANGE);
-            let data = postcard::to_stdvec(actions)?;
-            buf.extend_from_slice(&data);
-        }
     }
 
     Ok(buf)
@@ -149,10 +145,6 @@ pub fn decode(data: &[u8]) -> Result<WalEntry, CodecError> {
         DISC_DELETE => {
             let tombstones: Vec<crate::types::Tombstone> = postcard::from_bytes(payload)?;
             Ok(WalEntry::Delete { tombstones })
-        }
-        DISC_SCHEMA_CHANGE => {
-            let actions: Vec<crate::schema::SchemaAction> = postcard::from_bytes(payload)?;
-            Ok(WalEntry::SchemaChange { actions })
         }
         d => Err(CodecError::UnknownDiscriminant(d)),
     }
@@ -223,37 +215,5 @@ mod tests {
     #[test]
     fn decode_unknown_discriminant_returns_error() {
         assert!(decode(&[WAL_BINARY_V1, 0xFF, 0x00]).is_err());
-    }
-
-    #[test]
-    fn schema_change_roundtrip() {
-        use crate::schema::{ColumnDef, ColumnRole, ColumnType, MeasurementSchema, SchemaAction};
-
-        let actions = vec![
-            SchemaAction::CreateMeasurement(MeasurementSchema::new("cpu")),
-            SchemaAction::AddColumn {
-                measurement: "cpu".to_string(),
-                column: ColumnDef {
-                    name: "host".to_string(),
-                    column_type: ColumnType::String,
-                    role: ColumnRole::Tag,
-                },
-            },
-            SchemaAction::AddColumn {
-                measurement: "cpu".to_string(),
-                column: ColumnDef {
-                    name: "value".to_string(),
-                    column_type: ColumnType::F64,
-                    role: ColumnRole::Field,
-                },
-            },
-        ];
-
-        let entry = WalEntry::SchemaChange { actions };
-        let encoded = encode(&entry).unwrap();
-        assert_eq!(encoded[0], WAL_BINARY_V1);
-        assert_eq!(encoded[1], DISC_SCHEMA_CHANGE);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(entry, decoded);
     }
 }

@@ -8,9 +8,7 @@ use tracing::{debug, info, warn};
 
 use chronix_core::{SegmentState, ShardId};
 use chronix_engine::cache::metadata::CachedSegmentMeta;
-use chronix_engine::index::{
-    CatalogColumnStats, SegmentCatalogEntry, SeriesBloomFilter, TimeIndexEntry,
-};
+use chronix_engine::index::{CatalogColumnStats, SegmentCatalogEntry, TimeIndexEntry};
 use chronix_engine::memtable::FlushResult;
 use chronix_engine::segment::reader::SegmentReader;
 use chronix_query::plan::QueryPlan;
@@ -22,62 +20,86 @@ use crate::export::ParquetExportConfig;
 use crate::retention;
 
 impl super::Chronix {
-    /// Force a flush of the active memtable to a segment file.
+    /// Flush every memtable to segment files and advance the WAL floor.
     ///
-    /// This is normally triggered automatically when the memtable reaches
-    /// the configured threshold, but can be called manually for testing
-    /// or to ensure data is persisted before shutdown.
+    /// Normally the maintenance thread does this when a memtable crosses
+    /// its threshold; call it to make everything durable in segments now.
+    /// One flush runs at a time; a concurrent caller waits for it.
     ///
     /// # Errors
     ///
     /// Returns [`DbError::Closed`] if the database is already closed, or
-    /// propagates any I/O or storage error from the flush pipeline.
+    /// the first flush error. A shard whose flush failed keeps its
+    /// memtable — and its WAL records — for the next attempt; nothing is
+    /// lost by a failed flush.
     #[must_use = "flush errors may indicate data not persisted"]
     pub fn flush(&self) -> Result<Vec<FlushResult>> {
-        let _start = std::time::Instant::now();
+        let start = std::time::Instant::now();
         self.check_open()?;
+        let _gate = self.flush_gate.lock();
 
-        let shard_ids = self.shards.active_shard_ids();
         let mut all_results = Vec::new();
-        let mut global_max_wal_seq: Option<u64> = None;
-
-        for shard_id in shard_ids {
+        let mut first_error: Option<DbError> = None;
+        for shard_id in self.shards.shard_ids() {
             match self.flush_shard(shard_id) {
-                Ok(results) => {
-                    for r in &results {
-                        if let Some(seq) = r.max_wal_seq {
-                            global_max_wal_seq =
-                                Some(global_max_wal_seq.map_or(seq, |c| c.max(seq)));
-                        }
-                    }
-                    all_results.extend(results);
-                }
+                Ok(results) => all_results.extend(results),
                 Err(e) => {
                     warn!(shard = %shard_id, error = %e, "Flush failed for shard");
-                    return Err(e);
+                    first_error.get_or_insert(e);
                 }
             }
         }
+        // The floor is what the memtables say it is, so it can be raised
+        // after a partial failure too: the failed shard's records are
+        // still unflushed and still cap it.
+        self.raise_wal_floor_to_unflushed();
+        self.shards.retire_idle_shards();
 
-        // Truncate WAL only after ALL shards have been safely flushed,
-        // preventing early truncation from discarding entries needed by
-        // other shards on crash recovery.
-        //
-        // Additionally, cap the truncation point at the minimum WAL
-        // sequence still held in any active memtable — concurrent
-        // writers may have inserted records during the sequential
-        // flush, and those records must be preserved.
-        if let Some(mut max_seq) = global_max_wal_seq {
-            if let Some(active_min) = self.shards.min_active_wal_seq() {
-                max_seq = max_seq.min(active_min.saturating_sub(1));
-            }
-            if let Err(e) = self.wal.truncate_before(max_seq) {
-                warn!(error = %e, "Failed to truncate WAL after flush");
-            }
+        histogram!("chronix_flush_duration_seconds").record(start.elapsed().as_secs_f64());
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(all_results),
         }
+    }
 
-        histogram!("chronix_flush_duration_seconds").record(_start.elapsed().as_secs_f64());
-        Ok(all_results)
+    /// Record in the catalog that every WAL record below the oldest
+    /// unflushed one is in a segment, and drop the WAL files that hold
+    /// nothing newer.
+    ///
+    /// **The floor is derived from what is unflushed, never from what was
+    /// just flushed.** `floor = min_unflushed_seq − 1`, or the newest
+    /// sequence number when nothing is unflushed. "Unflushed" covers every
+    /// memtable — active or frozen, in any shard — and every write between
+    /// its WAL append and its memtable insert, which the write epoch
+    /// excludes by construction: writers hold the epoch for read across
+    /// that gap, and this takes it for write.
+    ///
+    /// Deriving it from what was *just flushed* instead cannot see a frozen
+    /// memtable another flush is still writing, nor a write appended but not
+    /// yet inserted. Either lets the floor pass an acknowledged record, and
+    /// a record below the floor is never replayed.
+    ///
+    /// The floor lives in the catalog because truncation cannot express it:
+    /// the active WAL file is never deleted, so without a recorded floor
+    /// every open replayed it in full.
+    pub(super) fn raise_wal_floor_to_unflushed(&self) {
+        let floor = {
+            let _no_writer_in_flight = self.write_epoch.write();
+            match self.shards.min_unflushed_wal_seq() {
+                Some(oldest) => oldest.saturating_sub(1),
+                None => self.wal.current_sequence(),
+            }
+        };
+        if floor == 0 {
+            return;
+        }
+        if let Err(e) = self.catalog.write().set_wal_floor(floor) {
+            warn!(error = %e, "Failed to record the WAL floor in the catalog");
+            return;
+        }
+        if let Err(e) = self.wal.truncate_before(floor) {
+            warn!(error = %e, "Failed to truncate WAL after flush");
+        }
     }
 
     /// Close the database, flushing all pending data.
@@ -88,7 +110,7 @@ impl super::Chronix {
     /// # Errors
     ///
     /// Returns any error encountered while flushing shards or syncing
-    /// the WAL during shutdown.
+    /// the WAL during shutdown. A failed close can be retried.
     #[must_use = "close errors may indicate data not persisted"]
     pub fn close(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
@@ -97,40 +119,43 @@ impl super::Chronix {
 
         info!("Closing Chronix database");
 
-        // Flush ingest-time downsample accumulators before flushing shards
-        if self.ingest_downsampler.has_rules() {
-            if let Err(e) = self.flush_ingest_downsampling() {
-                tracing::warn!(error = %e, "failed to flush ingest downsampling on close");
+        // Stop the maintenance thread first so no pass runs under a closing
+        // database. A close that runs *on* that thread — the last handle
+        // dropped there — must not join itself.
+        self.stop_maintenance.store(true, Ordering::Release);
+        self.wake_maintenance();
+        let on_maintenance_thread = self
+            .maintenance_thread_id
+            .get()
+            .is_some_and(|id| *id == std::thread::current().id());
+        if !on_maintenance_thread {
+            let handle = self.maintenance_thread.lock().take();
+            if let Some(handle) = handle {
+                if handle.join().is_err() {
+                    warn!("maintenance thread panicked");
+                }
             }
         }
 
-        // Flush all shards and collect WAL sequence numbers
-        let mut global_max_wal_seq: Option<u64> = None;
-        let mut any_failed = false;
-        for shard_id in self.shards.all_shard_ids() {
-            match self.flush_shard(shard_id) {
-                Ok(results) => {
-                    for r in &results {
-                        if let Some(seq) = r.max_wal_seq {
-                            global_max_wal_seq =
-                                Some(global_max_wal_seq.map_or(seq, |c| c.max(seq)));
-                        }
-                    }
-                }
-                Err(e) => {
+        {
+            let _gate = self.flush_gate.lock();
+            let mut any_failed = false;
+            for shard_id in self.shards.shard_ids() {
+                if let Err(e) = self.flush_shard(shard_id) {
                     warn!(shard = %shard_id, error = %e, "Error flushing shard during close");
                     any_failed = true;
                 }
             }
-        }
-
-        // Truncate WAL only if ALL shards flushed successfully —
-        // a failed shard still needs its WAL entries for replay
-        // on next startup.
-        if !any_failed {
-            if let Some(max_seq) = global_max_wal_seq {
-                if let Err(e) = self.wal.truncate_before(max_seq) {
-                    warn!(error = %e, "Failed to truncate WAL during close");
+            // Everything is in segments now, so the floor reaches the newest
+            // record — including a delete record, which needs no replay
+            // because its tombstones live in the catalog. Then leave an
+            // *empty* active WAL file behind: rotate, and drop the file that
+            // held the flushed records, so the next open reads nothing.
+            self.raise_wal_floor_to_unflushed();
+            if !any_failed {
+                match self.wal.rotate() {
+                    Ok(()) => self.raise_wal_floor_to_unflushed(),
+                    Err(e) => warn!(error = %e, "Failed to rotate WAL during close"),
                 }
             }
         }
@@ -145,6 +170,13 @@ impl super::Chronix {
         // Mark as closed only after everything has been persisted
         // successfully, so a failed close can be retried.
         self.closed.store(true, Ordering::Release);
+
+        // A closed database is not this process's any more: release the
+        // directory lock now rather than when the last handle drops, so
+        // `close()` followed by `open()` of the same directory works.
+        if let Err(e) = fs2::FileExt::unlock(&self._lock_file) {
+            warn!(error = %e, "Failed to release the database lock file");
+        }
 
         info!("Chronix database closed");
         Ok(())
@@ -215,6 +247,47 @@ impl super::Chronix {
     /// Returns an error if the database is closed.
     #[must_use = "retention errors must be handled"]
     pub fn enforce_retention(&self, retention_ns: i64) -> Result<retention::RetentionResult> {
+        self.enforce_retention_inner(Some(retention_ns))
+    }
+
+    /// Enforce every configured retention rule — the global one if there is
+    /// one, plus every per-measurement and per-rollup rule.
+    ///
+    /// This is what the maintenance thread calls. It used to call
+    /// `enforce_retention` only when a *global* retention was configured,
+    /// so a database that set a rule for one measurement, or a rollup that
+    /// declared its own `retention_ns`, expired nothing at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is closed.
+    #[must_use = "retention errors must be handled"]
+    pub fn enforce_configured_retention(&self) -> Result<retention::RetentionResult> {
+        let global = self
+            .config
+            .retention
+            .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+        self.enforce_retention_inner(global)
+    }
+
+    /// Is any retention rule configured at all?
+    #[must_use]
+    pub(crate) fn has_retention_rules(&self) -> bool {
+        self.config.retention.is_some()
+            || !self.config.measurement_retention.is_empty()
+            || self
+                .rollup_registry
+                .read()
+                .list()
+                .iter()
+                .any(|c| c.retention_ns.is_some())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn enforce_retention_inner(
+        &self,
+        global_retention_ns: Option<i64>,
+    ) -> Result<retention::RetentionResult> {
         self.check_open()?;
 
         let now_ns = i64::try_from(
@@ -224,10 +297,14 @@ impl super::Chronix {
                 .as_nanos(),
         )
         .unwrap_or(i64::MAX);
-        let global_cutoff = retention::retention_cutoff(now_ns, retention_ns);
+        // Without a global rule nothing expires by age alone; the
+        // per-measurement pass below still runs.
+        let global_cutoff =
+            global_retention_ns.map_or(i64::MIN, |ns| retention::retention_cutoff(now_ns, ns));
 
-        // Build per-measurement cutoffs from config overrides.
-        let per_measurement_cutoffs: std::collections::HashMap<String, i64> = self
+        // Build per-measurement cutoffs from config overrides, plus the
+        // retention each rollup declares for its own target measurement.
+        let mut per_measurement_cutoffs: std::collections::HashMap<String, i64> = self
             .config
             .measurement_retention
             .iter()
@@ -239,20 +316,47 @@ impl super::Chronix {
                 )
             })
             .collect();
+        for rollup in self.rollup_registry.read().list() {
+            if let Some(r) = rollup.retention_ns {
+                per_measurement_cutoffs
+                    .entry(rollup.target_measurement.clone())
+                    .or_insert_with(|| retention::retention_cutoff(now_ns, r));
+            }
+        }
 
-        // Collect shard bounds from time index
-        let shard_bounds: BTreeMap<ShardId, (i64, i64)> = {
-            let time_idx = self.time_index.read();
-            time_idx
-                .iter()
-                .map(|(&shard_id, idx)| {
-                    let all = idx.all_entries();
-                    let (min, max) = all.iter().fold((i64::MAX, i64::MIN), |(lo, hi), e| {
-                        (lo.min(e.min_ts), hi.max(e.max_ts))
-                    });
-                    (shard_id, (min, max))
-                })
-                .collect()
+        // Rollups first: a shard may only be dropped once every rollup its
+        // measurements feed has been materialised past it.
+        if let Err(e) = self.materialise_rollups() {
+            warn!(error = %e, "retention: rollup materialisation failed — raw data that feeds a rollup is preserved");
+        }
+
+        // Shard bounds and the segments in each shard come from **one**
+        // snapshot of the catalog, taken under one lock.
+        //
+        // They used to come from different places: the bounds from the time
+        // index and the segment list from the catalog, read one after the
+        // other. A flush or a compaction landing between the two put a
+        // segment in the catalog that the index did not know about, so its
+        // shard looked entirely expired and the pass deleted a segment
+        // newer than the cutoff. Deriving both from the same snapshot makes
+        // the window unrepresentable rather than merely unlikely.
+        let (shard_bounds, segments_by_shard) = {
+            let catalog = self.catalog.read();
+            let mut bounds: BTreeMap<ShardId, (i64, i64)> = BTreeMap::new();
+            let mut by_shard: BTreeMap<ShardId, Vec<SegmentCatalogEntry>> = BTreeMap::new();
+            for entry in catalog.all_segments() {
+                if entry.state != SegmentState::Active {
+                    continue;
+                }
+                let b = bounds.entry(entry.shard_id).or_insert((i64::MAX, i64::MIN));
+                b.0 = b.0.min(entry.min_timestamp);
+                b.1 = b.1.max(entry.max_timestamp);
+                by_shard
+                    .entry(entry.shard_id)
+                    .or_default()
+                    .push(entry.clone());
+            }
+            (bounds, by_shard)
         };
 
         // Use the global cutoff for whole-shard drops.
@@ -262,92 +366,38 @@ impl super::Chronix {
         let mut total_bytes: u64 = 0;
 
         for &shard_id in &expired {
-            // Find all segments in this shard
-            let entries: Vec<SegmentCatalogEntry> = {
-                let catalog = self.catalog.read();
-                catalog
-                    .all_segments()
-                    .into_iter()
-                    .filter(|e| e.shard_id == shard_id)
-                    .cloned()
-                    .collect()
-            };
+            // From the same snapshot the bounds came from.
+            let entries: Vec<SegmentCatalogEntry> = segments_by_shard
+                .get(&shard_id)
+                .cloned()
+                .unwrap_or_default();
 
-            // Rollup-aware retention: compute rollups before dropping
-            // segments so that aggregated data is preserved.
-            // Track segments whose rollups failed — we must NOT delete
-            // these, as the aggregated data would be lost.
-            let mut rollup_failed_segments: std::collections::HashSet<chronix_core::SegmentId> =
+            // Rollup-aware retention: raw data is dropped only once every
+            // rollup it feeds — the whole chain — has been materialised
+            // past this shard. A segment that is still needed is preserved
+            // and counted; the next pass tries again.
+            let shard_end = shard_bounds.get(&shard_id).map_or(i64::MIN, |b| b.1);
+            let mut protected: std::collections::HashSet<chronix_core::SegmentId> =
                 std::collections::HashSet::new();
             for entry in &entries {
-                let rollups: Vec<crate::rollup::RollupConfig> = {
-                    let reg = self.rollup_registry.read();
-                    reg.rollups_for_source(&entry.measurement)
-                        .into_iter()
-                        .cloned()
-                        .collect()
-                };
-                if !rollups.is_empty() {
-                    // A segment that cannot be read cannot be rolled
-                    // up, so it must be preserved. Falling through to the
-                    // delete loop here destroyed the raw data *and* the
-                    // aggregate that was supposed to replace it — silent,
-                    // permanent loss.
-                    match SegmentReader::open(&entry.path).and_then(|r| r.read_all()) {
-                        Ok(batch) => {
-                            let batches = [batch];
-                            for rollup_config in &rollups {
-                                let rollup_points =
-                                    crate::rollup::compute_rollup_points(&batches, rollup_config);
-                                if !rollup_points.is_empty() {
-                                    if let Err(e) = self.insert_batch(&rollup_points) {
-                                        warn!(
-                                            rollup = %rollup_config.name,
-                                            error = %e,
-                                            "Failed to compute rollup before retention drop — preserving segment"
-                                        );
-                                        rollup_failed_segments.insert(entry.segment_id);
-                                    } else {
-                                        info!(
-                                            rollup = %rollup_config.name,
-                                            points = rollup_points.len(),
-                                            shard = %shard_id,
-                                            "Rollup computed before retention drop"
-                                        );
-                                        // Drive the *whole* chain, not
-                                        // just the first tier. For a
-                                        // 1 s→1 min→15 min cascade the raw data
-                                        // is being traded for the 15 min tier;
-                                        // dropping it while only the 1 min tier
-                                        // exists loses the long-retention
-                                        // aggregate if the intermediate tier is
-                                        // itself expired before it compacts.
-                                        if !self.cascade_rollup(
-                                            &rollup_config.target_measurement,
-                                            &rollup_points,
-                                            1,
-                                        ) {
-                                            warn!(
-                                                rollup = %rollup_config.name,
-                                                "Rollup chain incomplete — preserving source segment"
-                                            );
-                                            rollup_failed_segments.insert(entry.segment_id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                segment_id = ?entry.segment_id,
-                                path = %entry.path.display(),
-                                error = %e,
-                                "Cannot read segment to compute its rollup — preserving segment"
-                            );
-                            counter!("chronix_retention_unreadable_segments_total").increment(1);
-                            rollup_failed_segments.insert(entry.segment_id);
-                        }
+                // A measurement with its own retention — a rollup tier kept
+                // for years beside raw data kept for days — is judged by
+                // that, not by the global cutoff that expired the shard.
+                if let Some(&own_cutoff) = per_measurement_cutoffs.get(&entry.measurement) {
+                    if entry.max_timestamp >= own_cutoff {
+                        protected.insert(entry.segment_id);
+                        continue;
                     }
+                }
+                if !self.rollups_materialised_past(&entry.measurement, shard_end.saturating_add(1))
+                {
+                    warn!(
+                        segment_id = ?entry.segment_id,
+                        measurement = %entry.measurement,
+                        "retention: rollups not yet materialised past this shard — preserving segment"
+                    );
+                    counter!("chronix_retention_segments_awaiting_rollup_total").increment(1);
+                    protected.insert(entry.segment_id);
                 }
             }
 
@@ -356,10 +406,7 @@ impl super::Chronix {
             let mut blooms = self.blooms.write();
 
             for entry in &entries {
-                // Skip segments whose rollup insertion failed — dropping
-                // them would lose the pre-aggregated data permanently.
-                if rollup_failed_segments.contains(&entry.segment_id) {
-                    warn!(segment_id = ?entry.segment_id, "retention: skipping segment with failed rollup");
+                if protected.contains(&entry.segment_id) {
                     continue;
                 }
                 total_bytes += entry.byte_size;
@@ -381,14 +428,21 @@ impl super::Chronix {
                         warn!(path = %entry.path.display(), error = %e, "retention: failed to remove segment file");
                     }
                 }
-                if let Err(e) = std::fs::remove_file(entry.path.with_extension("bloom")) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!(path = %entry.path.display(), error = %e, "retention: failed to remove bloom sidecar");
-                    }
+                if let Err(e) = chronix_engine::index::series_index::remove(&entry.path) {
+                    warn!(path = %entry.path.display(), error = %e, "retention: failed to remove series index");
                 }
             }
 
-            time_idx.remove(&shard_id);
+            // The shard's time index goes only when nothing in it survived.
+            if protected.is_empty() {
+                time_idx.remove(&shard_id);
+            } else if let Some(ti) = time_idx.get_mut(&shard_id) {
+                for entry in &entries {
+                    if !protected.contains(&entry.segment_id) {
+                        let _ = ti.remove_segment(entry.segment_id);
+                    }
+                }
+            }
         }
 
         // Per-measurement retention: drop individual segments in
@@ -409,6 +463,30 @@ impl super::Chronix {
                     .cloned()
                     .collect()
             };
+
+            // A measurement's own retention is still subject to the rollup
+            // gate: dropping raw data whose 15-minute tier has not been
+            // computed destroys exactly what the tier was traded for. The
+            // whole-shard pass above checks this; this one did not.
+            let seg_to_drop: Vec<SegmentCatalogEntry> = seg_to_drop
+                .into_iter()
+                .filter(|e| {
+                    if self.rollups_materialised_past(
+                        &e.measurement,
+                        e.max_timestamp.saturating_add(1),
+                    ) {
+                        true
+                    } else {
+                        warn!(
+                            segment_id = ?e.segment_id,
+                            measurement = %e.measurement,
+                            "retention: rollups not yet materialised past this segment — preserving it"
+                        );
+                        counter!("chronix_retention_segments_awaiting_rollup_total").increment(1);
+                        false
+                    }
+                })
+                .collect();
 
             if !seg_to_drop.is_empty() {
                 let mut catalog = self.catalog.write();
@@ -439,10 +517,8 @@ impl super::Chronix {
                             warn!(path = %entry.path.display(), error = %e, "retention: failed to remove segment file");
                         }
                     }
-                    if let Err(e) = std::fs::remove_file(entry.path.with_extension("bloom")) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            warn!(path = %entry.path.display(), error = %e, "retention: failed to remove bloom sidecar");
-                        }
+                    if let Err(e) = chronix_engine::index::series_index::remove(&entry.path) {
+                        warn!(path = %entry.path.display(), error = %e, "retention: failed to remove series index");
                     }
                 }
             }
@@ -504,6 +580,16 @@ impl super::Chronix {
 
         // Flush first so all memtable data is in segments
         self.flush()?;
+
+        // Rollups ride on the background pass whether or not anything gets
+        // compacted: a bucket becomes final by time passing, not by segment
+        // count — and a gateway writing a few megabytes an hour never
+        // reaches the compaction trigger at all. This runs *before* the
+        // early return below for exactly that reason; it once ran after it,
+        // and the `storage_lifecycle` example showed an empty rollup table.
+        if let Err(e) = self.materialise_rollups() {
+            warn!(error = %e, "Rollup materialisation failed");
+        }
 
         let segments: Vec<SegmentCatalogEntry> = {
             let catalog = self.catalog.read();
@@ -663,18 +749,21 @@ impl super::Chronix {
                             column_stats: col_stats,
                             state: SegmentState::Active,
                         };
-                        catalog.add_segment(entry)?;
-
-                        // Soft-delete input segments (grace period before hard-delete)
+                        // Output in, inputs out, tombstones retargeted — one
+                        // step, so a delete issued during the merge keeps
+                        // masking the rows the merge carried over.
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        for input in &task.input_segments {
-                            if let Err(e) = catalog.soft_delete_segment(input.segment_id, now_ms) {
-                                warn!(segment_id = ?input.segment_id, error = %e, "compaction: failed to soft-delete segment");
-                            }
-                        }
+                        let inputs: Vec<chronix_core::SegmentId> =
+                            task.input_segments.iter().map(|s| s.segment_id).collect();
+                        catalog.complete_compaction(entry, &inputs, now_ms)?;
+                        // Keep the in-memory set in step with the catalog's.
+                        self.tombstones.write().extend_to_compaction_output(
+                            &inputs.iter().map(|i| i.0).collect::<Vec<_>>(),
+                            seg_id.0,
+                        );
 
                         // Populate metadata cache for new segment
                         if let Some(header) = seg_header {
@@ -688,15 +777,21 @@ impl super::Chronix {
                         seg_id
                     };
 
-                    // Pre-compute tag pairs from the compacted segment BEFORE
-                    // removing old segments from the tag index, to avoid a window
-                    // where concurrent tag-filtered queries miss data.
-                    let measurement = &task.input_segments[0].measurement;
-                    let new_series_keys = SegmentReader::open(&meta.path)
-                        .ok()
-                        .and_then(|reader| reader.read_all().ok())
-                        .map(|batch| Self::extract_series_keys_from_batch(&batch, measurement))
-                        .unwrap_or_default();
+                    // The writer already knows the compacted segment's
+                    // series; persist them beside it before the old index
+                    // entries go, so a concurrent tag-filtered query never
+                    // sees a window with neither.
+                    if let Err(e) = chronix_engine::index::series_index::write(
+                        &meta.path,
+                        &meta.series_keys,
+                        chronix_engine::index::series_index::SegmentStamp::of(&meta.header),
+                    ) {
+                        warn!(
+                            segment = %meta.path.display(),
+                            error = %e,
+                            "Failed to write series index for compacted segment"
+                        );
+                    }
 
                     // Clean up old segment files and indexes
                     {
@@ -726,99 +821,18 @@ impl super::Chronix {
 
                     // Atomically swap old tag index entries with new ones —
                     // no window where concurrent queries miss data.
-                    if !new_series_keys.is_empty() {
-                        let tag_pairs: Vec<(&str, &str)> = new_series_keys
-                            .iter()
-                            .flat_map(|sk| sk.tags().iter().map(|(k, v)| (k.as_ref(), v.as_ref())))
-                            .collect();
-
+                    let tag_pairs =
+                        chronix_engine::index::series_index::tag_pairs(&meta.series_keys);
+                    if !tag_pairs.is_empty() {
                         let old_ids: Vec<chronix_core::SegmentId> =
                             task.input_segments.iter().map(|s| s.segment_id).collect();
-
                         self.tag_index
                             .replace_segments(&old_ids, segment_id, &tag_pairs);
-
-                        // Build and persist bloom filter
-                        let mut bloom = SeriesBloomFilter::new(new_series_keys.len(), 0.01);
-                        for key in &new_series_keys {
-                            bloom.insert(key);
-                        }
-
-                        let bloom_path = meta.path.with_extension("bloom");
-                        match bloom.to_bytes() {
-                            Ok(bytes) => {
-                                if let Err(e) = std::fs::write(&bloom_path, bytes) {
-                                    warn!(
-                                        bloom = %bloom_path.display(),
-                                        error = %e,
-                                        "Failed to write bloom sidecar for compacted segment"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "Failed to serialize bloom for compacted segment");
-                            }
-                        }
-
-                        self.blooms.write().insert(segment_id.0, bloom);
                     }
-
-                    // Compute rollups if configured for this measurement
-                    let rollups: Vec<crate::rollup::RollupConfig> = {
-                        let reg = self.rollup_registry.read();
-                        reg.rollups_for_source(measurement)
-                            .into_iter()
-                            .cloned()
-                            .collect()
-                    };
-
-                    if !rollups.is_empty() {
-                        // Read the compacted segment to get batches for rollup
-                        if let Ok(reader) = SegmentReader::open(&meta.path) {
-                            if let Ok(batch) = reader.read_all() {
-                                let rows_in = batch.num_rows();
-                                let batches = [batch];
-                                for rollup_config in &rollups {
-                                    let rollup_points = crate::rollup::compute_rollup_points(
-                                        &batches,
-                                        rollup_config,
-                                    );
-                                    if !rollup_points.is_empty() {
-                                        counter!("chronix_rollup_computations_total").increment(1);
-                                        counter!("chronix_rollup_rows_processed_total")
-                                            .increment(rows_in as u64);
-                                        // Insert rollup points into target measurement
-                                        if let Err(e) = self.insert_batch(&rollup_points) {
-                                            warn!(
-                                                rollup = %rollup_config.name,
-                                                error = %e,
-                                                "Failed to insert rollup points"
-                                            );
-                                        } else {
-                                            info!(
-                                                rollup = %rollup_config.name,
-                                                points = rollup_points.len(),
-                                                "Rollup points computed during compaction"
-                                            );
-
-                                            // Multi-tier chain: cascade to next
-                                            // tier if the target measurement has
-                                            // its own rollup(s) configured.
-                                            if !self.cascade_rollup(
-                                                &rollup_config.target_measurement,
-                                                &rollup_points,
-                                                1,
-                                            ) {
-                                                warn!(
-                                                    rollup = %rollup_config.name,
-                                                    "Rollup chain incomplete after compaction"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(bloom) =
+                        chronix_engine::index::series_index::bloom(&meta.series_keys)
+                    {
+                        self.blooms.write().insert(segment_id.0, bloom);
                     }
 
                     info!(
@@ -858,7 +872,9 @@ impl super::Chronix {
             // afterwards is therefore the one moment a tombstone can be
             // proven dead.
             self.gc_tombstones();
+        }
 
+        if completed > 0 {
             // After compaction, check for overlapping segments in
             // all measurements that were compacted.
             {
@@ -926,10 +942,8 @@ impl super::Chronix {
                     warn!(path = %path.display(), error = %e, "gc: failed to remove segment file");
                 }
             }
-            if let Err(e) = std::fs::remove_file(path.with_extension("bloom")) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!(path = %path.display(), error = %e, "gc: failed to remove bloom sidecar");
-                }
+            if let Err(e) = chronix_engine::index::series_index::remove(path) {
+                warn!(path = %path.display(), error = %e, "gc: failed to remove series index");
             }
             // Remove from catalog (manifest entry recorded)
             if let Err(e) = catalog.remove_segment(*seg_id) {
@@ -1044,165 +1058,124 @@ impl super::Chronix {
     }
 
     /// Flush a single shard to per-measurement segment files.
+    ///
+    /// Registration — catalog, indexes, sidecar — runs *inside* the engine's
+    /// flush window, so the memtable is released only once every segment it
+    /// produced is in the catalog. A failure at any step keeps the memtable
+    /// frozen for the next attempt and removes the files of this attempt.
     #[allow(clippy::too_many_lines)]
     pub fn flush_shard(&self, shard_id: ShardId) -> Result<Vec<FlushResult>> {
-        let _shard_flush_start = std::time::Instant::now();
-        match self.shards.flush_shard(shard_id) {
+        let shard_flush_start = std::time::Instant::now();
+        let outcome = self.shards.flush_shard_with(shard_id, |results| {
+            self.register_flushed(shard_id, results)
+                .map_err(|e| chronix_engine::memtable::MemtableError::Flush(e.to_string()))
+        });
+        match outcome {
             Ok(results) => {
-                // Accumulate per-shard totals for flush metrics.
-                let mut shard_total_rows: u64 = 0;
-                let mut shard_total_bytes: u64 = 0;
-
-                for result in &results {
-                    let meta = &result.segment_meta;
-                    shard_total_rows += meta.row_count;
-                    shard_total_bytes += meta.byte_size;
-                    debug!(
-                        shard = %shard_id,
-                        measurement = %result.measurement,
-                        segment = %meta.path.display(),
-                        rows = meta.row_count,
-                        "Shard flushed to segment"
-                    );
-
-                    // Emit compression ratio metric
-                    if meta.uncompressed_bytes > 0 && meta.byte_size > 0 {
-                        histogram!("chronix_segment_compression_ratio")
-                            .record(meta.uncompressed_bytes as f64 / meta.byte_size as f64);
-                    }
-
-                    // Build column stats from finalize() metadata (no disk I/O).
-                    let col_stats: Vec<CatalogColumnStats> = meta
-                        .column_metas
-                        .iter()
-                        .map(|cm| CatalogColumnStats {
-                            name: cm.name.clone(),
-                            data_type: cm.data_type,
-                            role: cm.role,
-                            stats: cm.stats.clone(),
-                        })
-                        .collect();
-                    let segment_header = meta.header.clone();
-                    let column_metas = meta.column_metas.clone();
-
-                    // Register in catalog — brief lock, no I/O
-                    let segment_id = {
-                        let mut catalog = self.catalog.write();
-                        let seg_id = catalog.next_segment_id();
-
-                        let entry = SegmentCatalogEntry {
-                            segment_id: seg_id,
-                            shard_id,
-                            measurement: result.measurement.clone(),
-                            path: meta.path.clone(),
-                            min_timestamp: meta.min_timestamp,
-                            max_timestamp: meta.max_timestamp,
-                            row_count: meta.row_count,
-                            series_count: meta.series_count,
-                            byte_size: meta.byte_size,
-                            row_group_count: meta.row_group_count,
-                            column_count: meta.column_count,
-                            column_stats: col_stats,
-                            state: SegmentState::Active,
-                        };
-                        catalog.add_segment(entry)?;
-                        seg_id
-                    };
-
-                    // Populate metadata cache
-                    self.metadata_cache.insert(CachedSegmentMeta {
-                        segment_id,
-                        header: segment_header,
-                        columns: column_metas,
-                    });
-
-                    // Update time index
-                    {
-                        let mut indices = self.time_index.write();
-                        let idx = indices.entry(shard_id).or_default();
-                        idx.add_segment(TimeIndexEntry {
-                            segment_id,
-                            min_ts: meta.min_timestamp,
-                            max_ts: meta.max_timestamp,
-                        });
-                    }
-
-                    // Build, persist, and register bloom filter from series keys
-                    if !result.series_keys.is_empty() {
-                        let mut bloom = SeriesBloomFilter::new(
-                            result.series_keys.len(),
-                            0.01, // 1% false positive rate
-                        );
-                        for key in &result.series_keys {
-                            bloom.insert(key);
-                        }
-
-                        // Persist bloom filter as sidecar file
-                        let bloom_path = meta.path.with_extension("bloom");
-                        match bloom.to_bytes() {
-                            Ok(bytes) => {
-                                if let Err(e) = std::fs::write(&bloom_path, bytes) {
-                                    warn!(
-                                        bloom = %bloom_path.display(),
-                                        error = %e,
-                                        "Failed to write bloom filter sidecar"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    bloom = %bloom_path.display(),
-                                    error = %e,
-                                    "Failed to serialize bloom filter"
-                                );
-                            }
-                        }
-
-                        self.blooms.write().insert(segment_id.0, bloom);
-                    }
-
-                    // Populate inverted index with tag values from flushed series
-                    {
-                        let tag_pairs: Vec<(&str, &str)> = result
-                            .series_keys
-                            .iter()
-                            .flat_map(|sk| sk.tags().iter().map(|(k, v)| (k.as_ref(), v.as_ref())))
-                            .collect();
-                        if !tag_pairs.is_empty() {
-                            self.tag_index.add_segment(segment_id, &tag_pairs);
-                        }
-                    }
+                let flushed_measurements: HashSet<&str> =
+                    results.iter().map(|r| r.measurement.as_str()).collect();
+                for m in flushed_measurements {
+                    self.detect_segment_overlaps(m);
                 }
-
-                // After flush, check for overlapping segments for
-                // each measurement that received new segments.
-                {
-                    let flushed_measurements: HashSet<&str> =
-                        results.iter().map(|r| r.measurement.as_str()).collect();
-                    for m in flushed_measurements {
-                        self.detect_segment_overlaps(m);
-                    }
-                }
-
-                // Return results — callers (flush, maybe_flush) are responsible
-                // for WAL truncation after ALL shards have been flushed, so that
-                // early truncation cannot discard entries needed by other shards.
-
-                // Emit per-shard flush metrics so operators can identify
-                // slow or oversized shards independently.
                 let shard_label = shard_id.to_string();
                 histogram!("chronix_flush_shard_duration_seconds", "shard" => shard_label.clone())
-                    .record(_shard_flush_start.elapsed().as_secs_f64());
+                    .record(shard_flush_start.elapsed().as_secs_f64());
+                let rows: u64 = results.iter().map(|r| r.segment_meta.row_count).sum();
+                let bytes: u64 = results.iter().map(|r| r.segment_meta.byte_size).sum();
                 counter!("chronix_flush_shard_rows_total", "shard" => shard_label.clone())
-                    .increment(shard_total_rows);
+                    .increment(rows);
                 counter!("chronix_flush_shard_bytes_total", "shard" => shard_label)
-                    .increment(shard_total_bytes);
-
+                    .increment(bytes);
                 Ok(results)
             }
             Err(chronix_engine::memtable::MemtableError::NoFrozenMemtable) => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Register freshly written segments: catalog entry, metadata cache,
+    /// time index, series sidecar, bloom and tag index.
+    fn register_flushed(&self, shard_id: ShardId, results: &[FlushResult]) -> Result<()> {
+        for result in results {
+            let meta = &result.segment_meta;
+            debug!(
+                shard = %shard_id,
+                measurement = %result.measurement,
+                segment = %meta.path.display(),
+                rows = meta.row_count,
+                "Shard flushed to segment"
+            );
+            if meta.uncompressed_bytes > 0 && meta.byte_size > 0 {
+                histogram!("chronix_segment_compression_ratio")
+                    .record(meta.uncompressed_bytes as f64 / meta.byte_size as f64);
+            }
+
+            // The sidecar first: it is derived data, and a segment without
+            // one is rebuilt at open, but the catalog entry is the moment the
+            // segment exists as far as anyone else is concerned.
+            chronix_engine::index::series_index::write(
+                &meta.path,
+                &result.series_keys,
+                chronix_engine::index::series_index::SegmentStamp::of(&meta.header),
+            )?;
+
+            let col_stats: Vec<CatalogColumnStats> = meta
+                .column_metas
+                .iter()
+                .map(|cm| CatalogColumnStats {
+                    name: cm.name.clone(),
+                    data_type: cm.data_type,
+                    role: cm.role,
+                    stats: cm.stats.clone(),
+                })
+                .collect();
+
+            let segment_id = {
+                let mut catalog = self.catalog.write();
+                let seg_id = catalog.next_segment_id();
+                catalog.add_segment(SegmentCatalogEntry {
+                    segment_id: seg_id,
+                    shard_id,
+                    measurement: result.measurement.clone(),
+                    path: meta.path.clone(),
+                    min_timestamp: meta.min_timestamp,
+                    max_timestamp: meta.max_timestamp,
+                    row_count: meta.row_count,
+                    series_count: meta.series_count,
+                    byte_size: meta.byte_size,
+                    row_group_count: meta.row_group_count,
+                    column_count: meta.column_count,
+                    column_stats: col_stats,
+                    state: SegmentState::Active,
+                })?;
+                seg_id
+            };
+
+            self.metadata_cache.insert(CachedSegmentMeta {
+                segment_id,
+                header: meta.header.clone(),
+                columns: meta.column_metas.clone(),
+            });
+            {
+                let mut indices = self.time_index.write();
+                let idx = indices.entry(shard_id).or_default();
+                idx.add_segment(TimeIndexEntry {
+                    segment_id,
+                    min_ts: meta.min_timestamp,
+                    max_ts: meta.max_timestamp,
+                });
+            }
+            {
+                let mut blooms = self.blooms.write();
+                Self::index_series_keys(
+                    &mut blooms,
+                    &self.tag_index,
+                    segment_id,
+                    &result.series_keys,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Detect overlapping segments at the same compaction level

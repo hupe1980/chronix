@@ -378,7 +378,8 @@ impl TriggerEngine {
             }
 
             // Evaluate condition
-            let (should_fire, value) = self.evaluate_condition(&trigger, fields, &cooldown_key);
+            let (should_fire, value) =
+                self.evaluate_condition(&trigger, fields, tags, &cooldown_key);
 
             if should_fire {
                 let severity = Severity::from_thresholds(
@@ -445,6 +446,7 @@ impl TriggerEngine {
                     severity,
                     value,
                     metadata,
+                    delivery_targets: trigger.delivery_targets.clone(),
                 };
 
                 // Atomic update of last_fired_ts using entry() API.
@@ -504,9 +506,10 @@ impl TriggerEngine {
         &self,
         trigger: &EventTrigger,
         fields: &BTreeMap<String, FieldValue>,
+        tags: &BTreeMap<String, String>,
         state_key: &(String, u64),
     ) -> (bool, f64) {
-        self.evaluate_condition_inner(&trigger.condition, fields, state_key)
+        self.evaluate_condition_inner(&trigger.condition, fields, tags, state_key)
     }
 
     /// Recursive evaluator for [`TriggerCondition`] trees.
@@ -514,9 +517,21 @@ impl TriggerEngine {
         &self,
         condition: &TriggerCondition,
         fields: &BTreeMap<String, FieldValue>,
+        tags: &BTreeMap<String, String>,
         state_key: &(String, u64),
     ) -> (bool, f64) {
         match condition {
+            // A tag comparison carries no numeric value, so it reports 0.0
+            // — the second half of the pair is the value that fired, and
+            // for a string match there is none.
+            TriggerCondition::TagEquals {
+                tag,
+                value,
+                negated,
+            } => {
+                let matched = tags.get(tag).is_some_and(|actual| actual == value);
+                (matched != *negated, 0.0)
+            }
             TriggerCondition::FieldThreshold { field, op, value } => {
                 if let Some(field_val) = extract_f64(fields, field) {
                     (op.evaluate(field_val, *value), field_val)
@@ -666,8 +681,8 @@ impl TriggerEngine {
             }
 
             TriggerCondition::And { left, right } => {
-                let (l_ok, l_val) = self.evaluate_condition_inner(left, fields, state_key);
-                let (r_ok, r_val) = self.evaluate_condition_inner(right, fields, state_key);
+                let (l_ok, l_val) = self.evaluate_condition_inner(left, fields, tags, state_key);
+                let (r_ok, r_val) = self.evaluate_condition_inner(right, fields, tags, state_key);
                 if l_ok && r_ok {
                     (true, l_val)
                 } else {
@@ -676,11 +691,11 @@ impl TriggerEngine {
             }
 
             TriggerCondition::Or { left, right } => {
-                let (l_ok, l_val) = self.evaluate_condition_inner(left, fields, state_key);
+                let (l_ok, l_val) = self.evaluate_condition_inner(left, fields, tags, state_key);
                 if l_ok {
                     return (true, l_val);
                 }
-                let (r_ok, r_val) = self.evaluate_condition_inner(right, fields, state_key);
+                let (r_ok, r_val) = self.evaluate_condition_inner(right, fields, tags, state_key);
                 (r_ok, r_val)
             }
         }

@@ -242,6 +242,31 @@ impl HoltWintersModel {
     }
 }
 
+/// `Var[e_h] / sigma^2` for additive Holt-Winters:
+/// `1 + sum_{j=1..h-1} psi_j^2` with
+/// `psi_j = alpha(1 + beta*j) + gamma*1[j mod m == 0]`.
+///
+/// Exactly `1.0` at `h = 1`.
+#[must_use]
+pub fn holt_winters_variance_factor(
+    alpha: f64,
+    beta: f64,
+    gamma: f64,
+    period: usize,
+    h: usize,
+) -> f64 {
+    let m = period.max(1);
+    let mut acc = 1.0;
+    for j in 1..h {
+        let mut psi = alpha * (1.0 + beta * j as f64);
+        if j % m == 0 {
+            psi += gamma;
+        }
+        acc += psi * psi;
+    }
+    acc
+}
+
 impl ForecastModel for HoltWintersModel {
     #[tracing::instrument(skip_all, level = "debug")]
     fn fit(&mut self, timestamps: &[i64], values: &[f64]) -> Result<(), ForecastError> {
@@ -347,6 +372,7 @@ impl ForecastModel for HoltWintersModel {
         let ModelParams::HoltWinters {
             alpha,
             beta,
+            gamma,
             level,
             trend,
             seasonal,
@@ -378,24 +404,24 @@ impl ForecastModel for HoltWintersModel {
                 level + h as f64 * trend + seasonal[si]
             };
 
-            // Exact recursive PI variance per Hyndman et al. (2008).
-            // For additive Holt-Winters the prediction variance coefficients
-            // follow the recurrence:
-            //   c_0 = 1
-            //   c_j = c_{j-1} + α(1 + β·j) + γ·𝟙[j mod m = 0]
-            // The seasonal smoothing parameter γ contributes to error
-            // propagation at each seasonal boundary.
-            let mut var_sum = 0.0;
-            let mut cj = 1.0;
-            for j in 0..h {
-                if j > 0 {
-                    cj += alpha * (1.0 + beta * j as f64);
-                    if j % period == 0 {
-                        cj += self.gamma.unwrap_or(0.0);
-                    }
-                }
-                var_sum += cj * cj;
-            }
+            // PI variance per Hyndman & Athanasopoulos (FPP3 §7.7) and
+            // Hyndman et al. (2008), Table 6.1 — additive Holt-Winters is a
+            // class-1 (linear) model, so
+            //
+            //   Var[e_h] = sigma^2 * (1 + sum_{j=1..h-1} psi_j^2)
+            //   psi_j    = alpha * (1 + beta * j) + gamma * 1[j mod m == 0]
+            //
+            // The psi-weights are *not* cumulative: each is the coefficient
+            // of a single innovation in the MA(inf) expansion. Summing them
+            // into a running total inflated the h = m factor for hourly data
+            // with a daily cycle from 3.45 to 42.4 (alpha = 0.3, beta = 0.1,
+            // m = 24) — an interval an order of magnitude too wide.
+            //
+            // gamma is the *fitted* value read back from the params, not the
+            // optional configured one: `self.gamma` is `None` whenever the
+            // caller let the model choose, which silently dropped the
+            // seasonal term from every auto-fitted model.
+            let var_sum = holt_winters_variance_factor(*alpha, *beta, *gamma, *period, h);
             let width = z * residual_std * var_sum.sqrt();
             values.push(forecast);
             timestamps.push(ts);
@@ -488,6 +514,64 @@ mod tests {
             })
             .collect();
         (ts, vals)
+    }
+
+    /// h = 1 must be exactly z*sigma; h = m must match the closed form
+    /// `1 + sum_{j=1..m-1} (alpha(1+beta*j))^2` (no j is divisible by m in
+    /// that range, so gamma does not enter). alpha = 0.3, beta = 0.1, m = 24:
+    /// 1 + 0.09*(23 + 0.2*276 + 0.01*4324) = 11.9296, sqrt = 3.4539253...
+    #[test]
+    fn hw_interval_matches_hyndman_psi_weights() {
+        let (ts, vals) = seasonal_data(120, 24);
+        let mut model = HoltWintersModel::new(Some(0.3), Some(0.1), Some(0.2), Some(24), false);
+        model.fit(&ts, &vals).unwrap();
+        let ModelParams::HoltWinters { residual_std, .. } = model.params() else {
+            panic!()
+        };
+        let sigma = *residual_std;
+        assert!(sigma > 0.0);
+        let r = model.predict(24).unwrap();
+
+        let z = 1.96;
+        let half1 = r.confidence_upper[0] - r.values[0];
+        assert!(
+            (half1 - z * sigma).abs() < 1e-12,
+            "h=1 half-width {half1} != z*sigma {}",
+            z * sigma
+        );
+
+        let expected_factor = 11.929_6_f64;
+        let ratio = (r.confidence_upper[23] - r.values[23]) / half1;
+        assert!(
+            (ratio * ratio - expected_factor).abs() < 1e-9,
+            "h=24 variance ratio {} != {expected_factor}",
+            ratio * ratio
+        );
+        assert!(
+            (ratio - expected_factor.sqrt()).abs() < 1e-9,
+            "h=24 width ratio {ratio} != {}",
+            expected_factor.sqrt()
+        );
+    }
+
+    /// The seasonal term must come from the *fitted* gamma, so an
+    /// auto-fitted model (constructed with `gamma = None`) still widens at
+    /// the seasonal boundary.
+    #[test]
+    fn hw_variance_factor_uses_fitted_gamma_at_seasonal_boundary() {
+        // Closed form at h = m + 1 = 5 with m = 4: psi_4 = alpha(1+4beta)+gamma.
+        let f = holt_winters_variance_factor(0.5, 0.1, 0.3, 4, 5);
+        let mut expected = 1.0;
+        for j in 1..5 {
+            let mut psi = 0.5 * (1.0 + 0.1 * j as f64);
+            if j % 4 == 0 {
+                psi += 0.3;
+            }
+            expected += psi * psi;
+        }
+        assert!((f - expected).abs() < 1e-12);
+        // gamma actually moved the answer.
+        assert!((f - holt_winters_variance_factor(0.5, 0.1, 0.0, 4, 5)).abs() > 0.1);
     }
 
     #[test]

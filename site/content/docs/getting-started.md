@@ -23,13 +23,13 @@ which CI compiles and runs on every change:
 
 ```rust
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A data directory is the whole deployment. It is file-locked, so a
-    // second process cannot open it by accident.
-    let config = ChronixConfig::builder().data_dir("/tmp/quickstart").build()?;
-    let db = Chronix::open(config)?;
+    // second process cannot open it by accident. `open_small` is the
+    // gateway preset; `Chronix::open(ChronixConfig::builder()…)` is the
+    // general form.
+    let db = Chronix::open_small("/tmp/quickstart")?;
 
     // A point is a series key (measurement + tags), some fields, and a
     // timestamp in **nanoseconds**.
@@ -41,28 +41,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     db.insert(&point)?;
 
-    // Query with the builder. Without `.range()` the plan covers all time.
+    // Query with the builder — an Arrow RecordBatch back.
     let plan = db.query().measurement("cpu").build()?;
-    let batch = db.execute(&plan)?; // an Arrow RecordBatch
+    let batch = db.execute(&plan)?;
     println!("{} rows", batch.num_rows());
 
-    // `close()` flushes and truncates the WAL. Dropping without it is safe —
-    // recovery replays the log — but closing makes the next open faster.
+    // …or with SQL. Every measurement is a table, `_time` is the timestamp.
+    let batches = db.sql("SELECT _time, host, usage_idle FROM cpu")?;
+    println!("{} batches", batches.len());
+
+    // `close()` flushes and records the WAL floor, so the next open replays
+    // nothing. Dropping the last handle does the same.
     db.close()?;
     Ok(())
 }
 ```
 
-On a memory-constrained machine — a gateway with 512&nbsp;MB of RAM and flash
-storage — use the preset instead of hand-tuning:
+`open_small` sets a ~48&nbsp;MB memory budget and a periodic WAL fsync
+policy that is gentler on eMMC and SD cards — the preset for a gateway with
+512&nbsp;MB of RAM. For anything else, build a `ChronixConfig`; see
+[Performance](@/docs/performance.md) for what each knob trades away.
 
-```rust
-let db = Chronix::open_small("/var/lib/chronix")?;
-```
+A `Chronix` maintains itself: one built-in thread flushes memtables as they
+fill and, every `maintenance_interval` (30 s), compacts, materialises
+rollups and enforces retention. There is nothing to start and nothing to
+schedule — in the embedded case or in `chronixd`.
 
-It sets a ~48&nbsp;MB memory budget and a periodic WAL fsync policy that is
-gentler on eMMC and SD cards. See [Performance](@/docs/performance.md) for what
-each knob trades away.
+`Chronix` is a handle: `clone()` is cheap, every clone shares the database,
+and the last one dropped closes it. Hand clones to threads freely. `db.sql`
+blocks on a private runtime; inside an async runtime call `db.sql_async`.
 
 ## Server
 
@@ -84,10 +91,10 @@ curl -X POST localhost:8086/api/v1/write \
        "fields":{"usage_idle":95.5},"timestamp":1700000000000000000}'
 
 # …or InfluxDB line protocol, which Telegraf already speaks
-curl -X POST localhost:8086/api/v1/write/influx \
+curl -X POST localhost:8086/write \
   --data-binary 'cpu,host=web-01 usage_idle=95.5 1700000000000000000'
 
-curl -X POST localhost:8086/api/v1/query \
+curl -X POST localhost:8086/api/v1/chronix/query \
   -H 'Content-Type: application/json' \
   -d '{"measurement":"cpu"}'
 ```
@@ -110,18 +117,45 @@ GROUP BY bucket
 ORDER BY bucket;
 ```
 
+The timestamp column is `_time`. It compares against an epoch-nanosecond
+integer, an RFC 3339 string and `now()` alike, so the numbers the write API
+gave you work unchanged:
+
+```sql
+SELECT * FROM cpu WHERE _time >= 1700000000000000000 LIMIT 10;
+```
+
+`SHOW TABLES` lists your measurements, `SHOW COLUMNS FROM cpu` their
+columns, and `EXPLAIN` tells you whether a time filter actually narrowed the
+scan — the difference between reading three segments and reading all of
+them:
+
+```sql
+EXPLAIN SELECT * FROM cpu WHERE _time >= 1700000000000000000;
+```
+
+```text
+ChronixExec: measurement=cpu, time=[1700000000000000000..9223372036854775807], filters=0, limit=None
+```
+
 **PromQL**, tracking Prometheus 3.x semantics — this is the same request
 Grafana sends a Prometheus data source:
 
 ```bash
-curl 'localhost:8086/api/v1/prom/query?query=rate(cpu[5m])'
+curl 'localhost:8086/api/v1/query?query=rate(cpu[5m])'
 ```
 
 **Analytics in the query**, rather than in a service beside it:
 
 ```sql
-SELECT FORECAST(usage_idle, 24)   AS predicted,
-       ANOMALY(usage_idle)        AS anomaly_score
+SELECT forecast(usage_idle, _time, 24) AS predicted
+FROM cpu;
+
+-- `anomaly_score` is a window function: it needs the ordering to score
+-- against, so it is always used with OVER.
+SELECT _time,
+       anomaly_score(usage_idle, 3.0) OVER (PARTITION BY host ORDER BY _time)
+         AS score
 FROM cpu;
 ```
 

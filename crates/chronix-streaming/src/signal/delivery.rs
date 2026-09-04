@@ -136,6 +136,19 @@ pub struct WebhookConfig {
     pub signing_secret: String,
     /// Custom headers to include.
     pub headers: Vec<(String, String)>,
+    /// Permit a target that resolves inside the deployment's own network.
+    ///
+    /// Off by default. A webhook URL reaching loopback, RFC1918 or a
+    /// link-local address is server-side request forgery when the URL came
+    /// from anywhere but the operator — the cloud metadata service, an
+    /// unauthenticated Docker socket and a service mesh all live there — so
+    /// the address rule is enforced at the connection regardless of what
+    /// built the channel.
+    ///
+    /// An operator wiring a webhook to a sink on their own host is the one
+    /// legitimate case, and it is spelled out here rather than left as a hole
+    /// in the check. The trigger DSL never sets it.
+    pub allow_private_targets: bool,
 }
 
 impl WebhookConfig {
@@ -150,7 +163,18 @@ impl WebhookConfig {
             timeout: Duration::from_secs(10),
             signing_secret: signing_secret.into(),
             headers: Vec::new(),
+            allow_private_targets: false,
         }
+    }
+
+    /// Permit a target inside the deployment's own network.
+    ///
+    /// See [`allow_private_targets`](Self::allow_private_targets) for what
+    /// this gives up.
+    #[must_use]
+    pub fn allow_private_targets(mut self, allow: bool) -> Self {
+        self.allow_private_targets = allow;
+        self
     }
 
     /// Set the timeout.
@@ -168,28 +192,18 @@ impl WebhookConfig {
     }
 }
 
-/// Delivers signals via HTTP POST with optional HMAC-SHA256 signature.
-///
-/// The webhook channel serializes the `SignalEvent` to JSON and posts it
-/// to the configured URL. If a signing secret is configured, an
-/// `X-Chronix-Signature` header with the HMAC-SHA256 hex digest is included.
 /// The TLS configuration for this crate's outbound HTTPS requests.
 ///
-/// **This is a library, so it does not install a process-global provider.**
+/// **This is a library, so it installs no process-global provider.**
 /// `CryptoProvider::install_default` sets process-wide state and silently
-/// loses to whoever called it first: a crate that installs `ring` on its first
-/// webhook would make a later `install_default(aws_lc_rs)` in the embedding
-/// application fail, and the application would get a provider it did not
-/// choose with no error to read. `chronix` is published for other people to
-/// embed, so that is not a theoretical objection.
-///
-/// Instead the provider the application installed is *used* if there is one,
-/// and `ring` is the fallback only when nobody has chosen. `chronixd`
-/// installs one at startup, so under the server this resolves to the server's
-/// choice.
+/// loses to whoever called it first, which would hand an embedding
+/// application a provider it did not choose with no error to read. The
+/// provider the application installed is used when there is one, and `ring`
+/// is the fallback only when nobody has chosen; `chronixd` installs one at
+/// startup.
 ///
 /// Trust anchors come from the platform verifier, matching what `reqwest`
-/// would have built on its own.
+/// builds on its own.
 fn tls_config() -> std::result::Result<rustls::ClientConfig, rustls::Error> {
     use rustls_platform_verifier::BuilderVerifierExt;
 
@@ -219,6 +233,12 @@ fn tls_config() -> std::result::Result<rustls::ClientConfig, rustls::Error> {
 /// and reused across all deliveries.
 pub struct WebhookChannel {
     config: WebhookConfig,
+    /// Channel name, `webhook:<url>`.
+    ///
+    /// The URL is part of the name because the name is what a trigger's
+    /// `DELIVER` clause routes on. A constant `"webhook"` made two endpoints
+    /// one channel, so a trigger asking for either got both.
+    name: String,
     /// Sender for delivery requests to the background thread.
     tx: std::sync::mpsc::SyncSender<DeliveryRequest>,
 }
@@ -237,10 +257,30 @@ impl WebhookChannel {
     /// Deliveries are submitted via a bounded channel, avoiding per-call
     /// OS thread creation.
     ///
+    /// # The target is resolved once, here, and the client is pinned to it
+    ///
+    /// [`ssrf::resolve_allowed_addrs`](crate::signal::ssrf::resolve_allowed_addrs)
+    /// resolves the host and refuses every address that is not routable on the
+    /// public internet; the client is then told to use exactly those addresses
+    /// for that host. Checking the URL and then letting the client resolve it
+    /// again is a DNS-rebinding hole — the name can answer with a public
+    /// address for the check and a link-local one for the request — and it is
+    /// the reason the check lives at the connection rather than only at
+    /// `CREATE TRIGGER`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the tokio runtime or HTTP client cannot be built.
+    /// Returns an error if the URL is not an allowed webhook target, if its
+    /// host does not resolve, or if the tokio runtime or HTTP client cannot be
+    /// built.
     pub fn new(config: WebhookConfig) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let addrs =
+            crate::signal::ssrf::resolve_allowed_addrs(&config.url, config.allow_private_targets)?;
+        let host = reqwest::Url::parse(&config.url)?
+            .host_str()
+            .ok_or_else(|| SignalError::InvalidConfig("webhook URL has no host".into()))?
+            .to_string();
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -249,6 +289,7 @@ impl WebhookChannel {
         let _guard = runtime.enter();
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
+            .resolve_to_addrs(&host, &addrs)
             .use_preconfigured_tls(tls_config().map_err(|e| {
                 SignalError::InvalidConfig(format!("failed to build TLS configuration: {e}"))
             })?)
@@ -302,7 +343,8 @@ impl WebhookChannel {
                 });
             })?;
 
-        Ok(Self { config, tx })
+        let name = format!("webhook:{}", config.url);
+        Ok(Self { config, name, tx })
     }
 
     /// Compute HMAC-SHA256 signature for a payload.
@@ -321,7 +363,7 @@ impl WebhookChannel {
 
 impl DeliveryChannel for WebhookChannel {
     fn name(&self) -> &str {
-        "webhook"
+        &self.name
     }
 
     fn deliver(&self, event: &SignalEvent) -> Result<()> {
@@ -378,6 +420,63 @@ impl Default for RetryPolicy {
             max_retries: 3,
             base_backoff: Duration::from_secs(1),
         }
+    }
+}
+
+/// A webhook channel that builds itself on first delivery.
+///
+/// [`WebhookChannel::new`] resolves the target host — a network call, and the
+/// channel is registered from `CREATE TRIGGER`, which must not do network I/O.
+/// So the URL's syntactic check happens at parse time and resolution happens
+/// here, on the first signal. A failure is retried on the next signal rather
+/// than cached.
+pub struct DeferredWebhookChannel {
+    config: WebhookConfig,
+    name: String,
+    inner: RwLock<Option<Arc<WebhookChannel>>>,
+}
+
+impl DeferredWebhookChannel {
+    /// Name a webhook target without connecting to it.
+    #[must_use]
+    pub fn new(config: WebhookConfig) -> Self {
+        let name = format!("webhook:{}", config.url);
+        Self {
+            config,
+            name,
+            inner: RwLock::new(None),
+        }
+    }
+
+    /// The built channel, building it if this is the first delivery.
+    fn channel(&self) -> Result<Arc<WebhookChannel>> {
+        if let Some(existing) = self.inner.read().clone() {
+            return Ok(existing);
+        }
+        let mut slot = self.inner.write();
+        // Another thread may have built it while this one waited.
+        if let Some(existing) = slot.clone() {
+            return Ok(existing);
+        }
+        let built = Arc::new(WebhookChannel::new(self.config.clone()).map_err(|e| {
+            SignalError::InvalidConfig(format!("webhook channel for {}: {e}", self.config.url))
+        })?);
+        *slot = Some(Arc::clone(&built));
+        Ok(built)
+    }
+}
+
+impl DeliveryChannel for DeferredWebhookChannel {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn deliver(&self, event: &SignalEvent) -> Result<()> {
+        self.channel()?.deliver(event)
+    }
+
+    fn health_check(&self) -> Result<()> {
+        self.channel().map(|_| ())
     }
 }
 
@@ -481,7 +580,53 @@ impl DeliveryRouter {
         self.channels.write().push(Arc::from(channel));
     }
 
-    /// Deliver a signal event to all channels.
+    /// Whether a channel of this name is registered.
+    ///
+    /// Used to make channel registration idempotent: a second trigger
+    /// delivering to the same webhook URL must reuse the channel, which owns a
+    /// runtime, a thread and a connection pool.
+    #[must_use]
+    pub fn has_channel(&self, name: &str) -> bool {
+        self.channels.read().iter().any(|c| c.name() == name)
+    }
+
+    /// The channels a signal is for.
+    ///
+    /// See [`deliver`](Self::deliver) for why this exists.
+    fn route(&self, event: &SignalEvent) -> Vec<Arc<dyn DeliveryChannel>> {
+        let all: Vec<Arc<dyn DeliveryChannel>> = self.channels.read().clone();
+        if event.delivery_targets.is_empty() {
+            return all;
+        }
+
+        let mut routed = Vec::with_capacity(event.delivery_targets.len());
+        for target in &event.delivery_targets {
+            match all.iter().find(|c| c.name() == target) {
+                Some(channel) => routed.push(Arc::clone(channel)),
+                None => {
+                    metrics::counter!("chronix_signal_delivery_unrouted_total").increment(1);
+                    warn!(
+                        trigger = %event.trigger_name,
+                        target = %target,
+                        "signal names a delivery channel that is not registered — \
+                         the signal fired and went nowhere"
+                    );
+                }
+            }
+        }
+        routed
+    }
+
+    /// Deliver a signal event to the channels its trigger named.
+    ///
+    /// [`SignalEvent::delivery_targets`] is matched against
+    /// [`DeliveryChannel::name`]. An empty list means every channel, which is
+    /// what a signal with no trigger behind it — an anomaly alert — wants.
+    ///
+    /// A target naming a channel that is not registered is not silently
+    /// dropped: it increments `chronix_signal_delivery_unrouted_total` and is
+    /// logged, because a webhook that was configured and never fires is the
+    /// failure this subsystem exists to avoid.
     ///
     /// Returns the number of successful deliveries.
     ///
@@ -493,16 +638,25 @@ impl DeliveryRouter {
         let mut success_count = 0;
         // Snapshot Arc refs and release the RwLock so retries with backoff
         // don't block add_channel or other deliver calls.
-        let channels: Vec<Arc<dyn DeliveryChannel>> = self.channels.read().clone();
+        let channels = self.route(event);
 
         for channel in channels.iter() {
             let mut last_error = None;
+            // Delivery latency including retries: a channel that succeeds
+            // only on its third attempt is healthy by the success counter
+            // and useless in practice, and nothing measured the difference.
+            let started = std::time::Instant::now();
 
             for attempt in 0..=self.retry_policy.max_retries {
                 match channel.deliver(event) {
                     Ok(()) => {
                         success_count += 1;
                         last_error = None;
+                        metrics::histogram!(
+                            "chronix_signal_delivery_duration_seconds",
+                            "channel" => channel.name().to_string()
+                        )
+                        .record(started.elapsed().as_secs_f64());
                         break;
                     }
                     Err(e) => {
@@ -557,7 +711,7 @@ impl DeliveryRouter {
     /// Uses `tokio::time::sleep` for backoff instead of blocking the OS thread.
     pub async fn deliver_async(&self, event: &SignalEvent) -> usize {
         let mut success_count = 0;
-        let channels: Vec<Arc<dyn DeliveryChannel>> = self.channels.read().clone();
+        let channels = self.route(event);
 
         for channel in channels.iter() {
             let mut last_error = None;
@@ -749,6 +903,7 @@ mod tests {
 
     fn test_signal(trigger_id: &str, measurement: &str, severity: Severity) -> SignalEvent {
         SignalEvent {
+            delivery_targets: Vec::new(),
             event_id: uuid::Uuid::new_v4().to_string(),
             trigger_id: trigger_id.into(),
             trigger_name: format!("Trigger {trigger_id}"),
@@ -784,13 +939,29 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn webhook_delivers_to_unreachable_returns_error() {
+        // Loopback is a forbidden target by default, so this test has to say
+        // it means it — which is the whole point of the flag being named.
         let config = WebhookConfig::new("http://127.0.0.1:1/hook", "my-secret")
-            .with_timeout(Duration::from_secs(1));
+            .with_timeout(Duration::from_secs(1))
+            .allow_private_targets(true);
         let ch = WebhookChannel::new(config).expect("failed to build webhook client");
         let event = test_signal("t1", "cpu", Severity::Warning);
         // Real HTTP delivery to an unreachable host should return an error.
         let result = ch.deliver(&event);
         assert!(result.is_err(), "delivery to unreachable host should fail");
+    }
+
+    /// The default refuses the same target, and says how to mean it.
+    #[test]
+    fn a_webhook_channel_refuses_a_private_target_by_default() {
+        let config = WebhookConfig::new("http://127.0.0.1:1/hook", "my-secret");
+        let Err(err) = WebhookChannel::new(config) else {
+            panic!("loopback must be refused unless asked for");
+        };
+        assert!(
+            err.to_string().contains("allow_private_targets"),
+            "the error must name the way out, got: {err}"
+        );
     }
 
     #[test]

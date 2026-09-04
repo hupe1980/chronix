@@ -19,7 +19,8 @@ embedded_code = """
 ```rust
 use chronix::prelude::*;
 
-// ~48 MB preset, flash-friendly WAL — sized for a gateway.
+// Gateway preset: under 25 MiB peak heap measured for ingest and rollups,
+// flash-friendly WAL.
 let db = Chronix::open_small("/var/lib/chronix")?;
 
 db.insert(&Point::new(
@@ -43,11 +44,11 @@ server_code = """
 chronixd --data-dir /var/lib/chronix
 
 # InfluxDB line protocol — Telegraf can write here unchanged
-curl -X POST localhost:8086/api/v1/write/influx \\
+curl -X POST localhost:8086/write \\
   --data-binary 'power,meter=main watts=231.45'
 
 # PromQL — the same request Grafana sends a Prometheus data source
-curl 'localhost:8086/api/v1/prom/query?query=rate(power[5m])'
+curl 'localhost:8086/api/v1/query?query=rate(power[5m])'
 ```
 """
 +++

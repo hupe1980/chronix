@@ -77,6 +77,35 @@ impl HoltLinearModel {
     }
 }
 
+/// psi-weight of the `j`-step-ahead forecast error for Holt's linear trend.
+///
+/// `psi_j = alpha * (1 + beta * phi_j)` where `phi_j = phi + ... + phi^j`,
+/// which collapses to `alpha * (1 + beta * j)` when `phi == 1`.
+/// Hyndman, Koehler, Ord & Snyder (2008), Table 6.1, class 1.
+#[inline]
+fn holt_psi(alpha: f64, beta: f64, phi: f64, j: usize) -> f64 {
+    let phi_j = if (phi - 1.0).abs() < 1e-10 {
+        j as f64
+    } else {
+        phi * (1.0 - phi.powi(j as i32)) / (1.0 - phi)
+    };
+    alpha * (1.0 + beta * phi_j)
+}
+
+/// `Var[e_h] / sigma^2 = 1 + sum_{j=1..h-1} psi_j^2` for Holt's linear trend.
+///
+/// Exactly `1.0` at `h = 1`, so the one-step interval is `z * sigma` and
+/// nothing else.
+#[must_use]
+pub fn holt_variance_factor(alpha: f64, beta: f64, phi: f64, h: usize) -> f64 {
+    let mut acc = 1.0;
+    for j in 1..h {
+        let psi = holt_psi(alpha, beta, phi, j);
+        acc += psi * psi;
+    }
+    acc
+}
+
 impl ForecastModel for HoltLinearModel {
     #[tracing::instrument(skip_all, level = "debug")]
     fn fit(&mut self, timestamps: &[i64], values: &[f64]) -> Result<(), ForecastError> {
@@ -169,26 +198,22 @@ impl ForecastModel for HoltLinearModel {
             };
             let forecast = level + damped_sum * trend;
 
-            // Correct PI variance per Hyndman et al. (2008) Chapter 6.
-            // Var[e_h] = sigma^2 * sum_{j=0..h-1} c_j^2
-            // where c_j = 1 + j * alpha * beta for additive Holt's (undamped),
-            // and c_j = 1 + alpha * beta * sum_{i=1..j} phi^i for damped Holt's.
-            let mut var_sum = 0.0;
-            for j in 0..h {
-                let cj = if (*phi - 1.0).abs() < 1e-10 {
-                    // Undamped: c_j = 1 + j * alpha * beta
-                    1.0 + j as f64 * alpha * beta
-                } else {
-                    // Damped: c_j = 1 + alpha * beta * phi * (1 - phi^j) / (1 - phi)
-                    let phi_sum = if j == 0 {
-                        0.0
-                    } else {
-                        phi * (1.0 - phi.powi(j as i32)) / (1.0 - phi)
-                    };
-                    1.0 + alpha * beta * phi_sum
-                };
-                var_sum += cj * cj;
-            }
+            // PI variance per Hyndman, Koehler, Ord & Snyder (2008), Table
+            // 6.1, class 1 (linear innovations state space, additive error):
+            //
+            //   Var[e_h] = sigma^2 * (1 + sum_{j=1..h-1} psi_j^2)
+            //
+            // with the *psi-weight* of the h-step error, not a running sum:
+            //
+            //   psi_j = alpha * (1 + beta * j)                       (undamped)
+            //   psi_j = alpha * (1 + beta * phi_j),
+            //           phi_j = phi + phi^2 + ... + phi^j            (damped)
+            //           phi_j = phi * (1 - phi^j) / (1 - phi)
+            //
+            // Setting `phi = 1` in the damped form recovers the undamped one,
+            // so the two agree at the boundary. At h = 1 the sum is empty and
+            // the half-width is exactly z*sigma.
+            let var_sum = holt_variance_factor(*alpha, *beta, *phi, h);
             let width = z * residual_std * var_sum.sqrt();
             values.push(forecast);
             timestamps.push(ts);
@@ -293,6 +318,69 @@ mod tests {
             panic!()
         };
         assert!(*level > 19.0);
+    }
+
+    /// h = 1 must be exactly z*sigma, and h = 3 must match the closed form
+    /// `1 + psi_1^2 + psi_2^2` with `psi_j = alpha(1 + beta*j)`.
+    /// alpha = 0.5, beta = 0.2: psi_1 = 0.6, psi_2 = 0.7 -> 1 + 0.36 + 0.49.
+    #[test]
+    fn holt_undamped_interval_matches_hyndman_psi_weights() {
+        let ts: Vec<i64> = (0..60).map(|i| i * 1_000_000_000).collect();
+        let vals: Vec<f64> = (0..60)
+            .map(|i| i as f64 * 2.0 + (i as f64 * 0.7).sin())
+            .collect();
+        let mut model = HoltLinearModel::new(Some(0.5), Some(0.2), 1.0);
+        model.fit(&ts, &vals).unwrap();
+        let ModelParams::HoltLinear { residual_std, .. } = model.params() else {
+            panic!()
+        };
+        let sigma = *residual_std;
+        let r = model.predict(3).unwrap();
+
+        let z = 1.96;
+        let half1 = r.confidence_upper[0] - r.values[0];
+        assert!(
+            (half1 - z * sigma).abs() < 1e-12,
+            "h=1 half-width {half1} != z*sigma {}",
+            z * sigma
+        );
+
+        let expected_factor: f64 = 1.85_f64; // 1 + 0.6^2 + 0.7^2
+        let half3 = r.confidence_upper[2] - r.values[2];
+        assert!(
+            (half3 - z * sigma * expected_factor.sqrt()).abs() < 1e-12,
+            "h=3 half-width {half3} != {}",
+            z * sigma * expected_factor.sqrt()
+        );
+    }
+
+    /// Damped: `psi_j = alpha(1 + beta * phi_j)`, `phi_j = phi + ... + phi^j`.
+    /// alpha = 0.5, beta = 0.2, phi = 0.9: phi_1 = 0.9, phi_2 = 1.71,
+    /// psi_1 = 0.59, psi_2 = 0.671 -> factor 1 + 0.3481 + 0.450241.
+    #[test]
+    fn holt_damped_interval_matches_hyndman_psi_weights() {
+        let ts: Vec<i64> = (0..60).map(|i| i * 1_000_000_000).collect();
+        let vals: Vec<f64> = (0..60)
+            .map(|i| i as f64 * 2.0 + (i as f64 * 0.7).sin())
+            .collect();
+        let mut model = HoltLinearModel::new(Some(0.5), Some(0.2), 0.9);
+        model.fit(&ts, &vals).unwrap();
+        let ModelParams::HoltLinear { residual_std, .. } = model.params() else {
+            panic!()
+        };
+        let sigma = *residual_std;
+        let r = model.predict(3).unwrap();
+
+        let z = 1.96;
+        assert!((r.confidence_upper[0] - r.values[0] - z * sigma).abs() < 1e-12);
+
+        let expected_factor: f64 = 1.0 + 0.59_f64 * 0.59 + 0.671_f64 * 0.671;
+        let half3 = r.confidence_upper[2] - r.values[2];
+        assert!(
+            (half3 - z * sigma * expected_factor.sqrt()).abs() < 1e-12,
+            "h=3 half-width {half3} != {}",
+            z * sigma * expected_factor.sqrt()
+        );
     }
 
     #[test]

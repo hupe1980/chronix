@@ -1,19 +1,32 @@
-//! Archiving cold segments to object storage.
+//! Archiving cold data to object storage.
 //!
-//! The write half of the cold tier: segments older than a threshold are
-//! re-encoded to Parquet, uploaded, verified, and then **dropped from the hot
-//! database**. The read half is [`crate::sql::cold_tier::register_cold_tier`],
-//! which exposes the archive as its own SQL table — and DuckDB, Polars and
-//! Spark read the same objects directly.
+//! The write half of the cold tier: data older than a threshold is encoded to
+//! Parquet, uploaded, verified, and then **dropped from the hot database**.
+//! The read half is [`crate::sql::cold_tier::register_cold_tier`], which
+//! exposes the archive as its own SQL table — and DuckDB, Polars and Spark
+//! read the same objects directly.
 //!
-//! # Why archiving removes the segment
+//! # What an object contains
+//!
+//! An object is built from the **read path**
+//! ([`execute_iter`](crate::Chronix::execute_iter)), so it holds what a query
+//! would return: deduplicated last-write-wins, tombstones applied, in the hot
+//! tier's schema. A deleted row is not in the archive; an overwritten point
+//! appears once, at its winning value.
+//!
+//! Deduplication is only meaningful across every segment covering a range, so
+//! the unit is a `(measurement, shard)` **group**, archived only when it is
+//! complete: no other live segment and no unflushed row overlaps its range,
+//! and every rollup fed by the measurement is materialised past it. An
+//! incomplete group stays hot and is retried next pass.
+//!
+//! # Why archiving removes the data
 //!
 //! A cold object is Parquet, which has nowhere to put a series bloom or a tag
-//! index. Serving it through the hot read path would mean a query whose time
-//! range crosses the boundary quietly changes cost class, with nothing in the
-//! plan saying so — so the boundary is explicit: after archiving, the segment
-//! lives in the archive table and nowhere else. This is retention with a copy
-//! kept.
+//! index. Serving it through the hot read path would let a query silently
+//! change cost class when its range crossed the boundary, so the boundary is
+//! explicit: after archiving, the data lives in the archive table and nowhere
+//! else. This is retention with a copy kept.
 //!
 //! ```no_run
 //! # use std::time::Duration;
@@ -28,16 +41,19 @@
 //!         ..Default::default()
 //!     })
 //!     .await?;
-//! println!("archived {} segments, {} bytes", outcome.segments, outcome.bytes);
+//! println!("archived {} objects, {} rows", outcome.objects, outcome.rows);
 //! # Ok(())
 //! # }
 //! ```
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use chronix_core::{NamespaceId, SegmentState};
+use arrow::datatypes::SchemaRef;
+use chronix_core::{SegmentState, ShardId};
+use chronix_engine::index::SegmentCatalogEntry;
 use chronix_engine::objstore::{
-    ColdFormat, ObjectStoreBackend, ObjectStoreConfig, TieringCandidate, TieringConfig,
+    ArchiveObject, ObjectStoreBackend, ObjectStoreConfig, ParquetArchiveWriter, TieringConfig,
     TieringEngine,
 };
 use tracing::{info, warn};
@@ -48,19 +64,16 @@ use crate::Chronix;
 /// Policy for [`Chronix::archive_cold_segments`].
 #[derive(Debug, Clone)]
 pub struct ArchiveConfig {
-    /// How old a segment's newest point must be before it is archived.
+    /// How old the newest point in a group must be before it is archived.
     pub cold_after: Duration,
     /// Object-store URL to archive into (`s3://`, `gs://`, `az://`, `file://`).
     pub remote_url: String,
-    /// Archive format. Parquet by default — an archive only chronix can read
-    /// is a walled garden.
-    pub cold_format: ColdFormat,
-    /// Maximum segments to archive in one call.
+    /// Maximum archive objects to write in one call.
     ///
-    /// Archiving reads, re-encodes and uploads whole segments, so an
-    /// unbounded pass over a large backlog is a long stall on a small
-    /// machine. The caller runs the operation again for the next batch.
-    pub max_segments_per_run: usize,
+    /// Archiving reads, re-encodes and uploads a whole `(measurement, shard)`
+    /// group, so an unbounded pass over a large backlog is a long stall on a
+    /// small machine. The caller runs the operation again for the next batch.
+    pub max_objects_per_run: usize,
 }
 
 impl Default for ArchiveConfig {
@@ -68,8 +81,7 @@ impl Default for ArchiveConfig {
         Self {
             cold_after: Duration::from_secs(30 * 86_400),
             remote_url: String::new(),
-            cold_format: ColdFormat::Parquet,
-            max_segments_per_run: 64,
+            max_objects_per_run: 8,
         }
     }
 }
@@ -77,31 +89,46 @@ impl Default for ArchiveConfig {
 /// What one archival pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArchiveOutcome {
-    /// Segments uploaded, verified and dropped from the hot database.
+    /// Archive objects uploaded and verified — one per `(measurement, shard)`.
+    pub objects: usize,
+    /// Source segments dropped from the hot database.
     pub segments: usize,
-    /// Bytes of local segment data archived.
+    /// Rows written to the archive, after deduplication and tombstones.
+    pub rows: u64,
+    /// Bytes of local segment data dropped.
     pub bytes: u64,
-    /// Eligible segments that could not be archived and were left in place.
+    /// Groups that were eligible but could not be archived, and were left hot.
     ///
     /// Non-zero means the archive is incomplete *and* the data is still hot —
-    /// never that data was lost. A failed upload leaves the segment exactly
-    /// where it was.
+    /// never that data was lost. A failed upload leaves the segments exactly
+    /// where they were.
     pub failed: usize,
 }
 
+/// One `(measurement, shard)` unit of archiving.
+struct Group {
+    measurement: String,
+    shard_id: ShardId,
+    segments: Vec<SegmentCatalogEntry>,
+    min_timestamp: i64,
+    max_timestamp: i64,
+}
+
 impl Chronix {
-    /// Archive segments older than `config.cold_after` to object storage.
+    /// Archive data older than `config.cold_after` to object storage.
     ///
-    /// For each eligible segment: upload it, verify the object landed, drop
-    /// the catalog entry, then delete the local file — in that order, so a
-    /// crash at any point leaves either a hot segment or an archived one,
-    /// never a catalog entry without a file.
+    /// Groups the catalog into `(measurement, shard)` units, reads each
+    /// complete cold group through the read path, writes it as one Parquet
+    /// object under `measurement=<m>/shard=<n>/`, verifies the upload, and
+    /// only then drops the source segments — in that order, so a crash at any
+    /// point leaves either hot data or archived data, never a catalog entry
+    /// without a file.
     ///
     /// # Errors
     ///
-    /// Returns an error if the object store cannot be reached. Per-segment
-    /// failures are counted in [`ArchiveOutcome::failed`] rather than
-    /// aborting the pass: one unreadable segment must not stop the rest.
+    /// Returns an error if the object store cannot be reached. Per-group
+    /// failures are counted in [`ArchiveOutcome::failed`] rather than aborting
+    /// the pass: one unreadable group must not stop the rest.
     pub async fn archive_cold_segments(&self, config: &ArchiveConfig) -> Result<ArchiveOutcome> {
         if config.remote_url.is_empty() {
             return Err(DbError::Internal(
@@ -119,20 +146,8 @@ impl Chronix {
         let cutoff =
             now_ns.saturating_sub(i64::try_from(config.cold_after.as_nanos()).unwrap_or(i64::MAX));
 
-        // Snapshot the candidates under a read lock, then release it: the
-        // uploads are network-bound and must not hold the catalog.
-        let candidates: Vec<_> = {
-            let catalog = self.catalog.read();
-            catalog
-                .all_segments()
-                .into_iter()
-                .filter(|e| e.state == SegmentState::Active && e.max_timestamp < cutoff)
-                .take(config.max_segments_per_run)
-                .cloned()
-                .collect()
-        };
-
-        if candidates.is_empty() {
+        let groups = self.cold_groups(cutoff, config.max_objects_per_run);
+        if groups.is_empty() {
             return Ok(ArchiveOutcome::default());
         }
 
@@ -150,65 +165,279 @@ impl Chronix {
             TieringConfig {
                 cold_after: config.cold_after,
                 remote_url: config.remote_url.clone(),
-                cold_format: config.cold_format,
             },
             remote,
         );
 
         let mut outcome = ArchiveOutcome::default();
-        let mut archived = Vec::new();
+        let mut archived: Vec<Group> = Vec::new();
 
-        for entry in candidates {
-            let Some(name) = entry.path.file_name().and_then(|n| n.to_str()) else {
-                warn!(path = %entry.path.display(), "cold archive: unnamed segment path");
-                outcome.failed += 1;
-                continue;
-            };
-
-            let candidate = TieringCandidate {
-                namespace: NamespaceId::default_namespace(),
-                shard_id: entry.shard_id,
-                segment_name: name.to_string(),
-                local_path: entry.path.clone(),
-                max_timestamp: entry.max_timestamp,
-                byte_size: entry.byte_size,
-            };
-
-            match engine.tier_segment(&candidate).await {
-                Ok(object) => {
+        for group in groups {
+            // Encoding is CPU- and I/O-bound and holds no lock across an
+            // await; the upload is network-bound and holds nothing at all.
+            let encoded = match self.encode_group(&group) {
+                Ok(Some(encoded)) => encoded,
+                Ok(None) => {
+                    // Every row in the group was deleted. There is nothing to
+                    // archive, and the segments are pure tombstone shadow —
+                    // dropping them is the whole point of the pass.
                     info!(
-                        segment_id = entry.segment_id.0,
-                        object = %object,
-                        "segment archived to cold storage"
+                        measurement = %group.measurement,
+                        shard = group.shard_id.0,
+                        "cold archive: group is empty after tombstones — dropping without an object"
                     );
+                    archived.push(group);
+                    continue;
                 }
                 Err(e) => {
-                    // The segment stays hot and queryable. That is the correct
+                    warn!(
+                        measurement = %group.measurement,
+                        shard = group.shard_id.0,
+                        error = %e,
+                        "cold archive: could not encode group, leaving it hot"
+                    );
+                    outcome.failed += 1;
+                    continue;
+                }
+            };
+
+            let object = match ArchiveObject::new(
+                group.measurement.clone(),
+                group.shard_id,
+                object_name(&group),
+            ) {
+                Ok(object) => object,
+                Err(e) => {
+                    warn!(
+                        measurement = %group.measurement,
+                        error = %e,
+                        "cold archive: cannot name an object for this measurement"
+                    );
+                    outcome.failed += 1;
+                    continue;
+                }
+            };
+
+            match engine.upload_archive(&object, &encoded.bytes).await {
+                Ok(key) => {
+                    info!(
+                        measurement = %group.measurement,
+                        shard = group.shard_id.0,
+                        object = %key,
+                        rows = encoded.rows,
+                        "group archived to cold storage"
+                    );
+                    outcome.rows += encoded.rows;
+                }
+                Err(e) => {
+                    // The segments stay hot and queryable. That is the correct
                     // failure direction for an operation whose next step is a
                     // delete.
                     warn!(
-                        segment_id = entry.segment_id.0,
+                        measurement = %group.measurement,
+                        shard = group.shard_id.0,
                         error = %e,
-                        "cold archive: upload failed, leaving segment hot"
+                        "cold archive: upload failed, leaving the group hot"
                     );
                     outcome.failed += 1;
                     continue;
                 }
             }
 
-            archived.push(entry);
+            outcome.objects += 1;
+            archived.push(group);
         }
 
-        // Drop every archived segment in one pass, taking the catalog, time
-        // index and bloom locks in their documented order. Doing this
-        // per segment inside the loop would interleave lock acquisition with
-        // network I/O for no benefit.
         if !archived.is_empty() {
-            let mut catalog = self.catalog.write();
-            let mut time_idx = self.time_index.write();
-            let mut blooms = self.blooms.write();
+            self.drop_archived(&archived, &mut outcome);
+        }
 
-            for entry in &archived {
+        metrics::counter!("chronix_cold_archive_objects_total").increment(outcome.objects as u64);
+        metrics::counter!("chronix_cold_archive_rows_total").increment(outcome.rows);
+        metrics::counter!("chronix_cold_archive_bytes_total").increment(outcome.bytes);
+        if outcome.failed > 0 {
+            metrics::counter!("chronix_cold_archive_failures_total")
+                .increment(outcome.failed as u64);
+        }
+
+        Ok(outcome)
+    }
+
+    /// Group the catalog into complete, cold `(measurement, shard)` units.
+    ///
+    /// Holds the catalog read lock for the grouping only; the encode and
+    /// upload that follow take it again per group.
+    fn cold_groups(&self, cutoff: i64, max_groups: usize) -> Vec<Group> {
+        let all: Vec<SegmentCatalogEntry> = {
+            let catalog = self.catalog.read();
+            catalog
+                .all_segments()
+                .into_iter()
+                .filter(|e| e.state == SegmentState::Active)
+                .cloned()
+                .collect()
+        };
+
+        let mut by_group: BTreeMap<(String, i64), Vec<SegmentCatalogEntry>> = BTreeMap::new();
+        for entry in all.iter().cloned() {
+            by_group
+                .entry((entry.measurement.clone(), entry.shard_id.0))
+                .or_default()
+                .push(entry);
+        }
+
+        let mut groups = Vec::new();
+        for ((measurement, shard), segments) in by_group {
+            if groups.len() >= max_groups {
+                break;
+            }
+            let Some(min_timestamp) = segments.iter().map(|e| e.min_timestamp).min() else {
+                continue;
+            };
+            let Some(max_timestamp) = segments.iter().map(|e| e.max_timestamp).max() else {
+                continue;
+            };
+
+            if max_timestamp >= cutoff {
+                continue;
+            }
+
+            // Completeness. Deduplication is only correct over every segment
+            // that covers the range, so a group that shares its range with a
+            // segment staying hot cannot be archived: the archive would hold a
+            // value the hot tier overrules. Compaction keeps a segment inside
+            // one shard, so this normally passes — but "normally" is the shape
+            // this tree has been bitten by, so it is checked rather than
+            // assumed.
+            let overlaps_outsider = all.iter().any(|e| {
+                e.measurement == measurement
+                    && e.shard_id.0 != shard
+                    && e.min_timestamp <= max_timestamp
+                    && e.max_timestamp >= min_timestamp
+            });
+            if overlaps_outsider {
+                warn!(
+                    measurement = %measurement,
+                    shard,
+                    "cold archive: a segment outside this shard overlaps its range — keeping it hot"
+                );
+                metrics::counter!("chronix_cold_archive_groups_incomplete_total").increment(1);
+                continue;
+            }
+
+            // An unflushed row in range would be archived *and* left hot,
+            // which is the duplication this redesign exists to remove.
+            if !self
+                .shards
+                .scan_measurement(&measurement, min_timestamp, max_timestamp)
+                .is_empty()
+            {
+                warn!(
+                    measurement = %measurement,
+                    shard,
+                    "cold archive: unflushed rows overlap this group — keeping it hot"
+                );
+                metrics::counter!("chronix_cold_archive_groups_incomplete_total").increment(1);
+                continue;
+            }
+
+            // Archiving removes the data from the hot database, so it is a
+            // deletion as far as every rollup fed by that measurement is
+            // concerned: a group whose buckets have not been aggregated yet
+            // must stay hot until they have. Without this gate a device that
+            // was offline long enough for its backlog to be older than
+            // `cold_after` had its raw data archived before the tier it was
+            // being kept for was ever computed.
+            if !self.rollups_materialised_past(&measurement, max_timestamp.saturating_add(1)) {
+                warn!(
+                    measurement = %measurement,
+                    shard,
+                    "cold archive: rollups not yet materialised past this group — keeping it hot"
+                );
+                metrics::counter!("chronix_cold_archive_groups_awaiting_rollup_total").increment(1);
+                continue;
+            }
+
+            groups.push(Group {
+                measurement,
+                shard_id: ShardId(shard),
+                segments,
+                min_timestamp,
+                max_timestamp,
+            });
+        }
+
+        groups
+    }
+
+    /// Read one group through the read path and encode it as a Parquet object.
+    ///
+    /// Returns `None` when the group has no surviving rows — every row was
+    /// deleted — in which case there is nothing to upload and the segments are
+    /// dropped outright.
+    fn encode_group(&self, group: &Group) -> Result<Option<Encoded>> {
+        let schema = self.archive_schema(&group.measurement)?;
+
+        let plan = self
+            .query()
+            .measurement(&group.measurement)
+            .range(group.min_timestamp, group.max_timestamp)
+            .build()?;
+
+        let mut writer = ParquetArchiveWriter::new(schema.clone())
+            .map_err(|e| DbError::Internal(format!("cold archive writer: {e}")))?;
+
+        for batch in self.execute_iter(&plan)? {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let batch = crate::sql::to_archive_batch(&batch, &schema)
+                .map_err(|e| DbError::Internal(format!("cold archive batch: {e}")))?;
+            writer
+                .write(&batch)
+                .map_err(|e| DbError::Internal(format!("cold archive write: {e}")))?;
+        }
+
+        let (bytes, rows) = writer
+            .finish()
+            .map_err(|e| DbError::Internal(format!("cold archive finish: {e}")))?;
+
+        if rows == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Encoded { bytes, rows }))
+    }
+
+    /// The Arrow schema an archive object for `measurement` is written with.
+    ///
+    /// This is the hot SQL schema — `_time` as `Timestamp(Nanosecond)`, then
+    /// tags sorted, then fields sorted — **plus** the namespace tag when the
+    /// measurement carries one. The hot tier hides that tag because a SQL
+    /// session is already scoped to one tenant; an archive is an operator-level
+    /// artifact covering every tenant, and dropping the only column that says
+    /// whose row this is would be data loss.
+    fn archive_schema(&self, measurement: &str) -> Result<SchemaRef> {
+        let ms = self.schema(measurement).ok_or_else(|| {
+            DbError::Internal(format!(
+                "cold archive: no schema for measurement {measurement}"
+            ))
+        })?;
+        Ok(crate::sql::measurement_schema_to_archive_arrow(&ms))
+    }
+
+    /// Drop every archived group's segments from the hot database.
+    ///
+    /// Done in one pass, taking the catalog, time index and bloom locks in
+    /// their documented order. Doing it per group inside the upload loop would
+    /// interleave lock acquisition with network I/O for no benefit.
+    fn drop_archived(&self, archived: &[Group], outcome: &mut ArchiveOutcome) {
+        let mut catalog = self.catalog.write();
+        let mut time_idx = self.time_index.write();
+        let mut blooms = self.blooms.write();
+
+        for group in archived {
+            for entry in &group.segments {
                 // Catalog first, then the file — a crash between them loses a
                 // segment that is already in the archive, never one that is
                 // not.
@@ -231,7 +460,10 @@ impl Chronix {
                 self.metadata_cache.remove(entry.segment_id);
                 self.segment_cache.invalidate_segment(entry.segment_id);
 
-                for path in [entry.path.clone(), entry.path.with_extension("bloom")] {
+                for path in [
+                    entry.path.clone(),
+                    chronix_engine::index::series_index::sidecar_path(&entry.path),
+                ] {
                     if let Err(e) = std::fs::remove_file(&path) {
                         if e.kind() != std::io::ErrorKind::NotFound {
                             warn!(path = %path.display(), error = %e, "cold archive: failed to remove local file");
@@ -243,14 +475,25 @@ impl Chronix {
                 outcome.bytes += entry.byte_size;
             }
         }
-
-        metrics::counter!("chronix_cold_archive_segments_total").increment(outcome.segments as u64);
-        metrics::counter!("chronix_cold_archive_bytes_total").increment(outcome.bytes);
-        if outcome.failed > 0 {
-            metrics::counter!("chronix_cold_archive_failures_total")
-                .increment(outcome.failed as u64);
-        }
-
-        Ok(outcome)
     }
+}
+
+/// An encoded archive object, ready to upload.
+struct Encoded {
+    bytes: Vec<u8>,
+    rows: u64,
+}
+
+/// Object name for a group: its time range in epoch nanoseconds.
+///
+/// The range is in the name so the archive is self-describing to somebody
+/// listing the bucket, and so two passes over the same shard cannot collide: a
+/// group re-formed after a compaction has a different range only if its data
+/// changed, and an identical range means an identical object, so re-uploading
+/// is idempotent rather than a lost update.
+fn object_name(group: &Group) -> String {
+    format!(
+        "part-{}-{}.parquet",
+        group.min_timestamp, group.max_timestamp
+    )
 }

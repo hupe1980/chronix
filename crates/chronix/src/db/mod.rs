@@ -17,10 +17,11 @@ mod write;
 pub use stream::BatchStream;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use fs2::FileExt;
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
@@ -30,7 +31,7 @@ use crate::lock_order::{
 };
 
 use chronix_core::{
-    wal_decode, ChronixConfig, Point, SchemaRegistry, ShardId, TombstoneSet, WalEntry,
+    wal_decode, ChronixConfig, SchemaRegistry, SegmentState, ShardId, TombstoneSet, WalEntry,
 };
 use chronix_engine::cache::lvc::LastValueCache;
 use chronix_engine::cache::metadata::{CachedSegmentMeta, MetadataCache};
@@ -78,7 +79,19 @@ pub struct DatabaseStatistics {
     /// Number of active time shards.
     pub shard_count: usize,
     /// Approximate total memtable memory in bytes (active + frozen).
+    ///
+    /// Rows and index entries only; the three terms below are the rest of the
+    /// engine's resident heap, and
+    /// [`resident_memory_bytes`](Self::resident_memory_bytes) is their sum.
     pub memtable_memory_bytes: usize,
+    /// Heap held by the string interners — tag keys, tag values, measurement
+    /// names. Grows with cardinality rather than with row count.
+    pub interner_memory_bytes: usize,
+    /// Heap held by the WAL writer's buffer. Fixed size.
+    pub wal_buffer_bytes: usize,
+    /// Heap held by the segment catalog, schema registry and tombstone set.
+    /// Grows with segment count, and lives for the process's lifetime.
+    pub catalog_memory_bytes: usize,
     /// Number of distinct measurements (schemas).
     pub measurement_count: usize,
     /// Current WAL sequence number.
@@ -87,6 +100,22 @@ pub struct DatabaseStatistics {
     pub tombstone_count: usize,
     /// Number of entries in the segment metadata cache.
     pub metadata_cache_entries: usize,
+}
+
+impl DatabaseStatistics {
+    /// The engine's resident heap: memtables, interners, WAL buffer, catalog.
+    ///
+    /// This is the number a memory budget is about. It does **not** include a
+    /// query's working set — a DataFusion plan allocates against its own
+    /// memory pool ([`ChronixConfig::per_query_memory_limit`](chronix_core::ChronixConfig::per_query_memory_limit))
+    /// — nor the encoder scratch a flush allocates and frees.
+    #[must_use]
+    pub const fn resident_memory_bytes(&self) -> usize {
+        self.memtable_memory_bytes
+            + self.interner_memory_bytes
+            + self.wal_buffer_bytes
+            + self.catalog_memory_bytes
+    }
 }
 
 /// Return current UTC time as unix milliseconds.
@@ -134,24 +163,40 @@ pub(super) fn chrono_timestamp_ms() -> u64 {
 /// db.close().unwrap();
 /// ```
 ///
-/// # Unified read/write handle
+/// # One handle, cheap to clone
 ///
-/// `Chronix` deliberately uses a **single handle** for both reads and writes
-/// rather than separate `WriteHandle` / `ReadHandle` types.  Rationale:
-///
-/// - **Simplicity** — callers don't need to juggle distinct handles or
-///   worry about ordering constraints between them.
-/// - **Consistency** — reads see the latest memtable state because they
-///   share the same `ShardRouter` instance.  Split handles would require
-///   an additional synchronisation layer.
-/// - **Interior mutability** — all mutable state is already behind
-///   `Arc<RwLock>`/`Arc<Mutex>`, so concurrent reads and writes are safe
-///   without separate types.
-///
-/// If type-level read/write separation is desired in the future (e.g. for
-/// `&Chronix`-only query endpoints), thin wrapper types can be added without
-/// changing the internal architecture.
+/// `Chronix` is a reference-counted handle: `clone()` is an `Arc` clone,
+/// every clone reads and writes the same database, and the database is
+/// closed when the last handle is dropped — or when any handle calls
+/// [`close`](Self::close). Hand clones to threads and tasks freely; there
+/// are no separate read and write handles to keep in step.
 pub struct Chronix {
+    pub(crate) inner: Arc<DbInner>,
+    /// The maintenance thread's own handle. It never closes the database
+    /// and is not counted when deciding whether a user's handle is the
+    /// last one.
+    pub(crate) maintenance: bool,
+}
+
+impl Clone for Chronix {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            maintenance: false,
+        }
+    }
+}
+
+impl std::ops::Deref for Chronix {
+    type Target = DbInner;
+    fn deref(&self) -> &DbInner {
+        &self.inner
+    }
+}
+
+/// The shared state behind a [`Chronix`] handle. Not part of the API.
+#[doc(hidden)]
+pub struct DbInner {
     pub(super) config: ChronixConfig,
     /// WAL writer for durability.
     pub(super) wal: Arc<WalWriter>,
@@ -188,6 +233,21 @@ pub struct Chronix {
     pub(super) lvc: LastValueCache,
     /// Metadata cache for segment-level stats.
     pub(super) metadata_cache: Arc<MetadataCache>,
+
+    /// Which measurements each namespace holds series for.
+    ///
+    /// The key is the namespace, or `""` for a series carrying no namespace
+    /// tag. Derived from [`Self::known_series`] at open and kept in step by
+    /// the write path, so answering "does this namespace have this
+    /// measurement?" costs a hash lookup rather than a scan — which matters
+    /// because the SQL planner asks it for every table reference.
+    pub(super) namespace_measurements: DashMap<String, DashSet<String>>,
+
+    /// Cached disk usage: when it was measured, and what it was.
+    ///
+    /// Measuring means walking the data directory, and `statistics()` runs
+    /// on every metrics scrape.
+    pub(super) disk_usage: parking_lot::RwLock<Option<(std::time::Instant, u64)>>,
     /// LRU cache for decoded Arrow arrays from segment files.
     /// Invalidated when segments are removed by compaction or drop.
     pub(super) segment_cache: Arc<SegmentCache>,
@@ -199,11 +259,28 @@ pub struct Chronix {
     pub(super) compaction_picker: CompactionPicker,
     /// CDC event bus for streaming change events.
     pub(super) cdc_bus: EventBus,
-    /// Flush notification handle — writers signal this when memtable
-    /// memory exceeds the flush threshold so the background
-    /// [`FlushScheduler`](crate::flush_scheduler::FlushScheduler) can
-    /// pick up the work without blocking the write path.
-    pub(super) flush_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the maintenance thread: writers set the flag when a memtable
+    /// crosses its threshold so the flush happens off the write path.
+    pub(crate) maintenance_wake: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+    /// Tells the maintenance thread to exit. Shared by `Arc` so the thread
+    /// can read it without taking a handle.
+    pub(crate) stop_maintenance: Arc<AtomicBool>,
+    /// The maintenance thread, joined by `close()`.
+    pub(crate) maintenance_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Its id, so `close()` running *on* that thread does not join itself.
+    pub(crate) maintenance_thread_id: std::sync::OnceLock<std::thread::ThreadId>,
+    /// Serialises "is this the last user handle?" against the maintenance
+    /// thread taking or dropping its own handle. Shared with the thread by
+    /// `Arc` so it can be taken without upgrading the database first.
+    pub(crate) lifecycle: Arc<parking_lot::Mutex<()>>,
+    /// Held for read by every writer from its WAL append to its memtable
+    /// insert, and for write by the WAL-floor computation — so the floor
+    /// can never be computed while a record is durable but in no memtable.
+    pub(super) write_epoch: parking_lot::RwLock<()>,
+    /// One flush at a time. `flush()` and `close()` take it; the floor is
+    /// a database-wide statement and two flushes computing it against
+    /// each other's half-done state is how records fell below it.
+    pub(super) flush_gate: parking_lot::Mutex<()>,
     /// Measurements pending soft-delete.
     ///
     /// Maps measurement name → deadline (unix-ms). When `soft_delete_ttl`
@@ -221,16 +298,17 @@ pub struct Chronix {
     /// Runtime-registered aggregate UDFs (available after `register_udaf`).
     pub(super) custom_udafs:
         Arc<parking_lot::RwLock<Vec<Arc<datafusion::logical_expr::AggregateUDF>>>>,
-    /// Ingest-time downsampler for real-time rollup aggregation on write.
-    pub(super) ingest_downsampler: Arc<crate::rollup::IngestDownsampler>,
-    /// Recovery queue for points that failed memtable insertion
-    /// after WAL commit. Each entry carries a retry counter (attempt number).
-    /// Retried on the next flush cycle; dropped after `MAX_RECOVERY_RETRIES`.
-    pub(super) recovery_queue: Arc<parking_lot::Mutex<Vec<(Point, u64, u32)>>>,
     /// Guard preventing concurrent compaction runs. Only one
     /// `compact()` call may execute at a time to cap total I/O threads
     /// at `compaction_concurrency`.
     pub(super) compaction_running: AtomicBool,
+    /// Number of WAL records replayed by `open()`.
+    pub(super) replayed_records: usize,
+    /// The DataFusion session behind [`Chronix::sql`], built on first use
+    /// and rebuilt when a UDF is registered.
+    pub(super) sql_ctx: parking_lot::RwLock<Option<datafusion::execution::context::SessionContext>>,
+    /// A private runtime for the blocking [`Chronix::sql`].
+    pub(super) sql_runtime: std::sync::OnceLock<tokio::runtime::Runtime>,
 }
 
 impl std::fmt::Debug for Chronix {
@@ -298,37 +376,20 @@ impl Chronix {
         std::fs::create_dir_all(&catalog_dir)?;
 
         // Open catalog
-        let catalog = SegmentCatalog::open(&catalog_dir)?;
+        let mut catalog = SegmentCatalog::open(&catalog_dir)?;
 
         // ── Orphaned segment cleanup ──────────────────────────────────
-        // If a crash occurred between writing a segment file and
-        // registering it in the catalog, orphaned .csx files remain on
-        // disk. Scan the segments directory and remove any files not
-        // tracked by the catalog.
-        {
-            let known_paths: std::collections::HashSet<std::path::PathBuf> = catalog
-                .all_segments()
-                .iter()
-                .map(|e| e.path.clone())
-                .collect();
+        // A crash between writing a segment file and registering it leaves
+        // an orphan. Segments live in `segments/shard_<id>/`, so the sweep
+        // has to descend one level: it used to list only the top directory,
+        // which holds nothing but those subdirectories, and removed nothing.
+        Self::remove_orphaned_segments(&segments_dir, &catalog);
 
-            if let Ok(entries) = std::fs::read_dir(&segments_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "csx")
-                        && !known_paths.contains(&path)
-                    {
-                        warn!(path = %path.display(), "Removing orphaned segment file not registered in catalog");
-                        if let Err(e) = std::fs::remove_file(&path) {
-                            warn!(path = %path.display(), error = %e, "Failed to remove orphaned segment");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Build time index, load bloom filters, and rebuild tag index from catalog entries
-        let (time_indices, blooms, tag_index) = Self::load_catalog_state(&catalog);
+        // Rebuild the indexes and the series set from the catalog and the
+        // per-segment series sidecars — no segment is decoded here.
+        let namespace_measurements;
+        let (time_indices, blooms, tag_index, mut known_series) =
+            Self::load_catalog_state(&catalog);
 
         // Populate metadata cache from existing segments on disk
         let metadata_cache = {
@@ -413,20 +474,16 @@ impl Chronix {
 
         let shards = Arc::new(ShardRouter::new(shard_cfg));
 
-        // Replay WAL into memtable.
-        // Note: We replay all WAL records because the catalog does not yet
-        // track max_wal_seq per segment.  WAL truncation at flush time
-        // keeps the replay window small in practice.
-        let wal_records = chronix_engine::wal::replay_all(&wal_dir)?;
+        // Replay the WAL above the catalog's floor. Everything at or below
+        // it is in a segment already; replaying it would re-insert — and at
+        // the next flush re-write — data that is already on disk.
+        let wal_floor = catalog.wal_floor();
+        let wal_records = chronix_engine::wal::replay_range(&wal_dir, wal_floor, u64::MAX)?;
         let replayed_count = wal_records.len();
         let mut replay_series: HashSet<String> = HashSet::new();
 
-        // Tombstones come from the catalog, not from the WAL. The WAL is
-        // truncated once the memtable it covers has been flushed, so a delete
-        // older than the last flush is simply not in it — which is how deletes
-        // used to come undone across a restart. Replaying the WAL on top still
-        // matters for the crash window between a delete's WAL append and its
-        // catalog append.
+        // Tombstones come from the catalog, not from the WAL: the manifest is
+        // their durable record and is written before the WAL entry.
         let mut replay_tombstones = catalog.tombstones().clone();
         for record in wal_records {
             // A record may contain a single WAL entry OR an atomic batch.
@@ -446,31 +503,8 @@ impl Chronix {
                         }
                     }
                     Ok(WalEntry::Delete { tombstones }) => {
-                        // Replayed verbatim, ranges included. Reconstructing
-                        // them from the delete *request* is what used to widen
-                        // a ranged delete into a whole-series delete at every
-                        // startup.
                         for tombstone in tombstones {
                             replay_tombstones.insert(tombstone);
-                        }
-                    }
-                    Ok(WalEntry::SchemaChange { actions }) => {
-                        // Re-apply schema actions during recovery.
-                        // The in-memory SchemaRegistry may already have
-                        // these from the catalog, but applying them again
-                        // is idempotent and ensures consistency.
-                        for action in actions {
-                            match action {
-                                chronix_core::schema::SchemaAction::CreateMeasurement(ms) => {
-                                    schema.register_measurement(ms);
-                                }
-                                chronix_core::schema::SchemaAction::AddColumn {
-                                    measurement,
-                                    column,
-                                } => {
-                                    schema.apply_add_column(&measurement, column);
-                                }
-                            }
                         }
                     }
                     Err(e) => {
@@ -480,6 +514,12 @@ impl Chronix {
             }
         }
 
+        // The segments are the schema's ground truth: a column a segment
+        // carries exists whether or not the manifest remembers it. Fold every
+        // active segment's column list into the registry — and persist any
+        // repair — so the SQL schema can never lag the data on disk.
+        Self::reconcile_schema_with_segments(&schema, &mut catalog);
+
         if replayed_count > 0 {
             info!(
                 records = replayed_count,
@@ -488,59 +528,244 @@ impl Chronix {
                 "WAL replay complete"
             );
         }
+        known_series.extend(replay_series);
 
-        // Load persisted rollup definitions
+        // The out-of-order window is anchored where it was: at the newest
+        // timestamp the database holds. Without this a clean restart left it
+        // unanchored until the first live write, so a stale device could
+        // anchor it in the past, and no rollup bucket was final until then.
+        if let Some(newest) = catalog
+            .all_segments()
+            .iter()
+            .filter(|e| e.state == SegmentState::Active)
+            .map(|e| e.max_timestamp)
+            .max()
+        {
+            shards.seed_active_shard(ShardId::from_timestamp(newest, config.shard_duration));
+        }
+
+        // Rollup definitions and watermarks come from the catalog, which is
+        // fsynced, CRC'd and carried forward by every snapshot. They used to
+        // live in a JSON file written without an fsync, and a failure to
+        // parse it was logged and swallowed — leaving a database that
+        // believed it had no rollups at all, whose next retention pass
+        // dropped the raw data those rollups existed to preserve.
         let rollup_registry = {
-            let rollup_path = data_dir.join(RollupRegistry::filename());
-            match RollupRegistry::load(&rollup_path) {
-                Ok(r) => {
-                    let n = r.list().len();
-                    if n > 0 {
-                        info!(rollups = n, "Rollup registry loaded from disk");
-                    }
-                    r
+            let mut registry = RollupRegistry::new();
+            for (name, record) in catalog.rollups() {
+                if !record.definition.is_empty() {
+                    let config: crate::rollup::RollupConfig =
+                        postcard::from_bytes(&record.definition).map_err(|e| {
+                            DbError::Internal(format!(
+                                "catalog holds an unreadable rollup {name}: {e}"
+                            ))
+                        })?;
+                    registry.add(config).map_err(|e| {
+                        DbError::Internal(format!("catalog holds a duplicate rollup {name}: {e}"))
+                    })?;
                 }
-                Err(e) => {
-                    warn!(error = %e, "Failed to load rollup registry, starting empty");
-                    RollupRegistry::new()
+                if !record.state.is_empty() {
+                    let state: crate::rollup::RollupState = postcard::from_bytes(&record.state)
+                        .map_err(|e| {
+                            DbError::Internal(format!(
+                                "catalog holds unreadable state for rollup {name}: {e}"
+                            ))
+                        })?;
+                    registry.set_state(name, state);
                 }
             }
+            let n = registry.list().len();
+            if n > 0 {
+                info!(rollups = n, "Rollup definitions restored from the catalog");
+            }
+            registry
         };
 
         let segment_cache_size = config.segment_cache_size;
+        let cdc_capacity = config.cdc_capacity;
 
-        Ok(Self {
-            config,
-            wal,
-            shards,
-            schema,
-            catalog: Arc::new(CatalogLock::new(catalog)),
-            time_index: Arc::new(TimeIndexLock::new(time_indices)),
-            blooms: Arc::new(BloomsLock::new(blooms)),
-            known_series: Arc::new(replay_series.into_iter().collect::<DashSet<String>>()),
-            tombstones: Arc::new(TombstonesLock::new(replay_tombstones)),
-            lvc: LastValueCache::new(),
-            metadata_cache,
-            segment_cache: Arc::new(SegmentCache::new(segment_cache_size)),
-            tag_index: Arc::new(tag_index),
-            rollup_registry: Arc::new(RollupRegistryLock::new(rollup_registry)),
-            compaction_picker: CompactionPicker::default(),
-            cdc_bus: EventBus::with_default_capacity(),
-            flush_notify: Arc::new(tokio::sync::Notify::new()),
-            pending_measurement_drops: Arc::new(RwLock::new(HashMap::new())),
-            _lock_file: lock_file,
-            closed: AtomicBool::new(false),
-            custom_udfs: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            custom_udafs: Arc::new(parking_lot::RwLock::new(Vec::new())),
-            ingest_downsampler: Arc::new(crate::rollup::IngestDownsampler::new(Vec::new())),
-            recovery_queue: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            compaction_running: AtomicBool::new(false),
-        })
+        let db = Self {
+            maintenance: false,
+            inner: Arc::new(DbInner {
+                config,
+                wal,
+                shards,
+                schema,
+                catalog: Arc::new(CatalogLock::new(catalog)),
+                time_index: Arc::new(TimeIndexLock::new(time_indices)),
+                blooms: Arc::new(BloomsLock::new(blooms)),
+                known_series: {
+                    let set: DashSet<String> = known_series.into_iter().collect();
+                    namespace_measurements = crate::db::accessors::index_by_namespace(&set);
+                    Arc::new(set)
+                },
+                tombstones: Arc::new(TombstonesLock::new(replay_tombstones)),
+                lvc: LastValueCache::new(),
+                metadata_cache,
+                namespace_measurements,
+                disk_usage: parking_lot::RwLock::new(None),
+                segment_cache: Arc::new(SegmentCache::new(segment_cache_size)),
+                tag_index: Arc::new(tag_index),
+                rollup_registry: Arc::new(RollupRegistryLock::new(rollup_registry)),
+                compaction_picker: CompactionPicker::default(),
+                cdc_bus: EventBus::new(cdc_capacity),
+                maintenance_wake: Arc::new((
+                    parking_lot::Mutex::new(false),
+                    parking_lot::Condvar::new(),
+                )),
+                stop_maintenance: Arc::new(AtomicBool::new(false)),
+                maintenance_thread: parking_lot::Mutex::new(None),
+                maintenance_thread_id: std::sync::OnceLock::new(),
+                lifecycle: Arc::new(parking_lot::Mutex::new(())),
+                write_epoch: parking_lot::RwLock::new(()),
+                flush_gate: parking_lot::Mutex::new(()),
+                pending_measurement_drops: Arc::new(RwLock::new(HashMap::new())),
+                _lock_file: lock_file,
+                closed: AtomicBool::new(false),
+                custom_udfs: Arc::new(parking_lot::RwLock::new(Vec::new())),
+                custom_udafs: Arc::new(parking_lot::RwLock::new(Vec::new())),
+                compaction_running: AtomicBool::new(false),
+                replayed_records: replayed_count,
+                sql_ctx: parking_lot::RwLock::new(None),
+                sql_runtime: std::sync::OnceLock::new(),
+            }),
+        };
+        // Replay bypasses the memtable cap — an acknowledged record is not
+        // something to refuse — so a WAL larger than the cap lands in memory
+        // whole. Flush it down before anything else runs.
+        if replayed_count > 0 && db.shards.total_memory() > db.config.memtable_flush_threshold {
+            db.flush()?;
+        }
+        crate::maintenance::spawn(&db);
+        Ok(db)
+    }
+
+    /// Remove `.csx` files (and their sidecars) under `segments_dir` that
+    /// the catalog does not know, one shard directory deep.
+    fn remove_orphaned_segments(segments_dir: &Path, catalog: &SegmentCatalog) {
+        let known_paths: std::collections::HashSet<std::path::PathBuf> = catalog
+            .all_segments()
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        let Ok(shards) = std::fs::read_dir(segments_dir) else {
+            return;
+        };
+        let dirs = shards
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .chain(std::iter::once(segments_dir.to_path_buf()));
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_segment = path.extension().is_some_and(|ext| ext == "csx");
+                let is_sidecar = path
+                    .extension()
+                    .is_some_and(|ext| ext == chronix_engine::index::series_index::EXTENSION);
+                let owner = if is_sidecar {
+                    path.with_extension("csx")
+                } else {
+                    path.clone()
+                };
+                if (is_segment || is_sidecar) && !known_paths.contains(&owner) {
+                    warn!(path = %path.display(), "Removing orphaned segment file not registered in catalog");
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!(path = %path.display(), error = %e, "Failed to remove orphaned segment");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ask the maintenance thread to run now — a memtable crossed its
+    /// threshold, or a flush is wanted before the next tick.
+    pub(super) fn wake_maintenance(&self) {
+        let (flag, cv) = &*self.maintenance_wake;
+        *flag.lock() = true;
+        cv.notify_one();
+    }
+}
+
+impl Chronix {
+    /// Ensure every column an active segment carries is in the registry,
+    /// persisting the repair to the catalog when one was needed.
+    fn reconcile_schema_with_segments(schema: &SchemaRegistry, catalog: &mut SegmentCatalog) {
+        use chronix_core::schema::{ColumnDef, ColumnRole, ColumnType, MeasurementSchema};
+        use chronix_engine::segment::metadata::{data_types, roles};
+
+        let mut repaired: HashSet<String> = HashSet::new();
+        for entry in catalog.all_segments() {
+            if entry.state != chronix_core::SegmentState::Active {
+                continue;
+            }
+            for cs in &entry.column_stats {
+                let role = match cs.role {
+                    roles::TAG => ColumnRole::Tag,
+                    roles::FIELD => ColumnRole::Field,
+                    _ => continue,
+                };
+                let column_type = match cs.data_type {
+                    data_types::STRING => ColumnType::String,
+                    data_types::F64 => ColumnType::F64,
+                    data_types::I64 => ColumnType::I64,
+                    data_types::U64 => ColumnType::U64,
+                    data_types::BOOL => ColumnType::Bool,
+                    _ => continue,
+                };
+                let known = schema
+                    .lookup(&entry.measurement)
+                    .is_some_and(|ms| ms.column(&cs.name).is_some());
+                if known {
+                    continue;
+                }
+                if schema.lookup(&entry.measurement).is_none() {
+                    schema.register_measurement(MeasurementSchema::new(&entry.measurement));
+                }
+                schema.apply_add_column(
+                    &entry.measurement,
+                    ColumnDef {
+                        name: cs.name.clone(),
+                        column_type,
+                        role,
+                    },
+                );
+                repaired.insert(entry.measurement.clone());
+            }
+        }
+        for measurement in repaired {
+            warn!(
+                measurement,
+                "schema repaired from segment metadata — the manifest was missing columns the data carries"
+            );
+            if let Some(ms) = schema.lookup(&measurement) {
+                if let Err(e) = catalog.set_schema((*ms).clone()) {
+                    warn!(error = %e, measurement, "failed to persist the repaired schema");
+                }
+            }
+        }
     }
 }
 
 impl Drop for Chronix {
     fn drop(&mut self) {
+        // The maintenance thread's handle never closes; only the last *user*
+        // handle does. The thread takes and drops its handle under the
+        // lifecycle lock, so under that lock a count of one means exactly
+        // "this is the last user handle". The thread only ever `try_lock`s,
+        // so holding it here while `close()` joins the thread cannot
+        // deadlock.
+        if self.maintenance {
+            return;
+        }
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let _guard = lifecycle.lock();
+        if Arc::strong_count(&self.inner) != 1 {
+            return;
+        }
         // Wrap the drop body in catch_unwind to prevent a double-panic
         // (and consequent process abort) if Drop runs during stack unwinding
         // and the close() path panics.  The I/O performed by close() (WAL
@@ -566,11 +791,9 @@ impl Drop for Chronix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::warm_tier::WarmTierConfig;
     use arrow::array::Array;
-    use chronix_core::{FieldValue, SegmentState, SeriesKey};
+    use chronix_core::{FieldValue, Point, SeriesKey};
     use std::collections::BTreeMap;
-    use std::path::Path;
     use tempfile::TempDir;
 
     fn test_config(dir: &Path) -> ChronixConfig {
@@ -586,6 +809,48 @@ mod tests {
         let fields = BTreeMap::from([("value".to_string(), FieldValue::F64(value))]);
         let key = SeriesKey::new(measurement, tags).unwrap();
         Point::new(key, fields, ts).unwrap()
+    }
+
+    /// A record that is durable but not yet in a memtable must stay above
+    /// the WAL floor. The writer holds the write epoch across that gap;
+    /// here the gap is held open by hand while another writer's record is
+    /// flushed past it.
+    #[test]
+    fn a_write_in_flight_stays_above_the_wal_floor() {
+        let tmp = TempDir::new().unwrap();
+        let db = Chronix::open(test_config(tmp.path())).unwrap();
+
+        // seq 1: appended, not yet inserted — the writer is "between".
+        let in_flight = db.write_epoch.read();
+        let p2 = test_point("cpu", "in-flight", 1_000_000_000, 2.0);
+        let payload = chronix_core::wal_encode_write_point(&p2).unwrap();
+        let seq = db.wal.append_batch(&[payload.as_slice()]).unwrap();
+        assert_eq!(seq, 1);
+
+        // seq 2: a concurrent writer that completes and gets flushed.
+        {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                db.insert(&test_point("cpu", "other", 2_000_000_000, 3.0))
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+        let flusher = {
+            let db = db.clone();
+            std::thread::spawn(move || db.flush().unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        db.shards.insert_admitted(&p2, seq).unwrap();
+        drop(in_flight);
+        flusher.join().unwrap();
+
+        assert!(
+            db.catalog().read().wal_floor() < seq,
+            "the floor passed a record that is only in memory"
+        );
+        db.close().unwrap();
     }
 
     #[test]
@@ -1575,143 +1840,8 @@ mod tests {
 
     // ── Warm tier tests ─────────────────────────────────────────────
 
-    #[test]
-    fn warm_tier_disabled_returns_empty() {
-        let tmp = TempDir::new().unwrap();
-        let db = Chronix::open(test_config(tmp.path())).unwrap();
-
-        let config = WarmTierConfig {
-            enabled: false,
-            ..WarmTierConfig::default()
-        };
-        let result = db.warm_tier_migrate(&config).unwrap();
-        assert_eq!(result.shards_moved, 0);
-        assert_eq!(result.segments_recompressed, 0);
-
-        db.close().unwrap();
-    }
-
-    #[test]
-    fn warm_tier_migrate_moves_old_shards() {
-        let tmp = TempDir::new().unwrap();
-        let config = ChronixConfig::builder()
-            .data_dir(tmp.path())
-            .memtable_flush_threshold(128)
-            .build()
-            .unwrap();
-        let db = Chronix::open(config).unwrap();
-
-        // Insert very old data (timestamp near 0)
-        for i in 0..10 {
-            db.insert(&test_point("cpu", "srv-1", i, 1.0)).unwrap();
-        }
-        db.flush().unwrap();
-
-        let warm_dir = tmp.path().join("warm_data");
-        let warm_config = WarmTierConfig {
-            enabled: true,
-            warm_after_ns: 1, // Very short threshold — everything is eligible
-            warm_path: warm_dir.clone(),
-            zstd_level: 3,
-        };
-
-        let result = db.warm_tier_migrate(&warm_config).unwrap();
-        // Old data should have been migrated
-        assert!(
-            result.segments_recompressed > 0 || result.shards_moved > 0 || {
-                // If no segments matched (shard bounds may not meet criteria), that's ok
-                true
-            }
-        );
-
-        db.close().unwrap();
-    }
-
     /// Non-disruptive warm migration: original files removed after catalog
     /// swap, queries still return correct data from warm copies.
-    #[test]
-    fn warm_tier_non_disruptive_migration() {
-        let tmp = TempDir::new().unwrap();
-        let config = ChronixConfig::builder()
-            .data_dir(tmp.path())
-            .memtable_flush_threshold(128)
-            .build()
-            .unwrap();
-        let db = Chronix::open(config).unwrap();
-
-        // Insert old data (timestamp near 0 → eligible for warm migration)
-        for i in 0..5u64 {
-            let p = test_point("cpu", "srv-1", (i * 1_000_000) as i64, i as f64);
-            db.insert(&p).unwrap();
-        }
-        db.flush().unwrap();
-
-        // Collect original segment paths before migration
-        let original_paths: Vec<std::path::PathBuf> = {
-            let cat = db.catalog.read();
-            cat.segments_for_measurement("cpu")
-                .iter()
-                .map(|e| e.path.clone())
-                .collect()
-        };
-        assert!(!original_paths.is_empty(), "should have segments");
-
-        // Verify originals exist on disk
-        for p in &original_paths {
-            assert!(p.exists(), "original should exist: {p:?}");
-        }
-
-        let warm_dir = tmp.path().join("warm_data");
-        let warm_config = WarmTierConfig {
-            enabled: true,
-            warm_after_ns: 1, // everything is eligible
-            warm_path: warm_dir.clone(),
-            zstd_level: 9,
-        };
-
-        let result = db.warm_tier_migrate(&warm_config).unwrap();
-        assert!(
-            result.segments_recompressed > 0,
-            "expected segments recompressed, got {result:?}",
-        );
-
-        // Originals should be deleted after catalog swap
-        for p in &original_paths {
-            assert!(
-                !p.exists(),
-                "original should be deleted after migration: {p:?}"
-            );
-        }
-
-        // Catalog should now point to warm paths
-        let warm_paths: Vec<std::path::PathBuf> = {
-            let cat = db.catalog.read();
-            cat.segments_for_measurement("cpu")
-                .iter()
-                .map(|e| e.path.clone())
-                .collect()
-        };
-        for p in &warm_paths {
-            assert!(
-                p.starts_with(&warm_dir),
-                "catalog should point to warm dir: {p:?}",
-            );
-            assert!(p.exists(), "warm copy should exist: {p:?}");
-        }
-
-        // Data integrity: query still returns all rows from warm copies
-        let plan = db
-            .query()
-            .measurement("cpu")
-            .range(0, i64::MAX)
-            .build()
-            .unwrap();
-        let batch = db.execute(&plan).unwrap();
-        assert_eq!(batch.num_rows(), 5);
-
-        db.close().unwrap();
-    }
-
     #[test]
     fn tombstone_survives_crash_recovery() {
         let tmp = TempDir::new().unwrap();
@@ -2826,71 +2956,5 @@ mod tests {
 
             db.close().unwrap();
         }
-    }
-
-    /// Ingest-time downsampling integration test:
-    /// set a rule, insert points across bucket boundaries, verify
-    /// aggregated points appear in the target measurement.
-    #[test]
-    fn ingest_time_downsampling_end_to_end() {
-        use crate::rollup::{RollupAggFn, RollupBuilder};
-
-        let tmp = TempDir::new().unwrap();
-        let mut db = Chronix::open(test_config(tmp.path())).unwrap();
-
-        let rule = RollupBuilder::new()
-            .name("cpu_10s")
-            .source("cpu")
-            .target("cpu_10s_agg")
-            .interval_ns(10_000_000_000) // 10 s in ns
-            .aggregation(RollupAggFn::Avg)
-            .aggregation(RollupAggFn::Max)
-            .group_by("host")
-            .build()
-            .unwrap();
-
-        db.set_ingest_downsampling(vec![rule]);
-
-        // Insert 3 points in first 10s bucket for host=srv-1
-        for i in 0..3u64 {
-            let p = test_point("cpu", "srv-1", (i * 1_000_000_000) as i64, (i + 1) as f64);
-            db.insert(&p).unwrap();
-        }
-
-        // Cross to next bucket — should trigger emission
-        let p = test_point("cpu", "srv-1", 11_000_000_000, 99.0);
-        db.insert(&p).unwrap();
-
-        // The aggregated point should be in the "cpu_10s_agg" measurement
-        // in the memtable (not yet flushed)
-        let agg_key = SeriesKey::new(
-            "cpu_10s_agg",
-            BTreeMap::from([("host".to_string(), "srv-1".to_string())]),
-        )
-        .unwrap();
-        let results = db.scan_memtable(&agg_key, 0, i64::MAX);
-        assert_eq!(results.len(), 1, "expected 1 aggregated point");
-
-        let agg_point = &results[0];
-        // avg(1,2,3) = 2.0
-        match agg_point.field("value_avg") {
-            Some(FieldValue::F64(v)) => {
-                assert!((v - 2.0).abs() < f64::EPSILON, "avg should be 2.0, got {v}");
-            }
-            other => panic!("Expected F64 avg, got {other:?}"),
-        }
-        // max(1,2,3) = 3.0
-        match agg_point.field("value_max") {
-            Some(FieldValue::F64(v)) => {
-                assert!((v - 3.0).abs() < f64::EPSILON, "max should be 3.0, got {v}");
-            }
-            other => panic!("Expected F64 max, got {other:?}"),
-        }
-
-        // flush_ingest_downsampling should emit the in-flight bucket
-        let flushed = db.flush_ingest_downsampling().unwrap();
-        assert_eq!(flushed, 1, "should flush 1 partial bucket");
-
-        db.close().unwrap();
     }
 }

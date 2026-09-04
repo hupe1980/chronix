@@ -25,6 +25,7 @@ doctest = false
 
 [dependencies]
 chronix-core = { workspace = true }
+pco = "1"
 thiserror = { workspace = true }
 
 [dev-dependencies]

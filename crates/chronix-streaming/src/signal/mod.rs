@@ -49,10 +49,11 @@ mod model;
 #[cfg(test)]
 mod perf;
 pub mod sql;
+pub mod ssrf;
 
 pub use delivery::{
-    DeadLetter, DeadLetterQueue, DeliveryChannel, DeliveryRouter, LogChannel, MetricChannel,
-    RetryPolicy, SignalStore, WebhookChannel, WebhookConfig,
+    DeadLetter, DeadLetterQueue, DeferredWebhookChannel, DeliveryChannel, DeliveryRouter,
+    LogChannel, MetricChannel, RetryPolicy, SignalStore, WebhookChannel, WebhookConfig,
 };
 pub use engine::{
     anomaly_threshold_trigger, forecast_deviation_trigger, ma_crossover_trigger,

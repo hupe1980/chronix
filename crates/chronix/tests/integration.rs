@@ -66,16 +66,25 @@ fn open_insert_close_reopen_read() {
         db.close().unwrap();
     }
 
-    // Phase 2: Reopen and read
+    // Phase 2: Reopen and read. A graceful close flushed everything into a
+    // segment and recorded the WAL floor, so nothing is replayed and the
+    // memtable is empty; the data is on disk and the query path finds it.
     {
         let db = Chronix::open(default_config(&path)).unwrap();
+        assert_eq!(db.wal_replayed_records(), 0);
 
         let key =
             SeriesKey::new("cpu", tags! { "host" => "srv-1", "region" => "us-east" }).unwrap();
+        assert!(db.scan_memtable(&key, 0, i64::MAX).is_empty());
 
-        let points = db.scan_memtable(&key, 0, i64::MAX);
-        // After WAL replay, all 50 points should be in the memtable
-        assert_eq!(points.len(), 50, "Expected 50 points after WAL replay");
+        let plan = db
+            .query()
+            .measurement("cpu")
+            .tag("host", "srv-1")
+            .range(0, i64::MAX)
+            .build()
+            .unwrap();
+        assert_eq!(db.execute(&plan).unwrap().num_rows(), 50);
 
         db.close().unwrap();
     }
@@ -233,45 +242,58 @@ fn double_flush_second_is_noop() {
 
 // ── Crash Recovery ─────────────────────────────────────────────────────
 
+/// Re-executes this test binary so a child process can write and then
+/// `abort()` — the only way to get a WAL that was never closed. Dropping
+/// the handle runs `close()`, which flushes; that is not a crash.
+fn run_crashing_child(test_name: &str, data_dir: &std::path::Path) {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("CHRONIX_CRASH_DIR", data_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "the child is expected to abort, it exited cleanly"
+    );
+}
+
+/// Child half of [`wal_replay_recovers_unflushed_data`]: writes 25 points
+/// with a per-batch fsync and aborts without flushing or closing.
 #[test]
 fn wal_replay_recovers_unflushed_data() {
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().to_path_buf();
-
-    // Simulate crash: write, sync WAL, but don't close cleanly
-    {
-        let db = Chronix::open(default_config(&path)).unwrap();
-
+    if let Ok(dir) = std::env::var("CHRONIX_CRASH_DIR") {
+        let db = Chronix::open(default_config(std::path::Path::new(&dir))).unwrap();
         for i in 0..25 {
             db.insert(&cpu_point("srv-1", i * 1_000_000_000, 88.0 + i as f64))
                 .unwrap();
         }
-
-        // Data is written to WAL via append_durable, then drop without close.
-        // The Drop impl will attempt a best-effort close.
+        std::process::abort();
     }
 
-    // Reopen: WAL should replay the 25 points
-    {
-        let db = Chronix::open(default_config(&path)).unwrap();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().to_path_buf();
+    run_crashing_child("wal_replay_recovers_unflushed_data", &path);
 
-        let key =
-            SeriesKey::new("cpu", tags! { "host" => "srv-1", "region" => "us-east" }).unwrap();
+    // Reopen: the WAL replays the 25 points the child never flushed.
+    let db = Chronix::open(default_config(&path)).unwrap();
+    assert_eq!(db.wal_replayed_records(), 25);
 
-        let points = db.scan_memtable(&key, 0, i64::MAX);
-        assert_eq!(points.len(), 25, "WAL replay should recover all 25 points");
+    let key = SeriesKey::new("cpu", tags! { "host" => "srv-1", "region" => "us-east" }).unwrap();
+    let points = db.scan_memtable(&key, 0, i64::MAX);
+    assert_eq!(points.len(), 25, "WAL replay should recover all 25 points");
+    let mut timestamps: Vec<i64> = points
+        .iter()
+        .map(chronix::prelude::Point::timestamp)
+        .collect();
+    timestamps.sort_unstable();
+    assert_eq!(timestamps[0], 0);
+    assert_eq!(timestamps[24], 24 * 1_000_000_000);
 
-        // Verify timestamps are correct
-        let mut timestamps: Vec<i64> = points
-            .iter()
-            .map(chronix::prelude::Point::timestamp)
-            .collect();
-        timestamps.sort_unstable();
-        assert_eq!(timestamps[0], 0);
-        assert_eq!(timestamps[24], 24 * 1_000_000_000);
-
-        db.close().unwrap();
-    }
+    // And the series count knows about them.
+    assert_eq!(db.statistics().series_count, 1);
+    db.close().unwrap();
 }
 
 #[test]
@@ -781,7 +803,7 @@ fn concurrent_writes_from_multiple_threads() {
 // ── Bloom filter persistence ───────────────────────────────────────
 
 #[test]
-fn bloom_filters_persist_across_restart() {
+fn series_indexes_persist_across_restart() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().to_path_buf();
 
@@ -797,7 +819,7 @@ fn bloom_filters_persist_across_restart() {
 
     // Verify .bloom files exist on disk (segments are in shard subdirectories)
     let segments_dir = path.join("segments");
-    let bloom_files: Vec<_> = walkdir(&segments_dir, "bloom");
+    let bloom_files: Vec<_> = walkdir(&segments_dir, "series");
     assert!(
         !bloom_files.is_empty(),
         "Expected at least one .bloom sidecar file after flush"
@@ -1080,7 +1102,7 @@ fn last_value_from_flushed_segments() {
 // ── Drop measurement cleans bloom files ────────────────────────────
 
 #[test]
-fn drop_measurement_removes_bloom_sidecar_files() {
+fn drop_measurement_removes_series_index_sidecars() {
     let tmp = TempDir::new().unwrap();
     let db = Chronix::open(default_config(tmp.path())).unwrap();
 
@@ -1091,14 +1113,14 @@ fn drop_measurement_removes_bloom_sidecar_files() {
 
     // Verify bloom files exist
     let segments_dir = tmp.path().join("segments");
-    let bloom_count_before = walkdir(&segments_dir, "bloom").len();
+    let bloom_count_before = walkdir(&segments_dir, "series").len();
     assert!(bloom_count_before > 0, "Expected bloom files after flush");
 
     // Drop measurement
     db.drop_measurement("cpu").unwrap();
 
     // Verify bloom files removed
-    let bloom_count_after = walkdir(&segments_dir, "bloom").len();
+    let bloom_count_after = walkdir(&segments_dir, "series").len();
     assert_eq!(
         bloom_count_after, 0,
         "Bloom files should be removed after drop_measurement"
@@ -1352,10 +1374,10 @@ fn missing_tag_filter_returns_empty() {
 
 // ── Cardinality enforcement after WAL replay ───────────────────────
 
-/// After crash + WAL replay, the cardinality tracker must know about
-/// replayed series so the limit is enforced correctly.
+/// After a restart the cardinality tracker must know every series the
+/// database holds — from the segments, not from the WAL.
 #[test]
-fn cardinality_enforced_after_wal_replay() {
+fn cardinality_enforced_after_restart() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().to_path_buf();
 
@@ -1372,11 +1394,10 @@ fn cardinality_enforced_after_wal_replay() {
             let host = format!("srv-{i}");
             db.insert(&cpu_point(&host, 1000, 99.0)).unwrap();
         }
-        // Simulate crash — drop without close (WAL not truncated)
-        drop(db);
+        db.close().unwrap();
     }
 
-    // Phase 2: reopen — WAL replays 4 series, limit is 5
+    // Phase 2: reopen — the segments hold 4 series, limit is 5
     {
         let config = ChronixConfig::builder()
             .data_dir(&path)

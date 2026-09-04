@@ -79,17 +79,35 @@ Write one or more time-series points in native JSON format.
 
 **Response:** `204 No Content`
 
-### `POST /api/v1/write/influx`
+### `POST /write`, `POST /api/v2/write`, `POST /api/v1/write/influx`
 
 Write data in [InfluxDB Line Protocol](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/) format.
 
-**Content-Type:** `text/plain`
+**Content-Type:** `text/plain`. Bodies may be **gzipped**
+(`Content-Encoding: gzip`), which is what Telegraf sends by default.
 
 ```
 cpu,host=srv1,region=us-east usage=72.5,count=42i 1700000000000000000
 ```
 
-**Response:** `204 No Content`
+**Query parameters:** `precision=ns|us|ms|s` sets the unit of every
+timestamp in the body (default `ns`). `db`, `bucket`, `org` and `rp` are
+accepted and ignored — chronix is one database per process and scopes by the
+`X-Namespace` header.
+
+**Response:** `204 No Content` when every line was stored.
+
+If some lines fail to parse, the good ones are **still stored** and the
+response is `400` with the counts:
+
+```json
+{"error": "partial write: line 2: …", "written": 2, "rejected": 1}
+```
+
+That is InfluxDB's behaviour, and the wording matters: Telegraf only treats
+a failure as permanent when it recognises the message, and retries anything
+else for ever — so failing the whole batch means the good lines never land.
+A body in which nothing parses is a plain `400` naming the first failure.
 
 #### Escape semantics
 
@@ -130,9 +148,14 @@ Flight SQL DoPut, Prometheus remote write, and OTLP metrics ingestion.
 
 ## Query Endpoints
 
-### `POST /api/v1/query`
+### `POST /api/v1/chronix/query`
 
 Query time-series data using the native query plan format.
+
+> Moved from `/api/v1/query`, which now serves the **Prometheus** instant
+> query — that is the path every Prometheus client derives from a base URL,
+> and a server that answers something else there cannot be used by one.
+> `/api/v1/chronix/query/explain` and `/api/v1/chronix/sql` moved with it.
 
 **Request Body:**
 
@@ -157,17 +180,54 @@ Query time-series data using the native query plan format.
 }
 ```
 
-### `POST /api/v1/sql`
+### `POST /api/v1/chronix/sql`
 
 Execute a SQL query via DataFusion.
 
 **Request Body:**
 
 ```json
-{"sql": "SELECT * FROM cpu WHERE host = 'srv1' ORDER BY timestamp DESC LIMIT 10"}
+{"sql": "SELECT * FROM cpu WHERE host = 'srv1' ORDER BY _time DESC LIMIT 10"}
 ```
 
 **Response:** JSON array of row objects with column names as keys.
+
+**Time predicates.** The timestamp column is `_time`, typed
+`TIMESTAMP(nanosecond)`. Three forms compare against it:
+
+```sql
+SELECT * FROM cpu WHERE _time >= 1700000000000000000;
+SELECT * FROM cpu WHERE _time >= timestamp '2023-11-14T22:13:20Z';
+SELECT * FROM cpu WHERE _time > now() - INTERVAL '1 hour';
+```
+
+An integer literal is read **in the column's unit**, so the epoch
+nanoseconds the write API took compare equal to themselves. `BETWEEN` and
+`IN` accept them too.
+
+All three forms **prune** — the bounds reach the scan, so only overlapping
+segments are read. `EXPLAIN` shows what the scan will read:
+
+```sql
+EXPLAIN SELECT * FROM cpu WHERE _time >= 1700000000000000000;
+```
+
+```text
+ChronixExec: measurement=cpu, time=[1700000000000000000..9223372036854775807], filters=0, limit=None
+```
+
+A full `[-9223372036854775808..9223372036854775807]` range means the filter
+did not reach the scan and the whole measurement is being read.
+
+**Catalog.** `SHOW TABLES`, `SHOW COLUMNS FROM <measurement>`, `DESCRIBE
+<measurement>` and the `information_schema` views list the measurements the
+request's namespace holds data for.
+
+**What is refused.** The endpoint is read-only: DDL, DML, `COPY` and
+statements such as `SET` and `PREPARE` are rejected before execution, so a
+refused statement has no side effect. `EXPLAIN` and `EXPLAIN ANALYZE` are
+permitted; the plan they wrap is held to the same rules, so
+`EXPLAIN ANALYZE INSERT …` is refused.
 
 ### SQL Trigger WHEN Clause Syntax
 
@@ -176,13 +236,15 @@ parenthesized grouping in `WHEN` clauses:
 
 ```sql
 -- Simple condition
-CREATE TRIGGER high_cpu WHEN value > 90
-  ON cpu_usage ACTION webhook 'https://alerts.example.com';
+CREATE TRIGGER high_cpu ON cpu_usage
+  WHEN value > 90
+  DELIVER webhook('https://alerts.example.com');
 
 -- Compound AND/OR with parentheses
-CREATE TRIGGER complex_alert
+CREATE TRIGGER complex_alert ON cpu_usage
   WHEN (value > 90 AND host = 'prod-srv1') OR (value > 95)
-  ON cpu_usage ACTION webhook 'https://alerts.example.com';
+  DELIVER webhook('https://alerts.example.com')
+  COOLDOWN INTERVAL '5m';
 ```
 
 The parser supports arbitrary nesting of `AND`/`OR` operators with
@@ -190,32 +252,141 @@ explicit parentheses for precedence control. Trigger names are validated
 against SQL injection patterns — only alphanumeric characters and
 underscores are accepted.
 
+**A quoted right-hand side compares a tag**, and an unquoted one compares a
+numeric field:
+
+```sql
+-- Only the production hosts, and never the canary.
+CREATE TRIGGER prod_cpu ON cpu_usage
+  WHEN value > 90 AND env = 'production' AND role <> 'canary'
+  DELIVER webhook('https://alerts.example.com');
+```
+
+Without one, a trigger fires for **every** series of its measurement. Only
+`=` and `<>` apply to a tag.
+
+The full grammar:
+
+```text
+CREATE TRIGGER <name> ON <measurement> WHEN <condition>
+  [DELIVER <channel>[, <channel>…]] [COOLDOWN INTERVAL '<duration>']
+SHOW TRIGGERS
+DROP TRIGGER <name>
+ALTER TRIGGER <name> ENABLE | DISABLE
+```
+
+There is no `WHERE`, `SEVERITY` or `ACTION` clause.
+
+### `DELIVER` channels
+
+Two: `log` and `webhook('https://…')`. Anything else — `nats(…)`, `mqtt(…)`,
+`DELIVER TO log` — is a parse error naming the channels that exist.
+
+Each webhook URL is its own channel, so two triggers can deliver to two
+endpoints. Every payload is HMAC-SHA256 signed with
+`triggers.webhook_signing_secret`; without it configured, `DELIVER webhook(…)`
+is refused at creation. The URL must be `https`, carry no userinfo, and name
+neither an internal host nor a non-routable address — see
+[Webhook URL SSRF Protection](/docs/security/#webhook-url-ssrf-protection).
+
+## Trigger Endpoints
+
+Served only when the server configuration has a `[triggers]` section;
+otherwise they answer `404`. Every statement is scoped to the caller's
+namespace: a trigger sees only its own tenant's series, two tenants may use the
+same trigger name, and neither can list, drop or disable the other's.
+
+### `POST /api/v1/triggers`
+
+Runs one trigger DSL statement.
+
+```bash
+curl -X POST localhost:8080/api/v1/triggers \
+  -H 'Content-Type: application/json' \
+  -d '{"sql": "CREATE TRIGGER hot_cpu ON cpu WHEN value > 90 DELIVER log"}'
+```
+
+`400` with the parser's message when the statement is refused — including a
+`DELIVER webhook(…)` with no signing secret configured.
+
+### `GET /api/v1/triggers`
+
+The caller's triggers, under the names they were created with.
+
+```json
+{
+  "triggers": [
+    { "name": "hot_cpu", "measurement": "cpu", "enabled": true, "delivery": ["log"] }
+  ]
+}
+```
+
+### `DELETE /api/v1/triggers/{name}`
+
+Drops one of the caller's triggers. A name the caller does not own is a `400`,
+which is also the answer when another tenant owns it.
+
+### `GET /api/v1/signals`
+
+Recently fired signals for the caller, newest last.
+
+```json
+[
+  {
+    "event_id": "9f1c…",
+    "trigger_name": "hot_cpu",
+    "measurement": "cpu",
+    "tags": { "host": "h1" },
+    "timestamp": 1609459200000000000,
+    "severity": "warning",
+    "value": 99.0
+  }
+]
+```
+
 ---
 
 ## PromQL Endpoints
 
-Prometheus-compatible query API. Configure Grafana with a Prometheus
-data source pointing to `http://chronix.example.com:8086/api/v1/prom/`.
+Prometheus-compatible query API, served at the paths a Prometheus client
+derives from a base URL. Point a Grafana **Prometheus** data source at
+`http://chronix.example.com:8086` and nothing else needs configuring.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET/POST` | `/api/v1/prom/query` | Instant query |
-| `GET/POST` | `/api/v1/prom/query_range` | Range query |
-| `GET` | `/api/v1/prom/labels` | List all label names |
-| `GET` | `/api/v1/prom/label/{name}/values` | Values for a given label |
-| `GET` | `/api/v1/prom/series` | Find series matching label matchers |
-| `GET` | `/api/v1/prom/metadata` | Metric metadata (types, help text) |
+| `GET/POST` | `/api/v1/query` | Instant query |
+| `GET/POST` | `/api/v1/query_range` | Range query |
+| `GET/POST` | `/api/v1/labels` | List all label names |
+| `GET/POST` | `/api/v1/label/{name}/values` | Values for a given label |
+| `GET/POST` | `/api/v1/series` | Find series matching label matchers |
+| `GET` | `/api/v1/metadata` | Metric metadata (types, help text) |
+| `GET` | `/api/v1/status/buildinfo` | Version, probed when a data source is saved |
+| `GET` | `/api/v1/rules`, `/api/v1/alerts`, `/api/v1/query_exemplars` | Empty but well-formed — chronix has no rules or exemplars |
+
+`/api/v1/prom/*` is an alias for every query and discovery path, for
+deployments that name it explicitly. Chronix's own JSON query API lives
+under `/api/v1/chronix/*`, because `/api/v1/query` is where every Prometheus
+client looks.
+
+`POST` bodies are `application/x-www-form-urlencoded`, which is what Grafana
+sends by default. `time`, `start` and `end` accept **RFC 3339 or a Unix
+timestamp**; `step` accepts a **duration** (`15s`, `1m30s`) or a bare number
+of seconds. An unparseable value is a 400 rather than a silent default.
+
+Errors carry Prometheus's status codes, because clients branch on them:
+`400` for `bad_data`, `422` for `execution`, `503` for `timeout`. The body is
+`{"status":"error","errorType":…,"error":…}`.
 
 `/query` and `/query_range` answer `{"status":"success","data":{"resultType":…,"result":…}}`.
 `/labels`, `/label/{name}/values` and `/series` answer a **bare array** under
 `data`, as Prometheus does, with label names and values **sorted**.
 
-All three accept `start` and `end` (seconds since epoch, defaulting to the last
-hour) and repeated **`match[]`** series selectors. Every matcher in a selector
-is applied, not only `__name__`:
+All three accept `start` and `end` (defaulting to the last hour) and
+repeated **`match[]`** series selectors. Every matcher in a selector is
+applied, not only `__name__`:
 
 ```
-GET /api/v1/prom/label/dc/values?match[]={__name__="cpu",host="a"}
+GET /api/v1/label/dc/values?match[]={__name__="cpu",host="a"}
 → {"status":"success","data":["eu"]}
 ```
 
@@ -244,6 +415,25 @@ over a range vector stamps the step's evaluation timestamp, so the matrix is
 step-aligned and strictly increasing. `NaN` ranks last in `topk`, `bottomk`,
 `sort` and `sort_desc`.
 
+**Modifiers.** `offset 5m` shifts back, `offset -5m` shifts forward, and
+`@ <unix seconds>` / `@ start()` / `@ end()` pin an evaluation instant — `@`
+replaces the evaluation time and the offset is then subtracted. Both attach to
+a **selector or a subquery** and to nothing else, so `sum(m) offset 5m` is a
+parse error naming the rule.
+
+**Subqueries.** `expr[5m:1m]` evaluates `expr` at each point of an absolute
+step grid; `expr[5m:]` uses the engine's 1-minute interval rather than the
+outer step. Every sample carries its **step** timestamp, the window is
+left-open on the grid, and a subquery is a range vector — so `rate(x[5m:15s])`
+extrapolates over five minutes exactly as `rate(x[5m])` does.
+
+**A comparison keeps the vector element's value**, whichever side the scalar is
+written on: `2 < some_metric` is the metric's value, not `2`. A duplicate on
+the "one" side of a `group_left` is an error rather than a cross product.
+`last_over_time` keeps `__name__` while every other `_over_time` and
+`timestamp()` drop it. `deriv` and `idelta` drop a series with fewer than two
+points rather than emitting `NaN`.
+
 The 3.x-only functions `double_exponential_smoothing`, `mad_over_time`,
 `sort_by_label` and `sort_by_label_desc` are available **without** a feature
 flag (upstream gates them behind `--enable-feature=promql-experimental-functions`).
@@ -268,23 +458,23 @@ A query using one of these returns an error rather than a wrong answer.
 ### Instant Query
 
 ```bash
-curl 'http://localhost:8086/api/v1/prom/query?query=cpu_usage{host="srv1"}&time=1700000000'
+curl 'http://localhost:8086/api/v1/query?query=cpu_usage{host="srv1"}&time=1700000000'
 ```
 
 ### Range Query
 
 ```bash
-curl 'http://localhost:8086/api/v1/prom/query_range?query=cpu_usage&start=1700000000&end=1700100000&step=60'
+curl 'http://localhost:8086/api/v1/query_range?query=cpu_usage&start=1700000000&end=1700100000&step=60'
 ```
 
 ### Label Values
 
 ```bash
 # List all measurement names
-curl http://localhost:8086/api/v1/prom/label/__name__/values
+curl http://localhost:8086/api/v1/label/__name__/values
 
 # List all values for the "host" tag
-curl http://localhost:8086/api/v1/prom/label/host/values
+curl http://localhost:8086/api/v1/label/host/values
 ```
 
 **Response Format:**
@@ -458,6 +648,88 @@ chronixd --export-dashboards ./grafana/
 
 ---
 
+## Drop-in client compatibility
+
+Every route below is one a stock client derives on its own. None of them
+needs a proxy, a path rewrite, or a non-default setting.
+
+### Grafana
+
+Add a **Prometheus** data source pointing at the server:
+
+```
+URL: http://chronixd:8086
+```
+
+That is the whole configuration. Grafana appends `/api/v1/query`,
+`/api/v1/query_range`, `/api/v1/labels`, `/api/v1/series` and
+`/api/v1/label/<name>/values` itself, POSTs them as
+`application/x-www-form-urlencoded` (its default `httpMethod`), and probes
+`/api/v1/status/buildinfo` when you press **Save & test**. All of those are
+served, on `GET` and `POST` alike. `time`, `start` and `end` accept RFC 3339
+or a Unix timestamp; `step` accepts `15s`, `1m30s` or a bare number of
+seconds.
+
+Errors carry the status codes Prometheus uses — 400 for `bad_data`, 422 for
+`execution`, 503 for `timeout` — because Grafana branches on them.
+
+### Telegraf
+
+```toml
+[[outputs.influxdb]]
+  urls = ["http://chronixd:8086"]
+  database = "telegraf"
+
+# or, for the v2 client
+[[outputs.influxdb_v2]]
+  urls = ["http://chronixd:8086"]
+  bucket = "metrics"
+  organization = "acme"
+```
+
+Both post gzipped bodies by default, to `/write` and `/api/v2/write`
+respectively; both are served and decompressed. The `precision` parameter is
+honoured (`ns`, `us`, `ms`, `s`), and `db`, `bucket`, `org` and `rp` are
+accepted and ignored — chronix is one database per process and scopes by the
+`X-Namespace` header.
+
+A batch containing a malformed line stores the good lines and answers
+`400 {"error": "partial write: …", "written": N, "rejected": M}`, which is
+what Telegraf recognises as a permanent failure. Failing the whole batch
+instead makes it retry for ever.
+
+### OpenTelemetry Collector
+
+```yaml
+exporters:
+  otlphttp:
+    endpoint: http://chronixd:8086
+```
+
+The exporter appends `/v1/metrics` and gzips by default; both are served.
+
+### Prometheus remote write and read
+
+```yaml
+remote_write:
+  - url: http://chronixd:8086/api/v1/prom/write
+
+remote_read:
+  - url: http://chronixd:8086/api/v1/prom/read
+```
+
+Remote read applies all four matcher types — `=`, `!=`, `=~` and `!~` — with
+regexes anchored the way Prometheus anchors its own, and a `__name__` regex
+selecting measurements. An absent label reads as the empty string, so
+`job!="a"` also selects series that have no `job`.
+
+A write whose points are rejected — a timestamp outside the out-of-order
+window, or a series over the cardinality limit — answers `400` naming the
+counts, not `204`. Both rejections are deterministic, so `400` is correct:
+Prometheus treats it as permanent and drops the batch, where a `503` would
+have it retry the same doomed batch for ever.
+
+
 ## Management Endpoints
 
 | Method | Path | Description |
@@ -466,9 +738,61 @@ chronixd --export-dashboards ./grafana/
 | `GET` | `/api/v1/measurements/{name}/schema` | Get schema for a measurement |
 | `DELETE` | `/api/v1/measurements/{name}` | Drop an entire measurement |
 | `POST` | `/api/v1/delete` | Delete points matching predicates |
-| `GET` | `/api/v1/rollups` | List rollup configurations |
+| `GET` | `/api/v1/rollups` | List rollup configurations, each with its watermark and any pending repairs |
+| `POST` | `/api/v1/rollups` | Create a rollup configuration |
+| `DELETE` | `/api/v1/rollups/{name}` | Delete a rollup configuration |
+| `POST` | `/api/v1/rollups/{name}/refresh` | Recompute a range now (`?start=&end=`, nanoseconds) |
 | `POST` | `/api/v1/export/parquet` | Export data as Apache Parquet |
 | `GET` | `/api/v1/connectors` | List active ingestion connectors |
+
+### Rollups
+
+A rollup's listing reports where it has got to and whether it is behind:
+
+```bash
+curl http://localhost:8086/api/v1/rollups
+```
+
+```json
+{
+  "items": [
+    {
+      "name": "energy_15m",
+      "source_measurement": "energy",
+      "target_measurement": "energy_15m",
+      "window_seconds": 900,
+      "aggregations": ["Avg", "Max"],
+      "materialised_until": 1700000000000000000,
+      "pending_repairs": [[1699900000000000000, 1699903600000000000]]
+    }
+  ],
+  "total": 1, "offset": 0, "limit": 100
+}
+```
+
+`materialised_until` is the exclusive end of the newest bucket aggregated so
+far. `pending_repairs` are bucket ranges *below* that watermark whose input
+changed afterwards — a `backfill`, an import, or a delete — and which the
+next maintenance pass will recompute. **A non-empty list is why retention is
+holding raw data**: the tier does not yet agree with the raw data, so the raw
+data stays. It empties on its own; if it does not, check the logs for
+`rollup materialisation failed` and the `chronix_rollup_failures_total`
+metric.
+
+To recompute a range immediately — after an out-of-band restore, say, which
+the engine cannot observe:
+
+```bash
+curl -X POST 'http://localhost:8086/api/v1/rollups/energy_15m/refresh?start=1699900000000000000&end=1699903600000000000'
+```
+
+```json
+{ "rollup": "energy_15m", "points_written": 96 }
+```
+
+The range is aligned outward to whole buckets. Recomputing is idempotent:
+the target's existing aggregates over the range are replaced, not merged
+with, and any tier fed by this one is marked for repair in turn.
 
 ### Delete Points
 
@@ -558,10 +882,17 @@ to it. `X-Namespace` selects the namespace for HTTP; gRPC and Flight SQL use
 the namespace for authorization and rate limiting, but every request sees all
 data. See [Security](/docs/security/#namespace-isolation).
 
-**Authorization:** When a Cedar authorization engine is configured, the
-namespace middleware checks that the authenticated principal is permitted
-to access the target namespace (`Chronix::Namespace` resource type).
-Policies can restrict users to specific namespaces:
+**Authorization:** the namespace a request may act in comes from its
+credential. An API key carries a `namespaces` list, a JWT carries a
+`namespaces` claim, and naming a namespace outside that list is answered
+`403` — the header alone is not authority. An empty list means unrestricted,
+which is why a server with `multi_tenancy = true` refuses to start while a
+key has one.
+
+When a Cedar authorization engine is also configured, the namespace
+middleware additionally checks that the principal is permitted to act on the
+target namespace (`Chronix::Namespace` resource type). Policies can restrict
+users to specific namespaces:
 
 ```cedar
 permit(
@@ -782,22 +1113,36 @@ curl -X DELETE http://localhost:8086/api/v1/admin/chaos/1
 
 ## Authentication
 
-When authentication is enabled, API keys are managed via these endpoints.
-All other endpoints require a valid `Authorization: Bearer <key>` header.
+When authentication is configured, every endpoint outside `auth.exempt_paths`
+requires `Authorization: Bearer <token>`, which may be an API key or a JWT.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/v1/auth/keys` | Create a new API key |
-| `GET` | `/api/v1/auth/keys` | List all API keys |
-| `DELETE` | `/api/v1/auth/keys/{name}` | Revoke an API key |
+| `POST` | `/api/v1/admin/auth/keys` | Create a new API key |
+| `GET` | `/api/v1/admin/auth/keys` | List all API keys |
+| `DELETE` | `/api/v1/admin/auth/keys/{name}` | Revoke an API key |
+
+These endpoints, like namespace management and backup/restore, require a
+credential carrying the **admin** capability.
 
 ### Create Key
 
 ```bash
-curl -X POST http://localhost:8086/api/v1/auth/keys \
+curl -X POST http://localhost:8086/api/v1/admin/auth/keys \
+  -H 'Authorization: Bearer <admin-key>' \
   -H 'Content-Type: application/json' \
-  -d '{"name": "grafana-reader", "expires_in_secs": 86400}'
+  -d '{
+        "name": "grafana-reader",
+        "expires_at": 1793491200,
+        "namespaces": ["tenant-a"]
+      }'
 ```
+
+`expires_at` is a Unix timestamp in seconds and is optional. `namespaces` is
+required when `multi_tenancy = true`, because a key naming none may act in
+every tenant.
+
+The raw key is returned **once**; only its Argon2 hash is stored.
 
 ---
 
@@ -848,7 +1193,7 @@ interfaces:
 |---------|---------|-------------|
 | `sql_query_timeout_secs` | `30` | Maximum seconds for SQL query execution including result streaming |
 | `sql_max_rows` | `100000` | Maximum rows returned by a single SQL query |
-| `prom_series_limit` | `10000` | Maximum label-sets returned by `/api/v1/prom/series` |
+| `prom_series_limit` | `10000` | Maximum label-sets returned by `/api/v1/series` |
 
 Queries exceeding the timeout are cancelled. Row limits are enforced at the
 batch level — once the cumulative row count reaches the limit, the final batch

@@ -103,12 +103,19 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         // The namespace travels with the ticket: `DoGet` arrives as a separate
         // request, potentially on a different connection, so a scope resolved
         // only here would be lost before the query runs.
-        let scope = crate::namespace::scope_from_metadata(self.multi_tenancy, request.metadata());
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
         let sql_ctx = self.sql_contexts.get(scope.as_deref());
 
-        // Use DataFusion to parse and plan the query to get the schema
-        let df = sql_ctx
-            .sql(sql)
+        // Plan through the **read-only** path, exactly as `DoGet` does.
+        //
+        // `SessionContext::sql` executes DDL, DML and `SET` eagerly rather
+        // than only planning them, and every JDBC/ADBC client calls
+        // `GetFlightInfo` before `DoGet` — so this was a complete bypass of
+        // the read-only admission the rest of the server enforces. A
+        // `CREATE EXTERNAL TABLE … LOCATION '/etc/passwd'` registered the
+        // file here and a later `SELECT` read it through the checked path;
+        // a `SET` mutated the shared session for every request after it.
+        let df = chronix::sql::sql_read_only(&sql_ctx, sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {e}")))?;
         let arrow_schema = df.schema().as_arrow().clone();
@@ -146,7 +153,24 @@ impl FlightSqlTrait for ChronixFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let handle = String::from_utf8(ticket.statement_handle.to_vec())
             .map_err(|_| Status::invalid_argument("invalid statement handle"))?;
-        let (scope, sql) = decode_handle(&handle)?;
+        let (handle_scope, sql) = decode_handle(&handle)?;
+
+        // **The ticket is not authoritative for scope.** A ticket is bytes
+        // the client sends, so a handle that names a namespace is a
+        // namespace the client chose — and it used to be trusted, which let
+        // any client read any tenant's data by editing the string.
+        //
+        // The scope comes from *this* request's metadata, exactly as it does
+        // on every other surface, and the handle's copy only has to agree.
+        // Disagreement is refused rather than silently resolved, so a client
+        // whose ticket outlived a namespace change gets an error instead of
+        // another tenant's rows.
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
+        if self.multi_tenancy && handle_scope.as_deref() != scope.as_deref() {
+            return Err(Status::permission_denied(
+                "the statement handle names a different namespace than this request",
+            ));
+        }
 
         debug!(%sql, ?scope, "Flight SQL DoGet");
 
@@ -241,7 +265,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             ));
         }
 
-        let scope = crate::namespace::scope_from_metadata(self.multi_tenancy, request.metadata());
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
 
         // Collect all FlightData from the stream
         let mut stream = request.into_inner();
@@ -515,11 +539,21 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let db = self.db.clone();
+        // The schema registry is process-wide, so a table listing told every
+        // tenant what the others were writing — which for a JDBC client is
+        // the first thing it fetches to populate its schema browser. A
+        // namespace sees the measurements it holds data for.
+        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
 
-        let names: Vec<String> =
-            tokio::task::spawn_blocking(move || db.schema_registry().measurement_names())
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let names: Vec<String> = tokio::task::spawn_blocking(move || match scope.as_deref() {
+            None => db.schema_registry().measurement_names(),
+            Some(ns) => {
+                let now_ns = crate::util::now_nanos().unwrap_or(i64::MAX);
+                crate::namespace::measurements_in(&db, Some(ns), i64::MIN, now_ns, usize::MAX)
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("catalog_name", DataType::Utf8, true),
@@ -830,6 +864,11 @@ fn arrow_batch_to_points(
 ///
 /// The handle is opaque to clients and never parsed from user input: `DoGet`
 /// only ever sees a handle this server produced.
+/// Build a statement handle.
+///
+/// The namespace it carries is a **hint that must agree** with the scope the
+/// `DoGet` request resolves for itself, never the scope itself: a ticket is
+/// bytes the client sends. See `do_get_statement`.
 fn encode_handle(namespace: Option<&str>, sql: &str) -> String {
     format!("{}\n{sql}", namespace.unwrap_or_default())
 }

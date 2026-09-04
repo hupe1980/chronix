@@ -61,6 +61,44 @@ pub struct AuthState {
 }
 
 impl AuthState {
+    /// Attach the issuer's published keys, when a JWKS URL is configured.
+    ///
+    /// `jwks_url` used to be accepted by the config and then dropped on the
+    /// floor: nothing built a cache, so an OIDC deployment authenticated
+    /// nobody and the config gave no hint why. Fetching once at startup
+    /// also turns an unreachable issuer into a startup failure instead of a
+    /// wall of 401s.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint cannot be fetched or holds no keys.
+    pub async fn attach_jwks(
+        &mut self,
+        jwks_url: &str,
+        ttl: std::time::Duration,
+    ) -> Result<(), chronix_security::auth::error::AuthError> {
+        let cache = std::sync::Arc::new(chronix_security::auth::oidc::JwksCache::new(
+            jwks_url.to_string(),
+            ttl,
+        ));
+        cache.refresh().await?;
+        if cache.is_empty() {
+            return Err(chronix_security::auth::error::AuthError::Config(format!(
+                "the JWKS endpoint {jwks_url} published no keys"
+            )));
+        }
+        info!(jwks_url, keys = cache.len(), "JWKS keys loaded");
+        match std::sync::Arc::get_mut(&mut self.middleware) {
+            Some(mw) => mw.set_jwks_cache(cache),
+            None => {
+                return Err(chronix_security::auth::error::AuthError::Config(
+                    "JWKS must be attached before the auth state is shared".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
     /// Build an [`AuthState`] from server auth configuration.
     ///
     /// This pre-configures the API key store and JWT validator so that
@@ -84,30 +122,13 @@ impl AuthState {
         //   3. Plain text (default): key = "my-secret"
         //      → hashed with Argon2 on load (backward compatible).
         for entry in &config.api_keys {
-            let resolved_key = if entry.key.starts_with("${") && entry.key.ends_with('}') {
-                // ${VAR_NAME} form
-                let var_name = &entry.key[2..entry.key.len() - 1];
-                match std::env::var(var_name) {
-                    Ok(val) => val,
-                    Err(_) => {
-                        warn!(name = %entry.name, var = var_name,
-                              "env var not set for API key — skipping");
-                        continue;
-                    }
+            let resolved_key = match crate::config::resolve_env_reference(&entry.key) {
+                Ok(val) => val,
+                Err(var_name) => {
+                    warn!(name = %entry.name, var = %var_name,
+                          "env var not set for API key — skipping");
+                    continue;
                 }
-            } else if entry.key.starts_with('$') && !entry.key.starts_with("$argon2") {
-                // $VAR_NAME form (but not $argon2... which is a PHC hash)
-                let var_name = &entry.key[1..];
-                match std::env::var(var_name) {
-                    Ok(val) => val,
-                    Err(_) => {
-                        warn!(name = %entry.name, var = var_name,
-                              "env var not set for API key — skipping");
-                        continue;
-                    }
-                }
-            } else {
-                entry.key.clone()
             };
 
             if resolved_key.starts_with("$argon2") {
@@ -121,30 +142,58 @@ impl AuthState {
                     hash: resolved_key,
                     expires_at: None,
                     created_at: now,
+                    namespaces: entry.namespaces.clone(),
+                    admin: entry.admin,
                 });
             } else if let Err(e) =
                 api_key_store.register_plaintext(&entry.name, &resolved_key, None)
             {
                 warn!(name = %entry.name, %e, "failed to register API key");
+            } else {
+                api_key_store.bind_namespaces(&entry.name, entry.namespaces.clone());
+                api_key_store.set_admin(&entry.name, entry.admin);
             }
         }
 
         // Configure JWT
-        let jwt_config =
-            config
-                .jwt
-                .as_ref()
-                .map(|jwt_cfg| chronix_security::auth::jwt::JwtConfig {
-                    secret: Some(zeroize::Zeroizing::new(jwt_cfg.secret.clone())),
+        // The key material follows the algorithm family. `public_key_pem`
+        // used to be hard-coded to `None` here, so an RS256 or ES256
+        // deployment had no key to verify with and answered 401 to every
+        // token — configuration the operator could write and the server
+        // would accept while never authenticating anyone.
+        let jwt_config = match config.jwt.as_ref() {
+            None => None,
+            Some(jwt_cfg) => {
+                let public_key_pem = match jwt_cfg.public_key_pem_file.as_ref() {
+                    None => None,
+                    Some(path) => {
+                        let pem = std::fs::read_to_string(path).map_err(|e| {
+                            chronix_security::auth::error::AuthError::Config(format!(
+                                "cannot read the JWT public key at {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                        Some(zeroize::Zeroizing::new(pem))
+                    }
+                };
+                let secret = if jwt_cfg.secret.is_empty() {
+                    None
+                } else {
+                    Some(zeroize::Zeroizing::new(jwt_cfg.secret.clone()))
+                };
+                Some(chronix_security::auth::jwt::JwtConfig {
+                    secret,
                     algorithm: Some(jwt_cfg.algorithm.clone()),
                     issuer: jwt_cfg.issuer.clone(),
                     audience: jwt_cfg.audience.clone(),
                     require_audience: jwt_cfg.audience.is_some(),
-                    rsa_public_key_pem: None,
-                    jwks_url: None,
+                    public_key_pem,
+                    jwks_url: jwt_cfg.jwks_url.clone(),
                     subject_claim: None,
                     role_claim: jwt_cfg.role_claim.clone(),
-                });
+                })
+            }
+        };
 
         let key_store = Arc::new(RwLock::new(api_key_store.clone()));
 
@@ -298,13 +347,19 @@ impl Interceptor for GrpcAuthInterceptor {
                 if let Some(ref token) = bearer_token {
                     let validated = {
                         let store = self.key_store.read();
-                        store.validate(token).ok()
+                        store.validate(token).ok().map(|name| {
+                            let namespaces = store.namespaces_for(&name).to_vec();
+                            let admin = store.is_admin(&name);
+                            (name, namespaces, admin)
+                        })
                     };
-                    if let Some(name) = validated {
+                    if let Some((name, namespaces, admin)) = validated {
                         let ctx = chronix_security::auth::AuthContext {
                             principal: name,
                             method: chronix_security::auth::AuthMethod::ApiKey,
                             claims: Default::default(),
+                            admin,
+                            namespaces,
                         };
                         debug!(
                             principal = %ctx.principal,
@@ -365,14 +420,39 @@ pub fn require_admin(
     state: &crate::http::SharedState,
     auth_ctx: Option<&chronix_security::auth::AuthContext>,
 ) -> Result<(), (StatusCode, String)> {
-    let engine = match &state.authz_engine {
-        Some(e) => e,
-        None => return Ok(()), // No authz engine → permit.
-    };
-
     let ctx = match auth_ctx {
         Some(c) => c,
-        None => return Ok(()), // No auth context → permit (unauthenticated mode).
+        None => {
+            // No principal at all. That happens only when the operator
+            // configured no authentication, in which case every endpoint is
+            // already open and refusing here would be theatre.
+            if state.auth_state.is_some() {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "administrative operations require authentication".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+    };
+
+    let Some(engine) = &state.authz_engine else {
+        // **No policy engine does not mean no policy.** This used to return
+        // `Ok`, so on any deployment without Cedar policies — the default —
+        // every authenticated key could restore a backup over the live data
+        // directory, mint keys and delete namespaces. The capability now
+        // lives on the credential, so its absence is a refusal.
+        if ctx.admin {
+            return Ok(());
+        }
+        warn!(
+            principal = %ctx.principal,
+            "administrative operation refused: credential has no admin capability"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "administrative operations require a credential marked `admin`".to_string(),
+        ));
     };
 
     let mut principal = chronix_security::authz::ChronixPrincipal::new(&ctx.principal);
@@ -472,8 +552,16 @@ pub async fn auth_layer(
             }
         });
 
-    // Try middleware first, then check mutable key store
-    match auth.middleware.authenticate(bearer_token.as_deref(), None) {
+    // Try middleware first, then check mutable key store.
+    //
+    // The async form so a JWKS-backed deployment can fetch and cache the
+    // issuer's keys; it delegates to the sync form whenever no cache is
+    // attached, which is every other deployment.
+    match auth
+        .middleware
+        .authenticate_async(bearer_token.as_deref(), None)
+        .await
+    {
         Ok(ctx) => {
             // If this was an API key auth, verify the key hasn't been
             // revoked from the runtime key store.  The middleware holds a
@@ -511,13 +599,19 @@ pub async fn auth_layer(
             if let Some(ref token) = bearer_token {
                 let validated = {
                     let store = auth.key_store.read();
-                    store.validate(token).ok()
+                    store.validate(token).ok().map(|name| {
+                        let namespaces = store.namespaces_for(&name).to_vec();
+                        let admin = store.is_admin(&name);
+                        (name, namespaces, admin)
+                    })
                 };
-                if let Some(name) = validated {
+                if let Some((name, namespaces, admin)) = validated {
                     let ctx = chronix_security::auth::AuthContext {
                         principal: name,
                         method: chronix_security::auth::AuthMethod::ApiKey,
                         claims: Default::default(),
+                        admin,
+                        namespaces,
                     };
                     debug!(
                         principal = %ctx.principal,
@@ -529,6 +623,19 @@ pub async fn auth_layer(
                 }
             }
             warn!(path = %path, error = %mw_err, "authentication failed");
+            // A refused credential is exactly the event an audit trail
+            // exists for, and only the gRPC side was recording it.
+            crate::audit::record(
+                &state,
+                "anonymous",
+                chronix_security::audit::AuditAction::LoginFailure,
+                path.clone(),
+                chronix_security::audit::AuditDecision::Deny,
+                &[
+                    ("reason", mw_err.to_string()),
+                    ("protocol", "http".to_string()),
+                ],
+            );
             // Return generic error message — never leak auth method details or key names.
             (StatusCode::UNAUTHORIZED, mw_err.client_message()).into_response()
         }
@@ -545,6 +652,13 @@ pub struct CreateKeyRequest {
     /// Optional Unix timestamp (seconds) when this key expires.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Namespaces the key may act in.
+    ///
+    /// Required under multi-tenancy: a key minted at runtime with no
+    /// confinement reaches every tenant, which is the same hole the
+    /// startup check closes for configured keys.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
 }
 
 /// Response body for `POST /api/v1/auth/keys`.
@@ -578,14 +692,34 @@ pub async fn create_key_handler(
         ));
     }
 
+    if state.config.multi_tenancy && body.namespaces.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a key must name the namespaces it may act in when multi-tenancy is on".to_string(),
+        ));
+    }
+
     let raw_key = {
         let mut store = auth.key_store.write();
-        store
+        let key = store
             .create_key(name, body.expires_at)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        store.bind_namespaces(name, body.namespaces.clone());
+        key
     };
 
     info!(name = %name, "API key created");
+    crate::audit::record(
+        &state,
+        name,
+        chronix_security::audit::AuditAction::KeyRotation,
+        format!("api_key:{name}"),
+        chronix_security::audit::AuditDecision::Allow,
+        &[
+            ("operation", "create".to_string()),
+            ("namespaces", body.namespaces.join(",")),
+        ],
+    );
     Ok((
         StatusCode::CREATED,
         Json(CreateKeyResponse {
@@ -635,6 +769,14 @@ pub async fn revoke_key_handler(
 
     if revoked {
         info!(name = %name, "API key revoked");
+        crate::audit::record(
+            &state,
+            &name,
+            chronix_security::audit::AuditAction::KeyRotation,
+            format!("api_key:{name}"),
+            chronix_security::audit::AuditDecision::Allow,
+            &[("operation", "revoke".to_string())],
+        );
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
@@ -666,6 +808,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "test-key".to_string(),
                 key: "super-secret-key-123".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec!["/health".to_string()],
@@ -700,6 +844,8 @@ mod tests {
                 issuer: None,
                 audience: None,
                 role_claim: None,
+                public_key_pem_file: None,
+                jwks_url: None,
             }),
             exempt_paths: vec![],
         };
@@ -727,6 +873,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "k".to_string(),
                 key: "real-key".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec![],
@@ -754,6 +902,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "admin".to_string(),
                 key: "admin-key".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec![],
@@ -905,8 +1055,10 @@ mod tests {
     }
 
     #[test]
-    fn require_admin_no_engine_allows() {
-        // When no authz engine is configured, all requests are allowed.
+    fn require_admin_without_an_engine_needs_the_capability() {
+        // No policy engine is the default deployment, and it used to mean
+        // "permit" — so any authenticated key could restore a backup over
+        // the live data directory. The capability lives on the credential.
         let db = make_test_db();
         let sql_contexts = crate::namespace::SqlContexts::new(db.clone());
         let state = crate::http::SharedState {
@@ -931,6 +1083,7 @@ mod tests {
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
+            pipeline: None,
             openapi_json: std::sync::OnceLock::new(),
             write_timeout: std::time::Duration::ZERO,
         };
@@ -938,8 +1091,18 @@ mod tests {
             principal: "user1".to_string(),
             method: chronix_security::auth::AuthMethod::ApiKey,
             claims: Default::default(),
+            namespaces: Vec::new(),
+            admin: false,
         };
-        assert!(super::require_admin(&state, Some(&ctx)).is_ok());
+        let (status, _) = super::require_admin(&state, Some(&ctx))
+            .expect_err("an ordinary key must not be an administrator");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let admin_ctx = chronix_security::auth::AuthContext { admin: true, ..ctx };
+        assert!(
+            super::require_admin(&state, Some(&admin_ctx)).is_ok(),
+            "a key marked admin must still be able to administer"
+        );
     }
 
     #[test]
@@ -969,6 +1132,7 @@ mod tests {
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
+            pipeline: None,
             openapi_json: std::sync::OnceLock::new(),
             write_timeout: std::time::Duration::ZERO,
         };
@@ -1004,6 +1168,7 @@ mod tests {
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
+            pipeline: None,
             openapi_json: std::sync::OnceLock::new(),
             write_timeout: std::time::Duration::ZERO,
         };
@@ -1011,6 +1176,8 @@ mod tests {
             principal: "user1".to_string(),
             method: chronix_security::auth::AuthMethod::ApiKey,
             claims: Default::default(),
+            namespaces: Vec::new(),
+            admin: false,
         };
         let result = super::require_admin(&state, Some(&ctx));
         assert!(result.is_err());
@@ -1026,6 +1193,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "test-key".to_string(),
                 key: "my-secret".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec![],
@@ -1046,6 +1215,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "test-key".to_string(),
                 key: "my-secret".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec![],
@@ -1072,6 +1243,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "test-key".to_string(),
                 key: "my-secret".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec![],
@@ -1118,6 +1291,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "test-key".to_string(),
                 key: "my-secret".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec![],
@@ -1194,6 +1369,8 @@ mod tests {
             api_keys: vec![ApiKeyEntry {
                 name: "test-key".to_string(),
                 key: "secret".to_string(),
+                namespaces: Vec::new(),
+                admin: false,
             }],
             jwt: None,
             exempt_paths: vec![],

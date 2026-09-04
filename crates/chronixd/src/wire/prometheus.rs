@@ -200,35 +200,165 @@ fn execute_read_request(
     Ok(prom_proto::ReadResponse { results })
 }
 
-/// Execute a single Prometheus read query.
+/// One matcher that cannot be pushed into the scan, applied per series.
+struct PostFilter {
+    /// The label it constrains.
+    label: String,
+    /// How it constrains it.
+    kind: PostFilterKind,
+}
+
+/// The kinds of matcher the scan cannot express.
+enum PostFilterKind {
+    /// `label != value`.
+    NotEqual(String),
+    /// `label =~ value` (or `!~` when negated). Anchored, `(?s)`, as
+    /// Prometheus anchors its own.
+    Regex {
+        /// The compiled, anchored pattern.
+        re: regex::Regex,
+        /// `true` for `!~`.
+        negated: bool,
+    },
+}
+
+impl PostFilter {
+    /// Does a series' label set satisfy this matcher?
+    ///
+    /// An absent label is the empty string, which is Prometheus's rule and
+    /// the reason `job!="a"` also selects series with no `job` at all.
+    fn matches(&self, labels: &std::collections::BTreeMap<String, String>) -> bool {
+        let value = labels.get(&self.label).map_or("", String::as_str);
+        match &self.kind {
+            PostFilterKind::NotEqual(v) => value != v,
+            PostFilterKind::Regex { re, negated } => re.is_match(value) != *negated,
+        }
+    }
+}
+
+/// Which measurements a query's `__name__` matchers select.
+///
+/// An equality matcher names one; a regex selects from the measurements the
+/// namespace holds. `{__name__=~"a|b"}` used to be a flat 400.
+fn resolve_measurements(
+    db: &Arc<Chronix>,
+    namespace: Option<&str>,
+    query: &prom_proto::Query,
+) -> Result<Vec<String>, ServerError> {
+    let mut exact: Option<String> = None;
+    let mut patterns: Vec<(regex::Regex, bool)> = Vec::new();
+    for matcher in &query.matchers {
+        if matcher.name != "__name__" {
+            continue;
+        }
+        let match_type =
+            prom_proto::label_matcher::Type::try_from(matcher.r#type).map_err(|_| {
+                ServerError::BadRequest(format!("unknown label matcher type: {}", matcher.r#type))
+            })?;
+        match match_type {
+            prom_proto::label_matcher::Type::Eq => exact = Some(matcher.value.clone()),
+            prom_proto::label_matcher::Type::Re | prom_proto::label_matcher::Type::Nre => {
+                let re = regex::Regex::new(&format!("^(?s:{})$", matcher.value))
+                    .map_err(|e| ServerError::BadRequest(format!("invalid __name__ regex: {e}")))?;
+                patterns.push((re, match_type == prom_proto::label_matcher::Type::Nre));
+            }
+            prom_proto::label_matcher::Type::Neq => {
+                patterns.push((
+                    regex::Regex::new(&format!("^{}$", regex::escape(&matcher.value)))
+                        .map_err(|e| ServerError::Internal(e.to_string()))?,
+                    true,
+                ));
+            }
+        }
+    }
+
+    if let Some(name) = exact {
+        // An equality matcher pins the measurement; any regex beside it just
+        // has to agree.
+        let keep = patterns.iter().all(|(re, neg)| re.is_match(&name) != *neg);
+        return Ok(if keep { vec![name] } else { Vec::new() });
+    }
+    if patterns.is_empty() {
+        return Err(ServerError::BadRequest(
+            "read query must include a __name__ matcher".into(),
+        ));
+    }
+    let start_ns = query.start_timestamp_ms.saturating_mul(1_000_000);
+    let end_ns = query.end_timestamp_ms.saturating_mul(1_000_000);
+    Ok(
+        crate::namespace::measurements_in(db, namespace, start_ns, end_ns, usize::MAX)
+            .into_iter()
+            .filter(|m| patterns.iter().all(|(re, neg)| re.is_match(m) != *neg))
+            .collect(),
+    )
+}
+
+/// Execute a single Prometheus read query, over every measurement its
+/// `__name__` matchers select.
 fn execute_single_query(
     db: &Arc<Chronix>,
     namespace: Option<&str>,
     query: &prom_proto::Query,
 ) -> Result<Vec<prom_proto::TimeSeries>, ServerError> {
-    // Extract __name__ matcher to determine measurement
-    let mut measurement = None;
+    let mut out = Vec::new();
+    for measurement in resolve_measurements(db, namespace, query)? {
+        out.extend(read_one_measurement(db, namespace, query, &measurement)?);
+    }
+    Ok(out)
+}
+
+/// Read one measurement, applying every matcher.
+fn read_one_measurement(
+    db: &Arc<Chronix>,
+    namespace: Option<&str>,
+    query: &prom_proto::Query,
+    measurement: &str,
+) -> Result<Vec<prom_proto::TimeSeries>, ServerError> {
+    // Equality matchers are pushed into the scan; the rest are applied per
+    // series below. They used to be collected and dropped, behind a comment
+    // claiming a post-filter that did not exist — so `job!="a"` returned
+    // *every* job.
     let mut tag_filters: Vec<(&str, &str)> = Vec::new();
+    let mut post_filters: Vec<PostFilter> = Vec::new();
 
     for matcher in &query.matchers {
-        let match_type = prom_proto::label_matcher::Type::try_from(matcher.r#type)
-            .unwrap_or(prom_proto::label_matcher::Type::Eq);
-
-        if matcher.name == "__name__" && match_type == prom_proto::label_matcher::Type::Eq {
-            measurement = Some(matcher.value.as_str());
-        } else if match_type == prom_proto::label_matcher::Type::Eq {
-            tag_filters.push((&matcher.name, &matcher.value));
+        if matcher.name == "__name__" {
+            continue; // resolved into the measurement list already
         }
-        // NEQ, RE, NRE matchers are handled post-filter
+        let match_type =
+            prom_proto::label_matcher::Type::try_from(matcher.r#type).map_err(|_| {
+                ServerError::BadRequest(format!("unknown label matcher type: {}", matcher.r#type))
+            })?;
+        match match_type {
+            prom_proto::label_matcher::Type::Eq => {
+                tag_filters.push((&matcher.name, &matcher.value));
+            }
+            prom_proto::label_matcher::Type::Neq => post_filters.push(PostFilter {
+                label: matcher.name.clone(),
+                kind: PostFilterKind::NotEqual(matcher.value.clone()),
+            }),
+            prom_proto::label_matcher::Type::Re | prom_proto::label_matcher::Type::Nre => {
+                let re = regex::Regex::new(&format!("^(?s:{})$", matcher.value)).map_err(|e| {
+                    ServerError::BadRequest(format!(
+                        "invalid regex for label {}: {e}",
+                        matcher.name
+                    ))
+                })?;
+                post_filters.push(PostFilter {
+                    label: matcher.name.clone(),
+                    kind: PostFilterKind::Regex {
+                        re,
+                        negated: match_type == prom_proto::label_matcher::Type::Nre,
+                    },
+                });
+            }
+        }
     }
 
-    let measurement = measurement.ok_or_else(|| {
-        ServerError::BadRequest("read query must include __name__ equality matcher".into())
-    })?;
-
-    // Query time range: Prometheus sends milliseconds
-    let start_ns = query.start_timestamp_ms * 1_000_000;
-    let end_ns = query.end_timestamp_ms * 1_000_000;
+    // Query time range: Prometheus sends milliseconds. Saturating, because a
+    // client is free to send a timestamp whose nanoseconds do not fit.
+    let start_ns = query.start_timestamp_ms.saturating_mul(1_000_000);
+    let end_ns = query.end_timestamp_ms.saturating_mul(1_000_000);
 
     let mut builder = db
         .query()
@@ -320,9 +450,16 @@ fn execute_single_query(
         }
     }
 
-    // Convert to TimeSeries
+    // Convert to TimeSeries, applying the matchers the scan could not.
     let mut result = Vec::with_capacity(series_map.len());
-    for (tags, samples) in series_map {
+    for (mut tags, samples) in series_map {
+        // The namespace tag is the server's own bookkeeping. Returning it as
+        // a label told each tenant its own scope name and, worse, made a
+        // round trip through remote write and read change the series.
+        tags.remove(crate::namespace::NAMESPACE_TAG);
+        if !post_filters.iter().all(|f| f.matches(&tags)) {
+            continue;
+        }
         let mut labels = vec![prom_proto::Label {
             name: "__name__".to_string(),
             value: measurement.to_string(),

@@ -377,3 +377,99 @@ async fn forecast_orders_by_its_timestamp_argument() {
     .await;
     assert_eq!(ordered, shuffled, "row delivery order changed the forecast");
 }
+
+/// `auto_forecast` runs the cross-validated selector from SQL: on a clean
+/// seasonal series it must beat the fixed-model `forecast` (SES) by a wide
+/// margin, and — like `forecast` — its answer must not depend on how many
+/// segments the data was flushed into.
+#[tokio::test]
+async fn auto_forecast_selects_a_better_model_than_ses_and_is_layout_independent() {
+    use arrow::array::{Array, ListArray};
+
+    let period = 12usize;
+    let truth =
+        |i: usize| 100.0 + (2.0 * std::f64::consts::PI * i as f64 / period as f64).sin() * 20.0;
+    let horizon = 12usize;
+
+    let mut answers = Vec::new();
+    for flushes in [1usize, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            Chronix::open(
+                ChronixConfig::builder()
+                    .data_dir(dir.path())
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let key = SeriesKey::new("s", tags! { "h" => "a" }).unwrap();
+        let n = 240usize;
+        for chunk in (0..n).collect::<Vec<_>>().chunks(n / flushes) {
+            let pts: Vec<Point> = chunk
+                .iter()
+                .map(|&i| {
+                    Point::new(
+                        key.clone(),
+                        fields! { "v" => truth(i) },
+                        (i as i64) * 60_000_000_000,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert!(db.insert_batch(&pts).unwrap().is_complete());
+            db.flush().unwrap();
+        }
+        let ctx = chronix::sql::create_session_context(db.clone());
+        let extract = |batches: Vec<arrow::record_batch::RecordBatch>| -> Vec<f64> {
+            let list = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let vals = list.value(0);
+            let f = vals
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            (0..f.len()).map(|i| f.value(i)).collect()
+        };
+        let auto = extract(
+            ctx.sql(&format!("SELECT auto_forecast(v, _time, {horizon}) FROM s"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+        );
+        let ses = extract(
+            ctx.sql(&format!("SELECT forecast(v, _time, {horizon}) FROM s"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+        );
+        let err = |f: &[f64]| -> f64 {
+            f.iter()
+                .enumerate()
+                .map(|(h, v)| (v - truth(n + h)).abs())
+                .sum::<f64>()
+                / f.len() as f64
+        };
+        assert!(
+            err(&auto) * 4.0 < err(&ses),
+            "auto {:.2} should beat SES {:.2} on a seasonal series",
+            err(&auto),
+            err(&ses)
+        );
+        answers.push(auto);
+    }
+    assert_eq!(answers[0].len(), horizon);
+    for (a, b) in answers[0].iter().zip(&answers[1]) {
+        assert!(
+            (a - b).abs() < 1e-9,
+            "the forecast depends on segment layout: {a} vs {b}"
+        );
+    }
+}

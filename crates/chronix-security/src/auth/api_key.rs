@@ -65,6 +65,31 @@ pub struct ApiKeyEntry {
     pub expires_at: Option<u64>,
     /// When the key was created (Unix seconds).
     pub created_at: u64,
+    /// Namespaces this key may act in.
+    ///
+    /// Empty means **unrestricted** — the key may name any namespace. That is
+    /// the right default for a single-tenant deployment, where the header is
+    /// always `default` and binding it would be ceremony. It is the wrong
+    /// default for a multi-tenant one, which is why `chronixd` refuses to
+    /// start multi-tenant with an unrestricted key rather than silently
+    /// handing every tenant's data to every key.
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Whether this key may perform administrative operations.
+    ///
+    /// Restore, namespace management and key management are all reachable
+    /// with an ordinary key otherwise, because the Cedar authorization
+    /// engine is optional and its absence used to mean "permit".
+    #[serde(default)]
+    pub admin: bool,
+}
+
+impl ApiKeyEntry {
+    /// Whether this key may act in `namespace`.
+    #[must_use]
+    pub fn allows_namespace(&self, namespace: &str) -> bool {
+        self.namespaces.is_empty() || self.namespaces.iter().any(|n| n == namespace)
+    }
 }
 
 /// In-memory store for API keys with Argon2 hashing.
@@ -161,6 +186,8 @@ impl ApiKeyStore {
             hash,
             expires_at,
             created_at: now,
+            namespaces: Vec::new(),
+            admin: false,
         };
 
         self.keys.insert(name.to_string(), entry);
@@ -170,6 +197,61 @@ impl ApiKeyStore {
             .push(name.to_string());
         debug!(name, "created API key");
         Ok(raw_key)
+    }
+
+    /// Confine an existing key to a set of namespaces.
+    ///
+    /// An empty list leaves the key unrestricted. Returns `false` when no
+    /// key of that name is stored.
+    pub fn bind_namespaces(&mut self, name: &str, namespaces: Vec<String>) -> bool {
+        match self.keys.get_mut(name) {
+            Some(entry) => {
+                entry.namespaces = namespaces;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Grant or revoke the administrative capability on an existing key.
+    ///
+    /// Returns `false` when no key of that name is stored.
+    pub fn set_admin(&mut self, name: &str, admin: bool) -> bool {
+        match self.keys.get_mut(name) {
+            Some(entry) => {
+                entry.admin = admin;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a key carries the administrative capability.
+    #[must_use]
+    pub fn is_admin(&self, name: &str) -> bool {
+        self.keys.get(name).is_some_and(|e| e.admin)
+    }
+
+    /// The namespaces a key is confined to; empty means unrestricted.
+    #[must_use]
+    pub fn namespaces_for(&self, name: &str) -> &[String] {
+        self.keys
+            .get(name)
+            .map_or(&[][..], |entry| entry.namespaces.as_slice())
+    }
+
+    /// Names of keys that may act in **any** namespace.
+    ///
+    /// A multi-tenant server refuses to start while this is non-empty: an
+    /// unconfined key is the whole isolation boundary gone, and it fails
+    /// open, so nothing in normal operation would reveal it.
+    #[must_use]
+    pub fn unconfined_keys(&self) -> Vec<&str> {
+        self.keys
+            .values()
+            .filter(|e| e.namespaces.is_empty())
+            .map(|e| e.name.as_str())
+            .collect()
     }
 
     /// Add a pre-hashed key entry (for loading from config).
@@ -227,6 +309,8 @@ impl ApiKeyStore {
             hash: hash.clone(),
             expires_at,
             created_at: now,
+            namespaces: Vec::new(),
+            admin: false,
         };
 
         // Zeroize the local hash copy now that it is stored in the entry.

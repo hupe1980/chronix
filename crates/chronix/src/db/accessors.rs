@@ -3,6 +3,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::error::{DbError, Result};
 
 use metrics::gauge;
 
@@ -12,7 +15,6 @@ use chronix_engine::memtable::ShardRouter;
 use chronix_engine::wal::WalWriter;
 use chronix_streaming::cdc::{EventBus, FilteredSubscription, SubscriptionFilter};
 
-use crate::error::Result;
 use crate::lock_order::{BloomsLock, CatalogLock, RollupRegistryLock};
 use crate::rollup::RollupRegistry;
 
@@ -21,47 +23,156 @@ use super::{Chronix, DatabaseStatistics};
 impl Chronix {
     /// Register a custom scalar UDF that will be available in SQL queries.
     pub fn register_udf(&self, udf: Arc<datafusion::logical_expr::ScalarUDF>) {
+        *self.sql_ctx.write() = None;
         self.custom_udfs.write().push(udf);
     }
 
     /// Register a custom aggregate UDF that will be available in SQL queries.
     pub fn register_udaf(&self, udaf: Arc<datafusion::logical_expr::AggregateUDF>) {
+        *self.sql_ctx.write() = None;
         self.custom_udafs.write().push(udaf);
     }
 
-    /// Configure ingest-time downsampling rules.
+    /// Run a SQL query and collect the result.
     ///
-    /// Incoming points matching a rule's source measurement will be
-    /// accumulated in memory and emitted as aggregated points to the
-    /// target measurement when a time-bucket boundary is crossed.
+    /// The whole SQL surface — DataFusion with Chronix's measurements as
+    /// tables, `time_bucket`, `rate`, `forecast` and the rest of the
+    /// analytics functions — from one call:
     ///
-    /// Rules follow the same [`RollupConfig`](crate::rollup::RollupConfig)
-    /// format as compaction-time rollups.
-    pub fn set_ingest_downsampling(&mut self, rules: Vec<crate::rollup::RollupConfig>) {
-        self.ingest_downsampler = Arc::new(crate::rollup::IngestDownsampler::new(rules));
+    /// ```no_run
+    /// # use chronix::Chronix;
+    /// # let db = Chronix::open_small("/tmp/db").unwrap();
+    /// let batches = db.sql(
+    ///     "SELECT time_bucket('5m', _time) AS t, avg(usage) FROM cpu GROUP BY t ORDER BY t",
+    /// )?;
+    /// # Ok::<(), chronix::DbError>(())
+    /// ```
+    ///
+    /// Queries are read-only, verified before they are planned: `SET`,
+    /// DDL and `COPY` are rejected, exactly as on the server. Writes go
+    /// through [`insert_batch`](Self::insert_batch).
+    ///
+    /// This call **blocks**: on a private runtime from synchronous code, or
+    /// by stepping the current worker aside on a multi-thread tokio runtime.
+    /// On a current-thread runtime it is an error rather than a deadlock —
+    /// use [`sql_async`](Self::sql_async) there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sql`] for a query that does not parse, plan or
+    /// execute, and [`DbError::Internal`] when called from inside a
+    /// current-thread async runtime.
+    pub fn sql(&self, query: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // On a multi-thread runtime the worker can step aside for the
+            // duration; on a current-thread runtime blocking would deadlock
+            // the only worker, so that is an error rather than a hang.
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                return tokio::task::block_in_place(|| handle.block_on(self.sql_async(query)));
+            }
+            return Err(DbError::Internal(
+                "Chronix::sql() blocks and was called inside a current-thread async runtime; \
+                 use sql_async()"
+                    .into(),
+            ));
+        }
+        let runtime = self.sql_runtime.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread tokio runtime can always be built")
+        });
+        runtime.block_on(self.sql_async(query))
     }
 
-    /// Flush any partial ingest-time downsample accumulators, emitting
-    /// points for incomplete time buckets.
-    pub fn flush_ingest_downsampling(&self) -> Result<usize> {
-        let points = self.ingest_downsampler.flush_all();
-        if points.is_empty() {
-            return Ok(0);
+    /// [`sql`](Self::sql) for async callers.
+    ///
+    /// # Errors
+    ///
+    /// As [`sql`](Self::sql).
+    pub async fn sql_async(&self, query: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        let ctx = self.session_context();
+        let df = crate::sql::sql_read_only(&ctx, query).await?;
+        Ok(df.collect().await?)
+    }
+
+    /// The DataFusion [`SessionContext`](datafusion::execution::context::SessionContext)
+    /// behind [`sql`](Self::sql): every measurement as a table, all
+    /// analytics functions registered. For callers that want DataFusion's
+    /// own API — `DataFrame`, `EXPLAIN`, streaming execution.
+    ///
+    /// Built on first use and shared; rebuilt after
+    /// [`register_udf`](Self::register_udf) / [`register_udaf`](Self::register_udaf).
+    /// Multi-tenant servers scope their own contexts with
+    /// [`create_namespaced_session_context`](crate::sql::create_namespaced_session_context).
+    pub fn session_context(&self) -> datafusion::execution::context::SessionContext {
+        if let Some(ctx) = self.sql_ctx.read().as_ref() {
+            return ctx.clone();
         }
-        // Report what was actually stored, not what was offered: a batch
-        // insert returns `Ok` even when the memtable rejects points (e.g.
-        // too far out of order), so returning `points.len()` claimed success
-        // for writes that never landed.
-        let result = self.insert_batch(&points)?;
-        if result.is_partial() {
-            tracing::warn!(
-                offered = points.len(),
-                inserted = result.memtable_inserted,
-                rejected = result.errors.len(),
-                "ingest downsample flush partially rejected"
-            );
+        let mut slot = self.sql_ctx.write();
+        if let Some(ctx) = slot.as_ref() {
+            return ctx.clone();
         }
-        Ok(result.memtable_inserted)
+        let ctx = crate::sql::create_session_context(Arc::new(self.clone()));
+        *slot = Some(ctx.clone());
+        ctx
+    }
+
+    /// Evaluate a PromQL instant query at `at_ns`.
+    ///
+    /// Measurements are metrics and tags are labels, exactly as
+    /// `chronixd` serves them to Grafana; the evaluator tracks Prometheus
+    /// 3.x semantics.
+    ///
+    /// ```no_run
+    /// # use chronix::Chronix;
+    /// # let db = Chronix::open_small("/tmp/db").unwrap();
+    /// let now = 1_700_000_000_000_000_000;
+    /// let value = db.promql(r#"rate(requests{host="a"}[5m])"#, now)?;
+    /// # Ok::<(), chronix::DbError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::PromQl`] for a query that does not parse or
+    /// evaluate.
+    pub fn promql(&self, query: &str, at_ns: i64) -> Result<crate::promql::ast::PromQLValue> {
+        let expr = crate::promql::parse(query).map_err(|e| DbError::PromQl(e.to_string()))?;
+        let params = crate::promql::eval::QueryParams {
+            time: at_ns,
+            ..Default::default()
+        };
+        crate::promql::PromQLEvaluator::new(Arc::new(self.clone()))
+            .instant_query(&expr, &params)
+            .map_err(|e| DbError::PromQl(e.0))
+    }
+
+    /// Evaluate a PromQL range query over `[start_ns, end_ns]` at `step_ns`.
+    ///
+    /// The result is one series per label set, one sample per step; the
+    /// window is read once, not once per step.
+    ///
+    /// # Errors
+    ///
+    /// As [`promql`](Self::promql); a non-positive step is an error.
+    pub fn promql_range(
+        &self,
+        query: &str,
+        start_ns: i64,
+        end_ns: i64,
+        step_ns: i64,
+    ) -> Result<crate::promql::ast::PromQLValue> {
+        let expr = crate::promql::parse(query).map_err(|e| DbError::PromQl(e.to_string()))?;
+        let params = crate::promql::eval::QueryParams {
+            time: end_ns,
+            start: Some(start_ns),
+            end: Some(end_ns),
+            step: Some(step_ns),
+            ..Default::default()
+        };
+        crate::promql::PromQLEvaluator::new(Arc::new(self.clone()))
+            .range_query(&expr, &params)
+            .map_err(|e| DbError::PromQl(e.0))
     }
 
     /// Return a snapshot of all runtime-registered scalar UDFs.
@@ -124,6 +235,9 @@ impl Chronix {
             ti.len()
         };
         let memtable_memory_bytes = self.shards.total_memory();
+        let interner_memory_bytes = self.shards.total_interner_memory();
+        let wal_buffer_bytes = self.wal.memory_bytes();
+        let catalog_memory_bytes = self.catalog.read().memory_bytes();
         let measurement_count = self.schema.measurement_count();
         let wal_sequence = self.wal.current_sequence();
         let tombstone_count = {
@@ -137,20 +251,92 @@ impl Chronix {
         gauge!("chronix_segment_count").set(segment_count as f64);
         gauge!("chronix_shard_count").set(shard_count as f64);
         gauge!("chronix_memtable_memory_bytes").set(memtable_memory_bytes as f64);
+        gauge!("chronix_interner_memory_bytes").set(interner_memory_bytes as f64);
+        gauge!("chronix_wal_buffer_bytes").set(wal_buffer_bytes as f64);
+        gauge!("chronix_catalog_memory_bytes").set(catalog_memory_bytes as f64);
         gauge!("chronix_measurement_count").set(measurement_count as f64);
         gauge!("chronix_wal_sequence").set(wal_sequence as f64);
         gauge!("chronix_tombstone_count").set(tombstone_count as f64);
         gauge!("chronix_metadata_cache_entries").set(metadata_cache_entries as f64);
+        gauge!("chronix_storage_disk_usage_bytes").set(self.disk_usage_bytes() as f64);
 
         DatabaseStatistics {
             series_count,
             segment_count,
             shard_count,
             memtable_memory_bytes,
+            interner_memory_bytes,
+            wal_buffer_bytes,
+            catalog_memory_bytes,
             measurement_count,
             wal_sequence,
             tombstone_count,
             metadata_cache_entries,
+        }
+    }
+
+    /// Bytes the database occupies on disk, cached for a minute.
+    ///
+    /// Disk usage is the storage number an operator actually alerts on, and
+    /// nothing exported it. It needs a directory walk, so the result is
+    /// cached: `statistics()` runs on every metrics scrape, and a walk per
+    /// scrape would make the exporter the most expensive thing in the
+    /// process once a deployment holds many segments.
+    #[must_use]
+    pub fn disk_usage_bytes(&self) -> u64 {
+        const TTL: Duration = Duration::from_secs(60);
+
+        {
+            let cached = self.disk_usage.read();
+            if let Some((measured_at, bytes)) = *cached {
+                if measured_at.elapsed() < TTL {
+                    return bytes;
+                }
+            }
+        }
+
+        let bytes = directory_size(self.data_dir());
+        *self.disk_usage.write() = Some((Instant::now(), bytes));
+        bytes
+    }
+
+    /// Measurement names this namespace holds series for.
+    ///
+    /// `None` means unscoped — every measurement, which is what a
+    /// single-tenant deployment wants and what the embedded API always
+    /// wants.
+    ///
+    /// The SQL catalog answers from this rather than from the process-wide
+    /// schema registry, which listed **every** tenant's measurement names:
+    /// `SELECT * FROM another_tenants_measurement` returned zero rows where a
+    /// name that does not exist errors, so a tenant could enumerate the
+    /// others by probing.
+    #[must_use]
+    pub fn measurement_names_in(&self, namespace: Option<&str>) -> Vec<String> {
+        let Some(namespace) = namespace else {
+            return self.schema.measurement_names();
+        };
+        let mut names: Vec<String> = self
+            .namespace_measurements
+            .get(namespace)
+            .map(|set| set.iter().map(|m| m.clone()).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        names
+    }
+
+    /// Whether `namespace` holds any series of `measurement`.
+    ///
+    /// `None` means unscoped, and then only the measurement's existence
+    /// matters.
+    #[must_use]
+    pub fn has_measurement_in(&self, namespace: Option<&str>, measurement: &str) -> bool {
+        match namespace {
+            None => self.schema(measurement).is_some(),
+            Some(namespace) => self
+                .namespace_measurements
+                .get(namespace)
+                .is_some_and(|set| set.contains(measurement)),
         }
     }
 
@@ -160,21 +346,20 @@ impl Chronix {
         &self.wal
     }
 
-    /// Return the flush notification handle.
-    ///
-    /// The [`FlushScheduler`](crate::flush_scheduler::FlushScheduler)
-    /// can call `set_flush_notify` to wire
-    /// in its own `Notify`, then the write path's `maybe_flush()` will
-    /// signal it instead of flushing inline.
-    #[must_use]
-    pub fn flush_notify(&self) -> &Arc<tokio::sync::Notify> {
-        &self.flush_notify
-    }
-
     /// Return the path to the data directory.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.config.data_dir
+    }
+
+    /// Number of WAL records `open()` replayed into the memtable.
+    ///
+    /// Zero after a graceful `close()`: everything acknowledged was already
+    /// in a segment, and the catalog records the WAL floor so replay has
+    /// nothing to do.
+    #[must_use]
+    pub fn wal_replayed_records(&self) -> usize {
+        self.replayed_records
     }
 
     /// Return the current WAL sequence number.
@@ -247,4 +432,83 @@ impl Chronix {
     pub fn rollup_registry(&self) -> &Arc<RollupRegistryLock<RollupRegistry>> {
         &self.rollup_registry
     }
+}
+
+/// Total size of every regular file under `root`, following no symlinks.
+///
+/// Errors are skipped rather than propagated: a file that vanished
+/// mid-walk (a compaction finishing) is normal, and a disk-usage figure
+/// that is a little stale is more useful than none.
+fn directory_size(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Build the namespace → measurements index from a set of canonical series
+/// keys.
+///
+/// A canonical key is `measurement\0k1\0v1\0k2\0v2…` with the tags sorted,
+/// so both halves are already here — the index only makes the lookup cheap
+/// enough for the SQL planner to ask on every table reference.
+pub(super) fn index_by_namespace(
+    known_series: &dashmap::DashSet<String>,
+) -> dashmap::DashMap<String, dashmap::DashSet<String>> {
+    let index = dashmap::DashMap::new();
+    for key in known_series.iter() {
+        record_series(&index, key.as_str());
+    }
+    index
+}
+
+/// Record one canonical series key in the index.
+pub(super) fn record_series(
+    index: &dashmap::DashMap<String, dashmap::DashSet<String>>,
+    canonical: &str,
+) {
+    let Some((measurement, namespace)) = split_canonical(canonical) else {
+        return;
+    };
+    index
+        .entry(namespace.to_string())
+        .or_default()
+        .insert(measurement.to_string());
+}
+
+/// The measurement and namespace of a canonical series key.
+///
+/// A canonical key is `measurement` then, for each tag in sorted key order,
+/// [`TAG_SEPARATOR`], the key, [`KV_SEPARATOR`], the value. Both separators
+/// are control characters that [`SeriesKey::validate_name`] rejects in user
+/// data, so splitting on them is unambiguous.
+///
+/// The namespace is `""` when the series carries no namespace tag, which is
+/// every series on a single-tenant deployment.
+///
+/// [`TAG_SEPARATOR`]: chronix_core::TAG_SEPARATOR
+/// [`KV_SEPARATOR`]: chronix_core::KV_SEPARATOR
+/// [`SeriesKey::validate_name`]: chronix_core::SeriesKey::validate_name
+fn split_canonical(canonical: &str) -> Option<(&str, &str)> {
+    let mut parts = canonical.split(chronix_core::TAG_SEPARATOR);
+    let measurement = parts.next()?;
+    let namespace = parts
+        .find_map(|tag| {
+            let (key, value) = tag.split_once(chronix_core::KV_SEPARATOR)?;
+            (key == chronix_core::NAMESPACE_TAG).then_some(value)
+        })
+        .unwrap_or("");
+    Some((measurement, namespace))
 }

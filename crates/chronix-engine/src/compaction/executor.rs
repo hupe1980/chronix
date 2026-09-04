@@ -175,6 +175,7 @@ impl CompactionExecutor {
                 )));
             }
         }
+        let segment_ids: Vec<u64> = sorted_entries.iter().map(|e| e.segment_id.0).collect();
         let mut all_batches: Vec<RecordBatch> = Vec::new();
         let mut loaded_bytes: u64 = 0;
         for entry in &sorted_entries {
@@ -296,6 +297,7 @@ impl CompactionExecutor {
             &canonical_ids,
             &canonicals,
             tombstones,
+            &segment_ids,
         );
 
         // 8. Build SORTED output directly from source batches (no
@@ -356,6 +358,7 @@ impl CompactionExecutor {
                 max_timestamp: 0,
                 row_count: 0,
                 series_count: 0,
+                series_keys: Vec::new(),
                 byte_size: 0,
                 row_group_count: 0,
                 column_count: 0,
@@ -708,7 +711,7 @@ impl PartialOrd for MergeEntry {
 /// tuples, only the row from the newest segment (highest `segment_ord`) is
 /// emitted — achieving last-write-wins semantics.
 ///
-/// Tombstoned series (canonicals in the `tombstones` set) are skipped.
+/// Rows masked by a tombstone issued against their segment are skipped.
 ///
 /// Returns a streaming iterator that yields one global
 /// index at a time instead of materializing the entire merged result.
@@ -721,6 +724,9 @@ struct KWayMergeIter<'a> {
     canonicals: &'a [String],
     /// TombstoneSet supports both full-series and ranged deletes.
     tombstones: &'a TombstoneSet,
+    /// The catalog id of each stream's segment: a tombstone masks a row
+    /// only if it was issued against the segment the row comes from.
+    segment_ids: &'a [u64],
     positions: Vec<usize>,
     heap: BinaryHeap<Reverse<MergeEntry>>,
 }
@@ -733,6 +739,7 @@ impl<'a> KWayMergeIter<'a> {
         canonical_ids: &'a [u32],
         canonicals: &'a [String],
         tombstones: &'a TombstoneSet,
+        segment_ids: &'a [u64],
     ) -> Self {
         let k = segment_streams.len();
         let mut positions = vec![0usize; k];
@@ -759,6 +766,7 @@ impl<'a> KWayMergeIter<'a> {
             canonical_ids,
             canonicals,
             tombstones,
+            segment_ids,
             positions,
             heap,
         }
@@ -789,9 +797,10 @@ impl Iterator for KWayMergeIter<'_> {
             }
 
             // Check ranged tombstones — supports both full-series and time-range deletes.
-            if self.tombstones.is_tombstoned(
+            if self.tombstones.is_tombstoned_in(
                 &self.canonicals[entry.global_idx],
                 self.timestamps[entry.global_idx],
+                self.segment_ids[entry.stream_idx],
             ) {
                 continue;
             }
@@ -960,9 +969,10 @@ mod tests {
         )
         .unwrap();
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(chronix_core::Tombstone::all_time(
-            srv1_key.canonical_form().to_string(),
-        ));
+        tombstones.insert(
+            chronix_core::Tombstone::all_time(srv1_key.canonical_form().to_string())
+                .with_segments(0..1000),
+        );
 
         let task = CompactionTask {
             shard_id: ShardId(0),
@@ -1385,9 +1395,10 @@ mod tests {
         )
         .unwrap();
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(chronix_core::Tombstone::all_time(
-            srv1_key.canonical_form().to_string(),
-        ));
+        tombstones.insert(
+            chronix_core::Tombstone::all_time(srv1_key.canonical_form().to_string())
+                .with_segments(0..1000),
+        );
 
         let task = CompactionTask {
             shard_id: ShardId(0),
@@ -1442,9 +1453,10 @@ mod tests {
         )
         .unwrap();
         let mut tombstones = TombstoneSet::new();
-        tombstones.insert(chronix_core::Tombstone::all_time(
-            srv1_key.canonical_form().to_string(),
-        ));
+        tombstones.insert(
+            chronix_core::Tombstone::all_time(srv1_key.canonical_form().to_string())
+                .with_segments(0..1000),
+        );
 
         let task = CompactionTask {
             shard_id: ShardId(0),

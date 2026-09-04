@@ -95,12 +95,8 @@ impl super::Chronix {
                         "Failed to delete segment file"
                     );
                 }
-                // Remove bloom sidecar file (best-effort)
-                let bloom_path = entry.path.with_extension("bloom");
-                if let Err(e) = std::fs::remove_file(&bloom_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!(path = %bloom_path.display(), error = %e, "failed to remove bloom sidecar");
-                    }
+                if let Err(e) = chronix_engine::index::series_index::remove(&entry.path) {
+                    warn!(path = %entry.path.display(), error = %e, "failed to remove series index");
                 }
                 // Remove from catalog manifest
                 catalog.remove_segment(entry.segment_id)?;
@@ -203,14 +199,10 @@ impl super::Chronix {
     /// a tombstone's segments remains, no stored row can still match it and
     /// the tombstone is provably dead.
     ///
-    /// Two weaker rules sat here before, and both resurrected data.
-    /// The first dropped a tombstone once its series had left `known_series`,
-    /// which the delete itself had just arranged — so it fired after the *next*
-    /// compaction pass regardless of whether that pass had touched the
-    /// segments holding the deleted rows. The second dropped a tombstone once
-    /// its measurement had no active segments, which is sound but never true
-    /// for a measurement that is still being written to. Neither asked the
-    /// question that matters: has the delete been materialised?
+    /// The question that matters is whether the delete has been
+    /// *materialised* — not whether the series is still known, nor whether
+    /// the measurement has active segments. Either weaker rule resurrects
+    /// data.
     ///
     /// Returns the number of tombstones reclaimed.
     pub fn gc_tombstones(&self) -> usize {
@@ -270,8 +262,7 @@ impl super::Chronix {
     /// appended to the catalog manifest and fsynced. They are logged to the
     /// data WAL as well, so a point-in-time restore replays them, but the
     /// catalog is what makes the delete survive a restart — the data WAL is
-    /// truncated once the memtable it covers has been flushed, and it used to
-    /// take every delete older than that flush with it.
+    /// truncated once the memtable it covers has been flushed.
     ///
     /// # Errors
     ///
@@ -424,19 +415,22 @@ impl super::Chronix {
             // middle leaves a database that has either applied the delete or
             // not seen it — never one that shows it and forgets it on restart.
             //
-            // The catalog append is the durable record; the WAL entry exists
-            // so that a point-in-time restore from a base backup replays the
-            // delete rather than silently resurrecting the rows.
+            // The catalog append is the durable record, and it goes first:
+            // the WAL floor is raised by any concurrent flush, and a WAL
+            // record below the floor is never replayed, so nothing may
+            // depend on the WAL entry for recovery. It exists so that a
+            // point-in-time restore from a base backup replays the delete
+            // rather than silently resurrecting the rows.
+            self.catalog
+                .write()
+                .record_tombstones(&tombstones)
+                .map_err(|e| DbError::Internal(format!("Failed to persist tombstones: {e}")))?;
+
             let payload = wal_encode(&WalEntry::Delete {
                 tombstones: tombstones.clone(),
             })
             .map_err(|e| DbError::Internal(format!("Failed to serialize WAL entry: {e}")))?;
             self.wal.append_durable(&payload)?;
-
-            self.catalog
-                .write()
-                .record_tombstones(&tombstones)
-                .map_err(|e| DbError::Internal(format!("Failed to persist tombstones: {e}")))?;
 
             {
                 let mut live = self.tombstones.write();
@@ -462,6 +456,37 @@ impl super::Chronix {
                     self.known_series.remove(canonical.as_str());
                 }
                 self.lvc.evict_by_key(key);
+            }
+            // A delete changes what every rollup fed by this measurement
+            // should say. The buckets it touched are recomputed by the next
+            // pass — which deletes the stale aggregates and writes the new
+            // ones — so a deletion request reaches the derived tiers too,
+            // rather than leaving the deleted rows summarised for ever.
+            {
+                let changed = self.rollup_registry.write().invalidate_source_range(
+                    measurement,
+                    start,
+                    end.saturating_add(1),
+                );
+                let states = self.snapshot_rollup_states(&changed);
+                if let Err(e) = self.persist_rollup_states(&states) {
+                    warn!(error = %e, "could not persist rollup invalidations after a delete");
+                }
+            }
+
+            // The budget is rebuilt from the sidecars at open, so they have
+            // to forget the series too — or the count came back at every
+            // restart and the limit refused the replacement device.
+            if covers_whole_series {
+                let gone: std::collections::HashSet<&str> =
+                    matched.keys().map(String::as_str).collect();
+                for entry in &entries {
+                    if let Err(e) =
+                        chronix_engine::index::series_index::remove_series(&entry.path, &gone)
+                    {
+                        warn!(segment = %entry.path.display(), error = %e, "could not rewrite the series index after a delete");
+                    }
+                }
             }
         }
 

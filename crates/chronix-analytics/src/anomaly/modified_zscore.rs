@@ -1,7 +1,9 @@
 //! Modified Z-Score detector using Median Absolute Deviation (MAD).
 
 use crate::anomaly::error::AnomalyError;
-use crate::anomaly::traits::{validate_lengths, AnomalyDetector, AnomalyScore, DetectorType};
+use crate::anomaly::traits::{
+    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+};
 
 /// MAD-based detector robust to outliers in training data.
 ///
@@ -11,6 +13,9 @@ pub struct ModifiedZScoreDetector {
     threshold: f64,
     median: f64,
     mad: f64,
+    /// Mean absolute deviation about the median, the fallback scale when the
+    /// MAD is exactly zero.
+    mean_ad: f64,
     fitted: bool,
 }
 
@@ -21,6 +26,7 @@ impl ModifiedZScoreDetector {
             threshold: threshold.unwrap_or(3.5),
             median: 0.0,
             mad: 0.0,
+            mean_ad: 0.0,
             fitted: false,
         }
     }
@@ -35,20 +41,32 @@ impl ModifiedZScoreDetector {
         }
     }
 
+    /// Iglewicz & Hoaglin (1993), *How to Detect and Handle Outliers*, §3.
+    ///
+    /// The primary statistic is `M_i = 0.6745·(x − x̃)/MAD`. On **quantised**
+    /// data — a 0.5 °C thermostat, a percentage rounded to whole numbers, an
+    /// integer counter — more than half the sample can equal the median, and
+    /// then the MAD is *exactly* zero: a real and common case, not a
+    /// degenerate one. Dividing by a `1e-12` floor there gave the value one
+    /// quantisation step away a modified z-score of ~1e7, so the detector
+    /// flagged the ordinary neighbouring bucket as an extreme outlier.
+    ///
+    /// Iglewicz & Hoaglin give the alternative for exactly this case:
+    /// `M_i = (x − x̃)/(1.253314·MeanAD)`, where `MeanAD` is the *mean*
+    /// absolute deviation about the median, whose expectation is `σ/1.253314`
+    /// for normal data — hence the constant, and hence no `0.6745` factor
+    /// here. Only when both dispersion estimates are zero (a genuinely
+    /// constant sample) does the relative floor apply.
     #[inline]
     fn score_value(&self, value: f64) -> f64 {
-        // When MAD ≈ 0 (constant training data), use a floor proportional
-        // to the median's magnitude so that only values genuinely different
-        // from the training distribution are flagged, and tiny float-rounding
-        // differences are not.
-        let effective_mad = if self.mad < 1e-15 {
-            // Floor: max(|median| * f64::EPSILON * 1e6, 1e-12)
-            // This absorbs rounding noise while still catching real shifts.
-            (self.median.abs() * f64::EPSILON * 1e6).max(1e-12)
+        let dev = value - self.median;
+        if self.mad > 0.0 {
+            (0.6745 * dev / self.mad).abs()
+        } else if self.mean_ad > 0.0 {
+            (dev / (1.253_314 * self.mean_ad)).abs()
         } else {
-            self.mad
-        };
-        (0.6745 * (value - self.median) / effective_mad).abs()
+            (0.6745 * dev / scale_floor(0.0, self.median)).abs()
+        }
     }
 
     #[inline]
@@ -70,6 +88,7 @@ impl AnomalyDetector for ModifiedZScoreDetector {
         let mut sorted = values.to_vec();
         self.median = Self::compute_median(&mut sorted);
         let mut deviations: Vec<f64> = values.iter().map(|&v| (v - self.median).abs()).collect();
+        self.mean_ad = deviations.iter().sum::<f64>() / deviations.len() as f64;
         self.mad = Self::compute_median(&mut deviations);
         self.fitted = true;
         metrics::histogram!("chronix_anomaly_fit_duration_seconds", "method" => "modified_zscore")

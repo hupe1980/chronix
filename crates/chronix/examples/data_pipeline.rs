@@ -33,6 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enable_metric_delivery: true,
         audit_memory_capacity: 1_000,
         forecast_horizon: 5,
+
+        ..PipelineConfig::default()
     };
 
     let pipeline = Arc::new(Pipeline::with_config(pipeline_config));

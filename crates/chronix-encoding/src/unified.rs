@@ -33,34 +33,97 @@ use crate::rle::{RleDecoder, RleEncoder};
 // EncodingType
 // ---------------------------------------------------------------------------
 
-/// Discriminant tag stored as the first byte of every [`EncodedBlock`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum EncodingType {
+/// Declare [`EncodingType`] once and derive everything that must stay in
+/// step with it.
+///
+/// Three things have to agree for the format to be safe: the variant list,
+/// the `u8` tag the reader maps back to it, and the codec list the fuzzer
+/// walks. Written out three times, a new codec can be added to one and
+/// forgotten in the others — and forgetting the fuzz list fails silently
+/// (the decoder is simply never fuzzed) rather than at compile time. So the
+/// enum, `from_tag`, `tag`, `Display` and `ALL` are all generated from this
+/// single list, and `ALL` is what the fuzz target iterates. Adding a variant
+/// here is the only edit a new codec needs.
+macro_rules! encoding_types {
+    ($(
+        $(#[$meta:meta])*
+        $variant:ident = $tag:literal, $name:literal;
+    )+) => {
+        /// Discriminant tag stored as the first byte of every [`EncodedBlock`].
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u8)]
+        pub enum EncodingType {
+            $(
+                $(#[$meta])*
+                $variant = $tag,
+            )+
+        }
+
+        impl EncodingType {
+            /// Every encoding type, in tag order.
+            ///
+            /// Complete by construction — generated from the same list as
+            /// the enum itself, so a codec cannot be added without appearing
+            /// here, and therefore in the fuzz corpus.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// Convert a `u8` tag to an `EncodingType`.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`EncodingError::UnsupportedEncoding`] for unknown tags.
+            pub fn from_tag(tag: u8) -> Result<Self> {
+                match tag {
+                    $($tag => Ok(Self::$variant),)+
+                    other => Err(EncodingError::UnsupportedEncoding { tag: other }),
+                }
+            }
+
+            /// Return the `u8` discriminant.
+            #[must_use]
+            pub fn tag(self) -> u8 {
+                self as u8
+            }
+        }
+
+        impl std::fmt::Display for EncodingType {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(match self {
+                    $(Self::$variant => $name,)+
+                })
+            }
+        }
+    };
+}
+
+encoding_types! {
     /// Delta-of-delta for timestamps.
-    DeltaOfDelta = 0,
+    ///
+    /// Kept as a selectable codec — it still wins on a perfect metronome —
+    /// but no longer the default: see [`ColumnEncoder::encode_timestamps`].
+    DeltaOfDelta = 0, "delta-of-delta";
     /// Chimp XOR for floats.
-    Chimp = 1,
+    Chimp = 1, "chimp";
     /// Gorilla XOR for floats.
-    Gorilla = 2,
+    Gorilla = 2, "gorilla";
     /// Delta + `ZigZag` for i64.
-    IntegerI64 = 3,
+    IntegerI64 = 3, "integer-i64";
     /// Delta + `ZigZag` for u64.
-    IntegerU64 = 4,
+    IntegerU64 = 4, "integer-u64";
     /// Dictionary encoding for strings.
-    Dictionary = 5,
+    Dictionary = 5, "dictionary";
     /// Bitmap for booleans.
-    Bitmap = 6,
+    Bitmap = 6, "bitmap";
     /// Plain f64.
-    PlainF64 = 7,
+    PlainF64 = 7, "plain-f64";
     /// Plain i64.
-    PlainI64 = 8,
+    PlainI64 = 8, "plain-i64";
     /// Plain u64.
-    PlainU64 = 9,
+    PlainU64 = 9, "plain-u64";
     /// Plain bool.
-    PlainBool = 10,
+    PlainBool = 10, "plain-bool";
     /// Plain string.
-    PlainString = 11,
+    PlainString = 11, "plain-string";
     /// Nullable wrapper — validity bitmap + inner encoded payload.
     ///
     /// Payload format:
@@ -69,99 +132,38 @@ pub enum EncodingType {
     /// ```
     /// Bit `1` in the validity bitmap means the value is present; `0` means null.
     /// Only non-null values are encoded in `inner_payload`.
-    Nullable = 12,
+    Nullable = 12, "nullable";
     /// Run-length encoding for columns with repeated consecutive values.
-    Rle = 13,
+    Rle = 13, "rle";
     /// Delta + ZigZag + LEB128 varint for i64.
     ///
     /// Better than [`IntegerI64`](Self::IntegerI64) for sparse or highly
     /// variable data where most deltas are small but occasional outliers
     /// would inflate the fixed bit width.
-    VarintI64 = 14,
+    VarintI64 = 14, "varint-i64";
     /// Delta + ZigZag + LEB128 varint for u64.
-    VarintU64 = 15,
+    VarintU64 = 15, "varint-u64";
     /// Chimp128 ring-buffer XOR for floats.
-    Chimp128 = 16,
+    Chimp128 = 16, "chimp128";
     /// Frame-of-Reference for narrow-range integers.
-    ForI64 = 17,
+    ForI64 = 17, "for-i64";
     /// Frame-of-Reference for narrow-range unsigned integers.
-    ForU64 = 18,
+    ForU64 = 18, "for-u64";
     /// Patas byte-aligned XOR for floats (VLDB 2023).
-    Patas = 19,
+    Patas = 19, "patas";
     /// ALP adaptive lossless floating-point compression (SIGMOD 2024).
     ///
-    /// The default choice for `f64` columns whose values originated as
-    /// decimals — which most sensor, meter and price data does. See
-    /// [`crate::alp`].
-    Alp = 20,
-}
-
-impl EncodingType {
-    /// Convert a `u8` tag to an `EncodingType`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodingError::UnsupportedEncoding`] for unknown tags.
-    pub fn from_tag(tag: u8) -> Result<Self> {
-        match tag {
-            0 => Ok(Self::DeltaOfDelta),
-            1 => Ok(Self::Chimp),
-            2 => Ok(Self::Gorilla),
-            3 => Ok(Self::IntegerI64),
-            4 => Ok(Self::IntegerU64),
-            5 => Ok(Self::Dictionary),
-            6 => Ok(Self::Bitmap),
-            7 => Ok(Self::PlainF64),
-            8 => Ok(Self::PlainI64),
-            9 => Ok(Self::PlainU64),
-            10 => Ok(Self::PlainBool),
-            11 => Ok(Self::PlainString),
-            12 => Ok(Self::Nullable),
-            13 => Ok(Self::Rle),
-            14 => Ok(Self::VarintI64),
-            15 => Ok(Self::VarintU64),
-            16 => Ok(Self::Chimp128),
-            17 => Ok(Self::ForI64),
-            18 => Ok(Self::ForU64),
-            19 => Ok(Self::Patas),
-            20 => Ok(Self::Alp),
-            other => Err(EncodingError::UnsupportedEncoding { tag: other }),
-        }
-    }
-
-    /// Return the `u8` discriminant.
-    #[must_use]
-    pub fn tag(self) -> u8 {
-        self as u8
-    }
-}
-
-impl std::fmt::Display for EncodingType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::DeltaOfDelta => "delta-of-delta",
-            Self::Chimp => "chimp",
-            Self::Gorilla => "gorilla",
-            Self::IntegerI64 => "integer-i64",
-            Self::IntegerU64 => "integer-u64",
-            Self::Dictionary => "dictionary",
-            Self::Bitmap => "bitmap",
-            Self::PlainF64 => "plain-f64",
-            Self::PlainI64 => "plain-i64",
-            Self::PlainU64 => "plain-u64",
-            Self::PlainBool => "plain-bool",
-            Self::PlainString => "plain-string",
-            Self::Rle => "rle",
-            Self::Nullable => "nullable",
-            Self::VarintI64 => "varint-i64",
-            Self::VarintU64 => "varint-u64",
-            Self::Chimp128 => "chimp128",
-            Self::ForI64 => "for-i64",
-            Self::ForU64 => "for-u64",
-            Self::Patas => "patas",
-            Self::Alp => "alp",
-        })
-    }
+    /// A second opinion behind [`Pco`](Self::Pco) for `f64` columns whose
+    /// values originated as decimals — which most sensor, meter and price
+    /// data does. See [`crate::alp`].
+    Alp = 20, "alp";
+    /// Pcodec for floats (Loncaric 2025): mode recovery, delta, binned ANS.
+    /// Leads every float candidate list — see [`crate::pco`].
+    Pco = 21, "pco";
+    /// Pcodec for signed integers, and the default timestamp codec.
+    PcoI64 = 22, "pco_i64";
+    /// Pcodec for unsigned integers.
+    PcoU64 = 23, "pco_u64";
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +217,31 @@ impl EncodedBlock {
 const MIN_COMPRESSION_RATIO: f64 = 1.5;
 
 // ---------------------------------------------------------------------------
+// TimestampEncoding
+// ---------------------------------------------------------------------------
+
+/// Which codec [`ColumnEncoder::encode_timestamps_with`] should use.
+///
+/// The float equivalent lives in `chronix_core::config::FloatEncoding`
+/// because it is a user-facing knob; this one is not (yet) reachable from
+/// configuration, and exists so the codec that lost the default can still be
+/// produced on demand — by the tests that measure it, by a tool that has to
+/// write a segment in the old shape, and by anyone re-running the comparison
+/// when pco next changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampEncoding {
+    /// Trial-encode pco and delta-of-delta, keep the smaller, ties to pco.
+    #[default]
+    Auto,
+    /// Always Pcodec ([`EncodingType::PcoI64`]).
+    Pco,
+    /// Always delta-of-delta ([`EncodingType::DeltaOfDelta`]).
+    DeltaOfDelta,
+    /// No compression ([`EncodingType::PlainI64`]).
+    Plain,
+}
+
+// ---------------------------------------------------------------------------
 // ColumnEncoder
 // ---------------------------------------------------------------------------
 
@@ -235,19 +262,87 @@ pub struct ColumnEncoder;
 impl ColumnEncoder {
     /// Encode a timestamp column (sorted i64 nanoseconds).
     ///
-    /// Uses delta-of-delta, falling back to plain if compression is poor.
+    /// Defaults to [`TimestampEncoding::Auto`]: pco leads, delta-of-delta is
+    /// tried as a second opinion, and the smaller block wins. See
+    /// [`encode_timestamps_with`](Self::encode_timestamps_with) for why.
     ///
     /// # Errors
     ///
     /// Returns an error if the input is empty.
     pub fn encode_timestamps(values: &[i64]) -> Result<EncodedBlock> {
+        Self::encode_timestamps_with(values, TimestampEncoding::Auto)
+    }
+
+    /// Encode a timestamp column with an explicit codec choice.
+    ///
+    /// # Why pco leads
+    ///
+    /// Delta-of-delta was the default here for as long as this crate has
+    /// existed, on the strength of its behaviour on a metronome: a perfectly
+    /// regular cadence makes every second difference zero and DoD reaches
+    /// ~63× (and the raw codec, without the block tag, over 1000×). Real
+    /// gateways do not produce metronomes. A userspace sampler on a 1 s
+    /// cadence jitters by milliseconds, and DoD costs a varint for every
+    /// non-zero second difference — on ±5 ms jitter it reaches **0.9×**,
+    /// i.e. it makes the column *larger* than storing the raw `i64`s.
+    /// pco entropy-codes the deltas against learned bins and reaches 2.7×
+    /// on the same data, which is within 2% of the Shannon bound for that
+    /// jitter (uniform over 10 ms of nanoseconds is 23.25 bits of genuine
+    /// information per sample; pco spends 23.7).
+    ///
+    /// pco is not merely better on the ragged shapes — it wins on all four
+    /// measured shapes, including the metronome (1092× against DoD's 63×),
+    /// so there is no shape for which DoD is kept as the default. It stays
+    /// *selectable* because a decoder for it must exist for as long as any
+    /// segment on disk contains a DoD block, and because a codec that can
+    /// be re-selected is a codec whose replacement can be measured.
+    /// `tests/timestamp_codec_check.rs` is the table.
+    ///
+    /// [`Auto`](TimestampEncoding::Auto) still trial-encodes both and keeps
+    /// the smaller: pco winning every shape we thought to measure is not the
+    /// same as pco winning every shape, and one extra encode of a column we
+    /// are already encoding is cheap insurance against a shape we did not
+    /// think of.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is empty.
+    pub fn encode_timestamps_with(
+        values: &[i64],
+        strategy: TimestampEncoding,
+    ) -> Result<EncodedBlock> {
         let raw_size = values.len() * 8;
-        let payload = DeltaOfDeltaEncoder::encode(values)?;
+
+        let (encoding, payload) = match strategy {
+            TimestampEncoding::Plain => {
+                return Ok(EncodedBlock {
+                    encoding: EncodingType::PlainI64,
+                    payload: PlainEncoder::encode_i64(values)?,
+                })
+            }
+            TimestampEncoding::DeltaOfDelta => (
+                EncodingType::DeltaOfDelta,
+                DeltaOfDeltaEncoder::encode(values)?,
+            ),
+            TimestampEncoding::Pco => (
+                EncodingType::PcoI64,
+                crate::pco::PcoEncoder::encode_timestamps(values)?,
+            ),
+            TimestampEncoding::Auto => {
+                let pco = crate::pco::PcoEncoder::encode_timestamps(values)?;
+                let dod = DeltaOfDeltaEncoder::encode(values)?;
+                // Ties go to pco: it is the default, and a tie on size is a
+                // win on decode speed.
+                if dod.len() < pco.len() {
+                    (EncodingType::DeltaOfDelta, dod)
+                } else {
+                    (EncodingType::PcoI64, pco)
+                }
+            }
+        };
+
         if should_use_specialized(&payload, raw_size) {
-            Ok(EncodedBlock {
-                encoding: EncodingType::DeltaOfDelta,
-                payload,
-            })
+            Ok(EncodedBlock { encoding, payload })
         } else {
             Ok(EncodedBlock {
                 encoding: EncodingType::PlainI64,
@@ -322,12 +417,12 @@ impl ColumnEncoder {
 
         let raw_size = values.len() * 8;
 
-        // Trial-encode with all integer encoders including FOR.
+        // Trial-encode with every integer encoder and keep the smallest.
         let fixed_payload = IntegerEncoder::encode_i64(values)?;
         let varint_payload = VarintEncoder::encode_i64(values)?;
         let for_payload = ForEncoder::encode_i64(values)?;
+        let pco_payload = crate::pco::PcoEncoder::encode_i64(values)?;
 
-        // Pick the smallest of fixed, varint, and FOR.
         let mut best_enc = EncodingType::IntegerI64;
         let mut best_payload = fixed_payload;
 
@@ -338,6 +433,10 @@ impl ColumnEncoder {
         if for_payload.len() < best_payload.len() {
             best_enc = EncodingType::ForI64;
             best_payload = for_payload;
+        }
+        if pco_payload.len() < best_payload.len() {
+            best_enc = EncodingType::PcoI64;
+            best_payload = pco_payload;
         }
 
         if should_use_specialized(&best_payload, raw_size) {
@@ -381,8 +480,9 @@ impl ColumnEncoder {
         let fixed_payload = IntegerEncoder::encode_u64(values)?;
         let varint_payload = VarintEncoder::encode_u64(values)?;
         let for_payload = ForEncoder::encode_u64(values)?;
+        let pco_payload = crate::pco::PcoEncoder::encode_u64(values)?;
 
-        // Pick the smallest of fixed, varint, and FOR.
+        // Pick the smallest.
         let mut best_enc = EncodingType::IntegerU64;
         let mut best_payload = fixed_payload;
 
@@ -393,6 +493,10 @@ impl ColumnEncoder {
         if for_payload.len() < best_payload.len() {
             best_enc = EncodingType::ForU64;
             best_payload = for_payload;
+        }
+        if pco_payload.len() < best_payload.len() {
+            best_enc = EncodingType::PcoU64;
+            best_payload = pco_payload;
         }
 
         if should_use_specialized(&best_payload, raw_size) {
@@ -763,6 +867,18 @@ impl ColumnDecoder {
                 let values = AlpDecoder::decode(&block.payload)?;
                 Ok(DecodedColumn::F64(values))
             }
+            EncodingType::Pco => {
+                let values = crate::pco::PcoDecoder::decode_f64(&block.payload)?;
+                Ok(DecodedColumn::F64(values))
+            }
+            EncodingType::PcoI64 => {
+                let values = crate::pco::PcoDecoder::decode_i64(&block.payload)?;
+                Ok(DecodedColumn::I64(values))
+            }
+            EncodingType::PcoU64 => {
+                let values = crate::pco::PcoDecoder::decode_u64(&block.payload)?;
+                Ok(DecodedColumn::U64(values))
+            }
             EncodingType::Gorilla => {
                 let values = GorillaDecoder::decode(&block.payload)?;
                 Ok(DecodedColumn::F64(values))
@@ -873,18 +989,21 @@ impl ColumnDecoder {
                 | EncodingType::Chimp128
                 | EncodingType::Gorilla
                 | EncodingType::Patas
-                | EncodingType::Alp => Ok(DecodedColumn::NullableF64(vec![None; total_count])),
+                | EncodingType::Alp
+                | EncodingType::Pco => Ok(DecodedColumn::NullableF64(vec![None; total_count])),
                 EncodingType::PlainI64
                 | EncodingType::IntegerI64
                 | EncodingType::VarintI64
                 | EncodingType::ForI64
+                | EncodingType::PcoI64
                 | EncodingType::DeltaOfDelta => {
                     Ok(DecodedColumn::NullableI64(vec![None; total_count]))
                 }
                 EncodingType::PlainU64
                 | EncodingType::IntegerU64
                 | EncodingType::VarintU64
-                | EncodingType::ForU64 => Ok(DecodedColumn::NullableU64(vec![None; total_count])),
+                | EncodingType::ForU64
+                | EncodingType::PcoU64 => Ok(DecodedColumn::NullableU64(vec![None; total_count])),
                 EncodingType::PlainString | EncodingType::Dictionary => {
                     Ok(DecodedColumn::NullableString(vec![None; total_count]))
                 }
@@ -1076,6 +1195,26 @@ mod tests {
         assert!(EncodingType::from_tag(255).is_err());
     }
 
+    /// `EncodingType::ALL` is what the fuzz target iterates, so a variant it
+    /// misses is a decoder that is never fuzzed. It is generated by the same
+    /// macro that declares the enum, so it is complete by construction; this
+    /// pins that `from_tag` agrees with it in both directions.
+    #[test]
+    fn all_lists_every_variant_and_agrees_with_from_tag() {
+        let scanned: Vec<EncodingType> = (0..=u8::MAX)
+            .filter_map(|t| EncodingType::from_tag(t).ok())
+            .collect();
+        assert_eq!(EncodingType::ALL, scanned.as_slice());
+        for enc in EncodingType::ALL {
+            assert_eq!(EncodingType::from_tag(enc.tag()).unwrap(), *enc);
+        }
+        // Tags are dense from 0: a gap would be a tag the reader accepts
+        // for a variant that no longer exists.
+        for (i, enc) in EncodingType::ALL.iter().enumerate() {
+            assert_eq!(usize::from(enc.tag()), i, "{enc} has a non-dense tag");
+        }
+    }
+
     // -- EncodedBlock serialization ---------------------------------------
 
     #[test]
@@ -1102,10 +1241,53 @@ mod tests {
     fn encode_timestamps_monotonic() {
         let ts: Vec<i64> = (0..1000).map(|i| 1_000_000 + i * 10_000).collect();
         let block = ColumnEncoder::encode_timestamps(&ts).unwrap();
-        // Should use delta-of-delta for monotonic timestamps
-        assert_eq!(block.encoding, EncodingType::DeltaOfDelta);
+        // pco is the default even on a perfect metronome, where DoD used to
+        // be chosen: pco beats it there too (see
+        // `tests/timestamp_codec_check.rs`).
+        assert_eq!(block.encoding, EncodingType::PcoI64);
         let decoded = ColumnDecoder::decode(&block).unwrap();
         assert_eq!(decoded, DecodedColumn::I64(ts));
+    }
+
+    #[test]
+    fn encode_timestamps_honours_an_explicit_codec() {
+        let ts: Vec<i64> = (0..1000).map(|i| 1_000_000 + i * 10_000).collect();
+        for (strategy, expected) in [
+            (TimestampEncoding::Pco, EncodingType::PcoI64),
+            (TimestampEncoding::DeltaOfDelta, EncodingType::DeltaOfDelta),
+            (TimestampEncoding::Plain, EncodingType::PlainI64),
+            (TimestampEncoding::Auto, EncodingType::PcoI64),
+        ] {
+            let block = ColumnEncoder::encode_timestamps_with(&ts, strategy).unwrap();
+            assert_eq!(block.encoding, expected, "{strategy:?}");
+            assert_eq!(
+                ColumnDecoder::decode(&block).unwrap(),
+                DecodedColumn::I64(ts.clone())
+            );
+        }
+    }
+
+    /// `Auto` must never be worse than the codec it could have picked.
+    #[test]
+    fn auto_timestamps_never_loses_to_delta_of_delta() {
+        // Random-ish timestamps: neither codec compresses, and Auto must
+        // still not be larger than the better of the two.
+        let mut seed = 7u64;
+        let ts: Vec<i64> = (0..2000)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (seed >> 20) as i64
+            })
+            .collect();
+        let auto = ColumnEncoder::encode_timestamps_with(&ts, TimestampEncoding::Auto).unwrap();
+        let dod =
+            ColumnEncoder::encode_timestamps_with(&ts, TimestampEncoding::DeltaOfDelta).unwrap();
+        let pco = ColumnEncoder::encode_timestamps_with(&ts, TimestampEncoding::Pco).unwrap();
+        assert!(auto.payload.len() <= dod.payload.len().min(pco.payload.len()));
+        assert_eq!(
+            ColumnDecoder::decode(&auto).unwrap(),
+            DecodedColumn::I64(ts)
+        );
     }
 
     #[test]
@@ -1125,7 +1307,7 @@ mod tests {
         // values that means ALP.
         let values: Vec<f64> = (0..500).map(|i| 20.0 + (i as f64) * 0.01).collect();
         let block = ColumnEncoder::encode_f64(&values, FloatEncoding::Chimp).unwrap();
-        assert_eq!(block.encoding, EncodingType::Alp);
+        assert_eq!(block.encoding, EncodingType::Pco);
         let decoded = ColumnDecoder::decode(&block).unwrap();
         assert_eq!(decoded, DecodedColumn::F64(values));
     }
@@ -1157,7 +1339,9 @@ mod tests {
         let values: Vec<i64> = (0..1000).collect();
         let block = ColumnEncoder::encode_i64(&values).unwrap();
         assert!(
-            block.encoding == EncodingType::IntegerI64 || block.encoding == EncodingType::PlainI64
+            block.encoding == EncodingType::PcoI64
+                || block.encoding == EncodingType::IntegerI64
+                || block.encoding == EncodingType::PlainI64
         );
         let decoded = ColumnDecoder::decode(&block).unwrap();
         assert_eq!(decoded, DecodedColumn::I64(values));
@@ -1168,7 +1352,9 @@ mod tests {
         let values: Vec<u64> = (0..1000).collect();
         let block = ColumnEncoder::encode_u64(&values).unwrap();
         assert!(
-            block.encoding == EncodingType::IntegerU64 || block.encoding == EncodingType::PlainU64
+            block.encoding == EncodingType::PcoU64
+                || block.encoding == EncodingType::IntegerU64
+                || block.encoding == EncodingType::PlainU64
         );
         let decoded = ColumnDecoder::decode(&block).unwrap();
         assert_eq!(decoded, DecodedColumn::U64(values));

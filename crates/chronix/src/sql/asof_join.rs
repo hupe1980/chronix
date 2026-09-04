@@ -1,22 +1,45 @@
 //! ASOF JOIN — nearest-timestamp cross-series alignment.
 //!
-//! Provides `asof_join()` for joining two time-series tables on common tags
-//! with a tolerance window. For each row in the left table, finds the closest
-//! (≤ timestamp) row in the right table within the tolerance.
+//! For each row of the left input, find the closest right row at or before its
+//! timestamp, within a tolerance, matching on a set of tag columns. Rows with
+//! no match keep their left columns and get nulls for the right ones.
 //!
-//! # SQL Usage
+//! # A Rust API, not SQL syntax
 //!
-//! ```sql
-//! SELECT l.*, r.value AS right_value
-//! FROM cpu AS l
-//! ASOF JOIN mem AS r
-//!   ON l.host = r.host
-//!   AND l._time >= r._time
-//!   TOLERANCE INTERVAL '5s'
+//! DataFusion's parser has no `ASOF JOIN` and this crate adds none. The entry
+//! point is [`execute_asof_join`], taking the two physical plans
+//! `DataFrame::create_physical_plan` produces.
+//!
+//! ```no_run
+//! # use std::sync::Arc;
+//! # async fn example(ctx: &datafusion::prelude::SessionContext)
+//! #     -> datafusion::error::Result<()> {
+//! use chronix::sql::execute_asof_join;
+//!
+//! let left = ctx.table("cpu").await?.create_physical_plan().await?;
+//! let right = ctx.table("mem").await?.create_physical_plan().await?;
+//! let joined = execute_asof_join(
+//!     left,
+//!     right,
+//!     "_time",
+//!     vec!["host".to_string()],
+//!     5_000_000_000, // 5s tolerance
+//!     ctx.task_ctx(),
+//! )
+//! .await?;
+//! # let _ = joined;
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! Since `DataFusion` doesn't natively support `ASOF JOIN` syntax, this module
-//! exposes a programmatic API used by [`crate::sql::create_session_context`].
+//! # Cost
+//!
+//! The right input is materialised and indexed by timestamp; the left is
+//! streamed. Matching is binary search plus a backward scan bounded by the
+//! tolerance — **O(L log R)** with the right side resident. That is the trade
+//! this makes: ASOF joins align a dense series against a sparse one, and
+//! `MAX_RIGHT_BUFFER_ROWS` turns a violated assumption into an error rather
+//! than an OOM.
 
 use std::fmt;
 use std::pin::Pin;
@@ -36,14 +59,35 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::Stream;
 
 /// Maximum number of rows buffered from the right side of an ASOF JOIN.
 /// Prevents OOM when the right input is unexpectedly large.
 const MAX_RIGHT_BUFFER_ROWS: usize = 10_000_000;
+
+/// Execute `plan` as a single stream, coalescing if it is partitioned.
+///
+/// `required_input_distribution` makes DataFusion insert the coalesce for a
+/// plan it optimised. `execute_asof_join` builds the operator by hand and
+/// skips the optimiser, so the guarantee has to hold here too — otherwise the
+/// programmatic API silently joins against one partition of the right side.
+fn coalesced(
+    plan: &Arc<dyn ExecutionPlan>,
+    context: Arc<TaskContext>,
+) -> DFResult<SendableRecordBatchStream> {
+    if plan.output_partitioning().partition_count() <= 1 {
+        return plan.execute(0, context);
+    }
+    let merged = Arc::new(
+        datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(Arc::clone(
+            plan,
+        )),
+    );
+    merged.execute(0, context)
+}
 
 /// ASOF JOIN execution plan.
 ///
@@ -110,6 +154,39 @@ impl AsofJoinExec {
 
         let left_schema = left.schema();
         let right_schema = right.schema();
+
+        // Every join key must exist on **both** sides, and be a string.
+        //
+        // This used to be resolved with `schema.index_of(tag).ok()`, so a key
+        // that was absent — a typo, or a column one side does not have —
+        // became `None` on both sides, and `None == None` compared equal.
+        // The key silently matched *everything*: `asof_join(cpu, mem,
+        // ["hostname"])` where the column is `host` returned a full
+        // nearest-timestamp join across unrelated series, with no error and
+        // no empty result to notice.
+        for side in [("left", &left_schema), ("right", &right_schema)] {
+            let (which, schema) = side;
+            if schema.index_of(time_col).is_err() {
+                return Err(DataFusionError::Plan(format!(
+                    "ASOF JOIN time column {time_col:?} is not in the {which} input"
+                )));
+            }
+            for tag in &tag_cols {
+                let Ok(idx) = schema.index_of(tag) else {
+                    return Err(DataFusionError::Plan(format!(
+                        "ASOF JOIN key {tag:?} is not in the {which} input; \
+                         a key that is absent from a side would match every row"
+                    )));
+                };
+                if !matches!(schema.field(idx).data_type(), DataType::Utf8) {
+                    return Err(DataFusionError::Plan(format!(
+                        "ASOF JOIN key {tag:?} must be a string on the {which} input, \
+                         found {:?}",
+                        schema.field(idx).data_type()
+                    )));
+                }
+            }
+        }
 
         // Build output schema: all left columns + right columns (excluding
         // duplicated time & tag columns, prefixed with "right_").
@@ -209,13 +286,34 @@ impl ExecutionPlan for AsofJoinExec {
         )?))
     }
 
+    /// Both inputs must arrive as one partition.
+    ///
+    /// The right side is materialised whole and searched for *every* left row,
+    /// so a partitioned right side is not a partitioned join — it is a join
+    /// against a fraction of the data. `execute` used to take its own
+    /// partition number and pass it to both children, which silently dropped
+    /// every partition but that one on each side. Declaring the requirement
+    /// makes DataFusion insert the coalesce, instead of leaving the operator
+    /// to be wrong when the plan happens to be parallel.
+    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
+        vec![
+            datafusion::physical_plan::Distribution::SinglePartition,
+            datafusion::physical_plan::Distribution::SinglePartition,
+        ]
+    }
+
     fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let left_stream = self.left.execute(partition, context.clone())?;
-        let right_stream = self.right.execute(partition, context)?;
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "AsofJoinExec produces one partition; asked for {partition}"
+            )));
+        }
+        let left_stream = coalesced(&self.left, context.clone())?;
+        let right_stream = coalesced(&self.right, context)?;
 
         Ok(Box::pin(AsofJoinStream::new(
             left_stream,
@@ -282,46 +380,18 @@ impl AsofJoinStream {
         }
     }
 
-    /// Materialise the right side fully, then process the left side in a
-    /// streaming fashion. This is the simplest correct implementation.
+    /// Drive the stream to completion and collect it.
     ///
-    /// For truly large right tables a two-cursor merge would be better, but
-    /// ASOF JOINs in practice involve small-to-medium right tables.
-    async fn execute_batch(mut self) -> DFResult<Vec<RecordBatch>> {
-        use futures::StreamExt;
-
-        // Materialise right side
-        while let Some(batch) = self.right.next().await {
-            let batch = batch?;
-            if batch.num_rows() > 0 {
-                self.right_buffer.push(batch);
-            }
-        }
-
-        // Flatten right into a single batch for easier random access
-        let right_batch = if self.right_buffer.is_empty() {
-            None
-        } else {
-            let schema = self.right_buffer[0].schema();
-            Some(arrow::compute::concat_batches(&schema, &self.right_buffer)?)
-        };
-
-        let mut output_batches = Vec::new();
-
-        // Process left side
-        while let Some(left_result) = self.left.next().await {
-            let left = left_result?;
-            if left.num_rows() == 0 {
-                continue;
-            }
-
-            let joined = self.join_batch(&left, right_batch.as_ref())?;
-            if joined.num_rows() > 0 {
-                output_batches.push(joined);
-            }
-        }
-
-        Ok(output_batches)
+    /// This is a *collect over the stream*, not a second implementation of
+    /// the join. It used to be the latter: the same "buffer the right, then
+    /// walk the left" state machine written twice, once here as an `async fn`
+    /// and once in `poll_next`, so a fix to one silently did not apply to the
+    /// other. Two implementations of one semantic is the bug class this tree
+    /// has paid for most often.
+    async fn execute_batch(self) -> DFResult<Vec<RecordBatch>> {
+        use futures::TryStreamExt;
+        let batches: Vec<RecordBatch> = Box::pin(self).try_collect().await?;
+        Ok(batches.into_iter().filter(|b| b.num_rows() > 0).collect())
     }
 
     /// Join a single left batch against the materialised right batch.
@@ -855,8 +925,8 @@ pub async fn execute_asof_join(
     context: Arc<TaskContext>,
 ) -> DFResult<Vec<RecordBatch>> {
     let plan = AsofJoinExec::try_new(left, right, time_col, tag_cols, tolerance_ns)?;
-    let left_stream = plan.left.execute(0, context.clone())?;
-    let right_stream = plan.right.execute(0, context)?;
+    let left_stream = coalesced(&plan.left, context.clone())?;
+    let right_stream = coalesced(&plan.right, context)?;
 
     let stream = AsofJoinStream::new(
         left_stream,
@@ -1201,5 +1271,181 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("non-negative"), "unexpected error: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod defect_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    //! The three defects this operator carried, each as the property it broke.
+
+    use super::*;
+    use arrow::array::Int64Array;
+    use datafusion::datasource::memory::MemorySourceConfig;
+
+    fn batch(times: &[i64], hosts: &[&str], values: &[f64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("host", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(times.to_vec())),
+                Arc::new(hosts.iter().map(|s| Some(*s)).collect::<StringArray>()),
+                Arc::new(values.iter().copied().map(Some).collect::<Float64Array>()),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn plan_of(batches: &[Vec<RecordBatch>]) -> Arc<dyn ExecutionPlan> {
+        let schema = batches[0][0].schema();
+        MemorySourceConfig::try_new_exec(batches, schema, None).unwrap()
+    }
+
+    /// A join key that is not on both sides must be refused.
+    ///
+    /// It used to be resolved with `index_of(..).ok()`, so a key absent from
+    /// both sides was `None` on both sides and `None == None` compared equal —
+    /// the key matched **every** row, silently, and a mistyped column name
+    /// turned an ASOF join into a nearest-timestamp cross join.
+    #[test]
+    fn a_join_key_missing_from_a_side_is_refused() {
+        let left = plan_of(&[vec![batch(&[1], &["a"], &[1.0])]]);
+        let right = plan_of(&[vec![batch(&[1], &["a"], &[2.0])]]);
+
+        let err = AsofJoinExec::try_new(
+            left.clone(),
+            right.clone(),
+            "_time",
+            vec!["hostname".to_string()], // the column is `host`
+            1_000,
+        )
+        .expect_err("a key that is on neither side must be refused");
+        assert!(
+            err.to_string().contains("hostname"),
+            "the error must name the key, got: {err}"
+        );
+
+        // A key that is not a string is refused too — the matcher only reads
+        // `StringArray`, and anything else silently compared as absent.
+        let err = AsofJoinExec::try_new(left, right, "_time", vec!["value".to_string()], 1_000)
+            .expect_err("a non-string key must be refused");
+        assert!(err.to_string().contains("must be a string"), "got: {err}");
+    }
+
+    /// An unknown time column is refused rather than producing an empty join.
+    #[test]
+    fn an_unknown_time_column_is_refused() {
+        let left = plan_of(&[vec![batch(&[1], &["a"], &[1.0])]]);
+        let right = plan_of(&[vec![batch(&[1], &["a"], &[2.0])]]);
+        assert!(AsofJoinExec::try_new(left, right, "ts", vec![], 1_000).is_err());
+    }
+
+    /// A partitioned right input must be joined against in full.
+    ///
+    /// `execute` used to pass its own partition number to both children, so a
+    /// right side split across N partitions contributed one of them and the
+    /// rest of the matches simply did not happen — a silently incomplete join.
+    #[tokio::test]
+    async fn a_partitioned_input_is_joined_in_full() {
+        // Left: three rows in one partition. Right: the matching rows split
+        // across three partitions, one each.
+        let left = plan_of(&[vec![batch(
+            &[10, 20, 30],
+            &["a", "a", "a"],
+            &[1.0, 2.0, 3.0],
+        )]]);
+        let right = plan_of(&[
+            vec![batch(&[10], &["a"], &[100.0])],
+            vec![batch(&[20], &["a"], &[200.0])],
+            vec![batch(&[30], &["a"], &[300.0])],
+        ]);
+        assert_eq!(right.output_partitioning().partition_count(), 3);
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches = execute_asof_join(
+            left,
+            right,
+            "_time",
+            vec!["host".to_string()],
+            1_000,
+            ctx.task_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let joined = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(joined.num_rows(), 3);
+        let right_values = joined
+            .column_by_name("right_value")
+            .expect("the right side's value column")
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(
+            (0..3).map(|i| right_values.value(i)).collect::<Vec<_>>(),
+            vec![100.0, 200.0, 300.0],
+            "every partition of the right side must contribute"
+        );
+    }
+
+    /// The collecting entry point and the stream must agree, because they are
+    /// now the same code — this pins that they stay so.
+    #[tokio::test]
+    async fn collecting_and_streaming_agree() {
+        let left = plan_of(&[vec![batch(&[10, 25], &["a", "a"], &[1.0, 2.0])]]);
+        let right = plan_of(&[vec![batch(&[9, 20], &["a", "a"], &[90.0, 200.0])]]);
+        let ctx = datafusion::prelude::SessionContext::new();
+
+        let collected = execute_asof_join(
+            left.clone(),
+            right.clone(),
+            "_time",
+            vec!["host".to_string()],
+            10,
+            ctx.task_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let plan = Arc::new(
+            AsofJoinExec::try_new(left, right, "_time", vec!["host".to_string()], 10).unwrap(),
+        );
+        let streamed = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+
+        let a = arrow::compute::concat_batches(&collected[0].schema(), &collected).unwrap();
+        let b = arrow::compute::concat_batches(&streamed[0].schema(), &streamed).unwrap();
+        assert_eq!(a, b, "the two entry points must produce the same rows");
+    }
+
+    /// `Int64` is not a timestamp type the operator reads, and must be
+    /// refused rather than silently matching nothing.
+    #[test]
+    fn an_int64_time_column_is_refused() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_time", DataType::Int64, false),
+            Field::new("host", DataType::Utf8, true),
+        ]));
+        let b = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        let p = MemorySourceConfig::try_new_exec(&[vec![b]], schema, None).unwrap();
+        // The plan builds; the mismatch surfaces when the batch is read, which
+        // is where `extract_timestamps` reports it.
+        assert!(AsofJoinExec::try_new(p.clone(), p, "_time", vec![], 0).is_ok());
     }
 }

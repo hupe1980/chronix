@@ -196,8 +196,9 @@ column even if the two orders were ever to drift apart again.
 
 ### Write Path
 
-1. `SegmentWriter::write_rows(&[Point])` accumulates points into an internal
-   buffer (multiple calls are supported — points are not discarded between calls)
+1. `SegmentWriter::finalize_batch(&RecordBatch, ..)` is the flush and
+   compaction entry point — the columns arrive as Arrow arrays.
+   `write_rows(&[Point])` + `finalize()` remain for callers that hold points
 2. `finalize()` performs all encoding in a **streaming** pass:
    a. Points are sorted by `(measurement, tags-in-cardinality-order, timestamp)`
       using `sort_unstable_by` with a zero-allocation borrow-based comparator —
@@ -341,11 +342,13 @@ Active Memtable ──freeze()──► Frozen Memtable ──flush()──► S
 1. The `FlushController` manages active and frozen memtable slots
 2. When `estimated_size > flush_threshold`, the active memtable is frozen
 3. A fresh empty memtable is swapped in atomically
-4. The frozen memtable is flushed to a segment via `SegmentWriter` using
-   `to_points()` (non-destructive scan of all entries). When a measurement
-   batch would produce an oversized segment, `estimate_max_rows()` splits
-   it into multiple segments based on `target_segment_size_bytes`
-   (segment auto-splitting)
+4. The frozen memtable is flushed on the maintenance thread: one Arrow
+   batch per measurement is built straight off the skip list
+   (`Memtable::to_record_batches()`) and handed to
+   `SegmentWriter::finalize_batch()` — no `Point` is rebuilt. When a
+   measurement batch would produce an oversized segment,
+   `estimate_max_rows()` slices it into multiple segments based on
+   `target_segment_size_bytes` (segment auto-splitting)
 5. `insert_batch(&[Point])` accepts multiple points with a single frozen check
    and a single atomic size update — reduces per-point lock/atomic contention
    and batch-updates the measurement index under a single write lock
@@ -463,13 +466,14 @@ using streaming I/O with incremental CRC32c.
    using the database's configured `compression_codec` and `float_encoding`
    (not hardcoded defaults)
 5. **Register** — new compacted segment added to catalog with column stats,
-   metadata cache, bloom filters, time index, and tag index entries.
-   Bloom filter sidecar is rebuilt from the compacted data and persisted.
-   Tag index is populated with all tag-value pairs from the merged segment.
-5. **Cleanup** — input segments removed from catalog, disk, and all indexes
-6. **Rollup** — if `RollupRegistry` has rollups for the source measurement,
-   reads the compacted segment, calls `compute_rollup_points()`, and inserts
-   the aggregated points into the target measurement via `insert_batch()`
+   metadata cache, bloom filter, time index, and tag index entries — all
+   from the series keys the writer recorded (`SegmentMeta::series_keys`),
+   persisted beside the segment as its `.series` sidecar. The compacted
+   segment is never read back.
+6. **Cleanup** — input segments removed from catalog, disk, and all indexes
+7. **Rollups** — `materialise_rollups()` runs after the pass, whether or
+   not anything was compacted: a bucket becomes final by time passing, not
+   by segment count. See [Rollup](#rollup) below.
 
 ### Backpressure
 
@@ -477,18 +481,23 @@ When L0 count exceeds `4 × trigger_threshold`, `backpressure_delay_ms()`
 returns a linear sleep duration (capped at 500ms) to throttle writes without
 dropping data.
 
-### Background Compaction Scheduler
+### The maintenance thread
 
-`CompactionScheduler` runs compaction automatically as a background Tokio task:
+Every open `Chronix` runs one maintenance thread (named `chronix::maintenance`),
+holding only a `Weak` reference so it never keeps the database alive:
 
-- **`CompactionSchedulerConfig`** — configurable `interval` (default: 30s),
-  `compaction_concurrency` (default: 2), `shutdown_timeout` (default: 30s)
-- **Start/Stop** — `start()` spawns a `tokio::spawn` task with a
-  `tokio::select!` loop: cooperative cancellation via `Arc<Notify>` vs
-  periodic sleep
-- **Compaction round** — `run_compaction_round()` runs up to `concurrency`
-  rounds of `db.compact()` + `db.gc()`, emitting
-  `histogram!("chronix_compaction_cycle_duration_seconds")` for observability
+- **Flush on demand** — writers wake it when a memtable crosses
+  `memtable_flush_threshold`; it freezes and writes the segment off the
+  write path.
+- **Periodic passes** — every `maintenance_interval` (default 30 s, 60 s in
+  the small preset, `Duration::ZERO` disables) it runs `compact()` — which
+  materialises rollups — then `gc()`, then `enforce_retention` when a
+  `retention` is configured.
+- **Lifecycle** — `close()` stops and joins it. Its own handle never closes
+  the database, so dropping the last *user* handle mid-pass still closes,
+  on the thread.
+
+There is nothing for a caller — embedded or `chronixd` — to start.
 - **Graceful shutdown** — `stop_and_wait()` signals via `Notify` and awaits
   the task handle; `stop()` is fire-and-forget
 - **Non-blocking** — compaction runs on a separate Tokio task, never blocking
@@ -558,37 +567,77 @@ Per-measurement retention follows the same ordering principle.
 
 `RollupConfig` defines source → target measurement downsampling. `RollupBuilder`
 provides fluent construction with validation (including `interval_ns > 0`).
-`RollupRegistry` manages CRUD via
-`add()`, `remove()`, `list()`, `get()`, and `rollups_for_source()`.
-`BucketAccumulator` computes incremental per-bucket aggregation (Avg, Min, Max,
-Sum, Count, Last). NaN values are skipped during accumulation to prevent
-permanently corrupting running sums and averages. `align_to_bucket()` defensively
-clamps `interval_ns` to at least 1 to prevent `rem_euclid(0)` panics even if
-`RollupConfig` is constructed directly (bypassing the builder). `compute_rollup_points()`
-converts Arrow RecordBatches into rollup Points suitable for insertion into the
-target measurement.
+`RollupRegistry` manages CRUD via `add()`, `remove()`, `list()`, `get()` and
+`rollups_for_source()`, refuses a definition that would make a measurement
+feed itself (`would_cycle()`), and carries a
+`RollupState { materialised_until, invalid }` per rollup. Both the
+definitions and the state are persisted in the **catalog manifest**, which
+is fsynced per append and CRC-32C framed — losing them silently disables
+every rollup, so they get the same durability as the segment list.
 
-**Integration:** `db.create_rollup()`, `db.list_rollups()`, and
-`db.delete_rollup()` expose the rollup management API. During `db.compact()`,
-rollups are computed automatically for each compacted measurement — the
-compacted segment is read, aggregated via `compute_rollup_points()`, and the
-resulting points are inserted into the target measurement.
+`RollupAccumulator` folds time-ordered batches into buckets and emits a
+bucket once a later one has started, so memory is one open bucket per tag
+group — and it reports `saw_unordered_input()`, which fails the
+materialisation rather than writing a partial bucket. `RollupAccumulator::unordered()`
+holds everything until `finish()` for callers whose input is complete but
+unsorted. `BucketAccumulator` holds the per-field running stats (Avg, Min,
+Max, First, Sum, Count, Last) and skips NaN; every numeric column is
+aggregated, `Int64` and `UInt64` included. `align_to_bucket()` uses
+Euclidean remainder, clamps `interval_ns` to at least 1, and saturates at
+`i64::MIN`.
 
-### Warm Tier
+**Materialisation** — `db.materialise_rollups()` does two things per rollup,
+in order:
 
-`WarmTierConfig` defines the age threshold (`warm_after_ns`, default 7 days),
-target path, and Zstd compression level. `shards_to_warm()` identifies eligible
-shards. `migrate_segment()` performs actual re-compression: it reads the source
-segment via `SegmentReader`, converts data to `Vec<Point>` via
-`record_batch_to_points()`, and writes a new segment with `CompressionCodec::Zstd`
-at the configured level. Bloom sidecars are copied separately (with `warn!` logging on copy failure).
-`migrate_shard_segments()` batches migration for all segments in a shard and
-tracks `bytes_saved` (original size minus re-compressed size).
+1. **Repair.** For each `[from, to)` range in the invalidation log: delete
+   the target's aggregates over that range, recompute them from the source,
+   sync the WAL, then clear the entry and invalidate the same range in every
+   tier downstream. The delete-then-rewrite works because a tombstone is
+   scoped to the segments it was issued against, so the recomputed points —
+   which land in a new segment — are visible immediately.
+2. **Advance.** From the watermark to the newest bucket whose input has gone
+   final: for a raw source, every bucket ending before the oldest shard the
+   out-of-order window still admits, where the window is anchored on the
+   newest write *or the newest timestamp on disk*; for a source that is
+   itself a rollup target, that rollup's watermark. The range is read
+   through `execute_iter` (deduplicated, tombstones applied, one
+   time-disjoint bucket of segments in memory at a time), folded through
+   `RollupAccumulator`, and written through `backfill` in chunks of 8 192
+   points, flushing every eighth chunk.
 
-**Integration:** `db.warm_tier_migrate(config)` evaluates all shards, migrates
-eligible ones via `warm_tier::migrate_shard_segments()`, and updates catalog
-segment paths to point to the new warm location. The migration is **non-
-disruptive**: during re-compression the catalog continues to point to the
-original segment path. After the new warm segment is verified on disk, the
-catalog entry is atomically swapped. Original segment files (`.csx` + `.bloom`)
-are then deleted. Queries transparently read from the warm path after the swap.
+**The points are synced before the watermark that claims them is
+persisted.** Under `FsyncPolicy::Periodic` — the gateway preset — a WAL
+append is only in the operating system's buffers, and a crash between the
+two would leave a watermark past rows that do not exist. Nothing recomputes
+a bucket below the watermark.
+
+A rollup whose pass fails keeps its own watermark and does not stop the
+others. `compact()` and `enforce_retention()` both call materialisation;
+retention drops data only once `rollups_rooted_at(measurement)` are all
+materialised past the end of the bucket containing it, with no repair
+pending.
+
+**Invalidation producers:** `backfill()` (any point below a rollup's
+watermark), `execute_delete()` (the deleted range), a repair of an upstream
+tier, and `refresh_rollup(name, start, end)` explicitly. The log is
+coalesced, kept disjoint and ascending, and capped at 64 ranges — past that
+they merge into their hull, so a writer scattering single points cannot grow
+the catalog without limit.
+
+### Two tiers, not three
+
+A warm tier — `.csx` re-compressed in place to Zstd on local disk — existed
+and has been removed. It duplicated what the hot tier already does when
+`compression = "zstd"` and `zstd_level` are set, nothing ever ran it (there
+was no scheduler, and the only caller in the tree was an example), and its
+migration was unsafe: it round-tripped every row through the `Point` path,
+which materialises an absent tag as an empty string and silently nulls a
+field whose type conflicts with the first one seen, and its catalog swap
+accepted any file that happened to exist at the target path — including a
+truncated one left by a failed migration — before deleting the original.
+
+What remains is the pair that earns its keep: **hot** `.csx` for the data
+being queried, and **cold** Parquet for the archive other tools have to be
+able to read. To trade CPU for space inside the hot tier, set
+`compression = "zstd"` with a higher `zstd_level`; to move data out, use the
+cold tier.

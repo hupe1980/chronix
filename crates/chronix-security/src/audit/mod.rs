@@ -66,7 +66,12 @@ mod perf;
 mod webhook;
 
 pub use error::AuditError;
-pub use logger::{AuditLogger, AuditSink, MemorySink, TracingSink, WriterSink};
-pub use model::{verify_hash_chain, AuditAction, AuditDecision, AuditEvent};
+pub use logger::{
+    last_event, read_events, AuditLogger, AuditSink, FileSink, MemorySink, TracingSink, WriterSink,
+};
+pub use model::{
+    verify_chain_from, verify_hash_chain, verify_hash_chain_with_key, AuditAction, AuditDecision,
+    AuditEvent,
+};
 #[cfg(feature = "webhook")]
 pub use webhook::{WebhookConfig, WebhookFormat, WebhookSink};

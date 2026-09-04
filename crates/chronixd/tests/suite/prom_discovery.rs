@@ -82,6 +82,7 @@ async fn server_with_data() -> (String, TempDir) {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
+        pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -239,4 +240,239 @@ async fn a_malformed_matcher_is_a_bad_request() {
         "a malformed selector returned {}",
         resp.status()
     );
+}
+
+// ─── What Grafana actually sends ──────────────────────────────────────
+//
+// Grafana's Prometheus datasource defaults to `httpMethod: POST` and sends
+// `application/x-www-form-urlencoded`, and it derives every path by
+// appending to the datasource URL — so it asks for `/api/v1/query`, not
+// `/api/v1/prom/query`. Handlers that read only the query string, mounted
+// only under a prefix nothing derives, answered every panel with a 400.
+// These tests send the bytes rather than the specification.
+
+/// A form-encoded POST to the path a Prometheus datasource derives.
+#[tokio::test]
+async fn grafana_posts_a_form_body_to_the_derived_path() {
+    let (base, _tmp) = server_with_data().await;
+    let c = reqwest::Client::new();
+
+    let resp = c
+        .post(format!("{base}/api/v1/query"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("query=cpu&time=1725364800")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "Grafana's default POST must be accepted at the derived path"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["data"]["resultType"], "vector");
+
+    // The same query as a GET, which is what `httpMethod: GET` sends.
+    let body: Value = c
+        .get(format!("{base}/api/v1/query"))
+        .query(&[("query", "cpu")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "success");
+
+    // And a range query, with the duration spelling Grafana uses for `step`
+    // when a dashboard sets an interval.
+    let resp = c
+        .post(format!("{base}/api/v1/query_range"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("query=cpu&start=1725364800&end=1725365100&step=15s")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["data"]["resultType"], "matrix");
+}
+
+/// `time`, `start` and `end` are "RFC 3339 **or** a Unix timestamp", and
+/// `step` is "a duration **or** seconds". Both spellings must work.
+#[tokio::test]
+async fn timestamps_may_be_rfc3339_and_steps_may_be_durations() {
+    let (base, _tmp) = server_with_data().await;
+    let c = reqwest::Client::new();
+
+    for (start, end, step) in [
+        ("2024-09-03T12:00:00Z", "2024-09-03T12:05:00Z", "1m"),
+        ("1725364800", "1725365100", "60"),
+        ("1725364800.500", "1725365100.500", "1m30s"),
+    ] {
+        let resp = c
+            .get(format!("{base}/api/v1/query_range"))
+            .query(&[
+                ("query", "cpu"),
+                ("start", start),
+                ("end", end),
+                ("step", step),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "start={start} end={end} step={step} was rejected"
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success", "start={start} step={step}");
+    }
+}
+
+/// A failing query answers with the status code Prometheus uses, because
+/// clients branch on it: 400 is permanent, 503 is worth retrying. Every
+/// error used to come back as HTTP 200 with an error body, which Grafana
+/// reads as a successful empty result.
+#[tokio::test]
+async fn errors_carry_prometheus_status_codes() {
+    let (base, _tmp) = server_with_data().await;
+    let c = reqwest::Client::new();
+
+    // A syntax error is bad_data → 400.
+    let resp = c
+        .get(format!("{base}/api/v1/query"))
+        .query(&[("query", "cpu{{{")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["errorType"], "bad_data");
+    assert!(body["error"].is_string());
+
+    // A missing required parameter is also bad_data.
+    let resp = c
+        .get(format!("{base}/api/v1/query_range"))
+        .query(&[("query", "cpu"), ("start", "0"), ("end", "1")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // An unparseable timestamp is refused rather than silently becoming
+    // epoch 0 and answering with whatever was stored in 1970.
+    for bad in ["NaN", "yesterday", "inf"] {
+        let resp = c
+            .get(format!("{base}/api/v1/query"))
+            .query(&[("query", "cpu"), ("time", bad)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "time={bad} must be refused"
+        );
+    }
+}
+
+/// The endpoints Grafana probes when a datasource is saved or tested. A 404
+/// here makes the datasource report itself unhealthy even though queries
+/// work, which is the first thing a new user sees.
+#[tokio::test]
+async fn the_capability_endpoints_grafana_probes_answer() {
+    let (base, _tmp) = server_with_data().await;
+    let c = reqwest::Client::new();
+
+    let body: Value = c
+        .get(format!("{base}/api/v1/status/buildinfo"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "success");
+    assert!(body["data"]["version"].is_string());
+
+    for (path, key) in [("/api/v1/rules", "groups"), ("/api/v1/alerts", "alerts")] {
+        let body: Value = c
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["status"], "success", "{path}");
+        assert!(body["data"][key].as_array().unwrap().is_empty(), "{path}");
+    }
+
+    let body: Value = c
+        .get(format!("{base}/api/v1/query_exemplars"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "success");
+}
+
+/// The discovery endpoints answer on POST too — Grafana's metric browser
+/// posts `match[]` in a form body.
+#[tokio::test]
+async fn discovery_endpoints_accept_a_posted_form() {
+    let (base, _tmp) = server_with_data().await;
+    let c = reqwest::Client::new();
+
+    let body: Value = c
+        .post(format!("{base}/api/v1/labels"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("match%5B%5D=cpu")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "success");
+    let labels: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"host"), "got {labels:?}");
+
+    let body: Value = c
+        .post(format!("{base}/api/v1/series"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("match%5B%5D=cpu")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "success");
+    assert!(!body["data"].as_array().unwrap().is_empty());
+
+    let body: Value = c
+        .post(format!("{base}/api/v1/label/host/values"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("match%5B%5D=cpu")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
 }

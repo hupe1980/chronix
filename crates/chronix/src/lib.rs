@@ -1,49 +1,60 @@
 //! # Chronix
 //!
-//! An embedded, analytics-optimised time-series database written in Rust.
+//! The embedded-first time-series database with analytics built in.
 //!
-//! Chronix delivers high write throughput on commodity hardware via a
-//! WAL-backed durable write path, a schema-on-write data model, and
-//! columnar storage designed for efficient analytical queries.
+//! One dependency gives you a crash-safe, columnar time-series engine with
+//! SQL (DataFusion), PromQL, forecasting and anomaly detection — in
+//! process, no server, no sidecar. The same engine runs as the `chronixd`
+//! server behind Grafana, Prometheus and Telegraf.
 //!
-//! ## Quick Start
+//! ## Quick start
 //!
 //! ```no_run
 //! use chronix::prelude::*;
-//! use chronix::{tags, fields};
 //!
-//! let config = ChronixConfig::builder()
-//!     .data_dir("/tmp/mydb")
-//!     .build()
-//!     .unwrap();
+//! let db = Chronix::open_small("/tmp/mydb")?;
 //!
-//! let db = Chronix::open(config).unwrap();
+//! let key = SeriesKey::new("cpu", tags! { "host" => "server-01" })?;
+//! let point = Point::new(key, fields! { "usage" => 95.5 }, 1_700_000_000_000_000_000)?;
+//! db.insert(&point)?;
 //!
-//! let key = SeriesKey::new("cpu", tags! {
-//!     "host" => "server-01",
-//!     "region" => "us-east",
-//! }).unwrap();
-//!
-//! let point = Point::new(key, fields! {
-//!     "usage_idle" => 95.5_f64,
-//!     "usage_system" => 1.2_f64,
-//! }, 1_700_000_000_000).unwrap();
-//!
-//! db.insert(&point).unwrap();
-//! db.close().unwrap();
+//! for batch in db.sql("SELECT host, avg(usage) FROM cpu GROUP BY host")? {
+//!     println!("{batch:?}");
+//! }
+//! db.close()?;
+//! # Ok::<(), chronix::DbError>(())
 //! ```
 //!
-//! ## Crate Structure
+//! ## Where things are
 //!
-//! - [`chronix_core`] — Fundamental types, schema, errors, configuration.
-//! - [`chronix_wal`] — Write-Ahead Log for crash-safe durability.
-//! - [`chronix_encoding`] — Column encoders/decoders (Chimp, Gorilla, delta, etc.).
-//! - [`chronix_segment`] — Columnar segment file reader/writer.
-//! - [`chronix_memtable`] — Lock-free in-memory buffer with shard routing.
-//! - [`chronix_storage`] — Pluggable storage backend (local FS, future: S3).
-//! - [`chronix_index`] — Time index, bloom filters, segment catalog.
-//! - [`chronix_query`] — Query planning, filtering, aggregation, downsampling.
-//! - **`chronix`** (this crate) — Unified public API.
+//! - [`Chronix`] — open, insert, query, [`sql`](Chronix::sql), forecast,
+//!   rollups, retention, backup. A cheap-to-clone handle.
+//! - [`prelude`] — the types and macros a typical program needs.
+//! - [`sql`], [`promql`] — the two query languages, for callers that want
+//!   more than [`Chronix::sql`] and [`Chronix::promql`] offer.
+//! - [`rollup`], [`retention`], [`export`], [`pipeline`] — background work
+//!   and interop.
+//! - The engine crates are re-exported under their own names
+//!   ([`chronix_core`], [`chronix_engine`], [`chronix_query`],
+//!   [`chronix_analytics`], [`chronix_streaming`], [`chronix_security`],
+//!   [`chronix_encoding`]) for advanced use.
+//!
+//! ## Stability
+//!
+//! Three tiers, and the difference matters when a dependency bumps:
+//!
+//! 1. **[`Chronix`], [`prelude`] and the types they name** — the supported
+//!    surface. Arrow's `RecordBatch` is the only third-party type in it, and
+//!    deliberately so: a columnar database that hides its batches is a
+//!    database you cannot stream out of.
+//! 2. **[`sql`] and [`promql`]** — for callers who want more than
+//!    [`Chronix::sql`] and [`Chronix::promql`] offer. `sql` takes and returns
+//!    `DataFusion` types, so it moves when `DataFusion` does.
+//! 3. **The re-exported engine crates** — no promise beyond their own.
+//!
+//! Within 0.x none of this is frozen; a breaking change bumps the minor
+//! (`CONTRIBUTING.md`). `public_api` pins the tier-1 surface so that a change
+//! to it is a deliberate edit rather than a side effect.
 
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
@@ -53,14 +64,17 @@
 pub mod analytics;
 #[cfg(feature = "object-store")]
 pub mod cold_archive;
-pub mod compaction_scheduler;
 pub mod db;
 pub mod delete;
 pub mod error;
 pub mod export;
-pub mod flush_scheduler;
 /// Compile-time lock ordering enforcement.
-pub mod lock_order;
+///
+/// Internal: the lock hierarchy is an invariant of this crate's own
+/// implementation, not a contract with callers, and the wrapper's signatures
+/// are `parking_lot`'s.
+pub(crate) mod lock_order;
+mod maintenance;
 #[macro_use]
 pub mod macros;
 pub mod pipeline;
@@ -68,31 +82,17 @@ pub mod promql;
 pub mod retention;
 pub mod rollup;
 pub mod sql;
-pub mod warm_tier;
 
-// Re-export sub-crates for advanced usage
+// The engine crates, for advanced use. No aliases: a module alias is a
+// second name for the same thing, and every one of them was a name the
+// docs could not resolve.
 pub use chronix_analytics;
-pub use chronix_analytics::anomaly as chronix_anomaly;
-pub use chronix_analytics::compute as chronix_compute;
-pub use chronix_analytics::forecast as chronix_forecast;
-pub use chronix_analytics::multivariate as chronix_multivariate;
-pub use chronix_analytics::preprocess as chronix_preprocess;
 pub use chronix_core;
 pub use chronix_encoding;
-pub use chronix_engine::cache as chronix_cache;
-pub use chronix_engine::compaction as chronix_compaction;
-pub use chronix_engine::index as chronix_index;
-pub use chronix_engine::memtable as chronix_memtable;
-#[cfg(feature = "object-store")]
-pub use chronix_engine::objstore as chronix_objstore;
-pub use chronix_engine::segment as chronix_segment;
-pub use chronix_engine::storage as chronix_storage;
-pub use chronix_engine::wal as chronix_wal;
+pub use chronix_engine;
 pub use chronix_query;
-pub use chronix_security::audit as chronix_audit;
-pub use chronix_security::authz as chronix_authz;
-pub use chronix_streaming::cdc as chronix_stream;
-pub use chronix_streaming::signal as chronix_signal;
+pub use chronix_security;
+pub use chronix_streaming;
 
 // Primary export
 pub use analytics::{AnomalyConfig, ForecastConfig};
@@ -104,30 +104,21 @@ pub use error::DbError;
 pub use error::InsertResult;
 pub use export::{ParquetCompression, ParquetExportConfig};
 pub use pipeline::{Pipeline, PipelineConfig};
-pub use rollup::{RollupAggFn, RollupBuilder, RollupConfig, RollupRegistry};
-pub use warm_tier::{WarmTierConfig, WarmTierResult};
+pub use rollup::{RollupAggFn, RollupBuilder, RollupConfig, RollupRegistry, RollupState};
 
-/// Convenience prelude — import everything you need with `use chronix::prelude::*`.
+/// Everything a typical program needs: `use chronix::prelude::*;`.
 pub mod prelude {
-    // Core types
     pub use chronix_core::{
         ChronixConfig, ChronixConfigBuilder, ChronixError, ColumnDef, ColumnRole, ColumnType,
-        CompressionCodec, ConfigError, FieldValue, FloatEncoding, FsyncPolicy, MeasurementSchema,
-        Point, SchemaAction, SchemaError, SchemaRegistry, SegmentId, SeriesKey, ShardId,
-        StorageBackendConfig, Timestamp, WalConfig, WalError,
+        CompressionCodec, FieldValue, FloatEncoding, FsyncPolicy, MeasurementSchema, Point,
+        SeriesKey, Timestamp,
     };
-
-    // WAL
-    pub use chronix_engine::wal::{replay_all, WalReader, WalRecord, WalRecordType, WalWriter};
-
-    // Query
-    pub use chronix_query::pruning::PruningStats;
     pub use chronix_query::{AggFn, QueryBuilder, QueryPlan};
 
-    // Arrow interop
     pub use arrow::record_batch::RecordBatch;
 
-    // Facade
     pub use crate::db::Chronix;
-    pub use crate::error::DbError;
+    pub use crate::error::{DbError, InsertResult};
+    pub use crate::rollup::{RollupAggFn, RollupBuilder};
+    pub use crate::{fields, tags};
 }

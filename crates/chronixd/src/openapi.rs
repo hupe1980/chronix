@@ -164,7 +164,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
 
     // ── Query ──────────────────────────────────────────────────────
     paths = paths.path(
-        "/api/v1/query",
+        "/api/v1/chronix/query",
         PathItem::new(
             HttpMethod::Post,
             OperationBuilder::new()
@@ -179,7 +179,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
     paths = paths.path(
-        "/api/v1/query/explain",
+        "/api/v1/chronix/query/explain",
         PathItem::new(
             HttpMethod::Post,
             OperationBuilder::new()
@@ -196,7 +196,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
 
     // ── SQL ────────────────────────────────────────────────────────
     paths = paths.path(
-        "/api/v1/sql",
+        "/api/v1/chronix/sql",
         PathItem::new(
             HttpMethod::Post,
             OperationBuilder::new()
@@ -627,6 +627,58 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 .summary(Some("OpenAPI specification"))
                 .description(Some("Returns this OpenAPI 3.1 JSON document."))
                 .response("200", ok_json("OpenAPI spec", obj_schema()))
+                .build(),
+        ),
+    );
+
+    // ── Signal triggers ────────────────────────────────────────────────
+    paths = paths.path(
+        "/api/v1/triggers",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Triggers")
+                .summary(Some("List the caller's triggers"))
+                .response("200", ok_json("Triggers", obj_schema()))
+                .response("404", ok_json("Triggers are not configured", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/triggers",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Triggers")
+                .summary(Some("Run one trigger DSL statement"))
+                .description(Some(
+                    "CREATE TRIGGER, ALTER TRIGGER, DROP TRIGGER or SHOW TRIGGERS. \
+                     Scoped to the caller's namespace.",
+                ))
+                .response("200", ok_json("Statement executed", obj_schema()))
+                .response("400", ok_json("The statement was refused", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/triggers/{name}",
+        PathItem::new(
+            HttpMethod::Delete,
+            OperationBuilder::new()
+                .tag("Triggers")
+                .summary(Some("Drop one of the caller's triggers"))
+                .response("200", ok_json("Trigger dropped", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/signals",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Triggers")
+                .summary(Some("Recently fired signals for the caller"))
+                .response("200", ok_json("Signals", obj_schema()))
                 .build(),
         ),
     );

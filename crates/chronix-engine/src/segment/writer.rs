@@ -185,6 +185,9 @@ pub struct SegmentMeta {
     pub header: crate::segment::header::SegmentHeader,
     /// Per-column metadata with stats (available from the write path).
     pub column_metas: Vec<crate::segment::metadata::ColumnMeta>,
+    /// The distinct series the segment holds, in series-major order — the
+    /// writer knows them, so nothing has to decode the segment to learn them.
+    pub series_keys: Vec<chronix_core::SeriesKey>,
 }
 
 /// Builds a `.csx` segment file from time-series data points.
@@ -306,7 +309,8 @@ impl SegmentWriter {
         });
 
         // Compute global stats
-        let (min_ts, max_ts, series_count) = compute_global_stats(points, &sorted_indices);
+        let (min_ts, max_ts, series_keys) = compute_global_stats(points, &sorted_indices);
+        let series_count = u32::try_from(series_keys.len()).unwrap_or(u32::MAX);
 
         let total_rows = sorted_indices.len();
 
@@ -365,6 +369,7 @@ impl SegmentWriter {
                     &sorted_indices,
                     points,
                     &self.config,
+                    header.created_at,
                     &mut writer,
                     &mut crc,
                     &mut pos,
@@ -416,6 +421,7 @@ impl SegmentWriter {
                     uncompressed_bytes,
                     header,
                     column_metas: metadata.columns,
+                    series_keys,
                 },
                 pos,
             ))
@@ -509,8 +515,8 @@ impl SegmentWriter {
             max_ts = max_ts.max(t);
         }
 
-        // Count distinct series by hashing tag columns
-        let series_count = count_series_from_batch(batch, measurement, tag_columns);
+        let series_keys = series_keys_from_batch(batch, measurement, tag_columns);
+        let series_count = u32::try_from(series_keys.len()).unwrap_or(u32::MAX);
 
         let column_count = u16::try_from(schema.len()).map_err(|_| SegmentError::CorruptFile {
             detail: format!("column count {} exceeds u16::MAX", schema.len()),
@@ -565,6 +571,7 @@ impl SegmentWriter {
                     &schema,
                     batch,
                     &self.config,
+                    header.created_at,
                     &mut writer,
                     &mut crc,
                     &mut pos,
@@ -616,6 +623,7 @@ impl SegmentWriter {
                     uncompressed_bytes,
                     header,
                     column_metas: metadata.columns,
+                    series_keys,
                 },
                 pos,
             ))
@@ -696,6 +704,7 @@ fn encode_row_groups_streaming<W: Write>(
     sorted_indices: &[usize],
     points: &[Point],
     config: &SegmentWriterConfig,
+    segment_created_at: i64,
     writer: &mut W,
     crc: &mut u32,
     pos: &mut u64,
@@ -807,6 +816,10 @@ fn encode_row_groups_streaming<W: Write>(
                     let encrypted = crate::segment::field_encryption::encrypt_block(
                         &final_data,
                         enc_key.key_bytes(),
+                        crate::segment::field_encryption::BlockContext {
+                            column: &col.name,
+                            segment_created_at,
+                        },
                     )?;
                     (encrypted, true)
                 } else {
@@ -1184,36 +1197,30 @@ fn encode_column(
 ///
 /// Since the indices are already sorted by `(canonical_form, timestamp)`,
 /// we count distinct series by checking when the canonical form changes.
-fn compute_global_stats(points: &[Point], sorted_indices: &[usize]) -> (i64, i64, u32) {
+fn compute_global_stats(
+    points: &[Point],
+    sorted_indices: &[usize],
+) -> (i64, i64, Vec<chronix_core::SeriesKey>) {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    let mut series_count: u32 = 0;
-    let mut prev_hash: Option<u64> = None;
-    let mut prev_canonical: Option<&str> = None;
+    let mut series_keys: Vec<chronix_core::SeriesKey> = Vec::new();
 
     for &idx in sorted_indices {
         let p = &points[idx];
         let ts = p.timestamp();
         min_ts = min_ts.min(ts);
         max_ts = max_ts.max(ts);
-
-        // Fast path: skip String allocation if hash matches previous point.
-        let h = p.series_key().hash_fnv();
-        if prev_hash == Some(h) {
-            // Hash match — verify with full canonical form only on hash collision.
-            let cf = p.series_key().canonical_form();
-            if prev_canonical == Some(cf) {
-                continue;
-            }
-            series_count += 1;
-            prev_canonical = Some(cf);
-        } else {
-            series_count += 1;
-            prev_hash = Some(h);
-            prev_canonical = Some(p.series_key().canonical_form());
+        // Series-major order: a new series starts wherever the canonical form
+        // changes. Comparing the form rather than the hash means a hash
+        // collision between adjacent series is counted as two, not one.
+        let is_new = series_keys
+            .last()
+            .is_none_or(|prev| prev.canonical_form() != p.series_key().canonical_form());
+        if is_new {
+            series_keys.push(p.series_key().clone());
         }
     }
-    (min_ts, max_ts, series_count)
+    (min_ts, max_ts, series_keys)
 }
 
 /// Encode a timestamp column from a set of points at the given indices.
@@ -1355,8 +1362,13 @@ fn discover_schema_from_batch(
 ///
 /// Uses the full canonical form (not just hash) to avoid undercounting
 /// in the extremely rare case of FNV hash collisions.
-fn count_series_from_batch(batch: &RecordBatch, measurement: &str, tag_columns: &[String]) -> u32 {
+fn series_keys_from_batch(
+    batch: &RecordBatch,
+    measurement: &str,
+    tag_columns: &[String],
+) -> Vec<chronix_core::SeriesKey> {
     let mut seen = std::collections::HashSet::new();
+    let mut keys = Vec::new();
     let num_rows = batch.num_rows();
 
     let tag_arrays: Vec<Option<&StringArray>> = tag_columns
@@ -1378,11 +1390,12 @@ fn count_series_from_batch(batch: &RecordBatch, measurement: &str, tag_columns: 
             }
         }
         if let Ok(key) = chronix_core::SeriesKey::new(measurement, tags) {
-            seen.insert(key.canonical_form().to_string());
+            if seen.insert(key.canonical_form().to_string()) {
+                keys.push(key);
+            }
         }
     }
-
-    seen.len() as u32
+    keys
 }
 
 /// Encode all row groups from a pre-sorted `RecordBatch`, streaming each
@@ -1393,6 +1406,7 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
     schema: &[ColumnDef],
     batch: &RecordBatch,
     config: &SegmentWriterConfig,
+    segment_created_at: i64,
     writer: &mut W,
     crc: &mut u32,
     pos: &mut u64,
@@ -1509,6 +1523,10 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
                     let encrypted = crate::segment::field_encryption::encrypt_block(
                         &final_data,
                         enc_key.key_bytes(),
+                        crate::segment::field_encryption::BlockContext {
+                            column: &col.name,
+                            segment_created_at,
+                        },
                     )?;
                     (encrypted, true)
                 } else {
