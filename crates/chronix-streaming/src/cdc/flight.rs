@@ -59,7 +59,7 @@ pub fn cdc_schema() -> Schema {
         Field::new("seq", DataType::UInt64, false),
         Field::new("event_type", DataType::Utf8, false),
         Field::new("measurement", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new("event_timestamp", DataType::Int64, false),
         Field::new("tags_json", DataType::Utf8, false),
         Field::new("fields_json", DataType::Utf8, false),
         Field::new("series_hash", DataType::UInt64, false),
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(schema.field(0).name(), "seq");
         assert_eq!(schema.field(1).name(), "event_type");
         assert_eq!(schema.field(2).name(), "measurement");
-        assert_eq!(schema.field(3).name(), "timestamp");
+        assert_eq!(schema.field(3).name(), "event_timestamp");
         assert_eq!(schema.field(4).name(), "tags_json");
         assert_eq!(schema.field(5).name(), "fields_json");
         assert_eq!(schema.field(6).name(), "series_hash");

@@ -306,7 +306,7 @@ mod tests {
 
         // A real header on disk, so `remove_series` can read the stamp.
         let header = crate::segment::header::SegmentHeader {
-            version: 2,
+            version: crate::segment::header::VERSION,
             flags: 0,
             created_at: 10,
             min_timestamp: 0,

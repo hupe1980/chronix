@@ -440,7 +440,7 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
             let col = batch.column(col_idx);
             let name = field.name();
 
-            if name == "timestamp" {
+            if name == chronix_core::TIME_COLUMN {
                 return col
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn record_batch_to_rows_basic() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, true),
         ]));
 
@@ -674,7 +674,7 @@ mod tests {
         metadata.insert("role".to_string(), "tag".to_string());
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true).with_metadata(metadata),
             Field::new("usage", DataType::Float64, true),
         ]));
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn record_batch_to_rows_all_types() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("f", DataType::Float64, true),
             Field::new("i", DataType::Int64, true),
             Field::new("u", DataType::UInt64, true),
@@ -734,7 +734,7 @@ mod tests {
     #[test]
     fn record_batch_to_rows_null_skipped() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, true),
         ]));
 
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn record_batch_to_rows_string_field() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
         ]));
 

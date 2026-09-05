@@ -270,8 +270,7 @@ fn batch_to_points(
 
     // Find timestamp column
     let ts_idx = arrow_schema
-        .index_of("time")
-        .or_else(|_| arrow_schema.index_of("timestamp"))
+        .index_of(chronix_core::TIME_COLUMN)
         .map_err(|_| {
             chronix_cluster::ClusterError::Internal("no timestamp column in result".into())
         })?;
@@ -303,7 +302,7 @@ fn batch_to_points(
         let mut fields = BTreeMap::new();
         for (col_idx, field_ref) in arrow_schema.fields().iter().enumerate() {
             let name = field_ref.name().as_str();
-            if name == "time" || name == "timestamp" || tag_col_refs.contains(&name) {
+            if name == chronix_core::TIME_COLUMN || tag_col_refs.contains(&name) {
                 continue;
             }
             let col = batch.column(col_idx);

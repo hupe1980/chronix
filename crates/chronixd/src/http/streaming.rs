@@ -194,7 +194,7 @@ fn collect_annotations(
             Err(_) => continue,
         };
         let len = batch.num_rows().min(max_per_measurement);
-        if let Some(ts_col) = batch.column_by_name("timestamp") {
+        if let Some(ts_col) = batch.column_by_name(chronix_core::TIME_COLUMN) {
             if let Some(ts_arr) = ts_col.as_any().downcast_ref::<arrow::array::Int64Array>() {
                 for i in 0..len {
                     anns.push(GrafanaAnnotation {

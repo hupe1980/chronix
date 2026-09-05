@@ -776,7 +776,7 @@ fn schema_to_proto_columns(schema: &MeasurementSchema) -> Vec<proto::ColumnSchem
     let mut columns = Vec::new();
 
     columns.push(proto::ColumnSchema {
-        name: "timestamp".to_string(),
+        name: chronix_core::TIME_COLUMN.to_string(),
         role: "timestamp".to_string(),
         data_type: "int64".to_string(),
     });
@@ -819,7 +819,7 @@ fn record_batch_to_proto_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<p
             let col = batch.column(col_idx);
             let name = field.name().clone();
 
-            if &name == "timestamp" {
+            if name == chronix_core::TIME_COLUMN {
                 if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
                     timestamp = arr.value(row_idx);
                 }
@@ -1023,7 +1023,7 @@ mod tests {
 
         let cols = schema_to_proto_columns(&schema);
         assert_eq!(cols.len(), 3);
-        assert_eq!(cols[0].name, "timestamp");
+        assert_eq!(cols[0].name, chronix_core::TIME_COLUMN);
         assert_eq!(cols[0].role, "timestamp");
         assert_eq!(cols[1].name, "host");
         assert_eq!(cols[1].role, "tag");
@@ -1037,7 +1037,7 @@ mod tests {
         tag_metadata.insert("role".to_string(), "tag".to_string());
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true).with_metadata(tag_metadata),
             Field::new("usage", DataType::Float64, true),
         ]));
@@ -1063,7 +1063,7 @@ mod tests {
     #[test]
     fn record_batch_to_proto_rows_all_types() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("f", DataType::Float64, true),
             Field::new("i", DataType::Int64, true),
             Field::new("u", DataType::UInt64, true),

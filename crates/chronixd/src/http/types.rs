@@ -501,7 +501,7 @@ pub(super) fn measurement_schema_to_info(
     // a query) got `No field named timestamp`. There is one name here, and it
     // is the one every query surface accepts.
     columns.push(ColumnInfo {
-        name: chronix::sql::TIME_COLUMN.to_string(),
+        name: chronix_core::TIME_COLUMN.to_string(),
         role: "timestamp".to_string(),
         data_type: Some("int64".to_string()),
     });
@@ -553,7 +553,7 @@ mod tests {
         assert_eq!(info.columns.len(), 5);
         // The name a query accepts, not the storage column name: the
         // endpoint exists to be read and then typed back in.
-        assert_eq!(info.columns[0].name, chronix::sql::TIME_COLUMN);
+        assert_eq!(info.columns[0].name, chronix_core::TIME_COLUMN);
         assert_eq!(info.columns[0].role, "timestamp");
         assert_eq!(info.columns[1].name, "host");
         assert_eq!(info.columns[1].role, "tag");

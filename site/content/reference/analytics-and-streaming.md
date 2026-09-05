@@ -367,14 +367,11 @@ let config = ChronixConfig::builder()
 ```
 
 A `forecast(v, _time, h)` with `h` over the limit is a planning error naming
-the setting; the training cap keeps the **newest** points, which is what a
-forecast is about.
+the setting; the training cap keeps the **newest** points.
 
-There is no per-measurement override and no `[multivariate]` section. They
-existed as configuration — parsed, validated, documented — and nothing read
-them, so setting one changed no behaviour and raised no error. The model, the
-detector and the confidence level are arguments to the analytics API, which is
-where a per-call choice belongs.
+The model, the detector and the confidence level are arguments to the
+analytics API rather than settings, so a per-call choice stays a per-call
+choice.
 
 ## Real-Time Analytics (`chronix-analytics`)
 

@@ -600,8 +600,8 @@ impl SegmentReader {
                 names.push(c.as_str());
             }
         } else {
-            if !column_names.contains(&"timestamp") {
-                names.push("timestamp");
+            if !column_names.contains(&chronix_core::TIME_COLUMN) {
+                names.push(chronix_core::TIME_COLUMN);
             }
             for &n in column_names {
                 if !names.contains(&n) {
@@ -615,7 +615,7 @@ impl SegmentReader {
             .metadata
             .columns
             .iter()
-            .position(|c| c.name == "timestamp");
+            .position(|c| c.name == chronix_core::TIME_COLUMN);
 
         // Resolve tag predicate column indices for row-group pushdown.
         let tag_col_indices: Vec<usize> = tag_predicates
@@ -1286,7 +1286,9 @@ mod tests {
         assert_eq!(reader.row_group_count(), 2);
 
         // Read specific columns from first row group
-        let columns = reader.read_columns(&["timestamp", "cpu"], 0).unwrap();
+        let columns = reader
+            .read_columns(&[chronix_core::TIME_COLUMN, "cpu"], 0)
+            .unwrap();
         assert_eq!(columns.len(), 2);
 
         // Read all data
@@ -1389,7 +1391,9 @@ mod tests {
         writer.finalize().unwrap();
 
         let reader = SegmentReader::open(&path).unwrap();
-        assert!(reader.read_columns(&["timestamp"], 999).is_err());
+        assert!(reader
+            .read_columns(&[chronix_core::TIME_COLUMN], 999)
+            .is_err());
     }
 
     #[test]
@@ -1436,7 +1440,7 @@ mod tests {
         let batch = reader.read_projected(&["cpu"]).unwrap();
         assert_eq!(batch.num_rows(), 80);
         assert_eq!(batch.num_columns(), 2); // timestamp + cpu
-        assert!(batch.column_by_name("timestamp").is_some());
+        assert!(batch.column_by_name(chronix_core::TIME_COLUMN).is_some());
         assert!(batch.column_by_name("cpu").is_some());
         assert!(batch.column_by_name("host").is_none());
 
@@ -1465,7 +1469,7 @@ mod tests {
         // Only request "host" — should still get timestamp
         let batch = reader.read_projected(&["host"]).unwrap();
         assert_eq!(batch.num_columns(), 2); // timestamp + host
-        assert!(batch.column_by_name("timestamp").is_some());
+        assert!(batch.column_by_name(chronix_core::TIME_COLUMN).is_some());
     }
 
     #[test]
@@ -1485,7 +1489,7 @@ mod tests {
 
         let all = reader.read_all().unwrap();
         let projected = reader
-            .read_projected(&["timestamp", "host", "cpu"])
+            .read_projected(&[chronix_core::TIME_COLUMN, "host", "cpu"])
             .unwrap();
 
         assert_eq!(all.num_rows(), projected.num_rows());
@@ -1617,7 +1621,7 @@ mod tests {
 
         // Verify timestamps are in the expected range.
         let ts = batch
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -1667,7 +1671,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 0);
         // Schema should still have timestamp + cpu.
         assert_eq!(batch.num_columns(), 2);
-        assert!(batch.column_by_name("timestamp").is_some());
+        assert!(batch.column_by_name(chronix_core::TIME_COLUMN).is_some());
         assert!(batch.column_by_name("cpu").is_some());
     }
 
@@ -1697,7 +1701,7 @@ mod tests {
 
         // Verify timestamps are from the second row group.
         let ts = rg1
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -1770,7 +1774,7 @@ mod tests {
         let ts_meta = reader
             .column_metadata()
             .iter()
-            .find(|c| c.name == "timestamp")
+            .find(|c| c.name == chronix_core::TIME_COLUMN)
             .unwrap();
         assert!(ts_meta.bloom_filter.is_none());
 
@@ -1897,7 +1901,7 @@ mod tests {
         let ts_meta = reader_no_key
             .column_metadata()
             .iter()
-            .find(|c| c.name == "timestamp")
+            .find(|c| c.name == chronix_core::TIME_COLUMN)
             .unwrap();
         assert!(!ts_meta.encrypted);
         assert!(ts_meta.stats.min_value != i64::MAX || ts_meta.stats.max_value != i64::MIN);

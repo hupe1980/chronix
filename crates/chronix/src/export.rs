@@ -199,7 +199,7 @@ mod tests {
 
     fn make_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("value", DataType::Float64, true),
         ]));
@@ -293,7 +293,7 @@ mod tests {
         // Many rows, few distinct hosts — the shape dictionary encoding is for.
         let n = 4096;
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("value", DataType::Float64, true),
         ]));

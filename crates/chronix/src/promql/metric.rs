@@ -1,41 +1,29 @@
 //! The mapping between a Chronix `(measurement, field)` pair and a PromQL
 //! metric name.
 //!
-//! # Why this exists
-//!
 //! Chronix stores a *measurement* with many *fields*; PromQL addresses a
-//! *metric*, which carries exactly one value per sample. Something has to
-//! decide which name a series answers to, and that decision has to be made in
-//! **one** place: it is read by the evaluator (to resolve a selector and to
-//! label a result), by `/api/v1/series`, by `/api/v1/label/__name__/values`
-//! and by `/api/v1/metadata`. When those disagreed, a query returned series
-//! under names no selector could name, and the metric browser offered names
-//! the query engine did not recognise.
-//!
-//! # The rule
+//! *metric*, which carries one value per sample. This module decides which
+//! name a series answers to, and it is the only place that does — the
+//! evaluator, `/api/v1/series`, `/api/v1/label/__name__/values` and
+//! `/api/v1/metadata` all resolve through it, so they cannot disagree.
 //!
 //! ```text
 //! field == "value"  →  <measurement>
 //! otherwise         →  <measurement>_<field>
 //! ```
 //!
-//! Two properties are worth stating, because both were violated by the scheme
-//! this replaces:
+//! Two properties follow, and both matter:
 //!
 //! - **A name is a function of its own pair.** It does not depend on how many
-//!   other fields the measurement happens to have, so writing a second field
-//!   never renames the first one's history.
+//!   other fields the measurement has, so writing a second field never
+//!   renames the first one's history.
 //! - **A name a query returns can be typed back in.** [`resolve`] is the exact
 //!   inverse of [`metric_name`], so the `__name__` in a result is a selector.
 //!
-//! The `value` special case is the inverse of how the Prometheus remote-write
-//! and OTLP ingestion paths store a sample: metric name → measurement, value →
-//! a field called `value`. Without it, `up` scraped by Prometheus and written
-//! here would come back as `up_value`.
-//!
-//! Line-protocol writers get the same rule from the other side, and it is the
-//! one VictoriaMetrics uses for Influx ingestion (`measurement_field`, with
-//! the measurement alone when the field carries no name of its own).
+//! The `value` case inverts how the Prometheus remote-write and OTLP paths
+//! store a sample — metric name → measurement, value → a field called
+//! `value` — so a scraped `up` comes back as `up` rather than `up_value`. It
+//! is also the rule VictoriaMetrics uses for line-protocol ingestion.
 
 use chronix_core::schema::SchemaRegistry;
 

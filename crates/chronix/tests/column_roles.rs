@@ -66,7 +66,10 @@ fn every_scanned_column_carries_its_role_from_the_memtable_and_from_a_segment() 
     let plan = db.query().measurement("cpu").build().unwrap();
 
     let expected = vec![
-        ("timestamp".to_string(), "timestamp".to_string()),
+        (
+            chronix_core::TIME_COLUMN.to_string(),
+            "timestamp".to_string(),
+        ),
         ("host".to_string(), "tag".to_string()),
         ("note".to_string(), "field".to_string()),
         ("usage".to_string(), "field".to_string()),

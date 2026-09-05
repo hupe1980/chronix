@@ -465,7 +465,7 @@ fn cap_by_series(
 /// rather than assumed across a crate boundary. The check is one linear pass
 /// over an `i64` column; the sort never runs in practice.
 fn ensure_ts_sorted(batch: RecordBatch) -> Result<RecordBatch> {
-    let Some(col) = batch.column_by_name("timestamp") else {
+    let Some(col) = batch.column_by_name(chronix_core::TIME_COLUMN) else {
         return Ok(batch);
     };
     let Some(ts) = col.as_any().downcast_ref::<Int64Array>() else {
@@ -522,7 +522,7 @@ fn build_buckets(entries: Vec<SegmentCatalogEntry>, memtable: RecordBatch) -> Re
 
     let memtable = ensure_ts_sorted(memtable)?;
     let ts: &[i64] = memtable
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
         .map_or(&[][..], |a| a.values().as_ref());
     // Every row must have a readable timestamp, because the slicing below is

@@ -117,9 +117,10 @@ GROUP BY bucket
 ORDER BY bucket;
 ```
 
-The timestamp column is `_time`. It compares against an epoch-nanosecond
-integer, an RFC 3339 string and `now()` alike, so the numbers the write API
-gave you work unchanged:
+The time column is `_time` — the same name the schema endpoint, an Arrow
+batch and a `.csx` segment use, so what you read back is what you type. It
+compares against an epoch-nanosecond integer, an RFC 3339 string and `now()`
+alike, so the numbers the write API gave you work unchanged:
 
 ```sql
 SELECT * FROM cpu WHERE _time >= 1700000000000000000 LIMIT 10;

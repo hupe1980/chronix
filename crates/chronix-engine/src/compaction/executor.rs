@@ -240,7 +240,7 @@ impl CompactionExecutor {
             canonicals.extend(c);
 
             let ts_col = batch
-                .column_by_name("timestamp")
+                .column_by_name(chronix_core::TIME_COLUMN)
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 .ok_or_else(|| CompactionError::Internal("missing timestamp column".into()))?;
             for i in 0..batch.num_rows() {
@@ -931,7 +931,7 @@ mod tests {
         // Verify dedup: srv1@200 should have value 99.0 (last-write-wins = segment 2)
         let host_col = batch.column_by_name("host").unwrap();
         let host_arr = host_col.as_any().downcast_ref::<StringArray>().unwrap();
-        let ts_col = batch.column_by_name("timestamp").unwrap();
+        let ts_col = batch.column_by_name(chronix_core::TIME_COLUMN).unwrap();
         let ts_arr = ts_col.as_any().downcast_ref::<Int64Array>().unwrap();
         let cpu_col = batch.column_by_name("cpu").unwrap();
         let cpu_arr = cpu_col.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -1087,7 +1087,7 @@ mod tests {
 
         let host_col = batch.column_by_name("host").unwrap();
         let host_arr = host_col.as_any().downcast_ref::<StringArray>().unwrap();
-        let ts_col = batch.column_by_name("timestamp").unwrap();
+        let ts_col = batch.column_by_name(chronix_core::TIME_COLUMN).unwrap();
         let ts_arr = ts_col.as_any().downcast_ref::<Int64Array>().unwrap();
 
         // Collect timestamps per series.
@@ -1187,7 +1187,7 @@ mod tests {
 
         let host_col = batch.column_by_name("host").unwrap();
         let host_arr = host_col.as_any().downcast_ref::<StringArray>().unwrap();
-        let ts_col = batch.column_by_name("timestamp").unwrap();
+        let ts_col = batch.column_by_name(chronix_core::TIME_COLUMN).unwrap();
         let ts_arr = ts_col.as_any().downcast_ref::<Int64Array>().unwrap();
         let cpu_col = batch.column_by_name("cpu").unwrap();
         let cpu_arr = cpu_col.as_any().downcast_ref::<Float64Array>().unwrap();

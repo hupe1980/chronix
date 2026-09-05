@@ -53,7 +53,7 @@ impl AggregateUDFImpl for FirstUdaf {
                 args.return_field.data_type().clone(),
                 true,
             )),
-            Arc::new(Field::new("timestamp", DataType::Int64, true)),
+            Arc::new(Field::new(chronix_core::TIME_COLUMN, DataType::Int64, true)),
         ])
     }
 }
@@ -163,7 +163,7 @@ impl AggregateUDFImpl for LastUdaf {
                 args.return_field.data_type().clone(),
                 true,
             )),
-            Arc::new(Field::new("timestamp", DataType::Int64, true)),
+            Arc::new(Field::new(chronix_core::TIME_COLUMN, DataType::Int64, true)),
         ])
     }
 }
@@ -844,7 +844,7 @@ mod tests {
 /// GROUP BY host
 /// ```
 ///
-/// The `timestamp` argument is not decoration: aggregates see rows in whatever
+/// The `_time` argument is not decoration: aggregates see rows in whatever
 /// order the plan delivers them, so the accumulator sorts by it. Passing a
 /// constant, or a column that is not time, produces a forecast of a shuffled
 /// series.

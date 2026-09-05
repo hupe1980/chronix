@@ -72,12 +72,9 @@ let config = ChronixConfig::builder()
 
 ### Analytics
 
-Two bounds, both enforced by the SQL forecast aggregates. There is no
-`[multivariate]` section and no per-measurement analytics override: those
-were eleven settings that were parsed, validated and read by nothing, so a
-value set there changed no behaviour and reported no error. The analytics
-API takes its model, method and confidence level as arguments, which is where
-that choice belongs.
+Two bounds, both enforced by the SQL forecast aggregates. The model, the
+detector and the confidence level are arguments to the analytics API rather
+than settings, so a per-call choice stays a per-call choice.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|

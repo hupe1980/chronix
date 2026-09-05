@@ -33,22 +33,27 @@ timestamp:    1700000000000000000                  ← i64, nanoseconds
 Timestamps are always **nanoseconds since the Unix epoch**, as a signed 64-bit
 integer. Negative values (before 1970) are valid and handled throughout.
 
-### What the timestamp column is called
+### The time column is `_time`
 
-One column, and each surface spells it the way that surface's users expect:
+One name everywhere: the embedded `MeasurementSchema`, an Arrow batch from
+`execute_iter`, a `.csx` segment, SQL, PromQL and the schema endpoint. What
+the schema reports is what a query accepts.
 
-| Surface | Name |
-|---------|------|
-| SQL (`/api/v1/chronix/sql`, Flight SQL, `db.sql`) | `_time`, typed `TIMESTAMP(nanosecond)` |
-| `GET /api/v1/measurements/{name}/schema` | `_time` — the name a query accepts |
-| A JSON query row, and an Arrow batch from `execute_iter` | `timestamp`, `Int64` |
-| The embedded `MeasurementSchema` | `time` |
+```sql
+SELECT _time, usage FROM cpu WHERE _time >= 1700000000000000000;
+```
 
-In SQL the column is `_time` and only `_time` — in `SELECT` and in `WHERE`
-alike. `WHERE timestamp > …` is a planning error naming the columns that
-exist, which is the right failure: it is loud, and it says what to type.
-Writes reject `time`, `timestamp` and `_time` as *user* column names, so
-nothing you send can collide with it.
+Not `time` or `timestamp`: both are SQL type keywords, and the leading
+underscore marks the column as engine-owned. All three are rejected as *user*
+column names, so nothing you write can collide with it.
+
+The **type** differs by layer: `Int64` nanoseconds in storage, which is what
+it encodes, and `TIMESTAMP(nanosecond)` in SQL, so date functions and
+interval arithmetic work.
+
+A **point** is not a table, and its `timestamp` field keeps that name — in a
+JSON write body, a JSON query row and the gRPC `Point` message, as in every
+protocol that carries points.
 
 ### Tag or field?
 

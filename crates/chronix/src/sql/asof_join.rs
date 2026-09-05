@@ -1432,7 +1432,7 @@ mod defect_tests {
     #[test]
     fn an_int64_time_column_is_refused() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("_time", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
         ]));
         let b = RecordBatch::try_new(

@@ -468,12 +468,24 @@ pub const MAX_FIELDS_PER_POINT: usize = 1024;
 /// `chronix-encoding/tests/string_length_boundary.rs`.
 pub const MAX_STRING_FIELD_LENGTH: usize = u16::MAX as usize; // 65_535
 
+/// The name of the time column, in every layer: the measurement schema, an
+/// Arrow scan batch, a segment on disk, SQL and PromQL.
+///
+/// Not `time` or `timestamp`, because both are SQL type keywords —
+/// `TIMESTAMP '2023-01-01'` is a literal, not a column — and the leading
+/// underscore marks the column as engine-owned, as
+/// [`NAMESPACE_TAG`](crate::NAMESPACE_TAG) does for its tag.
+///
+/// The *type* differs by layer: `Int64` nanoseconds in storage,
+/// `Timestamp(Nanosecond)` in SQL.
+pub const TIME_COLUMN: &str = "_time";
+
 /// Column names the engine owns: a field or tag may not use them.
 ///
-/// `timestamp` is the storage layer's time column, `_time` is its SQL name,
-/// and `series_key_hash` is the routing column the read path adds. `time`
-/// is reserved as well because the SQL layer accepts it as an alias for the
-/// time column.
+/// `time` and `timestamp` are reserved beside [`TIME_COLUMN`] because they are
+/// what a writer reaches for when it means the time column — accepting one as
+/// an ordinary field would make `SELECT time FROM cpu` return something that
+/// is not the time.
 pub const RESERVED_COLUMN_NAMES: &[&str] = &["time", "timestamp", "_time", "series_key_hash"];
 
 /// A unique series identifier: measurement name + sorted tag set.
@@ -1379,6 +1391,75 @@ impl fmt::Display for Point {
 
 #[cfg(test)]
 mod tests {
+    /// The time column's name is written **once**.
+    ///
+    /// It was three names spelled as literals at roughly a hundred and eighty
+    /// sites, and the cost was not internal: a reader who called the schema
+    /// endpoint and then wrote `SELECT timestamp` got a planning error. A
+    /// literal creeping back in is how that returns, so the scan is the guard.
+    ///
+    /// A `"timestamp"` literal is still legitimate as a *role* value
+    /// (`role=timestamp` in Arrow field metadata), as a column **type** name,
+    /// and as the `timestamp` field of a point in a JSON or protobuf payload —
+    /// so the check is for the two names the engine abandoned appearing where
+    /// a *column* is named.
+    #[test]
+    fn the_time_column_is_named_in_exactly_one_place() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        // Contexts in which a bare string is a column name.
+        let column_shapes = [
+            "column_by_name(\"",
+            "index_of(\"",
+            "Field::new(\"",
+            "column_with_name(\"",
+        ];
+        let mut offenders = Vec::new();
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (n, line) in text.lines().enumerate() {
+                    for shape in column_shapes {
+                        for name in ["timestamp", "time", "_time"] {
+                            if line.contains(&format!("{shape}{name}\"")) {
+                                offenders.push(format!(
+                                    "{}:{}: {}",
+                                    path.display(),
+                                    n + 1,
+                                    line.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the time column must be named with `chronix_core::TIME_COLUMN`, \
+             not a literal:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     use super::*;
 
     fn make_tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

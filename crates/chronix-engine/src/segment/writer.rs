@@ -496,7 +496,7 @@ impl SegmentWriter {
 
         // Compute global stats directly from Arrow arrays
         let ts_col = batch
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
             .ok_or_else(|| SegmentError::CorruptFile {
                 detail: "missing or non-Int64 timestamp column".into(),
@@ -704,7 +704,9 @@ fn encode_row_groups_streaming<W: Write>(
     sorted_indices: &[usize],
     points: &[Point],
     config: &SegmentWriterConfig,
-    segment_created_at: i64,
+    // Only the encryption path reads it: it is half of the AEAD nonce's
+    // associated data, so a block cannot be replayed into another segment.
+    #[cfg_attr(not(feature = "field-encryption"), allow(unused_variables))] segment_created_at: i64,
     writer: &mut W,
     crc: &mut u32,
     pos: &mut u64,
@@ -963,7 +965,7 @@ fn discover_schema(points: &[Point]) -> Vec<ColumnDef> {
 
     // Timestamp column is always first
     columns.push(ColumnDef {
-        name: "timestamp".to_string(),
+        name: chronix_core::TIME_COLUMN.to_string(),
         data_type: data_types::TIMESTAMP,
         role: roles::TIMESTAMP,
         default_encoding: chronix_encoding::EncodingType::DeltaOfDelta.tag(),
@@ -1294,7 +1296,7 @@ fn discover_schema_from_batch(
 
     // Timestamp first
     columns.push(ColumnDef {
-        name: "timestamp".to_string(),
+        name: chronix_core::TIME_COLUMN.to_string(),
         data_type: data_types::TIMESTAMP,
         role: roles::TIMESTAMP,
         default_encoding: chronix_encoding::EncodingType::DeltaOfDelta.tag(),
@@ -1317,7 +1319,7 @@ fn discover_schema_from_batch(
     // Fields (everything else except timestamp and tags)
     for field in batch.schema().fields() {
         let name = field.name().as_str();
-        if name == "timestamp" || tag_columns.contains(name) {
+        if name == chronix_core::TIME_COLUMN || tag_columns.contains(name) {
             continue;
         }
         let (dt, enc) = match field.data_type() {
@@ -1406,7 +1408,9 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
     schema: &[ColumnDef],
     batch: &RecordBatch,
     config: &SegmentWriterConfig,
-    segment_created_at: i64,
+    // Only the encryption path reads it: it is half of the AEAD nonce's
+    // associated data, so a block cannot be replayed into another segment.
+    #[cfg_attr(not(feature = "field-encryption"), allow(unused_variables))] segment_created_at: i64,
     writer: &mut W,
     crc: &mut u32,
     pos: &mut u64,
@@ -1676,7 +1680,7 @@ fn encode_column_from_batch(
     match (col.role, col.data_type) {
         (roles::TIMESTAMP, _) => {
             let arr = batch
-                .column_by_name("timestamp")
+                .column_by_name(chronix_core::TIME_COLUMN)
                 .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
                 .ok_or_else(|| SegmentError::CorruptFile {
                     detail: "missing timestamp".into(),

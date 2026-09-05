@@ -24,15 +24,13 @@
 //! [`Chronix::sql`](crate::Chronix::sql), which returns Arrow `RecordBatch`es
 //! and nothing else.
 
-/// The name SQL knows the timestamp column by.
+/// The name of the time column.
 ///
-/// Storage calls it `timestamp`, each JSON query row carries it under
-/// `timestamp`, and SQL exposes it as `_time` — three names for one column,
-/// and the schema endpoint reported the wrong one for the surface it invites
-/// you to use, so "read the schema, then write a query" answered `No field
-/// named timestamp`. Named here so the endpoint and the provider cannot
-/// drift.
-pub const TIME_COLUMN: &str = "_time";
+/// Re-exported from [`chronix_core::TIME_COLUMN`] so SQL cannot drift from
+/// storage: they were different names — `_time` here, `timestamp` there,
+/// `time` in the schema registry — and the endpoint that reported a schema
+/// had to pick one, so "read the schema, then write a query" failed.
+pub use chronix_core::TIME_COLUMN;
 
 pub mod asof_join;
 mod batch;

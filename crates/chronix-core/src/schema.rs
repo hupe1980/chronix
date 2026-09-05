@@ -171,7 +171,7 @@ impl MeasurementSchema {
     #[must_use]
     pub fn new(measurement: impl Into<String>) -> Self {
         let ts_col = ColumnDef {
-            name: "time".to_string(),
+            name: crate::TIME_COLUMN.to_string(),
             column_type: ColumnType::Timestamp,
             role: ColumnRole::Timestamp,
         };
@@ -651,7 +651,7 @@ mod tests {
         let schema = MeasurementSchema::new("cpu");
         assert_eq!(schema.measurement(), "cpu");
         assert_eq!(schema.columns().len(), 1);
-        assert_eq!(schema.columns()[0].name, "time");
+        assert_eq!(schema.columns()[0].name, crate::TIME_COLUMN);
         assert_eq!(schema.columns()[0].role, ColumnRole::Timestamp);
     }
 

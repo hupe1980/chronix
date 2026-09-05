@@ -238,7 +238,7 @@ impl Chronix {
             let ts_idx = schema
                 .fields()
                 .iter()
-                .position(|f| f.name() == "timestamp" || f.name() == "_time" || f.name() == "time");
+                .position(|f| f.name() == chronix_core::TIME_COLUMN);
             let field_idx = schema.index_of(field).ok();
 
             if let (Some(ts_idx), Some(field_idx)) = (ts_idx, field_idx) {

@@ -368,7 +368,7 @@ fn collect_series(
         let ts_col_idx = schema
             .fields()
             .iter()
-            .position(|f| f.name() == "timestamp" || f.name() == "_time" || f.name() == "time")
+            .position(|f| f.name() == chronix_core::TIME_COLUMN)
             .ok_or_else(|| EvalError("no timestamp column".into()))?;
 
         let Some(value_col_idx) = schema

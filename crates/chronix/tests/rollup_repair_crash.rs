@@ -122,7 +122,7 @@ fn child(dir: &std::path::Path) -> ! {
 fn rollup_buckets(db: &Chronix) -> BTreeMap<i64, (f64, f64)> {
     let m = db.rollup("raw_1m", i64::MIN, i64::MAX - 1).unwrap();
     let ts = m
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .unwrap()
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
@@ -158,7 +158,7 @@ fn raw_buckets(db: &Chronix) -> BTreeMap<i64, (f64, f64)> {
     let mut out: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
     for batch in db.execute_stream(&plan).unwrap() {
         let ts = batch
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()

@@ -116,7 +116,7 @@ fn align_batch(batch: &RecordBatch, target: &Arc<Schema>) -> Result<RecordBatch>
 /// authoritative identity — preventing hash-collision data loss.
 ///
 /// Tag columns are identified by Arrow field metadata (`role=tag`), or as a
-/// fallback, all `Utf8` columns except `"timestamp"`.
+/// fallback, all `Utf8` columns except `_time`.
 ///
 /// When multiple rows share the same `(series_canonical, timestamp)`, the
 /// row from the batch appearing **later** in the input list wins
@@ -220,7 +220,7 @@ pub fn sort_merge_dedup_chunked(
 /// the memtable and every merged output are ordered already.
 fn sort_batch_by_timestamp(batch: &RecordBatch) -> Result<RecordBatch> {
     let Some(ts) = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
     else {
         // No timestamp column to order by (a projection that dropped it);
@@ -355,7 +355,7 @@ fn plan_merge(
     }
 
     let time_idx = schema
-        .index_of("timestamp")
+        .index_of(chronix_core::TIME_COLUMN)
         .map_err(|_| QueryError::Validation("'timestamp' column not found".into()))?;
     let tag_columns = resolve_tag_columns(&schema);
 
@@ -603,7 +603,7 @@ fn chunk_batch(batch: &RecordBatch, chunk_size: usize) -> Vec<RecordBatch> {
 ///
 /// Prefers the Arrow field metadata (`role=tag`) annotation when
 /// available. Falls back to treating all `Utf8` columns except
-/// `"timestamp"` as tags — this matches the heuristic used elsewhere
+/// `_time` as tags — this matches the heuristic used elsewhere
 /// in the codebase.
 fn resolve_tag_columns(schema: &Schema) -> Vec<(usize, String)> {
     // First try explicit metadata
@@ -622,7 +622,7 @@ fn resolve_tag_columns(schema: &Schema) -> Vec<(usize, String)> {
         .fields()
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.data_type() == &DataType::Utf8 && f.name() != "timestamp")
+        .filter(|(_, f)| f.data_type() == &DataType::Utf8 && f.name() != chronix_core::TIME_COLUMN)
         .map(|(i, f)| (i, f.name().clone()))
         .collect()
 }
@@ -747,7 +747,7 @@ mod tests {
 
     fn make_batch(times: Vec<i64>, values: Vec<f64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
         ]));
 
@@ -828,7 +828,7 @@ mod tests {
 
         // b2 has (timestamp, value, extra_field) — schema evolution
         let schema2 = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
             Field::new("extra_field", DataType::Utf8, true),
         ]));
@@ -859,7 +859,7 @@ mod tests {
     fn different_column_order_aligned() {
         // b1: (timestamp, host, region, value)
         let schema1 = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("region", DataType::Utf8, true),
             Field::new("value", DataType::Float64, false),
@@ -877,7 +877,7 @@ mod tests {
 
         // b2: (timestamp, region, host, value) — different order
         let schema2 = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("region", DataType::Utf8, true),
             Field::new("host", DataType::Utf8, true),
             Field::new("value", DataType::Float64, false),
@@ -915,7 +915,7 @@ mod tests {
         // Two different series (host=srv1 vs host=srv2) at the SAME timestamp
         // must both be preserved after dedup.
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true)
                 .with_metadata([("role".into(), "tag".into())].into()),
             Field::new("value", DataType::Float64, false),
@@ -1007,7 +1007,7 @@ mod ordering_tests {
     #[test]
     fn a_single_series_major_batch_comes_back_in_time_order() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("v", DataType::Float64, true),
         ]));
@@ -1025,7 +1025,7 @@ mod ordering_tests {
         let out = sort_merge_dedup_chunked(vec![batch], "m", 1024, None).unwrap();
         assert_eq!(out.len(), 1);
         let ts = out[0]
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -1040,7 +1040,7 @@ mod ordering_tests {
     #[test]
     fn an_ordered_batch_is_not_reshuffled() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("v", DataType::Float64, true),
         ]));
         let batch = RecordBatch::try_new(

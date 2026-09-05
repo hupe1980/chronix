@@ -39,7 +39,7 @@ fn all_rows(batches: &[RecordBatch]) -> Vec<(i64, f64)> {
     let mut out = Vec::new();
     for b in batches {
         let ts = b
-            .column(b.schema().index_of("timestamp").unwrap())
+            .column(b.schema().index_of(chronix_core::TIME_COLUMN).unwrap())
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();

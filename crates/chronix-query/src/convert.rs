@@ -51,6 +51,7 @@ struct Column {
 /// same key from the storage side.
 #[must_use]
 fn role_metadata(role: ColumnRole) -> std::collections::HashMap<String, String> {
+    // The *role*, not the column name.
     let name = match role {
         ColumnRole::Timestamp => "timestamp",
         ColumnRole::Tag => "tag",
@@ -230,7 +231,7 @@ fn discover_columns(points: &[Point]) -> Vec<Column> {
 
     // Timestamp first
     columns.push(Column {
-        name: "timestamp".to_string(),
+        name: chronix_core::TIME_COLUMN.to_string(),
         role: ColumnRole::Timestamp,
     });
 
@@ -388,7 +389,7 @@ mod tests {
         let schema = batch.schema();
 
         // Order: timestamp, dc, host (tags sorted), a_field, z_field (fields sorted)
-        assert_eq!(schema.field(0).name(), "timestamp");
+        assert_eq!(schema.field(0).name(), chronix_core::TIME_COLUMN);
         assert_eq!(schema.field(1).name(), "dc");
         assert_eq!(schema.field(2).name(), "host");
         assert_eq!(schema.field(3).name(), "a_field");

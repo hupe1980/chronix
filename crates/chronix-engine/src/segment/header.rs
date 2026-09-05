@@ -9,13 +9,15 @@
 //! The header contains a `version: u16` field (bytes 4–5, after the 4-byte
 //! magic `CXSG`). The current format version is [`VERSION`].
 //!
-//! On read, [`SegmentHeader::from_bytes`] validates:
-//!   - version ≠ 0 (reserved/corrupt)
-//!   - version ≤ `VERSION` (rejects files from a newer writer)
+//! On read, [`SegmentHeader::from_bytes`] requires `version == VERSION`
+//! exactly — a file from a newer writer *or* an older one is refused with
+//! [`SegmentError::UnsupportedVersion`].
 //!
-//! If the check fails, [`SegmentError::UnsupportedVersion`] is returned,
-//! giving operators a clear error when encountering segments written by a
-//! future or incompatible version of Chronix.
+//! Accepting an older version would be silent corruption rather than
+//! compatibility: v2 named its time column `timestamp` and v3 names it
+//! `_time`, so a v2 file opened by a v3 reader yields a batch with a column
+//! nothing looks for — no error, no rows. Chronix is pre-release and there is
+//! no data in the wild, so the reader refuses instead of translating.
 
 use crate::segment::error::{Result, SegmentError};
 use crate::segment::to_array;
@@ -30,12 +32,18 @@ pub const MAGIC: [u8; 4] = *b"CXSG";
 ///   longer encoded as `0`/`""`/`false` sentinels, so `IS NULL` and
 ///   aggregates are correct on sparse data. See
 ///   [`ColumnBlockMeta::validity_length`].
+/// - **v3** — the time column is stored as `_time`, the one name every layer
+///   uses. It was `timestamp` here, `time` in the schema registry and `_time`
+///   in SQL, so a reader who printed a schema and then wrote a query had to
+///   translate.
 ///
-/// Chronix is pre-release, so v1 readers were removed rather than kept:
-/// there is no v1 data in the wild to migrate.
+/// Chronix is pre-release, so readers for older versions were removed rather
+/// than kept: there is no data in the wild to migrate, and a reader that
+/// *accepted* v2 would hand back a column called `timestamp` that nothing
+/// looks for any more — zero rows and no error.
 ///
 /// [`ColumnBlockMeta::validity_length`]: crate::segment::metadata::ColumnBlockMeta::validity_length
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// Size of the serialized header in bytes.
 pub const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 2 + 4 + 1 + 1;
@@ -112,7 +120,10 @@ impl SegmentHeader {
         }
 
         let version = u16::from_le_bytes([data[4], data[5]]);
-        if version == 0 || version > VERSION {
+        // Equality, not `<=`: an older segment is a *different* format, and
+        // reading one would produce a batch whose time column has the name
+        // this version stopped using.
+        if version != VERSION {
             return Err(SegmentError::UnsupportedVersion { version });
         }
 
@@ -334,6 +345,35 @@ mod tests {
         assert!(matches!(
             SegmentHeader::from_bytes(&bytes),
             Err(SegmentError::UnsupportedVersion { version: 0 })
+        ));
+    }
+
+    /// An *older* segment is refused too, not read.
+    ///
+    /// v2 called the time column `timestamp`; v3 calls it `_time`. A reader
+    /// that accepted v2 would return a batch whose time column nothing looks
+    /// for — no rows, no error — so the version check is equality.
+    #[test]
+    fn header_older_version_rejected() {
+        let header = SegmentHeader {
+            version: VERSION,
+            flags: 0,
+            created_at: 0,
+            min_timestamp: 0,
+            max_timestamp: 0,
+            row_count: 0,
+            column_count: 0,
+            series_count: 0,
+            compression: 0,
+            sort_order: 0,
+        };
+        let mut bytes = header.to_bytes();
+        let older = super::VERSION - 1;
+        bytes[4] = older as u8;
+        bytes[5] = (older >> 8) as u8;
+        assert!(matches!(
+            SegmentHeader::from_bytes(&bytes),
+            Err(SegmentError::UnsupportedVersion { .. })
         ));
     }
 

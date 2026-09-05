@@ -112,7 +112,7 @@ pub fn apply_filter(batch: &RecordBatch, mask: &BooleanArray) -> Result<RecordBa
 /// Apply time range and tag filters to a `RecordBatch`.
 ///
 /// This is the main entry point for the filter pipeline. It:
-/// 1. Applies the time range filter on the `"timestamp"` column
+/// 1. Applies the time range filter on the `_time` column
 /// 2. Applies tag equality filters on the specified columns
 /// 3. Combines all masks with AND
 /// 4. Filters the batch
@@ -136,7 +136,7 @@ pub fn filter_batch(
 
     // Time range filter
     let time_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .ok_or_else(|| QueryError::Validation("'timestamp' column not found".into()))?;
     let timestamps = time_col
         .as_any()
@@ -193,7 +193,7 @@ pub fn filter_batch(
 
 /// Build a `RecordBatch` with the specified column projection.
 ///
-/// Selects only the named columns from the input batch. Always includes `"timestamp"`.
+/// Selects only the named columns from the input batch. Always includes `_time`.
 ///
 /// # Errors
 ///
@@ -204,9 +204,9 @@ pub fn project_batch(batch: &RecordBatch, projection: &[String]) -> Result<Recor
     }
 
     // Always include timestamp column
-    let mut col_names: Vec<&str> = vec!["timestamp"];
+    let mut col_names: Vec<&str> = vec![chronix_core::TIME_COLUMN];
     for name in projection {
-        if name != "timestamp" {
+        if name != chronix_core::TIME_COLUMN {
             col_names.push(name);
         }
     }
@@ -259,7 +259,7 @@ pub fn filter_tombstoned(
     }
 
     // Resolve tag columns — prefer explicit names when available,
-    // fall back to heuristic (all string-like columns except "timestamp").
+    // fall back to heuristic (all string-like columns except `_time`).
     let schema = batch.schema();
     let tag_columns: Vec<(usize, &str)> = if let Some(names) = tag_col_names {
         names
@@ -271,7 +271,7 @@ pub fn filter_tombstoned(
             .fields()
             .iter()
             .enumerate()
-            .filter(|(_, f)| is_string_like(f.data_type()) && f.name() != "timestamp")
+            .filter(|(_, f)| is_string_like(f.data_type()) && f.name() != chronix_core::TIME_COLUMN)
             .map(|(i, f)| (i, f.name().as_str()))
             .collect()
     };
@@ -280,7 +280,7 @@ pub fn filter_tombstoned(
     // collision-proof tombstone matching.
     // Support ranged tombstones via timestamp lookup.
     let ts_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
     let keep: Vec<bool> = (0..batch.num_rows())
         .map(|row| {
@@ -367,7 +367,7 @@ mod tests {
 
     fn test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn filter_empty_batch() {
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "timestamp",
+            chronix_core::TIME_COLUMN,
             DataType::Int64,
             false,
         )]));
@@ -442,7 +442,10 @@ mod tests {
         let batch = test_batch();
         let projected = project_batch(&batch, &["value".to_string()]).unwrap();
         assert_eq!(projected.num_columns(), 2); // timestamp + value
-        assert_eq!(projected.schema().field(0).name(), "timestamp");
+        assert_eq!(
+            projected.schema().field(0).name(),
+            chronix_core::TIME_COLUMN
+        );
         assert_eq!(projected.schema().field(1).name(), "value");
     }
 
@@ -507,7 +510,7 @@ mod tests {
         let hosts: DictionaryArray<Int32Type> = vec!["a", "b", "a", "b", "a"].into_iter().collect();
         let values = arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", hosts.data_type().clone(), false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -530,7 +533,7 @@ mod tests {
             vec!["host-a", "host-b", "host-a"].into_iter().collect();
         let values = Float64Array::from(vec![1.0, 2.0, 3.0]);
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", hosts.data_type().clone(), false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -564,7 +567,7 @@ mod tests {
         let hosts: DictionaryArray<Int32Type> = vec!["host-x", "host-y"].into_iter().collect();
         let values = Float64Array::from(vec![1.0, 2.0]);
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", hosts.data_type().clone(), false),
             Field::new("value", DataType::Float64, false),
         ]));

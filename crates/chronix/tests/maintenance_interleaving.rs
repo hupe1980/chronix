@@ -131,14 +131,21 @@ fn concurrent_maintenance_never_loses_an_acknowledged_write() {
 
     // A reader, asserting only that a query never fails and never sees more
     // rows than have been attempted.
+    //
+    // The ordering of these two reads is the whole invariant, and both ways of
+    // getting it wrong were tried. A writer counts *before* it inserts, so a
+    // row that exists has already been counted; the query must therefore
+    // finish **before** the counter is read, or writers that landed during the
+    // scan are visible in `seen` and missing from `attempted`. Count after
+    // insert and read the counter first, and it fails the other way.
     {
         let db = Arc::clone(&db);
         let stop = Arc::clone(&stop);
         let written = Arc::clone(&written);
         background.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let attempted = written.load(Ordering::Relaxed);
                 let seen = count_rows(&db);
+                let attempted = written.load(Ordering::Relaxed);
                 assert!(
                     seen <= attempted,
                     "a query returned {seen} rows against {attempted} attempted writes"

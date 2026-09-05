@@ -29,13 +29,13 @@ fn buckets(batches: &[RecordBatch]) -> Vec<(i64, f64)> {
     let mut out = Vec::new();
     for b in batches {
         let ts = b
-            .column(b.schema().index_of("timestamp").unwrap())
+            .column(b.schema().index_of(chronix_core::TIME_COLUMN).unwrap())
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         // The aggregated value column is the one that is not the timestamp.
         let vi = (0..b.num_columns())
-            .find(|i| b.schema().field(*i).name() != "timestamp")
+            .find(|i| b.schema().field(*i).name() != chronix_core::TIME_COLUMN)
             .unwrap();
         let v = b
             .column(vi)

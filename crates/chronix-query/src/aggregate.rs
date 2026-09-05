@@ -140,7 +140,7 @@ pub fn aggregate_batch(
 
     // Extract timestamp column for timestamp-aware First/Last.
     let ts_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
     for &field_name in field_columns {
@@ -237,7 +237,7 @@ pub fn aggregate_grouped(
         .collect();
 
     let ts_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
     // One accumulator per (group, field_column) — a single
@@ -701,7 +701,7 @@ pub fn aggregate_sorted(
         .collect();
 
     let ts_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
     let group_cols: Vec<&StringArray> = group_by
@@ -1000,7 +1000,7 @@ fn push_grouped(
         .collect();
 
     let ts_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
     // Resolve field columns for this batch — pre-downcast once.
@@ -1143,7 +1143,7 @@ impl UngroupedState {
     #[allow(clippy::cast_precision_loss)]
     fn push(&mut self, batch: &RecordBatch, field_columns: &[&str]) {
         let ts_col = batch
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
 
         for (fi, &field_name) in field_columns.iter().enumerate() {
@@ -1275,7 +1275,7 @@ mod tests {
 
     fn test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -1445,7 +1445,7 @@ mod tests {
 
     fn u64_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("count", DataType::UInt64, false),
         ]));
         let timestamps = Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500]));
@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn first_last_out_of_order_timestamps() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -1608,7 +1608,7 @@ mod tests {
     #[test]
     fn first_last_timestamp_ties() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -1642,7 +1642,7 @@ mod tests {
     #[test]
     fn grouped_first_last_by_timestamp() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -1703,7 +1703,7 @@ mod tests {
     #[test]
     fn grouped_last_timestamp_tie_breaking() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -1731,7 +1731,7 @@ mod tests {
     #[test]
     fn first_last_single_row() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -1885,7 +1885,7 @@ mod tests {
     #[test]
     fn sort_aggregate_produces_sorted_output() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("region", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));

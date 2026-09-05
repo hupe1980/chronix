@@ -678,7 +678,7 @@ impl<'a> RollupAccumulator<'a> {
     pub fn push(&mut self, batch: &arrow::record_batch::RecordBatch) -> Vec<chronix_core::Point> {
         use arrow::array::{Array, Float64Array, Int64Array, StringArray, UInt64Array};
 
-        let Ok(ts_idx) = batch.schema().index_of("timestamp") else {
+        let Ok(ts_idx) = batch.schema().index_of(chronix_core::TIME_COLUMN) else {
             return Vec::new();
         };
         let Some(ts_array) = batch.column(ts_idx).as_any().downcast_ref::<Int64Array>() else {
@@ -695,7 +695,7 @@ impl<'a> RollupAccumulator<'a> {
             .iter()
             .enumerate()
             .filter(|(_, f)| {
-                f.name() != "timestamp"
+                f.name() != chronix_core::TIME_COLUMN
                     && f.name() != "series_key_hash"
                     && !self.config.group_by_tags.contains(f.name())
                     && matches!(
@@ -857,7 +857,7 @@ fn dedup_bucket_points(points: Vec<chronix_core::Point>) -> Vec<chronix_core::Po
     by_key.into_values().collect()
 }
 
-/// Convert a `RecordBatch` of `measurement` back into points: `timestamp`,
+/// Convert a `RecordBatch` of `measurement` back into points: `_time`,
 /// every `Utf8` column as a tag, every `Float64` column as a field.
 #[must_use]
 pub fn record_batch_to_points(
@@ -867,7 +867,7 @@ pub fn record_batch_to_points(
     use arrow::array::{Array, Float64Array, Int64Array, StringArray};
     let schema = batch.schema();
     let Some(ts) = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
     else {
         return Vec::new();
@@ -930,7 +930,7 @@ pub fn record_batch_to_points(
 
 /// Convert a slice of [`chronix_core::Point`] into an Arrow `RecordBatch`.
 ///
-/// This function assembles a flat table with a `timestamp` column, one
+/// This function assembles a flat table with a `_time` column, one
 /// `Utf8` column per distinct tag key, and one `Float64` column per
 /// distinct field key.  Returns `None` if `points` is empty.
 #[must_use]
@@ -959,7 +959,11 @@ pub fn points_to_record_batch(
     }
 
     // Build schema: timestamp + tags (Utf8) + fields (Float64)
-    let mut fields = vec![Field::new("timestamp", DataType::Int64, false)];
+    let mut fields = vec![Field::new(
+        chronix_core::TIME_COLUMN,
+        DataType::Int64,
+        false,
+    )];
     for tag in &tag_keys {
         fields.push(Field::new(tag, DataType::Utf8, true));
     }
@@ -1190,7 +1194,7 @@ mod tests {
 
         // Create 6 data points: 3 in first 10s bucket, 3 in second
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("cpu", DataType::Float64, true),
         ]));
@@ -1260,7 +1264,7 @@ mod tests {
 
         let batch = points_to_record_batch(&[p]).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert!(batch.schema().index_of("timestamp").is_ok());
+        assert!(batch.schema().index_of(chronix_core::TIME_COLUMN).is_ok());
         assert!(batch.schema().index_of("host").is_ok());
         assert!(batch.schema().index_of("cpu_avg").is_ok());
         assert!(batch.schema().index_of("cpu_max").is_ok());

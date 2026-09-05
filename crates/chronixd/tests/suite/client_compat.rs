@@ -157,7 +157,7 @@ async fn a_precision_parameter_scales_the_timestamps() {
         .unwrap();
     let batch = db.execute(&plan).unwrap();
     let ts = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .unwrap()
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()

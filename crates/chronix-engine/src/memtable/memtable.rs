@@ -1323,8 +1323,10 @@ impl MeasurementBuilder {
         use crate::segment::metadata::roles;
         // A tag and a string field are the same Arrow type, so the schema has
         // to carry the role or every consumer guesses at it.
-        let mut fields = vec![Field::new("timestamp", DataType::Int64, false)
-            .with_metadata(roles::arrow_metadata(roles::TIMESTAMP))];
+        let mut fields = vec![
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false)
+                .with_metadata(roles::arrow_metadata(roles::TIMESTAMP)),
+        ];
         let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(self.timestamps.finish())];
         let tag_columns: Vec<String> = self.tags.keys().map(ToString::to_string).collect();
         for (name, mut b) in self.tags {

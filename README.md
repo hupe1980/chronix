@@ -126,7 +126,7 @@ let point = Point::new(
 )?;
 db.insert(&point)?;
 
-// SQL — every measurement is a table, `_time` is the timestamp, and it
+// SQL — every measurement is a table and `_time` is the time column, and it
 // compares against the same epoch nanoseconds `insert` took.
 for batch in db.sql(
     "SELECT time_bucket('5m', _time) AS t, host, avg(usage_idle) FROM cpu
@@ -195,11 +195,10 @@ Each claim below is pinned by a test; the depth is in the
   every segment they were issued against has been rewritten — so writing to a
   series after deleting it re-creates it rather than being swallowed.
 - **Rollups are materialised and repaired, never approximated.** A cascade
-  (1 s → 1 min → 15 min) with a persisted watermark per tier. Because "the
-  out-of-order window closed" is not proof of finality, a backfill, a delete
-  or an import into an aggregated range records an **invalidation** that the
-  next pass recomputes. Retention drops raw data only once every tier it feeds
-  is materialised past it and has no repair pending.
+  (1 s → 1 min → 15 min) with a persisted watermark per tier. A backfill, a
+  delete or an import into an already-aggregated range records an
+  **invalidation** that the next pass recomputes, and retention drops raw data
+  only once every tier it feeds has caught up.
 - **Parquet cold archive** reads each cold `(measurement, shard)` group
   *through the read path* — deduplicated, tombstones applied — writes one
   Hive-partitioned object to S3/GCS/Azure, verifies it, and only then drops
@@ -214,20 +213,16 @@ Each claim below is pinned by a test; the depth is in the
   open bucket, `LIMIT` stopping the scan. No two entry points can disagree.
 - **SQL** through DataFusion, one call away: `db.sql("…")` synchronously,
   `db.sql_async` from async, `db.session_context()` for DataFusion's own API.
-  Predicate pushdown, cost statistics, spill-to-disk, read-only enforcement at
-  plan level, and **23 analytics functions** — `time_bucket`, fifteen window
-  functions (`diff`, `zscore`, `rolling_*`, `stl_*`, `anomaly_score`, …) and
-  seven aggregates (`first`, `last`, `rate`, `irate`, `forecast`,
-  `auto_forecast`, `multivariate_forecast`).
+  Predicate pushdown, spill-to-disk, read-only enforcement at plan level, and
+  **23 analytics functions** — `time_bucket`, fifteen window functions
+  (`rolling_*`, `stl_*`, `anomaly_score`, …) and seven aggregates (`rate`,
+  `irate`, `forecast`, `auto_forecast`, …).
 - **PromQL tracking Prometheus 3.x** — 50+ functions, all matcher operators,
   vector matching, subqueries, `@` and negative offsets, embedded via
   `db.promql(…)` or served at the paths a Prometheus client derives. A range
   query reads its window **once**, not once per step. A metric is one
-  `(measurement, field)` pair named `<measurement>_<field>` — or the
-  measurement alone when the field is `value`, which is how remote write and
-  OTLP store a sample — so a name a query returns is a selector that returns
-  it, and adding a field never renames an existing metric. An end-to-end
-  conformance suite drives the real query path.
+  `(measurement, field)` pair, so a name a query returns is a selector that
+  returns it. Pinned by an end-to-end conformance suite.
 
 **Analytics** — [guide](https://hupe1980.github.io/chronix/docs/analytics/)
 
@@ -396,22 +391,22 @@ API documentation for the published crates is on
 
 ## Project Status
 
-Pre-release, under active development. The engine is extensively hardened —
-a green default-build suite (`cargo test` prints the count), property tests
-on every codec, three fuzz targets run nightly, crash-recovery integration
-tests that really crash (a child process that `abort()`s), and 40 deep
-audit passes — but the on-disk format and public API are **not yet
-stable**. The first tagged release will declare both.
+**Pre-release.** The on-disk format and the public API are not yet stable;
+the first tagged release will declare both. There are no production
+deployments.
+
+The engine is hardened against the failures that matter: a property test on
+every codec, three fuzz targets run nightly, and crash-recovery tests that
+really crash — a child process that `abort()`s mid-flush, mid-compaction and
+mid-materialisation, with the parent checking that nothing acknowledged was
+lost.
 
 The tree tracks the current ecosystem: **Arrow 59, DataFusion 55, parquet 59,
-arrow-flight 59, tonic 0.14**. The release procedure and version policy are in
-[CONTRIBUTING.md](CONTRIBUTING.md); what remains before a first release is a
-Grafana walkthrough and TSBS results.
-
-`cargo clippy --all-targets` is clean on the default build at the configured
-lint level. The frozen cluster crates (`chronix-meta`, `chronix-cluster`,
-`chronix-dsim`, excluded from `default-members`) are compile-checked in CI
-but not lint-clean.
+arrow-flight 59, tonic 0.14**. `cargo clippy --all-targets` is clean on the
+default build at the configured lint level; the frozen cluster crates
+(`chronix-meta`, `chronix-cluster`, `chronix-dsim`, outside
+`default-members`) are compile-checked in CI but not lint-clean. The release
+procedure and version policy are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

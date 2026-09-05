@@ -6,7 +6,7 @@
 //!
 //! It lives here because it had **two** implementations, and they drifted: the
 //! SQL scan converted the timestamp column and the cold archive did not, so
-//! the same measurement was `_time` when queried hot and `timestamp` when
+//! the same measurement was `_time` when queried hot and `_time` when
 //! queried from the archive, and `time_bucket` worked on one and not the
 //! other.
 
@@ -18,7 +18,15 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::DataFusionError;
 
-/// Convert the "timestamp" / "time" Int64 column to `_time` Timestamp(Nanosecond).
+/// Retype the time column from storage's `Int64` nanoseconds to SQL's
+/// `Timestamp(Nanosecond)`.
+///
+/// A **retype**, not a rename: the column is `_time` on both sides. It used to
+/// be a rename too — storage called it `timestamp` — which is why a reader who
+/// printed the schema and then wrote `SELECT timestamp …` got a planning
+/// error. The type still differs deliberately: storage stores an `i64` because
+/// that is what it encodes, and SQL presents a `TIMESTAMP` so DataFusion's
+/// date functions and interval arithmetic work on it.
 pub(crate) fn convert_timestamp_column(batch: RecordBatch) -> Result<RecordBatch, DataFusionError> {
     if batch.num_rows() == 0 {
         // Return empty batch — avoid schema mismatches.
@@ -31,14 +39,12 @@ pub(crate) fn convert_timestamp_column(batch: RecordBatch) -> Result<RecordBatch
 
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
-        if (field.name() == "timestamp" || field.name() == "time")
-            && *field.data_type() == DataType::Int64
-        {
+        if field.name() == chronix_core::TIME_COLUMN && *field.data_type() == DataType::Int64 {
             let ts = compute::cast(col, &DataType::Timestamp(TimeUnit::Nanosecond, None))
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             new_fields.push(
                 arrow::datatypes::Field::new(
-                    crate::sql::TIME_COLUMN,
+                    chronix_core::TIME_COLUMN,
                     DataType::Timestamp(TimeUnit::Nanosecond, None),
                     false,
                 )
@@ -198,7 +204,7 @@ mod tests {
 
     fn storage_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("watts", DataType::Float64, true),
         ]));

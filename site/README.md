@@ -33,17 +33,14 @@ sitemap and the search index all derive from the content tree.
 
 ## Two things the deploy does that a local build does not
 
-**`scripts/stamp-lastmod.sh` writes each page's `updated` date** from the last
-commit that touched it, so the sitemap carries `<lastmod>`. It runs in CI
-against an ephemeral checkout and rewrites files in place — never commit its
-output. A hand-kept date would go stale, and a `lastmod` a crawler learns to
-distrust is worse than none, which is why it is not front matter you maintain.
+**`scripts/stamp-lastmod.sh`** writes each page's `updated` date from its last
+commit, so the sitemap carries `<lastmod>`. It runs in CI against an ephemeral
+checkout and rewrites files in place — **never commit its output**, and do not
+maintain `updated` by hand.
 
-**The social card is a PNG.** Facebook, LinkedIn, Slack, Discord and X all
-refuse an SVG `og:image` and render the card with no picture at all, silently.
-`og-image.svg` is the source; regenerate the PNG with
-`rsvg-convert -w 1200 -h 630 -f png -o og-image.png og-image.svg` when it
-changes.
+**The social card is a PNG**, because no major platform renders an SVG
+`og:image`. `og-image.svg` is the source; regenerate with
+`rsvg-convert -w 1200 -h 630 -f png -o og-image.png og-image.svg`.
 
 ## Conventions
 
@@ -63,23 +60,9 @@ anchors too, which is how the site catches a heading being renamed out from
 under a deep link.
 
 **The search index is loaded on demand.** It is 3.4 MB — elasticlunr indexes
-the full text of every page — and it used to be a `<script defer>` in the head,
-so every visitor to every page downloaded and parsed it whether or not they
-ever searched. `search.js` now fetches it on the first sign that someone means
-to search. Keep it that way: `defer` keeps a script off the critical rendering
-path, it does not make it free.
+every page in full — so `search.js` fetches it on the first sign that someone
+means to search, rather than on every page view. Keep it that way.
 
-**Numbers name their evidence.** A performance or compression figure in these
-pages should say which test or benchmark pins it. Unsourced numbers rot: this
-documentation previously claimed "up to 55× compression" (a per-column
-timestamp ratio quoted as a whole-database one) and documented a GPU backend
-that had been deleted.
-
-## Why not mdBook
-
-The site was an mdBook whose chapters were stubs `{{#include}}`-ing Markdown
-from the repository root. That kept two copies in sync but left nowhere to put
-per-page titles, descriptions, canonical URLs or structured data — so every
-page shared one description and search engines had nothing to distinguish them.
-Zola gives each page its own metadata and fails the build on a broken internal
-link, which is what a documentation site needs.
+**Numbers name their evidence.** A performance or compression figure should
+say which test or benchmark pins it. An unsourced number cannot be rechecked,
+so it rots.

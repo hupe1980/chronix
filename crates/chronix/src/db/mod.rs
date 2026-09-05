@@ -1034,7 +1034,7 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 2); // timestamp + "idle"
-        assert_eq!(batch.schema().field(0).name(), "timestamp");
+        assert_eq!(batch.schema().field(0).name(), chronix_core::TIME_COLUMN);
         assert_eq!(batch.schema().field(1).name(), "idle");
 
         db.close().unwrap();
@@ -1521,7 +1521,7 @@ mod tests {
         assert_eq!(result.num_rows(), 0);
         // Schema should still contain the measurement's columns
         let schema = result.schema();
-        assert!(schema.column_with_name("timestamp").is_some());
+        assert!(schema.column_with_name(chronix_core::TIME_COLUMN).is_some());
         assert!(schema.column_with_name("value").is_some());
         assert!(schema.column_with_name("host").is_some());
     }

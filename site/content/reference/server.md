@@ -331,14 +331,14 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | `chronix_multivariate_anomaly_detect_duration_seconds` | Histogram | `chronix-analytics::multivariate` | Duration of MV anomaly detection |
 | `chronix_derived_series_eval_duration_seconds` | Histogram | `chronix-analytics::multivariate` | Duration of derived series evaluation |
 | `chronix_composite_signal_fired_total` | Counter | `chronix-analytics::multivariate` | Composite signals fired |
-| `chronix_signal_delivery_queued_total` | Counter | `DeliveryRouter::deliver` | Signals queued for delivery. Delivery runs on each channel's own worker, so this counts what was handed over, not what was sent |
+| `chronix_signal_delivery_queued_total` | Counter | `DeliveryRouter::deliver` | Signals handed to a channel's worker — queued, not yet sent |
 | `chronix_signal_delivery_total` | Counter | delivery worker | Signals delivered, labelled `channel` |
-| `chronix_signal_delivery_failed_total` | Counter | delivery worker | Delivery attempts that failed, labelled `channel`. A retried signal counts once per attempt |
-| `chronix_signal_delivery_duration_seconds` | Histogram | delivery worker | Time from queueing to a successful delivery, **including retries**, labelled `channel`. A channel that only succeeds on its third attempt looks healthy by the success counter and is not |
-| `chronix_signal_delivery_queue_depth` | Gauge | `DeliveryRouter::deliver` | Signals waiting on a channel's worker, labelled `channel`. A channel that is slow or unreachable grows here first |
-| `chronix_signal_delivery_dropped_total` | Counter | `DeliveryRouter::deliver` | Signals discarded because a channel's queue was full, labelled `channel`. **Any non-zero rate means alerts are being lost** — raise the capacity or fix the channel |
-| `chronix_signal_delivery_unrouted_total` | Counter | `DeliveryRouter::deliver` | Signals naming a channel that is not registered, so they fired and went nowhere |
-| `chronix_signal_evicted_total` | Counter | `SignalStore::store` | Signals evicted from a namespace's ring to make room. The ring is per namespace, so this never means another tenant pushed yours out |
+| `chronix_signal_delivery_failed_total` | Counter | delivery worker | Failed delivery *attempts*, labelled `channel` — a retried signal counts once per attempt |
+| `chronix_signal_delivery_duration_seconds` | Histogram | delivery worker | Queue to successful delivery, **including retries**, labelled `channel` |
+| `chronix_signal_delivery_queue_depth` | Gauge | `DeliveryRouter::deliver` | Signals waiting on a channel's worker, labelled `channel` |
+| `chronix_signal_delivery_dropped_total` | Counter | `DeliveryRouter::deliver` | Signals discarded on a full queue, labelled `channel`. **Non-zero means alerts are being lost** |
+| `chronix_signal_delivery_unrouted_total` | Counter | `DeliveryRouter::deliver` | Signals naming an unregistered channel — fired, delivered nowhere |
+| `chronix_signal_evicted_total` | Counter | `SignalStore::store` | Signals evicted from a namespace's own ring to make room |
 
 **Tracing instrumentation** – All forecast `fit()`/`predict()` and anomaly `fit()`/`detect()` operations are annotated with `#[tracing::instrument]` spans at debug level, enabling timing analysis via any `tracing-subscriber` backend.
 ## Distributed Tracing (`chronixd::otel`)

@@ -353,7 +353,7 @@ impl super::Chronix {
                         .fields()
                         .iter()
                         .filter(|f| {
-                            f.name() != "timestamp"
+                            f.name() != chronix_core::TIME_COLUMN
                                 && f.data_type() == &arrow::datatypes::DataType::Utf8
                         })
                         .map(|f| f.name().clone())
@@ -364,7 +364,7 @@ impl super::Chronix {
             // delete's upper bound, so the row loop cannot stop at the first
             // row of a series.
             let ts_col = filtered
-                .column_by_name("timestamp")
+                .column_by_name(chronix_core::TIME_COLUMN)
                 .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
                 .ok_or_else(|| DbError::Internal("segment has no timestamp column".into()))?;
 

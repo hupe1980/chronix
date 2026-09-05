@@ -191,7 +191,6 @@ done
 # changed no behaviour and raised no error. That is the failure mode of every
 # setting: it does not fail, it is simply ignored.
 echo "checking that documented settings are read…"
-declaring_files=$(grep -rlE '^[[:space:]]+pub [a-z_0-9]+:' crates/ | grep -E 'config\.rs$' | sort -u)
 for page in site/content/docs/*.md; do
   case "$page" in
     */cluster.md|*/api-reference.md) continue ;;
@@ -203,8 +202,14 @@ for page in site/content/docs/*.md; do
   for key in $keys; do
     leaf=${key##*.}
     # Where is it named, other than in a `config.rs` that declares it?
+    #
+    # No `head` on this pipeline: it closes the pipe while `grep -r` is still
+    # writing, and the SIGPIPE that follows fails the script under
+    # `pipefail` — which is how this check passed locally and exited 2 in CI.
+    # The second `grep` consumes the whole stream, so nothing is left writing
+    # into a closed pipe.
     users=$(grep -rl "\b${leaf}\b" crates/ --include='*.rs' 2>/dev/null \
-            | grep -vE 'config\.rs$' | head -1)
+            | { grep -vE 'config\.rs$' || true; })
     if [ -z "$users" ]; then
       note "$page documents setting '$key', which no code outside a config module reads"
     fi

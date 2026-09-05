@@ -479,7 +479,7 @@ fn query_projection_selects_subset_of_fields() {
     assert_eq!(batch.num_rows(), 5);
     // Should have timestamp + temperature = 2 columns
     assert_eq!(batch.num_columns(), 2);
-    assert!(batch.column_by_name("timestamp").is_some());
+    assert!(batch.column_by_name(chronix_core::TIME_COLUMN).is_some());
     assert!(batch.column_by_name("temperature").is_some());
     assert!(batch.column_by_name("humidity").is_none());
     assert!(batch.column_by_name("pressure").is_none());
@@ -751,8 +751,8 @@ fn empty_result_preserves_measurement_schema() {
 
     let schema = result.schema();
     assert!(
-        schema.column_with_name("timestamp").is_some(),
-        "empty result should preserve timestamp column"
+        schema.column_with_name(chronix_core::TIME_COLUMN).is_some(),
+        "empty result should preserve the time column"
     );
     assert!(
         schema.column_with_name("usage_idle").is_some(),
@@ -1438,7 +1438,7 @@ fn downsample_negative_timestamps() {
 
     // Create a batch with negative timestamps
     let schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
     ]));
     let timestamps = Arc::new(Int64Array::from(vec![-15, -5, 5, 15]));
@@ -1449,7 +1449,7 @@ fn downsample_negative_timestamps() {
     let result = downsample(&batch, "value", 10, &AggFn::Sum, None).unwrap();
 
     let ts_col = result
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .unwrap()
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -1488,7 +1488,7 @@ fn count_on_empty_returns_zero() {
 
     // Create an empty batch with a value column
     let schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
     ]));
     let batch = RecordBatch::new_empty(schema);
@@ -2145,7 +2145,7 @@ fn multi_flush_compact_query_correctness() {
 
     // Verify ordering: timestamps should be monotonically increasing
     let ts_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .expect("should have timestamp column");
     let ts_arr = ts_col
         .as_any()

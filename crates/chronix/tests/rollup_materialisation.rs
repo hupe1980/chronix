@@ -76,7 +76,7 @@ fn f64_col(batch: &arrow::record_batch::RecordBatch, name: &str, row: usize) -> 
 
 fn ts_col(batch: &arrow::record_batch::RecordBatch, row: usize) -> i64 {
     batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .unwrap()
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()

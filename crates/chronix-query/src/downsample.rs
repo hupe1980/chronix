@@ -43,12 +43,12 @@ fn extract_f64(col: &dyn Array, index: usize) -> Option<f64> {
 /// For each bucket `[bucket_start, bucket_start + interval)`, the
 /// aggregation function is applied to the values in the `value_column`.
 ///
-/// Returns a new `RecordBatch` with two columns: "timestamp" (bucket start)
+/// Returns a new `RecordBatch` with two columns: `_time` (bucket start)
 /// and the aggregated value column.
 ///
 /// # Arguments
 ///
-/// * `batch` – input data (must have a "timestamp" Int64 column)
+/// * `batch` – input data (must have a `_time` Int64 column)
 /// * `value_column` – name of the column to aggregate
 /// * `interval` – bucket width in the same unit as timestamps (e.g. nanos)
 /// * `function` – aggregation function to apply per bucket
@@ -73,7 +73,7 @@ pub fn downsample(
     let schema = batch.schema();
 
     let time_idx = schema
-        .index_of("timestamp")
+        .index_of(chronix_core::TIME_COLUMN)
         .map_err(|_| QueryError::Validation("'timestamp' column not found".into()))?;
     let val_idx = schema
         .index_of(value_column)
@@ -188,7 +188,7 @@ pub fn downsample(
     }
 
     let out_schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
         Field::new(value_column, DataType::Float64, false),
     ]));
 
@@ -350,7 +350,7 @@ impl StreamingDownsampler {
         }
         let schema = batch.schema();
         let time_idx = schema
-            .index_of("timestamp")
+            .index_of(chronix_core::TIME_COLUMN)
             .map_err(|_| QueryError::Validation("'timestamp' column not found".into()))?;
         let val_idx =
             schema
@@ -447,7 +447,7 @@ impl StreamingDownsampler {
 /// Build the two-column output batch for a run of completed buckets.
 fn build_batch(value_column: &str, rows: &[(i64, f64)]) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
         Field::new(value_column, DataType::Float64, false),
     ]));
     let times: Vec<i64> = rows.iter().map(|(t, _)| *t).collect();
@@ -469,7 +469,7 @@ mod tests {
 
     fn make_batch(times: Vec<i64>, values: Vec<f64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
         ]));
 
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn downsample_i64_column() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn downsample_u64_column() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn downsample_unsupported_type_fails() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Boolean, false),
         ]));
         let batch = RecordBatch::try_new(

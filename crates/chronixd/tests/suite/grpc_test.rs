@@ -200,7 +200,7 @@ async fn grpc_get_schema() {
     assert!(!resp.columns.is_empty());
 
     let col_names: Vec<&str> = resp.columns.iter().map(|c| c.name.as_str()).collect();
-    assert!(col_names.contains(&"timestamp"));
+    assert!(col_names.contains(&chronix_core::TIME_COLUMN));
     assert!(col_names.contains(&"value"));
 }
 

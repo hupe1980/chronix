@@ -194,7 +194,7 @@ impl super::Chronix {
                     .fields()
                     .iter()
                     .filter(|f| {
-                        f.name() != "timestamp"
+                        f.name() != chronix_core::TIME_COLUMN
                             && !tag_filters.iter().any(|tf| tf.key == *f.name())
                             && !group_by.iter().any(|g| g == f.name())
                     })
@@ -233,7 +233,7 @@ impl super::Chronix {
                     .fields()
                     .iter()
                     .find(|f| {
-                        f.name() != "timestamp"
+                        f.name() != chronix_core::TIME_COLUMN
                             && matches!(
                                 f.data_type(),
                                 arrow::datatypes::DataType::Float64
@@ -708,7 +708,7 @@ impl super::Chronix {
                 }
 
                 let filtered_ts = filtered
-                    .column_by_name("timestamp")
+                    .column_by_name(chronix_core::TIME_COLUMN)
                     .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
                     .ok_or_else(|| DbError::Internal("missing timestamp column".into()))?;
 
@@ -772,7 +772,7 @@ impl super::Chronix {
     ) -> Result<Point> {
         let schema = batch.schema();
         let ts_col = batch
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .and_then(|c| c.as_any().downcast_ref::<arrow::array::Int64Array>())
             .ok_or_else(|| DbError::Internal("missing timestamp".into()))?;
         let timestamp = ts_col.value(row);
@@ -783,7 +783,7 @@ impl super::Chronix {
         let mut fields = BTreeMap::new();
         for field_ref in schema.fields() {
             let name = field_ref.name();
-            if name == "timestamp" || tags.contains_key(name.as_str()) {
+            if name == chronix_core::TIME_COLUMN || tags.contains_key(name.as_str()) {
                 continue;
             }
             let Some(col) = batch.column_by_name(name) else {
@@ -883,7 +883,7 @@ impl super::Chronix {
             .fields()
             .iter()
             .map(|f| {
-                let role = if f.name() == "timestamp" || f.name() == "time" || f.name() == "_time" {
+                let role = if f.name() == chronix_core::TIME_COLUMN {
                     Some(chronix_core::ColumnRole::Timestamp)
                 } else {
                     // A column the registry does not know is one a query node
@@ -918,8 +918,7 @@ impl super::Chronix {
                 if projection.is_empty() {
                     return true;
                 }
-                col.name == "timestamp"
-                    || col.name == "time"
+                col.name == chronix_core::TIME_COLUMN
                     || col.role == chronix_core::ColumnRole::Tag
                     || projection.iter().any(|p| p == &col.name)
             })
@@ -931,13 +930,7 @@ impl super::Chronix {
                     ColumnType::Bool => DataType::Boolean,
                     ColumnType::String => DataType::Utf8,
                 };
-                // Use "timestamp" as the canonical column name
-                let name = if col.name == "time" {
-                    "timestamp".to_string()
-                } else {
-                    col.name.clone()
-                };
-                Field::new(name, dt, true).with_metadata(role_metadata(col.role))
+                Field::new(col.name.clone(), dt, true).with_metadata(role_metadata(col.role))
             })
             .collect();
         Arc::new(arrow::datatypes::Schema::new(fields))
@@ -1073,7 +1066,7 @@ impl super::Chronix {
     /// Extract unique series keys from a `RecordBatch` by inspecting tag columns.
     ///
     /// Identifies tag columns via Arrow field metadata (`role=tag`) or falls
-    /// back to all `Utf8` columns except `timestamp`. Returns deduplicated
+    /// back to all `Utf8` columns except `_time`. Returns deduplicated
     /// `SeriesKey` instances.
     pub(super) fn extract_series_keys_from_batch(
         batch: &arrow::array::RecordBatch,
@@ -1138,7 +1131,7 @@ impl super::Chronix {
         let mut columns: Vec<String> = Vec::new();
 
         // Always need timestamp for dedup / filter / downsample
-        columns.push("timestamp".to_string());
+        columns.push(chronix_core::TIME_COLUMN.to_string());
 
         // Need tag columns for filtering
         for tf in tag_filters {
@@ -1188,7 +1181,7 @@ impl super::Chronix {
                     .fields()
                     .iter()
                     .filter(|f| {
-                        f.name() != "timestamp"
+                        f.name() != chronix_core::TIME_COLUMN
                             && !tag_filters.iter().any(|tf| tf.key == *f.name())
                             && !group_by.iter().any(|g| g == f.name())
                     })
@@ -1237,7 +1230,7 @@ impl super::Chronix {
                     .fields()
                     .iter()
                     .find(|f| {
-                        f.name() != "timestamp"
+                        f.name() != chronix_core::TIME_COLUMN
                             && matches!(
                                 f.data_type(),
                                 arrow::datatypes::DataType::Float64

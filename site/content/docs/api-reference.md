@@ -346,22 +346,15 @@ neither an internal host nor a non-routable address — see
 [Webhook URL SSRF Protection](/docs/security/#webhook-url-ssrf-protection).
 
 **Delivery does not block evaluation.** Each channel owns a bounded queue and
-a worker; a trigger's evaluation hands the signal over and returns. One
-unreachable webhook backing off for seven seconds therefore delays nothing but
-itself — it used to delay every trigger evaluation behind it, and a sustained
-write rate overran the event bus.
+a worker, so an unreachable webhook delays only itself. A queue that fills
+drops the oldest waiting signal and counts it in
+`chronix_signal_delivery_dropped_total{channel}` — a non-zero rate there means
+alerts are being lost. Shutdown waits up to five seconds for the queues to
+drain.
 
-A queue that fills **drops the oldest waiting signal** and counts it in
-`chronix_signal_delivery_dropped_total{channel}`. That is the honest failure:
-the alternative is blocking ingestion on a channel nobody can reach. Watch
-that counter — a non-zero rate means alerts are being lost. On shutdown the
-server waits up to five seconds for the queues to drain, so a signal that
-fired just before `SIGTERM` still goes out.
-
-**A trigger may watch a rollup tier.** Materialisation writes through the
-ordinary write path, so a rollup's target measurement publishes the same
-change events any other write does, and the `WHEN` clause names an aggregate
-column as readily as a raw field:
+**A trigger may watch a rollup tier.** A rollup's target measurement publishes
+the same change events any write does, and the `WHEN` clause names an
+aggregate column as readily as a raw field:
 
 ```sql
 CREATE TRIGGER hot_avg ON cpu_1m WHEN usage_avg > 90 DELIVER log;

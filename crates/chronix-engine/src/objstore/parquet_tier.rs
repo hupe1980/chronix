@@ -194,7 +194,7 @@ mod tests {
 
     fn sample_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("value", DataType::Float64, true),
         ]));
@@ -241,7 +241,7 @@ mod tests {
             3,
             "column order and count must survive"
         );
-        assert_eq!(merged.schema().field(0).name(), "timestamp");
+        assert_eq!(merged.schema().field(0).name(), chronix_core::TIME_COLUMN);
 
         let values = merged
             .column(2)

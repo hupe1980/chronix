@@ -393,9 +393,9 @@ impl ExecutionPlan for ChronixExec {
             .iter()
             .map(|field| {
                 // Map the Arrow field name back to the Chronix column name.
-                // The `_time` virtual column maps to `timestamp`.
+                // The `_time` virtual column maps to `_time`.
                 let chronix_name = if field.name() == "_time" {
-                    "timestamp"
+                    chronix_core::TIME_COLUMN
                 } else {
                     field.name().as_str()
                 };

@@ -303,7 +303,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             }
 
             // Identify column roles
-            let ts_idx = schema.index_of("timestamp").map_err(|_| {
+            let ts_idx = schema.index_of(chronix_core::TIME_COLUMN).map_err(|_| {
                 Status::invalid_argument("RecordBatch must have a 'timestamp' column")
             })?;
 
@@ -710,7 +710,11 @@ fn extract_time_bound(predicate: &str, op: &str) -> Option<i64> {
 /// Convert a `MeasurementSchema` to an Arrow `Schema`.
 #[cfg(test)]
 fn measurement_to_arrow_schema(schema: &MeasurementSchema) -> Schema {
-    let mut fields = vec![Field::new("timestamp", DataType::Int64, false)];
+    let mut fields = vec![Field::new(
+        chronix_core::TIME_COLUMN,
+        DataType::Int64,
+        false,
+    )];
 
     for tag in schema.tag_names() {
         fields.push(Field::new(tag, DataType::Utf8, true));
@@ -935,7 +939,7 @@ mod tests {
 
         let arrow = measurement_to_arrow_schema(&schema);
         assert_eq!(arrow.fields().len(), 4); // timestamp + host + usage + count
-        assert_eq!(arrow.field(0).name(), "timestamp");
+        assert_eq!(arrow.field(0).name(), chronix_core::TIME_COLUMN);
         assert_eq!(*arrow.field(0).data_type(), DataType::Int64);
         assert_eq!(arrow.field(1).name(), "host");
         assert_eq!(*arrow.field(1).data_type(), DataType::Utf8);
@@ -948,7 +952,7 @@ mod tests {
     #[test]
     fn arrow_batch_to_points_basic() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, true),
             Field::new("usage", DataType::Float64, true),
         ]));
@@ -981,7 +985,7 @@ mod tests {
     #[test]
     fn arrow_batch_to_points_multi_types() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("f_val", DataType::Float64, true),
             Field::new("i_val", DataType::Int64, true),
             Field::new("u_val", DataType::UInt64, true),
@@ -1043,7 +1047,7 @@ mod tests {
     #[test]
     fn arrow_batch_to_points_null_rows_skipped() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, true),
         ]));
 
@@ -1076,7 +1080,7 @@ mod tests {
         let dict_hosts: DictionaryArray<Int32Type> =
             vec!["srv1", "srv2", "srv1"].into_iter().collect();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", dict_hosts.data_type().clone(), true),
             Field::new("value", DataType::Float64, true),
         ]));

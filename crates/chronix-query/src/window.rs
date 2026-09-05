@@ -191,7 +191,7 @@ pub fn apply_window(
 
     // Locate the timestamp column (needed for Rate / IRate)
     let ts_col = batch
-        .column_by_name("timestamp")
+        .column_by_name(chronix_core::TIME_COLUMN)
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>().cloned());
 
     // Validate that timestamps look like nanoseconds when a
@@ -685,7 +685,7 @@ mod tests {
 
     fn test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -705,7 +705,7 @@ mod tests {
 
     fn partitioned_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("host", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
@@ -750,7 +750,7 @@ mod tests {
     fn rank_and_dense_rank() {
         // Values: 10, 20, 20, 25, 30 → rank: 1, 2, 2, 4, 5; dense_rank: 1, 2, 2, 3, 4
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
         ]));
         let ts = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]));
@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn i64_and_u64_columns() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("icount", DataType::Int64, false),
             Field::new("ucount", DataType::UInt64, false),
         ]));
@@ -1311,7 +1311,7 @@ mod tests {
     #[test]
     fn range_with_null_values() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, true),
         ]));
         let ts = Arc::new(Int64Array::from(vec![
@@ -1385,7 +1385,7 @@ mod tests {
     #[test]
     fn range_all_null_returns_none() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, true),
         ]));
         let ts = Arc::new(Int64Array::from(vec![1_000_000_000, 2_000_000_000]));
@@ -1483,7 +1483,7 @@ mod tests {
     #[test]
     fn range_duplicate_timestamps() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
         ]));
         // Two rows at the same timestamp
@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn range_single_row() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("timestamp", DataType::Int64, false),
+            Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
             Field::new("value", DataType::Float64, false),
         ]));
         let ts = Arc::new(Int64Array::from(vec![1_000_000_000]));

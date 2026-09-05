@@ -600,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn cache_hit_returns_same_data() {
         let cache = SegmentCache::new(1024 * 1024);
-        let key = make_key(1, 0, "timestamp");
+        let key = make_key(1, 0, chronix_core::TIME_COLUMN);
         let arr = make_array(100);
 
         let loaded = cache

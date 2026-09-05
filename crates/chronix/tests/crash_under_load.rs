@@ -136,7 +136,7 @@ fn a_crash_under_load_loses_nothing_acknowledged_and_duplicates_nothing() {
     let mut seen: Vec<i64> = Vec::new();
     for b in &batches {
         let ts = b
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
@@ -182,7 +182,7 @@ fn a_crash_under_load_loses_nothing_acknowledged_and_duplicates_nothing() {
     let check = |db: &Chronix| {
         let m = db.rollup("raw_1m", 0, i64::MAX - 1).unwrap();
         let ts = m
-            .column_by_name("timestamp")
+            .column_by_name(chronix_core::TIME_COLUMN)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()

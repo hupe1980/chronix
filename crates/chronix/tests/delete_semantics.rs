@@ -52,7 +52,7 @@ fn visible_timestamps(db: &Chronix) -> Vec<i64> {
         .build()
         .unwrap();
     let batch = db.execute(&plan).unwrap();
-    let Some(col) = batch.column_by_name("timestamp") else {
+    let Some(col) = batch.column_by_name(chronix_core::TIME_COLUMN) else {
         return Vec::new();
     };
     let arr = col

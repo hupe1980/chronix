@@ -113,6 +113,8 @@ pub mod roles {
     /// Arrow field metadata for one stored role.
     #[must_use]
     pub fn arrow_metadata(role: u8) -> std::collections::HashMap<String, String> {
+        // The *role*, not the column name: a consumer reads `role=timestamp`,
+        // `role=tag` or `role=field` off the field's metadata.
         let name = match role {
             TIMESTAMP => "timestamp",
             TAG => "tag",
@@ -423,7 +425,7 @@ mod tests {
         let meta = SegmentMetadata {
             columns: vec![
                 ColumnMeta {
-                    name: "timestamp".to_string(),
+                    name: chronix_core::TIME_COLUMN.to_string(),
                     data_type: data_types::TIMESTAMP,
                     role: roles::TIMESTAMP,
                     default_encoding: EncodingType::DeltaOfDelta.tag(),
