@@ -136,8 +136,14 @@ class ChronixClient:
         body = [p.to_dict() for p in points]
         # `POST /api/v1/write` answers **204 No Content** — no body to parse,
         # so the count returned here is the caller's own.
-        path = "/api/v1/write?backfill=true" if backfill else "/api/v1/write"
-        await self._post_no_content(path, json=body, extra_headers=headers)
+        #
+        # `params`, never a query string concatenated into the path: the live
+        # smoke test checks every path this file names against the server's
+        # OpenAPI document, and a path carrying its own query matches nothing.
+        params = {"backfill": "true"} if backfill else None
+        await self._post_no_content(
+            "/api/v1/write", json=body, params=params, extra_headers=headers
+        )
         return len(points)
 
     async def write_line_protocol(
@@ -459,11 +465,14 @@ class ChronixClient:
         path: str,
         *,
         json: Any = None,
+        params: dict[str, str] | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> None:
         """POST to an endpoint that answers `204 No Content`."""
         try:
-            resp = await self._client.post(path, json=json, headers=extra_headers)
+            resp = await self._client.post(
+                path, json=json, params=params, headers=extra_headers
+            )
         except httpx.ConnectError as e:
             raise ConnectionError(str(e)) from e
         self._check_response(resp)

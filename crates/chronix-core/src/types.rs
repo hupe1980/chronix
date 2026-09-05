@@ -474,7 +474,7 @@ pub const MAX_STRING_FIELD_LENGTH: usize = u16::MAX as usize; // 65_535
 /// Not `time` or `timestamp`, because both are SQL type keywords —
 /// `TIMESTAMP '2023-01-01'` is a literal, not a column — and the leading
 /// underscore marks the column as engine-owned, as
-/// [`NAMESPACE_TAG`](crate::NAMESPACE_TAG) does for its tag.
+/// [`NAMESPACE_TAG`] does for its tag.
 ///
 /// The *type* differs by layer: `Int64` nanoseconds in storage,
 /// `Timestamp(Nanosecond)` in SQL.
@@ -1404,6 +1404,7 @@ mod tests {
     /// so the check is for the two names the engine abandoned appearing where
     /// a *column* is named.
     #[test]
+    #[cfg_attr(miri, ignore = "reaches the filesystem")]
     fn the_time_column_is_named_in_exactly_one_place() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
