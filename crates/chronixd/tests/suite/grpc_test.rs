@@ -112,7 +112,10 @@ async fn grpc_write_and_query() {
     ];
 
     let resp = client
-        .write(proto::WriteRequest { points })
+        .write(proto::WriteRequest {
+            points,
+            backfill: false,
+        })
         .await
         .unwrap()
         .into_inner();
@@ -150,7 +153,13 @@ async fn grpc_query_with_tag_filter() {
         make_point("mem", &[("host", "b")], &[("used", 1024.0)], 2000),
         make_point("mem", &[("host", "a")], &[("used", 768.0)], 3000),
     ];
-    client.write(proto::WriteRequest { points }).await.unwrap();
+    client
+        .write(proto::WriteRequest {
+            points,
+            backfill: false,
+        })
+        .await
+        .unwrap();
 
     // Query with tag filter
     let query = proto::QueryRequest {
@@ -185,7 +194,13 @@ async fn grpc_get_schema() {
         &[("value", 23.5)],
         1000,
     )];
-    client.write(proto::WriteRequest { points }).await.unwrap();
+    client
+        .write(proto::WriteRequest {
+            points,
+            backfill: false,
+        })
+        .await
+        .unwrap();
 
     // Get schema
     let resp = client
@@ -232,7 +247,13 @@ async fn grpc_list_measurements() {
         make_point("cpu", &[], &[("usage", 50.0)], 1000),
         make_point("mem", &[], &[("used", 1024.0)], 2000),
     ];
-    client.write(proto::WriteRequest { points }).await.unwrap();
+    client
+        .write(proto::WriteRequest {
+            points,
+            backfill: false,
+        })
+        .await
+        .unwrap();
 
     let resp = client
         .list_measurements(proto::ListMeasurementsRequest {})
@@ -257,7 +278,13 @@ async fn grpc_delete() {
         make_point("sensor", &[("id", "s1")], &[("temp", 21.0)], 2000),
         make_point("sensor", &[("id", "s1")], &[("temp", 22.0)], 3000),
     ];
-    client.write(proto::WriteRequest { points }).await.unwrap();
+    client
+        .write(proto::WriteRequest {
+            points,
+            backfill: false,
+        })
+        .await
+        .unwrap();
 
     // Delete range [1500, 2500)
     let resp = client
@@ -290,7 +317,13 @@ async fn grpc_drop_measurement() {
 
     // Write
     let points = vec![make_point("to_drop", &[], &[("val", 1.0)], 1000)];
-    client.write(proto::WriteRequest { points }).await.unwrap();
+    client
+        .write(proto::WriteRequest {
+            points,
+            backfill: false,
+        })
+        .await
+        .unwrap();
 
     // Verify it exists
     client
@@ -398,7 +431,13 @@ async fn grpc_query_with_limit() {
             (1000 + i * 100) as i64,
         ));
     }
-    client.write(proto::WriteRequest { points }).await.unwrap();
+    client
+        .write(proto::WriteRequest {
+            points,
+            backfill: false,
+        })
+        .await
+        .unwrap();
 
     // Query with limit
     let query = proto::QueryRequest {
@@ -483,6 +522,7 @@ async fn grpc_write_query_data_integrity() {
 
     client
         .write(proto::WriteRequest {
+            backfill: false,
             points: points.clone(),
         })
         .await
@@ -763,6 +803,7 @@ fn as_tenant<T>(msg: T, namespace: &str) -> tonic::Request<T> {
 /// Write one point of `cpu` as `namespace`.
 async fn write_as(client: &mut ChronixServiceClient<Channel>, namespace: &str, value: f64) {
     let req = proto::WriteRequest {
+        backfill: false,
         points: vec![make_point(
             "cpu",
             &[("host", namespace)],

@@ -96,7 +96,7 @@ impl ShardRouter {
     pub fn insert(&self, point: &Point) -> Result<()> {
         let shard_id = ShardId::from_timestamp(point.timestamp(), self.config.shard_duration);
 
-        self.ensure_shard_allowed(shard_id)?;
+        self.ensure_shard_allowed(shard_id, point.timestamp())?;
         self.insert_into_shard(shard_id, point)
     }
 
@@ -109,7 +109,7 @@ impl ShardRouter {
     pub fn insert_with_wal_seq(&self, point: &Point, wal_seq: u64) -> Result<()> {
         let shard_id = ShardId::from_timestamp(point.timestamp(), self.config.shard_duration);
 
-        self.ensure_shard_allowed(shard_id)?;
+        self.ensure_shard_allowed(shard_id, point.timestamp())?;
         self.insert_into_shard_with_wal_seq(shard_id, point, wal_seq)
     }
 
@@ -129,7 +129,7 @@ impl ShardRouter {
     /// shard outside the tolerance window.
     pub fn admit(&self, timestamp: Timestamp) -> Result<ShardId> {
         let shard_id = ShardId::from_timestamp(timestamp, self.config.shard_duration);
-        self.ensure_shard_allowed(shard_id)?;
+        self.ensure_shard_allowed(shard_id, timestamp)?;
         Ok(shard_id)
     }
 
@@ -220,11 +220,7 @@ impl ShardRouter {
             let shards = self.shards.read();
             let entry = shards
                 .get(&shard_id)
-                .ok_or(MemtableError::ShardOutOfRange {
-                    target: shard_id.0,
-                    min_allowed: 0,
-                    max_allowed: 0,
-                })?;
+                .ok_or(MemtableError::NoSuchShard(shard_id.0))?;
             Arc::clone(&entry.controller)
         };
 
@@ -400,7 +396,10 @@ impl ShardRouter {
     }
 
     /// Check if a shard is within the tolerance window.
-    fn ensure_shard_allowed(&self, shard_id: ShardId) -> Result<()> {
+    /// `timestamp` is carried through only so the rejection can name the
+    /// value the caller actually wrote. Reporting the shard's *start* instead
+    /// hands back a number the caller never sent.
+    fn ensure_shard_allowed(&self, shard_id: ShardId, timestamp: Timestamp) -> Result<()> {
         let mut active_guard = self.active_shard.write();
 
         let active = if let Some(active) = *active_guard {
@@ -421,9 +420,11 @@ impl ShardRouter {
 
         if shard_id.0 < min_allowed || shard_id.0 > max_allowed {
             return Err(MemtableError::ShardOutOfRange {
-                target: shard_id.0,
-                min_allowed,
-                max_allowed,
+                timestamp,
+                earliest: ShardId(min_allowed).start_timestamp(self.config.shard_duration),
+                latest: ShardId(max_allowed).end_timestamp(self.config.shard_duration),
+                tolerance: self.config.ooo_shard_tolerance,
+                shard_secs: self.config.shard_duration.as_secs(),
             });
         }
 

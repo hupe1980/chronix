@@ -768,7 +768,7 @@ impl ChronixConfigBuilder {
             .ok_or(ConfigError::MissingField { field: "data_dir" })?;
 
         // Construct the config first, then validate shared invariants via
-        // the single `ChronixConfig::validate()` method (FINDING-11).
+        // the single `ChronixConfig::validate()` method.
         let config = ChronixConfig {
             data_dir,
             wal: self.wal,
@@ -800,9 +800,9 @@ impl ChronixConfigBuilder {
         // Shared structural validation (same checks as from_toml path).
         config.validate()?;
 
-        // Builder-only checks below (FINDING-12, -13, -14, -15).
+        // Builder-only checks below.
 
-        // FINDING-12: Warn when segment_cache_size is zero.
+        // Warn when segment_cache_size is zero.
         if config.segment_cache_size == 0 {
             tracing::warn!("segment_cache_size is 0 — segment caching is effectively disabled");
         }

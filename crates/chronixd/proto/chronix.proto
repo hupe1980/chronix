@@ -49,6 +49,10 @@ message TimeRange {
 
 message WriteRequest {
   repeated Point points = 1;
+  /// Write outside the out-of-order window — importing history rather than
+  /// ingesting live. Everything else (admission, cardinality, schema, the
+  /// future-timestamp bound) is unchanged. Off by default.
+  bool backfill = 2;
 }
 
 message WriteResponse {
@@ -195,6 +199,9 @@ message SqlResponse {
   repeated SqlColumnMeta columns = 1;
   repeated SqlRow rows = 2;
   uint64 row_count = 3;
+  /// Whether `sql_max_rows` cut the result short. The server used to log a
+  /// warning and send the short result as though it were the whole answer.
+  bool truncated = 4;
 }
 
 // ── Service ────────────────────────────────────────────────────────────

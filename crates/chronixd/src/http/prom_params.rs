@@ -68,6 +68,30 @@ impl PromParams {
         self.get(key).map(|v| parse_time_ns(key, v)).transpose()
     }
 
+    /// The `limit` parameter, as Prometheus defines it: a non-negative
+    /// integer bounding the number of results, where `0` means no limit.
+    ///
+    /// Every discovery endpoint and both query endpoints accept it upstream,
+    /// and chronix accepted it from every client and **ignored it** — a
+    /// `limit=1` returned everything. An ignored bound is the same failure as
+    /// a bound applied without saying so, from the other side.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::BadRequest`] when the value is not a non-negative
+    /// integer, which is what Prometheus's `parseLimitParam` answers.
+    pub fn limit(&self) -> Result<Option<usize>, ServerError> {
+        let Some(raw) = self.get("limit") else {
+            return Ok(None);
+        };
+        let n: usize = raw.parse().map_err(|_| {
+            ServerError::BadRequest(format!(
+                "cannot parse limit as a non-negative integer: {raw}"
+            ))
+        })?;
+        Ok((n > 0).then_some(n))
+    }
+
     /// A duration, in nanoseconds, from a Prometheus duration or a number of
     /// seconds.
     ///

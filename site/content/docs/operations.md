@@ -43,13 +43,16 @@ The distributed tier is frozen and excluded from the default build; it needs
 error, not a warning: every configuration struct is `deny_unknown_fields`, so
 a typo fails loudly instead of being ignored.
 
-### Server
+### Server — `[server]`
+
+Every setting below lives under a `[server]` table. A key the server does not
+know is a startup error naming it.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `http_addr` | `0.0.0.0:8086` | REST, PromQL, Prometheus and OTLP endpoints |
 | `grpc_addr` | `0.0.0.0:8087` | gRPC service |
-| `flight_addr` | `0.0.0.0:8088` | Flight SQL |
+| `flight_addr` | `0.0.0.0:8817` | Flight SQL |
 | `metrics_path` | `/metrics` | Prometheus scrape path |
 | `metrics_require_auth` | `true` | Set `false` to allow unauthenticated scraping |
 | `max_body_size` | `10485760` | Maximum HTTP request body, bytes |
@@ -130,6 +133,7 @@ Kafka and MQTT connectors — is wrapped in `write_timeout_secs` and answers
 ### Multi-tenancy
 
 ```toml
+[server]
 multi_tenancy = true
 ```
 
@@ -181,6 +185,7 @@ admin = false                 # required for restore, namespace and key manageme
 [auth.jwt]
 # issuer, audience, and either a secret (HS*), public_key_pem_file, or jwks_url
 
+[server]
 authz_policy_dir = "/etc/chronix/policies"   # Cedar policies; absent = open mode
 
 [audit]
@@ -419,15 +424,20 @@ Import via Grafana UI: Dashboards → Import → Upload JSON.
 Enable OpenTelemetry trace export:
 
 ```toml
-[tracing]
-service_name = "chronixd"
+[server]
 log_format = "json"
 
+[tracing]
+service_name = "chronixd"
+
 [tracing.otlp]
-endpoint = "http://otel-collector:4317"
+endpoint = "https://otel-collector:4317"
 sampling = { ratio = 0.01 }
 always_sample_errors = true
 ```
+
+Requires `--features otlp`; without it the section is a startup error rather
+than a collector that never receives anything.
 
 **`always_sample_errors`** (default: `true`): When enabled, the sampler is
 overridden to `AlwaysOn`, ensuring all traces — including error-bearing ones —
@@ -591,19 +601,24 @@ Namespace routing uses the `X-Namespace` header.  If omitted, the
 `default` namespace is used.  Namespace definitions are durably persisted
 to disk and survive process restarts.
 
-### Chaos Injection
+### When the data volume fills
 
-Controlled fault injection for resilience testing.
+1. A write that cannot reach the WAL answers **`507 STORAGE_FULL`**. Clients
+   retry; the condition usually clears.
+2. The WAL **rewinds to its last durable offset**, so writes resume the moment
+   space returns — no restart — and a record reported as failed is never
+   written later.
+3. A flush that cannot write its segment leaves the memtable **frozen** for the
+   next attempt, so nothing acknowledged is lost.
+4. Reads keep working and `/ready` stays `200`: back-pressure, not a reason to
+   leave the load balancer.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST`   | `/api/v1/admin/chaos/inject` | Inject a fault (DiskFull, LatencySpike, etc.) |
-| `GET`    | `/api/v1/admin/chaos` | List active injections |
-| `DELETE` | `/api/v1/admin/chaos/{id}` | Clear a specific injection |
-| `DELETE` | `/api/v1/admin/chaos` | Clear all injections |
+**Fix it by freeing space** — retention, WAL `max_file_size`, or the cold tier.
+Alert on `chronix_write_errors_total{reason="storage_full"}`.
 
-See the [API Reference](@/docs/api-reference.md#admin-chaos-injection) for
-available fault types and request examples.
+A failed `fsync` is different and **does** stop writes: the kernel may drop the
+dirty pages and clear the error, so the file's contents are unknown. `/ready`
+answers `503` with the reason; recovery is to close and reopen the database.
 
 ### OpenAPI Specification
 

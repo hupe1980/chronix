@@ -44,8 +44,7 @@ use arrow::array::{Array, Int64Array, RecordBatch};
 use chronix_engine::index::SegmentCatalogEntry;
 use chronix_engine::segment::FieldPredicate;
 use chronix_query::plan::{
-    extract_field_predicates, extract_max_series, extract_namespace, extract_scan, QueryPlan,
-    TagFilter, TimeRange,
+    extract_field_predicates, extract_namespace, extract_scan, QueryPlan, TagFilter, TimeRange,
 };
 
 use crate::error::{DbError, Result};
@@ -409,7 +408,6 @@ impl Chronix {
             "execute_iter segment pruning"
         );
 
-        let matching_entries = cap_by_series(matching_entries, extract_max_series(plan));
         let buckets = build_buckets(matching_entries, memtable_batch)?;
 
         let tag_col_names: Option<Vec<String>> = self
@@ -436,26 +434,6 @@ impl Chronix {
             pruning_stats,
         })
     }
-}
-
-/// Cap the scan by *estimated series count* rather than by segment count.
-fn cap_by_series(
-    entries: Vec<SegmentCatalogEntry>,
-    limit: Option<usize>,
-) -> Vec<SegmentCatalogEntry> {
-    let Some(limit) = limit else {
-        return entries;
-    };
-    let mut accumulated: u64 = 0;
-    let mut kept = Vec::with_capacity(entries.len().min(limit));
-    for entry in entries {
-        if accumulated >= limit as u64 {
-            break;
-        }
-        accumulated += u64::from(entry.series_count.max(1));
-        kept.push(entry);
-    }
-    kept
 }
 
 /// Ensure a batch is ascending by timestamp, sorting only if it is not.

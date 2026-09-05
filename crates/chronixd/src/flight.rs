@@ -220,22 +220,21 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         } {
             let batch =
                 batch_result.map_err(|e| Status::internal(format!("SQL execution error: {e}")))?;
-            if max_rows > 0 && total_rows >= max_rows {
-                break;
+            total_rows += batch.num_rows();
+            // Refuse rather than truncate. An Arrow Flight stream carries no
+            // field this could set, so a truncated result is indistinguishable
+            // from a complete one — and the client here is a BI tool or a
+            // DataFrame library that will compute an aggregate over whatever
+            // it is handed. The cap is still a memory guard; it just says so
+            // now, and names the way out.
+            if max_rows > 0 && total_rows > max_rows {
+                metrics::counter!("chronix_sql_results_truncated_total").increment(1);
+                return Err(Status::resource_exhausted(format!(
+                    "result exceeds the server's sql_max_rows limit of {max_rows}; \
+                     add a LIMIT clause or narrow the time range"
+                )));
             }
-            if max_rows > 0 {
-                let remaining = max_rows - total_rows;
-                if batch.num_rows() <= remaining {
-                    total_rows += batch.num_rows();
-                    batches.push(batch);
-                } else {
-                    batches.push(batch.slice(0, remaining));
-                    break;
-                }
-            } else {
-                total_rows += batch.num_rows();
-                batches.push(batch);
-            }
+            batches.push(batch);
         }
 
         stream_batches(batches).await

@@ -172,12 +172,24 @@ persisted to segments. This bounds WAL disk usage to approximately:
 WAL_size ≈ memtable_threshold + one_file_headroom
 ```
 
-## Poison Flag and Recovery
+## When a write fails
 
-The WAL poison flag is queryable via `is_poisoned()` and clearable via
-`clear_poison()` for recovery from transient I/O errors. `clear_poison()`
-re-opens the file descriptor and resets internal state, allowing the WAL
-to resume operation without a full process restart.
+A failed **write** rewinds: the writer truncates back to the offset the last
+successful `fsync` covered and rebuilds its buffer, discarding the records in
+between. All of them are unacknowledged by construction — `PerWrite` and
+`PerBatch` sync before returning, and `Periodic` promises only the OS's
+buffers — so the caller is told the truth, and the next write succeeds as soon
+as the condition clears. `ENOSPC` therefore costs no restart.
+
+A failed **`fsync`** poisons the writer, and every later write is refused. The
+kernel may discard the dirty pages *and* clear the error, so a retry can
+succeed over data that is gone: there is no state to return to. `is_poisoned()`
+reports it; recovery is to close and reopen the database, which validates the
+existing records first. `clear_poison()` is the in-place version, for an
+operator who has verified the WAL replays.
+
+Group commit's watermark is epoch-guarded, so a record discarded by a rewind is
+never reported as durable by a later sync that passes its sequence number.
 
 ## References
 

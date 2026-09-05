@@ -245,12 +245,6 @@ pub struct SharedState {
     pub namespace_registry: Option<Arc<chronix_security::tenant::NamespaceRegistry>>,
     /// Model catalog for analytics model management.
     pub model_catalog: Arc<parking_lot::RwLock<chronix::chronix_analytics::forecast::ModelCatalog>>,
-    /// Optional chaos agent for fault injection testing.
-    #[cfg(feature = "chaos")]
-    pub chaos_agent: Option<Arc<chronix_chaos::ChaosAgent>>,
-    /// Persistent store for chaos injection guards to avoid `mem::forget` leaks.
-    #[cfg(feature = "chaos")]
-    pub chaos_guards: parking_lot::Mutex<Vec<chronix_chaos::FaultGuard>>,
     /// SQL plan cache, keyed by (namespace, SQL) to
     /// prevent cross-tenant plan leakage.  Each entry carries an insertion
     /// `Instant` for TTL-based expiry and a last-access `Instant` for LRU

@@ -175,7 +175,7 @@ impl NamespaceId {
             });
         }
 
-        // FINDING-24: First character must be a letter (DNS-label convention).
+        // First character must be a letter (DNS-label convention).
         if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
             return Err(SchemaError::InvalidName {
                 name: name.to_string(),
@@ -301,7 +301,7 @@ impl ShardId {
         let duration_ns = i64::try_from(shard_duration.as_nanos()).unwrap_or_else(|_| {
             tracing::warn!(
                 duration_nanos = %shard_duration.as_nanos(),
-                "FINDING-05: shard_duration overflows i64 — falling back to i64::MAX"
+                "shard_duration overflows i64 — falling back to i64::MAX"
             );
             i64::MAX
         });
@@ -319,7 +319,7 @@ impl ShardId {
             i64::try_from(shard_duration.as_nanos()).unwrap_or_else(|_| {
                 tracing::warn!(
                     duration_nanos = %shard_duration.as_nanos(),
-                    "FINDING-05: shard_duration overflows i64 — falling back to i64::MAX"
+                    "shard_duration overflows i64 — falling back to i64::MAX"
                 );
                 i64::MAX
             }),
@@ -334,7 +334,7 @@ impl ShardId {
             i64::try_from(shard_duration.as_nanos()).unwrap_or_else(|_| {
                 tracing::warn!(
                     duration_nanos = %shard_duration.as_nanos(),
-                    "FINDING-05: shard_duration overflows i64 — falling back to i64::MAX"
+                    "shard_duration overflows i64 — falling back to i64::MAX"
                 );
                 i64::MAX
             }),
@@ -396,7 +396,7 @@ impl fmt::Display for FieldValue {
             Self::U64(v) => write!(f, "{v}u"),
             Self::Bool(v) => write!(f, "{v}"),
             Self::String(v) => {
-                // FINDING-33: Escape backslashes and double-quotes inside string values.
+                // Escape backslashes and double-quotes inside string values.
                 let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
                 write!(f, "\"{escaped}\"")
             }
@@ -721,7 +721,7 @@ impl SeriesKey {
         &self.tags
     }
 
-    /// Insert a tag in-place using copy-on-write (FINDING-22).
+    /// Insert a tag in-place using copy-on-write.
     ///
     /// Only clones the inner `Vec` if another `Arc` handle exists;
     /// otherwise the insertion happens without allocation.
@@ -1225,7 +1225,7 @@ impl Point {
         if fields.is_empty() {
             return Err(SchemaError::EmptyFields);
         }
-        // FINDING-02: Reject points with too many fields.
+        // Reject points with too many fields.
         if fields.len() > MAX_FIELDS_PER_POINT {
             return Err(SchemaError::TooManyFields {
                 count: fields.len(),
@@ -1251,7 +1251,7 @@ impl Point {
                 });
             }
 
-            // FINDING-01: Reject non-finite f64 values (NaN, Infinity).
+            // Reject non-finite f64 values (NaN, Infinity).
             // NaN breaks dedup (NaN ≠ NaN), sorting, and equality checks.
             if let FieldValue::F64(v) = value {
                 if !v.is_finite() {
@@ -1262,7 +1262,7 @@ impl Point {
                 }
             }
 
-            // FINDING-03: Reject oversized string field values.
+            // Reject oversized string field values.
             if let FieldValue::String(s) = value {
                 if s.len() > MAX_STRING_FIELD_LENGTH {
                     return Err(SchemaError::InvalidFieldValue {
@@ -1355,7 +1355,7 @@ impl Point {
 
     /// Inject a tag into this point's series key.
     ///
-    /// Inject a tag into this point's series key using copy-on-write (FINDING-22).
+    /// Inject a tag into this point's series key using copy-on-write.
     ///
     /// Delegates to [`SeriesKey::inject_tag`] which uses `Arc::make_mut`
     /// to avoid unnecessary deep clones.

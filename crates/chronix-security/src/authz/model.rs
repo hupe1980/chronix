@@ -83,8 +83,6 @@ pub enum ChronixAction {
     ManageCluster,
     /// Manage analytics models (list, delete, retrain).
     ManageModels,
-    /// Manage chaos injection experiments.
-    ManageChaos,
     /// Manage API keys (create, list, revoke).
     ManageKeys,
     /// Manage runtime configuration (e.g. log levels).
@@ -113,7 +111,6 @@ impl ChronixAction {
             Self::ViewCluster => "ViewCluster",
             Self::ManageCluster => "ManageCluster",
             Self::ManageModels => "ManageModels",
-            Self::ManageChaos => "ManageChaos",
             Self::ManageKeys => "ManageKeys",
             Self::ManageConfig => "ManageConfig",
             Self::ManageBackups => "ManageBackups",
@@ -136,7 +133,6 @@ impl ChronixAction {
                 | Self::ViewCluster
                 | Self::ManageCluster
                 | Self::ManageModels
-                | Self::ManageChaos
                 | Self::ManageKeys
                 | Self::ManageConfig
                 | Self::ManageBackups
@@ -161,7 +157,6 @@ impl std::fmt::Display for ChronixAction {
             Self::ViewCluster => "ViewCluster",
             Self::ManageCluster => "ManageCluster",
             Self::ManageModels => "ManageModels",
-            Self::ManageChaos => "ManageChaos",
             Self::ManageKeys => "ManageKeys",
             Self::ManageConfig => "ManageConfig",
             Self::ManageBackups => "ManageBackups",

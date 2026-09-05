@@ -182,6 +182,32 @@ impl super::Chronix {
         Ok(())
     }
 
+    /// Whether the database can accept writes at all, and why not.
+    ///
+    /// **Persistent** conditions only: closed, or a WAL poisoned by a failed
+    /// `fsync`, which refuses every write until the database is reopened.
+    /// Transient back-pressure — a full memtable waiting on a flush — is
+    /// deliberately not unready: that is the moment to keep serving and let
+    /// back-pressure work, not the moment to leave the load balancer.
+    ///
+    /// `chronixd`'s `/ready` is the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Closed`] or [`DbError::PersistentOverload`], with the
+    /// reason.
+    pub fn check_writable(&self) -> Result<()> {
+        self.check_open()?;
+        if self.wal.is_poisoned() {
+            return Err(DbError::PersistentOverload {
+                reason: "the WAL writer is poisoned after a failed fsync; the \
+                         database must be closed and reopened"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Check if the database is open.
     pub(super) fn check_open(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {

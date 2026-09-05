@@ -30,9 +30,11 @@
 #![deny(unsafe_code)]
 
 mod reader;
+mod sink;
 mod writer;
 
 pub use reader::{replay_all, replay_range, WalReader, WalRecord};
+pub use sink::WalSink;
 pub use writer::WalWriter;
 
 /// WAL file magic bytes.

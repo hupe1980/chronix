@@ -10,6 +10,62 @@ use chronix_core::{ColumnType, FieldValue, Point};
 
 use crate::error::ServerError;
 
+/// Whether a batch is live ingestion or an import of history.
+///
+/// An **explicit opt-in**, never an automatic fallback for a late point: the
+/// out-of-order window is what bounds the number of open memtables, and
+/// routing anything late to the backfill path would let one client with a
+/// wrong clock open a shard per hour of history. The caller knows whether it
+/// is importing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteMode {
+    /// Live ingestion, held to the out-of-order window.
+    #[default]
+    Live,
+    /// Importing history: the window is not enforced. Everything else —
+    /// admission, the cardinality budget, the schema, the future-timestamp
+    /// bound — is unchanged.
+    Backfill,
+}
+
+impl WriteMode {
+    /// The mode a request's `?backfill=` parameter asks for.
+    #[must_use]
+    pub fn from_flag(backfill: bool) -> Self {
+        if backfill {
+            Self::Backfill
+        } else {
+            Self::Live
+        }
+    }
+}
+
+/// The `?backfill=` query parameter, on every network write path.
+///
+/// Its own extractor rather than a field on each handler's body type: line
+/// protocol and OTLP have no JSON body to put it in, and one spelling across
+/// six surfaces is the whole point.
+///
+/// Deliberately **not** `deny_unknown_fields`, unlike the request bodies: a
+/// query string is decorated by proxies and agents, and a remote-write sender
+/// treats a 400 as final, so refusing an unread parameter would drop data.
+/// The *value* is still checked — `?backfill=yes` is a 400, not a silent
+/// `false`.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+pub struct BackfillParam {
+    /// `true` writes outside the out-of-order window.
+    #[serde(default)]
+    pub backfill: bool,
+}
+
+impl BackfillParam {
+    /// The write mode this parameter asks for.
+    #[must_use]
+    pub fn mode(self) -> WriteMode {
+        WriteMode::from_flag(self.backfill)
+    }
+}
+
 /// Stamp `namespace` on every point and insert the batch under a deadline.
 ///
 /// **The server's only write path.** Every ingestion surface — REST JSON,
@@ -29,8 +85,23 @@ use crate::error::ServerError;
 pub async fn insert_with_timeout(
     db: &Arc<Chronix>,
     namespace: Option<&str>,
+    points: Vec<Point>,
+    timeout: Duration,
+) -> Result<(), ServerError> {
+    insert_batch_with_mode(db, namespace, points, timeout, WriteMode::Live).await
+}
+
+/// [`insert_with_timeout`], with the write mode chosen by the caller.
+///
+/// # Errors
+///
+/// As [`insert_with_timeout`].
+pub async fn insert_batch_with_mode(
+    db: &Arc<Chronix>,
+    namespace: Option<&str>,
     mut points: Vec<Point>,
     timeout: Duration,
+    mode: WriteMode,
 ) -> Result<(), ServerError> {
     crate::namespace::scope_points(namespace, &mut points)?;
     let db = db.clone();
@@ -42,7 +113,10 @@ pub async fn insert_with_timeout(
     metrics::histogram!("chronix_batch_size").record(batch_size as f64);
     let started = std::time::Instant::now();
 
-    let future = tokio::task::spawn_blocking(move || db.insert_batch(&points));
+    let future = tokio::task::spawn_blocking(move || match mode {
+        WriteMode::Live => db.insert_batch(&points),
+        WriteMode::Backfill => db.backfill(&points),
+    });
 
     let join_result = if timeout.is_zero() {
         future.await
@@ -71,6 +145,9 @@ pub async fn insert_with_timeout(
         })?;
 
     metrics::counter!("chronix_points_written_total").increment(insert_result.accepted as u64);
+    if mode == WriteMode::Backfill {
+        metrics::counter!("chronix_backfill_points_total").increment(insert_result.accepted as u64);
+    }
 
     if insert_result.is_partial() {
         // Rejected points are *reported*, not only logged. A sender told

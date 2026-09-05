@@ -322,7 +322,7 @@ impl ConnectorManager {
                     "kafka-default",
                     kafka_cfg.clone(),
                     self.db.clone(),
-                    config.multi_tenancy,
+                    config.server.multi_tenancy,
                 );
                 info!(name = "kafka-default", "registering new Kafka connector");
                 connectors.push(consumer.clone());
@@ -336,7 +336,7 @@ impl ConnectorManager {
                     "mqtt-default",
                     mqtt_cfg.clone(),
                     self.db.clone(),
-                    config.multi_tenancy,
+                    config.server.multi_tenancy,
                 );
                 info!(name = "mqtt-default", "registering new MQTT connector");
                 connectors.push(subscriber.clone());
@@ -368,6 +368,7 @@ pub enum ConnectorFormat {
 
 /// Kafka consumer connector configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KafkaConfig {
     /// Namespace ingested points are written to.
     ///
@@ -421,6 +422,7 @@ pub struct KafkaConfig {
 
 /// MQTT subscriber connector configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MqttConfig {
     /// Namespace ingested points are written to.
     ///

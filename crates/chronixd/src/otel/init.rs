@@ -132,9 +132,9 @@ fn init_logging_only(config: &TracingConfig, filter: EnvFilter) -> Result<(), St
     let registry = tracing_subscriber::registry().with(filter_layer);
 
     match config.log_format {
-        LogFormat::Pretty => {
+        LogFormat::Text => {
             registry
-                .with(tracing_subscriber::fmt::layer().pretty())
+                .with(tracing_subscriber::fmt::layer())
                 .try_init()
                 .map_err(|e| format!("failed to init tracing subscriber: {e}"))?;
         }
@@ -251,9 +251,9 @@ fn init_with_otlp(
         .with(otel_layer);
 
     match config.log_format {
-        LogFormat::Pretty => {
+        LogFormat::Text => {
             registry
-                .with(tracing_subscriber::fmt::layer().pretty())
+                .with(tracing_subscriber::fmt::layer())
                 .try_init()
                 .map_err(|e| format!("failed to init tracing subscriber: {e}"))?;
         }
@@ -354,7 +354,7 @@ mod tests {
         // so just validate config construction
         let config = TracingConfig::default();
         assert_eq!(config.service_name, "chronix");
-        assert_eq!(config.log_format, LogFormat::Pretty);
+        assert_eq!(config.log_format, LogFormat::Text);
         assert!(config.otlp.is_none());
     }
 

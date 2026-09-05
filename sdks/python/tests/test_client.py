@@ -248,12 +248,47 @@ async def test_sql(mock_api):
             ],
             "rows": [["a", 42.5]],
             "row_count": 1,
+            "truncated": False,
         }
     )
     async with ChronixClient(BASE) as c:
         result = await c.sql("SELECT * FROM cpu LIMIT 1")
     assert len(result) == 1
     assert result.rows[0] == {"host": "a", "usage": 42.5}
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_sql_reports_truncation(mock_api):
+    # `sql_max_rows` cutting the result is a fact the caller must be able to
+    # see: an aggregate over a truncated scan is a wrong number, not a
+    # partial one. The server answered without saying so at all.
+    mock_api.post("/api/v1/chronix/sql").respond(
+        json={
+            "columns": [{"name": "usage", "data_type": "Float64"}],
+            "rows": [[1.0], [2.0]],
+            "row_count": 2,
+            "truncated": True,
+        }
+    )
+    async with ChronixClient(BASE) as c:
+        result = await c.sql("SELECT usage FROM cpu")
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_write_backfill_sets_the_query_parameter(mock_api):
+    # `backfill=True` must reach the wire: `backfill()` had no network
+    # surface at all, so a client importing history was refused for ever.
+    route = mock_api.post("/api/v1/write", params={"backfill": "true"}).respond(
+        status_code=204
+    )
+    async with ChronixClient(BASE) as c:
+        await c.write(
+            [Point("cpu", {"usage": 1.0}, tags={"host": "a"}, timestamp=1)],
+            backfill=True,
+        )
+    assert route.called
 
 
 @pytest.mark.asyncio

@@ -92,20 +92,45 @@ struct Cli {
     tls_reload_interval_secs: u64,
 
     /// Log format. `--log-format jsom` is a usage error, not plain text.
-    #[arg(long, env = "CHRONIXD_LOG_FORMAT", default_value = "text", value_enum)]
-    log_format: chronixd::config::LogFormat,
+    ///
+    /// `Option`, with no `default_value`: a default makes the flag always
+    /// present, so assigning it would overwrite the file and the environment
+    /// with a value nobody typed, inverting the documented precedence.
+    #[arg(long, env = "CHRONIXD_LOG_FORMAT", value_enum)]
+    log_format: Option<chronixd::config::LogFormat>,
 
     /// Log level filter.
-    #[arg(long, env = "CHRONIXD_LOG_LEVEL", default_value = "info")]
-    log_level: String,
+    #[arg(long, env = "CHRONIXD_LOG_LEVEL")]
+    log_level: Option<String>,
 
     /// Export bundled Grafana dashboards to the given directory and exit.
     #[arg(long)]
     export_dashboards: Option<PathBuf>,
+
+    /// Load and validate the configuration, print what it resolves to, and
+    /// exit without opening the database or binding a port.
+    ///
+    /// An unknown key is a startup error, but "start the server to find out"
+    /// is not a check anybody runs before a deploy.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // `Display`, not `Debug`: returning `Result` from `main` prints
+            // the `Debug` form, which renders a config parse error with its
+            // newlines escaped inside a tuple struct — legible to nobody.
+            eprintln!("chronixd: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Load config from file or use defaults
@@ -125,17 +150,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.database.data_dir = data_dir.clone();
     }
     if let Some(ref bind) = cli.bind {
-        config.http_addr = bind
+        config.server.http_addr = bind
             .parse()
             .map_err(|e| format!("invalid HTTP bind address '{bind}': {e}"))?;
     }
     if let Some(ref grpc_bind) = cli.grpc_bind {
-        config.grpc_addr = grpc_bind
+        config.server.grpc_addr = grpc_bind
             .parse()
             .map_err(|e| format!("invalid gRPC bind address '{grpc_bind}': {e}"))?;
     }
     if let Some(ref flight_bind) = cli.flight_bind {
-        config.flight_addr = flight_bind
+        config.server.flight_addr = flight_bind
             .parse()
             .map_err(|e| format!("invalid Flight SQL bind address '{flight_bind}': {e}"))?;
     }
@@ -151,8 +176,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reload_interval_secs: cli.tls_reload_interval_secs,
         });
     }
-    config.log_format = cli.log_format;
-    config.log_level = cli.log_level;
+    if let Some(format) = cli.log_format {
+        config.server.log_format = format;
+    }
+    if let Some(ref level) = cli.log_level {
+        config.server.log_level.clone_from(level);
+    }
 
     // Cluster mode configuration
     match cli.mode {
@@ -195,9 +224,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.validate_tenancy()?;
     // Refuse to start with an [auth] section that authenticates nobody
     config.validate_auth()?;
+    // Refuse a [tracing] section this build cannot honour
+    config.validate_tracing()?;
 
-    // Setup logging
-    setup_logging(&config);
+    if cli.check_config {
+        // Print what the file *resolved to*, not what it said: the point of
+        // the check is the difference between the two.
+        println!("configuration is valid");
+        println!("  http_addr        {}", config.server.http_addr);
+        println!("  grpc_addr        {}", config.server.grpc_addr);
+        println!("  flight_addr      {}", config.server.flight_addr);
+        println!("  data_dir         {}", config.database.data_dir.display());
+        println!("  log_format       {:?}", config.server.log_format);
+        println!("  log_level        {}", config.server.log_level);
+        println!("  sql_max_rows     {}", config.server.sql_max_rows);
+        println!("  max_body_size    {}", config.server.max_body_size);
+        println!("  multi_tenancy    {}", config.server.multi_tenancy);
+        let sections = [
+            ("tls", config.tls.is_some()),
+            ("auth", config.auth.is_some()),
+            ("audit", config.audit.is_some()),
+            ("triggers", config.triggers.is_some()),
+            ("cold_archive", config.cold_archive.is_some()),
+            ("kafka", config.kafka.is_some()),
+            ("mqtt", config.mqtt.is_some()),
+            ("cluster", config.cluster.is_some()),
+            ("tracing", config.tracing.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| present.then_some(name))
+        .collect::<Vec<_>>();
+        println!(
+            "  sections         {}",
+            if sections.is_empty() {
+                "none besides [server] and [database]".to_string()
+            } else {
+                sections.join(", ")
+            }
+        );
+        if config.auth.is_none() {
+            println!(
+                "  warning          no [auth] section: every listener accepts \
+                 reads, writes and deletes from anyone who can reach it"
+            );
+        }
+        return Ok(());
+    }
+
+    // `init_tracing` is the only initialiser: it registers the reload handle
+    // `PUT /api/v1/admin/log-level` swaps, and the OTLP exporter. A second,
+    // private one would leave both dead. The guard flushes pending OTLP
+    // batches on drop, so it is held for the life of the process.
+    let _tracing_guard = chronixd::otel::init_tracing(&config.tracing_config())?;
 
     // Handle --export-dashboards early exit
     if let Some(ref out_dir) = cli.export_dashboards {
@@ -215,43 +293,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     chronixd::server::run(config).await?;
 
     Ok(())
-}
-
-/// Initialize tracing-subscriber with the configured format and level.
-///
-/// # Trace Filtering & Sampling
-///
-/// Log verbosity is controlled by the `RUST_LOG` environment variable (takes
-/// precedence) or the `--log-level` / `log_level` config field.  Examples:
-///
-/// ```text
-/// RUST_LOG=chronix=debug,info          # debug for chronix crates, info elsewhere
-/// RUST_LOG=chronix_wal=trace,warn      # trace WAL internals, warn for the rest
-/// ```
-///
-/// For distributed **trace sampling** (OTLP), use the `otel` module's
-/// [`TracingConfig`](chronixd::otel::TracingConfig) with an
-/// [`OtlpConfig`](chronixd::otel::OtlpConfig) that exposes
-/// `SamplingStrategy::Ratio(f64)` (e.g. 0.01 = 1 %).  This function only
-/// sets up local logging; OTLP export with head-based sampling is handled
-/// separately via `chronixd::otel::init_tracing`.
-fn setup_logging(config: &ServerConfig) {
-    use tracing_subscriber::fmt;
-    use tracing_subscriber::EnvFilter;
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
-
-    // Exhaustive: a format the server does not have is refused when the
-    // configuration is parsed, not silently rendered as text here.
-    match config.log_format {
-        chronixd::config::LogFormat::Json => {
-            fmt::fmt().with_env_filter(filter).json().init();
-        }
-        chronixd::config::LogFormat::Text => {
-            fmt::fmt().with_env_filter(filter).init();
-        }
-    }
 }
 
 /// Export bundled Grafana dashboard JSON files from the `dashboards/` directory.

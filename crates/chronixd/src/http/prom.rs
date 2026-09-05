@@ -34,10 +34,54 @@ fn prom_error(error_type: &str, message: impl Into<String>) -> axum::response::R
             data: None,
             error: Some(message.into()),
             error_type: Some(error_type.into()),
+            warnings: Vec::new(),
         }),
     )
         .into_response()
 }
+
+/// A [`ServerError`] on a Prometheus-API route.
+///
+/// Exists so the handlers can keep writing `?` and still answer in the
+/// envelope their clients parse: `From<ServerError>` makes the conversion
+/// implicit, `IntoResponse` makes it the Prometheus shape.
+#[derive(Debug)]
+pub struct PromApiError(ServerError);
+
+impl From<ServerError> for PromApiError {
+    fn from(e: ServerError) -> Self {
+        Self(e)
+    }
+}
+
+impl axum::response::IntoResponse for PromApiError {
+    fn into_response(self) -> axum::response::Response {
+        prom_server_error(&self.0)
+    }
+}
+
+/// Render a [`ServerError`] in the Prometheus error envelope.
+///
+/// Grafana branches on `errorType`, so every route of this API — the
+/// discovery endpoints included — has to answer in the same shape.
+fn prom_server_error(e: &ServerError) -> axum::response::Response {
+    match e {
+        ServerError::BadRequest(msg) => prom_error("bad_data", msg.clone()),
+        ServerError::NotFound(msg) => prom_error("bad_data", msg.clone()),
+        ServerError::WriteTimeout(_) => prom_error("timeout", e.to_string()),
+        // Anything else is ours, and its detail is redacted the same way
+        // `ServerError`'s own renderer redacts a 5xx.
+        other => {
+            tracing::error!(error = %other, "prometheus endpoint error");
+            prom_error("internal", "an internal error occurred")
+        }
+    }
+}
+
+/// The warning Prometheus attaches when a `limit` cut the result.
+///
+/// Verbatim: it is the string clients and dashboards match on.
+pub const TRUNCATED_WARNING: &str = "results truncated due to limit";
 
 /// Prometheus-compatible API response envelope.
 #[derive(Debug, Serialize)]
@@ -53,6 +97,9 @@ pub struct PromResponse {
     /// Error type (if status == "error").
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
+    /// Non-fatal annotations. Present only when non-empty, as upstream does.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Prometheus API response whose `data` is a bare array.
@@ -76,16 +123,24 @@ pub struct PromListResponse {
     /// Error type (if status == "error").
     #[serde(rename = "errorType", skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
+    /// Non-fatal annotations. Present only when non-empty, as upstream does.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl PromListResponse {
-    /// A successful list response.
-    fn success(data: serde_json::Value) -> Self {
+    /// A successful list response, `truncated` saying whether a limit cut it.
+    fn success(data: serde_json::Value, truncated: bool) -> Self {
         Self {
             status: "success".into(),
             data,
             error: None,
             error_type: None,
+            warnings: if truncated {
+                vec![TRUNCATED_WARNING.to_string()]
+            } else {
+                Vec::new()
+            },
         }
     }
 }
@@ -135,14 +190,23 @@ pub async fn prom_instant_query_handler(
         Err(e) => return prom_error("bad_data", e.to_string()),
     };
 
+    let limit = match params.limit() {
+        Ok(l) => l,
+        Err(e) => return prom_error("bad_data", e.to_string()),
+    };
+
     let query_kind = "instant";
     let evaluator = chronix::promql::PromQLEvaluator::new(state.db.clone()).with_namespace(scope);
+    // The same bounds the range query sets. One selector must not have a
+    // series cap and a memory budget on `/query_range` and neither here.
     let params = chronix::promql::eval::QueryParams {
         time: eval_time_ns,
+        max_series: state.config.server.prom_series_limit,
+        max_memory_bytes: state.config.server.prom_max_result_bytes,
         ..Default::default()
     };
 
-    let timeout_secs = state.config.prom_query_timeout_secs;
+    let timeout_secs = state.config.server.prom_query_timeout_secs;
     // The evaluator carries the scan counters, and it moves into the blocking
     // task — so the stats have to come back out with the result. Without this
     // the counters existed, were asserted by a test, and were visible to
@@ -168,7 +232,7 @@ pub async fn prom_instant_query_handler(
     });
 
     match result {
-        Ok(Ok(value)) => Json(prom_value_to_response(value)).into_response(),
+        Ok(Ok(value)) => Json(prom_value_to_response(value, limit)).into_response(),
         Ok(Err(e)) => prom_error("execution", e.to_string()),
         Err(e) => prom_error("internal", format!("query task failed: {e}")),
     }
@@ -200,7 +264,7 @@ pub async fn prom_range_query_handler(
     }
 
     // Guard against excessive evaluation points that could OOM the server.
-    let max_points = state.config.max_range_query_points;
+    let max_points = state.config.server.max_range_query_points;
     // i128 avoids overflow when the range spans the whole i64 domain.
     let span = (i128::from(end_ns) - i128::from(start_ns)) as u64;
     let num_points = span.checked_div(step_ns as u64).unwrap_or(0) + 1;
@@ -212,6 +276,11 @@ pub async fn prom_range_query_handler(
             ),
         );
     }
+
+    let limit = match params.limit() {
+        Ok(l) => l,
+        Err(e) => return prom_error("bad_data", e.to_string()),
+    };
 
     let expr = match chronix::promql::parse(&query_str) {
         Ok(e) => e,
@@ -225,13 +294,13 @@ pub async fn prom_range_query_handler(
         start: Some(start_ns),
         end: Some(end_ns),
         step: Some(step_ns),
-        max_series: state.config.prom_series_limit,
-        max_memory_bytes: state.config.prom_max_result_bytes,
+        max_series: state.config.server.prom_series_limit,
+        max_memory_bytes: state.config.server.prom_max_result_bytes,
         max_points: usize::try_from(max_points).unwrap_or(usize::MAX),
         ..Default::default()
     };
 
-    let timeout_secs = state.config.prom_query_timeout_secs;
+    let timeout_secs = state.config.server.prom_query_timeout_secs;
     let task = tokio::task::spawn_blocking(move || {
         let value = evaluator.range_query(&expr, &qparams);
         (value, evaluator.scan_stats())
@@ -253,7 +322,7 @@ pub async fn prom_range_query_handler(
     });
 
     match result {
-        Ok(Ok(value)) => Json(prom_value_to_response(value)).into_response(),
+        Ok(Ok(value)) => Json(prom_value_to_response(value, limit)).into_response(),
         Ok(Err(e)) => prom_error("execution", e.to_string()),
         Err(e) => prom_error("internal", format!("query task failed: {e}")),
     }
@@ -315,37 +384,53 @@ pub async fn prom_labels_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     prom_params: super::PromParams,
-) -> Result<Json<PromListResponse>, ServerError> {
+) -> Result<Json<PromListResponse>, PromApiError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let params = PromSeriesQuery::from_params(&prom_params)?;
     let (start_ns, end_ns) = params.window()?;
     let matchers = params.matchers;
-    let limit = state.config.prom_series_limit;
+    let requested = prom_params.limit()?;
+    // The server's cap bounds the *enumeration*; the request's `limit` bounds
+    // the label **names** returned, as it does upstream. Passing `limit` down
+    // here would report only the names the first `limit` series carried.
+    let limit = state.config.server.prom_series_limit;
 
-    let labels = tokio::task::spawn_blocking(move || -> Result<Vec<String>, ServerError> {
-        let selectors = parse_selectors(&db, &matchers)?;
-        let mut label_set = std::collections::BTreeSet::new();
-        for set in observed_label_sets(
-            &db,
-            scope.as_deref(),
-            start_ns,
-            end_ns,
-            limit,
-            &selectors,
-            false,
-        )? {
-            for (key, _) in set {
-                label_set.insert(key);
+    let (mut labels, mut truncated) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<String>, bool), ServerError> {
+            let selectors = parse_selectors(&db, &matchers)?;
+            let mut label_set = std::collections::BTreeSet::new();
+            let (sets, truncated) = observed_label_sets(
+                &db,
+                scope.as_deref(),
+                start_ns,
+                end_ns,
+                limit,
+                &selectors,
+                false,
+            )?;
+            for set in sets {
+                for (key, _) in set {
+                    label_set.insert(key);
+                }
             }
+            Ok((label_set.into_iter().collect(), truncated))
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))??;
+
+    // Upstream applies `limit` to the *label names* returned, not to the
+    // series scanned to find them.
+    if let Some(n) = requested {
+        if labels.len() > n {
+            labels.truncate(n);
+            truncated = true;
         }
-        Ok(label_set.into_iter().collect())
-    })
-    .await
-    .map_err(|e| ServerError::Internal(e.to_string()))??;
+    }
 
     Ok(Json(PromListResponse::success(
         serde_json::to_value(labels).unwrap_or_default(),
+        truncated,
     )))
 }
 
@@ -360,41 +445,57 @@ pub async fn prom_label_values_handler(
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     Path(label_name): Path<String>,
     prom_params: super::PromParams,
-) -> Result<Json<PromListResponse>, ServerError> {
+) -> Result<Json<PromListResponse>, PromApiError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let params = PromSeriesQuery::from_params(&prom_params)?;
     let (start_ns, end_ns) = params.window()?;
     let matchers = params.matchers;
-    let limit = state.config.prom_series_limit;
+    let requested = prom_params.limit()?;
+    // As for `/labels`: `limit` bounds the label **values** returned, not the
+    // series read to find them.
+    let limit = state.config.server.prom_series_limit;
 
-    let values = tokio::task::spawn_blocking(move || -> Result<Vec<String>, ServerError> {
-        let selectors = parse_selectors(&db, &matchers)?;
-        let mut values = std::collections::BTreeSet::new();
-        for set in observed_label_sets(
-            &db,
-            scope.as_deref(),
-            start_ns,
-            end_ns,
-            limit,
-            &selectors,
-            false,
-        )? {
-            for (key, value) in set {
-                if key == label_name {
-                    values.insert(value);
+    let (mut values, mut truncated) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<String>, bool), ServerError> {
+            let selectors = parse_selectors(&db, &matchers)?;
+            let mut values = std::collections::BTreeSet::new();
+            let (sets, truncated) = observed_label_sets(
+                &db,
+                scope.as_deref(),
+                start_ns,
+                end_ns,
+                limit,
+                &selectors,
+                false,
+            )?;
+            for set in sets {
+                for (key, value) in set {
+                    if key == label_name {
+                        values.insert(value);
+                    }
                 }
             }
+            Ok((values.into_iter().collect(), truncated))
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))??;
+
+    if let Some(n) = requested {
+        if values.len() > n {
+            values.truncate(n);
+            truncated = true;
         }
-        Ok(values.into_iter().collect())
-    })
-    .await
-    .map_err(|e| ServerError::Internal(e.to_string()))??;
+    }
 
     Ok(Json(PromListResponse::success(
         serde_json::to_value(values).unwrap_or_default(),
+        truncated,
     )))
 }
+
+/// The label sets an enumeration found, and whether it stopped at the limit.
+type ObservedLabelSets = (Vec<Vec<(String, String)>>, bool);
 
 /// One parsed `match[]` selector: the metrics it names and the rest of its
 /// matchers, compiled.
@@ -551,6 +652,9 @@ impl PromSeriesQuery {
 ///   metrics. Decoding one dictionary block per tag instead of every sample in
 ///   the window is the difference between a responsive editor and a scan, and
 ///   the label names and values it reports are the same set.
+///
+/// The `truncated` half of the return is how the caller knows to put
+/// `results truncated due to limit` in the response.
 fn observed_label_sets(
     db: &std::sync::Arc<chronix::Chronix>,
     namespace: Option<&str>,
@@ -559,9 +663,10 @@ fn observed_label_sets(
     limit: usize,
     selectors: &[Selector],
     project_value: bool,
-) -> Result<Vec<Vec<(String, String)>>, ServerError> {
+) -> Result<ObservedLabelSets, ServerError> {
     let mut out: std::collections::BTreeSet<Vec<(String, String)>> =
         std::collections::BTreeSet::new();
+    let mut truncated = false;
 
     // With no selector every metric is in scope; with selectors, only the ones
     // they name — which is what makes a Grafana label dropdown show the values
@@ -629,7 +734,7 @@ fn observed_label_sets(
             continue;
         };
 
-        'batches: for batch in stream {
+        for batch in stream {
             let batch = batch.map_err(|e| {
                 ServerError::Internal(format!("failed to read '{measurement}': {e}"))
             })?;
@@ -675,18 +780,35 @@ fn observed_label_sets(
                         }
                     }
                     out.insert(pairs);
-                    if out.len() >= limit {
-                        tracing::warn!(
-                            "prom label enumeration hit the series limit ({limit}), truncating"
-                        );
-                        break 'batches;
+                    // Keep the smallest `limit` sets rather than stopping at
+                    // the first `limit` the scan meets, so a truncated answer
+                    // is the sorted **prefix** at every limit instead of
+                    // moving with the data's physical layout. Memory stays
+                    // bounded at `limit + 1`; the cost is the early exit, and
+                    // it is paid only in the truncating case.
+                    if out.len() > limit {
+                        out.pop_last();
+                        truncated = true;
                     }
                 }
             }
         }
     }
 
-    Ok(out.into_iter().collect())
+    Ok((out.into_iter().collect(), truncated))
+}
+
+/// The cardinality cap one request enumerates under, and its source.
+///
+/// The request's `limit` and the server's `prom_series_limit` are both
+/// ceilings, so the effective one is the smaller. A `limit` above the
+/// server's cap does not raise it — it is an operator's bound, not a
+/// client's.
+fn effective_limit(server_cap: usize, requested: Option<usize>) -> usize {
+    match requested {
+        Some(n) => n.min(server_cap),
+        None => server_cap,
+    }
 }
 
 /// One scan of `observed_label_sets`: a measurement, optionally a value
@@ -709,18 +831,19 @@ pub async fn prom_series_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     prom_params: super::PromParams,
-) -> Result<Json<PromListResponse>, ServerError> {
+) -> Result<Json<PromListResponse>, PromApiError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let params = PromSeriesQuery::from_params(&prom_params)?;
     let (start_ns, end_ns) = params.window()?;
     let matchers = params.matchers;
-    let series_limit = state.config.prom_series_limit;
+    let requested = prom_params.limit()?;
+    let series_limit = effective_limit(state.config.server.prom_series_limit, requested);
 
-    let series_list =
-        tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, ServerError> {
+    let (series_list, truncated) = tokio::task::spawn_blocking(
+        move || -> Result<(Vec<serde_json::Value>, bool), ServerError> {
             let selectors = parse_selectors(&db, &matchers)?;
-            Ok(observed_label_sets(
+            let (sets, truncated) = observed_label_sets(
                 &db,
                 scope.as_deref(),
                 start_ns,
@@ -728,23 +851,28 @@ pub async fn prom_series_handler(
                 series_limit,
                 &selectors,
                 true,
-            )?
-            .into_iter()
-            .map(|pairs| {
-                serde_json::Value::Object(
-                    pairs
-                        .into_iter()
-                        .map(|(k, v)| (k, serde_json::Value::String(v)))
-                        .collect(),
-                )
-            })
-            .collect())
-        })
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))??;
+            )?;
+            Ok((
+                sets.into_iter()
+                    .map(|pairs| {
+                        serde_json::Value::Object(
+                            pairs
+                                .into_iter()
+                                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                truncated,
+            ))
+        },
+    )
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))??;
 
     Ok(Json(PromListResponse::success(
         serde_json::to_value(series_list).unwrap_or_default(),
+        truncated,
     )))
 }
 
@@ -762,10 +890,10 @@ pub struct PromMetadataResponse {
 pub async fn prom_metadata_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
-) -> Result<Json<PromMetadataResponse>, ServerError> {
+) -> Result<Json<PromMetadataResponse>, PromApiError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let limit = state.config.prom_series_limit;
+    let limit = state.config.server.prom_series_limit;
     let now_ns = crate::util::now_nanos()?;
     let start_ns = now_ns - 3_600_000_000_000;
 
@@ -807,8 +935,31 @@ pub async fn prom_metadata_handler(
     }))
 }
 
-fn prom_value_to_response(value: chronix::promql::PromQLValue) -> PromResponse {
+/// Render a PromQL value, applying the request's `limit` to the number of
+/// series and saying so when it bites.
+///
+/// Prometheus limits *series*, not samples, and leaves a scalar or a string
+/// alone — `limit` on `/query?query=1` means nothing, so it does nothing.
+fn prom_value_to_response(
+    value: chronix::promql::PromQLValue,
+    limit: Option<usize>,
+) -> PromResponse {
     use chronix::promql::PromQLValue;
+
+    let mut truncated = false;
+    let value = match (value, limit) {
+        (PromQLValue::Vector(mut series), Some(n)) if series.len() > n => {
+            series.truncate(n);
+            truncated = true;
+            PromQLValue::Vector(series)
+        }
+        (PromQLValue::Matrix(mut series), Some(n)) if series.len() > n => {
+            series.truncate(n);
+            truncated = true;
+            PromQLValue::Matrix(series)
+        }
+        (other, _) => other,
+    };
 
     let (result_type, result) = match value {
         PromQLValue::Scalar(v) => ("scalar".into(), serde_json::json!([0, v.to_string()])),
@@ -873,6 +1024,11 @@ fn prom_value_to_response(value: chronix::promql::PromQLValue) -> PromResponse {
         }),
         error: None,
         error_type: None,
+        warnings: if truncated {
+            vec![TRUNCATED_WARNING.to_string()]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -890,6 +1046,7 @@ mod tests {
             }),
             error: None,
             error_type: None,
+            warnings: Vec::new(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "success");

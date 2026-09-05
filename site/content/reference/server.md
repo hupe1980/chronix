@@ -291,6 +291,9 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 
 | Metric | Type | Emitted From | Description |
 |--------|------|--------------|-------------|
+| `chronix_write_errors_total` | Counter | every write path | Writes that failed, labelled `reason` = `storage_full` \| `timeout` \| `rejected` \| `panic`. `storage_full` is the data volume, and the one to alert on |
+| `chronix_sql_results_truncated_total` | Counter | the HTTP, gRPC and Flight SQL query paths | Results the `sql_max_rows` ceiling cut short or refused. A non-zero rate means somebody is reading a prefix and calling it an answer |
+| `chronix_backfill_points_total` | Counter | every write path with `?backfill=true` | Points written **outside** the out-of-order window — importing history rather than ingesting live |
 | `chronix_compaction_backpressure_active` | Gauge | `apply_backpressure()` | 1.0 when write throttling is active, 0.0 otherwise |
 | `chronix_memtable_memory_bytes` | Gauge | `statistics()` | Memtable rows and index entries |
 | `chronix_interner_memory_bytes` | Gauge | `statistics()` | String interners — grows with cardinality, not row count |

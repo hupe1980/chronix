@@ -705,7 +705,7 @@ pub async fn create_key_handler(
         ));
     }
 
-    if state.config.multi_tenancy && body.namespaces.is_empty() {
+    if state.config.server.multi_tenancy && body.namespaces.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "a key must name the namespaces it may act in when multi-tenancy is on".to_string(),
@@ -1086,13 +1086,9 @@ mod tests {
             model_catalog: std::sync::Arc::new(parking_lot::RwLock::new(
                 chronix::chronix_analytics::forecast::ModelCatalog::new(),
             )),
-            #[cfg(feature = "chaos")]
-            chaos_agent: None,
             authz_engine: None,
             audit_logger: None,
             namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
-            #[cfg(feature = "chaos")]
-            chaos_guards: parking_lot::Mutex::new(Vec::new()),
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
@@ -1135,13 +1131,9 @@ mod tests {
             model_catalog: std::sync::Arc::new(parking_lot::RwLock::new(
                 chronix::chronix_analytics::forecast::ModelCatalog::new(),
             )),
-            #[cfg(feature = "chaos")]
-            chaos_agent: None,
             authz_engine: None,
             audit_logger: None,
             namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
-            #[cfg(feature = "chaos")]
-            chaos_guards: parking_lot::Mutex::new(Vec::new()),
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
@@ -1171,13 +1163,9 @@ mod tests {
             model_catalog: std::sync::Arc::new(parking_lot::RwLock::new(
                 chronix::chronix_analytics::forecast::ModelCatalog::new(),
             )),
-            #[cfg(feature = "chaos")]
-            chaos_agent: None,
             authz_engine: Some(std::sync::Arc::new(engine)),
             audit_logger: None,
             namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
-            #[cfg(feature = "chaos")]
-            chaos_guards: parking_lot::Mutex::new(Vec::new()),
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,

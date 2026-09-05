@@ -1032,12 +1032,24 @@ impl SegmentCatalog {
         // Atomic snapshot write: write temp → fsync → rename → fsync parent.
         let snapshot_path = self.manifest_dir.join("manifest.snapshot.bin");
         let tmp_path = self.manifest_dir.join("manifest.snapshot.bin.tmp");
-        {
+        // The temp file is removed on failure. The segment writer and the
+        // local storage backend both do this; the catalog did not, so a
+        // snapshot interrupted by `ENOSPC` left a partial `.tmp` behind —
+        // consuming the space whose absence caused the failure, on the one
+        // file the database cannot afford to lose.
+        let write_tmp = (|| -> std::io::Result<()> {
             let mut file = std::fs::File::create(&tmp_path)?;
             file.write_all(&data)?;
-            file.sync_all()?;
+            file.sync_all()
+        })();
+        if let Err(e) = write_tmp {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
         }
-        std::fs::rename(&tmp_path, &snapshot_path)?;
+        if let Err(e) = std::fs::rename(&tmp_path, &snapshot_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
 
         // Fsync parent directory to make the rename durable.
         // This MUST succeed before truncating the WAL; otherwise a crash

@@ -39,6 +39,7 @@ use crate::otlp;
 pub async fn otlp_metrics_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    axum::extract::Query(backfill): axum::extract::Query<crate::util::BackfillParam>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -69,8 +70,14 @@ pub async fn otlp_metrics_handler(
 
     let count = points.len();
 
-    crate::util::insert_with_timeout(&state.db, scope.as_deref(), points, state.write_timeout)
-        .await?;
+    crate::util::insert_batch_with_mode(
+        &state.db,
+        scope.as_deref(),
+        points,
+        state.write_timeout,
+        backfill.mode(),
+    )
+    .await?;
 
     debug!(count, "wrote points via OTLP metrics");
     metrics::counter!("chronix_otlp_metrics_points_total").increment(count as u64);

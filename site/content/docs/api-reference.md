@@ -26,7 +26,6 @@ weight = 20
 - [Namespace Endpoints (Multi-Tenancy)](#namespace-endpoints)
 - [Admin — Cluster Management](#admin-cluster-management)
 - [Admin — Analytics Model Management](#admin-analytics-model-management)
-- [Admin — Chaos Injection](#admin-chaos-injection)
 - [Authentication](#authentication)
 - [gRPC API](#grpc-api)
 - [Flight SQL API](#flight-sql-api)
@@ -76,7 +75,7 @@ because every Prometheus client branches on that instead.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Liveness probe. Returns `200 OK` when the process is running. |
-| `GET` | `/ready` | Readiness probe. Returns `200 OK` when the database is open and accepting queries. |
+| `GET` | `/ready` | Readiness probe. `200` when the database is open **and accepting writes**; `503` with `{"ready": false, "reason": …}` when it is not. Point a Kubernetes `readinessProbe` here. |
 | `GET` | `/metrics` | Prometheus-format metrics scrape endpoint. Path is configurable. All four Prometheus metric types (counter, gauge, histogram, summary) are fully parsed, including per-bucket and per-quantile data. |
 
 ### Example
@@ -115,7 +114,13 @@ Write one or more time-series points in native JSON format.
 - `fields` (object, required): Numeric/boolean/string field values.
 - `timestamp` (i64, optional): Nanosecond Unix epoch. Defaults to server time.
 
+**Query parameters:** `backfill=true` writes points **outside** the
+out-of-order window — see [Backfilling history](#backfilling-history).
+
 **Response:** `204 No Content`
+
+A malformed body answers `400` naming the field and its position in the
+batch — `invalid write batch: points[1]: unknown field \`measurment\``.
 
 ### `POST /write`, `POST /api/v2/write`, `POST /api/v1/write/influx`
 
@@ -129,9 +134,45 @@ cpu,host=srv1,region=us-east usage=72.5,count=42i 1700000000000000000
 ```
 
 **Query parameters:** `precision=ns|us|ms|s` sets the unit of every
-timestamp in the body (default `ns`). `db`, `bucket`, `org` and `rp` are
-accepted and ignored — chronix is one database per process and scopes by the
-`X-Namespace` header.
+timestamp in the body (default `ns`); `backfill=true` writes outside the
+out-of-order window. `db`, `bucket`, `org` and `rp` are accepted and ignored —
+chronix is one database per process and scopes by the `X-Namespace` header.
+
+### Backfilling history
+
+Live ingestion is held to ±`ooo_shard_tolerance` shards of the newest admitted
+write. A point older than that is refused, and the refusal names the timestamp,
+the window and the remedy:
+
+```json
+{"error": "partial write: 0 accepted, 1 rejected: Memtable error: timestamp 1600000000000000000 is outside the out-of-order window [1788613200000000000, 1788631200000000000] (+/-2 shard(s) of 3600s around the newest admitted write); import history with a backfill write instead",
+ "code": "PARTIAL_WRITE"}
+```
+
+It is an explicit opt-in, not an automatic fallback: the window is what bounds
+the number of open memtables.
+
+```bash
+# JSON, line protocol, remote write and OTLP all take the same parameter.
+curl -X POST 'localhost:8086/api/v1/write?backfill=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"measurement":"cpu","fields":{"usage":1.0},"timestamp":1600000000000000000}'
+```
+
+| Surface | How to ask |
+|---|---|
+| `POST /api/v1/write` | `?backfill=true` |
+| `POST /write`, `/api/v2/write`, `/api/v1/write/influx` | `?backfill=true` |
+| `POST /api/v1/prom/write` | `?backfill=true` |
+| `POST /v1/metrics`, `/api/v1/otlp/metrics` | `?backfill=true` |
+| gRPC `Write` | `WriteRequest.backfill = true` |
+| Python SDK | `client.write(points, backfill=True)` |
+
+Admission, the cardinality budget, the schema and the future-timestamp bound
+are unchanged. Arrow Flight `DoPut` has no field for the flag.
+
+A backfill below a rollup's watermark marks those buckets for
+re-materialisation ([Data Model](/docs/data-model/)).
 
 **Response:** `204 No Content` when every line was stored.
 
@@ -212,6 +253,11 @@ The time bounds live under `range`, and every key is checked: an unknown one
 is a `400` rather than a field quietly dropped, because a dropped `start`
 answers the whole measurement as though it had understood.
 
+`limit` is bounded by the server's `sql_max_rows`. A larger one is refused
+before the scan; naming none is refused after it if the result would exceed the
+ceiling. The response is a bare array with nowhere to carry a `truncated` flag,
+so this endpoint refuses rather than returning a prefix.
+
 **Response** — a JSON **array** of rows. Each row separates the tags that
 identify the series from the fields that carry values, and a string *field*
 stays a field:
@@ -244,9 +290,17 @@ a frame without re-deriving the schema:
   "columns": [{"name": "_time", "data_type": "Timestamp(ns)"},
               {"name": "usage", "data_type": "Float64"}],
   "rows": [[1700000000000000000, 72.5]],
-  "row_count": 1
+  "row_count": 1,
+  "truncated": false
 }
 ```
+
+`truncated` is `true` when `sql_max_rows` cut the answer short, and is always
+present — an aggregate over a truncated scan is a wrong number, not a partial
+one. Add a `LIMIT`, narrow the range, or raise `server.sql_max_rows`.
+
+Arrow Flight SQL has no field for the flag, so it **refuses** a result over the
+ceiling with `RESOURCE_EXHAUSTED`.
 
 **Time predicates.** The timestamp column is `_time`, typed
 `TIMESTAMP(nanosecond)`. Three forms compare against it:
@@ -458,7 +512,29 @@ of seconds. An unparseable value is a 400 rather than a silent default.
 Errors carry Prometheus's status codes, because clients branch on them:
 `400` for `bad_data`, `422` for `execution`, `503` for `timeout`. The body is
 `{"status":"error","errorType":…,"error":…}` — not the envelope the rest of the
-API uses, for the same reason.
+API uses, for the same reason. The discovery endpoints answer in the same
+envelope, which is what Grafana branches on.
+
+### `limit`, and truncation
+
+`/query`, `/query_range`, `/series`, `/labels` and `/label/{name}/values`
+accept **`limit`**: a non-negative integer bounding the number of results,
+where `0` (or absent) means no limit. On the query endpoints it bounds the
+number of **series**, as upstream does, and leaves a scalar or a string alone.
+
+Two ceilings can cut an answer — the request's `limit` and the server's
+`prom_series_limit` — and either way the response says so, in the field
+Prometheus uses:
+
+```json
+{"status": "success",
+ "data": [{"__name__": "cpu_usage", "host": "a"}],
+ "warnings": ["results truncated due to limit"]}
+```
+
+`warnings` is **absent** when nothing was cut, so its presence carries
+information. A `limit` above `prom_series_limit` does not raise it: an
+operator's ceiling is not a client's to lift.
 
 A **parse** error is `bad_data`, and that includes the two things upstream
 also catches in its parser: an unknown function name, and a selector whose
@@ -1202,64 +1278,25 @@ curl -X POST http://localhost:8086/api/v1/admin/analytics/retrain \
 
 ---
 
-## Admin — Chaos Injection
+## When the disk fills
 
-Controlled fault injection for resilience testing. The chaos agent must
-be enabled via configuration.
+A write that cannot be made durable answers **`507 Insufficient Storage`**;
+gRPC answers `RESOURCE_EXHAUSTED` with the same text.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/v1/admin/chaos/inject` | Inject a fault |
-| `GET` | `/api/v1/admin/chaos` | List active injections |
-| `DELETE` | `/api/v1/admin/chaos` | Clear all injections |
-| `DELETE` | `/api/v1/admin/chaos/{id}` | Clear a specific injection |
-
-### Available Fault Types
-
-| Fault | Parameters | Description |
-|-------|-----------|-------------|
-| `DiskFull` | — | Simulate disk full on the node |
-| `LatencySpike` | `delay` (Duration) | Add artificial latency to all operations |
-| `SlowDisk` | `latency` (Duration) | Add latency to disk I/O |
-| `WriteDropper` | `drop_ratio` (0.0–1.0) | Drop a percentage of writes |
-| `NetworkPartition` | `isolated_nodes` (Vec) | Isolate specific nodes |
-| `KillNode` | `delay` (Duration) | Kill the node after a delay |
-| `ReadCorruption` | `corruption_ratio` (0.0–1.0) | Corrupt a percentage of reads |
-
-### Inject Fault
-
-```bash
-curl -X POST http://localhost:8086/api/v1/admin/chaos/inject \
-  -H 'Content-Type: application/json' \
-  -d '{"fault": "DiskFull", "duration_secs": 30, "description": "Test disk full handling"}'
-# {"injection_id": 1, "fault": "DiskFull", "duration_secs": 30}
+```json
+{"error": "no space left on the data volume: WAL error: WAL I/O error: No space left on device (os error 28)",
+ "code": "STORAGE_FULL"}
 ```
 
-### Inject Latency Spike
+`507` is a 5xx, so retrying clients keep retrying — the condition usually
+clears when a log rotates or retention runs.
 
-```bash
-curl -X POST http://localhost:8086/api/v1/admin/chaos/inject \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "fault": {"LatencySpike": {"delay": {"secs": 1, "nanos": 0}}},
-    "duration_secs": 60,
-    "description": "Simulate slow network"
-  }'
-```
-
-### List Active Faults
-
-```bash
-curl http://localhost:8086/api/v1/admin/chaos
-# [{"id": 1, "fault": "DiskFull", "description": "Test", "remaining_secs": 25.3}]
-```
-
-### Clear Fault
-
-```bash
-curl -X DELETE http://localhost:8086/api/v1/admin/chaos/1
-# 204 No Content
-```
+**Nothing is lost.** The WAL rewinds to its last durable offset, so writes
+resume once space returns without a restart, and a record the caller was told
+had failed is never written later. A flush that cannot write its segment
+leaves the memtable frozen for the next attempt. Reads keep working and
+`/ready` stays `200`: this is back-pressure, not a reason to leave the load
+balancer.
 
 ---
 

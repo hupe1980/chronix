@@ -3,19 +3,23 @@
 use serde::{Deserialize, Serialize};
 
 /// Log output format.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LogFormat {
-    /// Human-readable pretty format (default for development).
-    #[default]
-    Pretty,
-    /// Structured JSON format (recommended for production).
-    Json,
-    /// Compact single-line format.
-    Compact,
-}
+///
+/// Re-exported from [`crate::config`] rather than declared again: there were
+/// two of these — `Text`/`Json` in the config file and `Pretty`/`Json`/
+/// `Compact` here — and only the first was ever read, because `main` installed
+/// its own subscriber instead of calling [`init_tracing`](super::init_tracing).
+/// A second enum for one setting is how `log_format = "json"` came to mean two
+/// different things depending on which initialiser ran.
+pub use crate::config::LogFormat;
 
 /// Sampling strategy for distributed traces.
+///
+/// `rename_all = "snake_case"` so the TOML reads
+/// `sampling = "always_on"` or `sampling = { ratio = 0.01 }`. Without it the
+/// variant names were the Rust ones, so the form the documentation showed —
+/// and the only form anybody would write — did not parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SamplingStrategy {
     /// Sample all traces (1.0 = 100%).
     AlwaysOn,
@@ -33,6 +37,7 @@ impl Default for SamplingStrategy {
 
 /// OTLP export configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OtlpConfig {
     /// OTLP gRPC endpoint (e.g. `https://collector:4317`).
     pub endpoint: String,
@@ -92,7 +97,13 @@ impl Default for OtlpConfig {
     }
 }
 
-/// Top-level tracing configuration.
+/// Top-level tracing configuration — what [`init_tracing`](super::init_tracing)
+/// takes.
+///
+/// This is *not* the shape of the `[tracing]` section; see
+/// [`crate::config::TracingSettings`], which carries only what belongs to
+/// tracing, and [`crate::config::ServerConfig::tracing_config`], which
+/// composes this from it and from `[server]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TracingConfig {
     /// Service name for trace identification.

@@ -157,16 +157,23 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         let req = request.into_inner();
         let points = req
             .points
-            .into_iter()
+            .iter()
+            .cloned()
             .map(proto_point_to_point)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_grpc_status())?;
 
         let count = points.len() as u64;
 
-        crate::util::insert_with_timeout(&self.db, scope.as_deref(), points, self.write_timeout)
-            .await
-            .map_err(|e| e.to_grpc_status())?;
+        crate::util::insert_batch_with_mode(
+            &self.db,
+            scope.as_deref(),
+            points,
+            self.write_timeout,
+            crate::util::WriteMode::from_flag(req.backfill),
+        )
+        .await
+        .map_err(|e| e.to_grpc_status())?;
 
         debug!(count, "wrote points via gRPC");
         metrics::counter!("chronix_grpc_points_written_total").increment(count);
@@ -622,6 +629,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
                 max_rows = self.sql_max_rows,
                 "gRPC SQL result truncated to max_rows"
             );
+            metrics::counter!("chronix_sql_results_truncated_total").increment(1);
         }
 
         let row_count = rows.len() as u64;
@@ -629,6 +637,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             columns,
             rows,
             row_count,
+            truncated,
         }))
     }
 }

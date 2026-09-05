@@ -59,7 +59,7 @@ pub fn spec_json(server_url: &str) -> String {
 /// configuration required. Deployments that need an absolute URL (publishing
 /// the spec to a portal, say) set `public_url`.
 fn server_url(config: &crate::config::ServerConfig) -> String {
-    if let Some(url) = &config.public_url {
+    if let Some(url) = &config.server.public_url {
         return url.clone();
     }
     "/".to_string()
@@ -86,6 +86,39 @@ fn ok_json(desc: &str, schema: RefOr<Schema>) -> utoipa::openapi::response::Resp
 
 fn ok_empty(desc: &str) -> utoipa::openapi::response::Response {
     ResponseBuilder::new().description(desc).build()
+}
+
+/// An optional query parameter, described.
+fn query_param(name: &str, desc: &str) -> utoipa::openapi::path::Parameter {
+    ParameterBuilder::new()
+        .name(name)
+        .parameter_in(ParameterIn::Query)
+        .required(utoipa::openapi::Required::False)
+        .description(Some(desc))
+        .build()
+}
+
+/// The `?backfill=` parameter, on every write route that accepts it.
+fn backfill_param() -> utoipa::openapi::path::Parameter {
+    query_param(
+        "backfill",
+        "`true` writes points **outside** the out-of-order window — importing \
+         history rather than ingesting live. Live writes are held to \
+         ±`ooo_shard_tolerance` shards of the newest write; anything older is \
+         refused with a 400 naming the window. Everything else (admission, the \
+         cardinality budget, the schema, the future-timestamp bound) is \
+         unchanged.",
+    )
+}
+
+/// The `?limit=` parameter, as Prometheus defines it.
+fn limit_param() -> utoipa::openapi::path::Parameter {
+    query_param(
+        "limit",
+        "Maximum number of results; `0` or absent means no limit. When it \
+         cuts the answer, the response carries \
+         `warnings: [\"results truncated due to limit\"]`.",
+    )
 }
 
 fn obj_schema() -> RefOr<Schema> {
@@ -158,6 +191,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 .description(Some(
                     "Write one or more data points in JSON format. Supports single point or batch.",
                 ))
+                .parameter(backfill_param())
                 .request_body(Some(json_body("Write point(s)", obj_schema())))
                 .response("204", ok_empty("Points written successfully"))
                 .response("400", ok_json("Bad request", obj_schema()))
@@ -172,6 +206,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 .tag("Write")
                 .summary(Some("Write points (InfluxDB line protocol)"))
                 .description(Some("Write data using InfluxDB line protocol format."))
+                .parameter(backfill_param())
                 .response("204", ok_empty("Points written successfully"))
                 .response("400", ok_json("Bad request", obj_schema()))
                 .build(),
@@ -314,6 +349,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
                         .required(utoipa::openapi::Required::True)
                         .build(),
                 )
+                .parameter(limit_param())
                 .response("200", ok_json("Label values", obj_schema()))
                 .build(),
         ),
@@ -325,6 +361,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
             OperationBuilder::new()
                 .tag("Prometheus")
                 .summary(Some("Find series"))
+                .parameter(limit_param())
                 .response("200", ok_json("Matching series", obj_schema()))
                 .build(),
         ),
@@ -777,6 +814,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
                         .required(utoipa::openapi::Required::True)
                         .build(),
                 )
+                .parameter(limit_param())
                 .response("200", ok_json("Label values", obj_schema()))
                 .build(),
         ),

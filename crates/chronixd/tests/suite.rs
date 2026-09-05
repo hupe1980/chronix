@@ -16,6 +16,8 @@ mod flight_test;
 mod grpc_test;
 #[path = "suite/integration.rs"]
 mod integration;
+#[path = "suite/partial_answers.rs"]
+mod partial_answers;
 #[path = "suite/prom_discovery.rs"]
 mod prom_discovery;
 #[path = "suite/tenancy_test.rs"]

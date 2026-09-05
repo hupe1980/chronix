@@ -141,7 +141,7 @@ jobs:
       # not denied here — the frozen tier is compile-checked, not lint-clean —
       # but a deny-level lint must not go unnoticed.
       - run: cargo clippy -p chronix-meta -p chronix-cluster -p chronix-dsim --all-targets
-      - run: cargo check -p chronixd --features cluster,chaos
+      - run: cargo check -p chronixd --features cluster
 
   features:
     # Optional features are not covered by the default build, so nothing

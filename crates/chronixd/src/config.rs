@@ -10,20 +10,24 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level server configuration — loaded from TOML or CLI arguments.
 ///
-/// The `[database]` section maps directly to [`chronix_core::ChronixConfig`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The file is a set of named sections: `[server]` holds the scalars the
+/// process itself needs, `[database]` maps to [`chronix_core::ChronixConfig`],
+/// and every other table switches a subsystem on by being present.
+///
+/// **Every struct in this file is `deny_unknown_fields`.** serde drops a table
+/// it does not recognise as silently as a misspelt key, and this file's whole
+/// purpose is to change behaviour — so a key it cannot act on is a startup
+/// error naming it, never a default applied in silence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// HTTP bind address (REST + Prometheus + health).
-    #[serde(default = "default_http_addr")]
-    pub http_addr: SocketAddr,
+    /// Process-level settings: listen addresses, limits, logging.
+    #[serde(default)]
+    pub server: ServerSettings,
 
-    /// gRPC bind address.
-    #[serde(default = "default_grpc_addr")]
-    pub grpc_addr: SocketAddr,
-
-    /// Flight SQL bind address.
-    #[serde(default = "default_flight_addr")]
-    pub flight_addr: SocketAddr,
+    /// Distributed tracing export (optional — logging only if absent).
+    #[serde(default)]
+    pub tracing: Option<TracingSettings>,
 
     /// TLS configuration (optional — plaintext if absent).
     #[serde(default)]
@@ -36,6 +40,52 @@ pub struct ServerConfig {
     /// Periodic cold archiving (optional — nothing runs if absent).
     #[serde(default)]
     pub cold_archive: Option<ColdArchiveConfig>,
+
+    /// Kafka ingestion connector configuration (optional).
+    #[serde(default)]
+    pub kafka: Option<crate::connector::KafkaConfig>,
+
+    /// MQTT ingestion connector configuration (optional).
+    #[serde(default)]
+    pub mqtt: Option<crate::connector::MqttConfig>,
+
+    /// Authentication configuration (optional — unauthenticated if absent).
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+
+    /// Audit log configuration.
+    ///
+    /// Absent means the audit trail exists only in the process log, which
+    /// is not an audit trail: it does not survive a restart and nothing
+    /// can prove it was not edited.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+
+    /// Cluster configuration (optional — standalone if absent).
+    #[serde(default)]
+    pub cluster: Option<ClusterConfig>,
+
+    /// Embedded database configuration.
+    #[serde(default)]
+    pub database: DatabaseConfig,
+}
+
+/// The `[server]` section: everything the process needs that is not a
+/// subsystem of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSettings {
+    /// HTTP bind address (REST + Prometheus + health).
+    #[serde(default = "default_http_addr")]
+    pub http_addr: SocketAddr,
+
+    /// gRPC bind address.
+    #[serde(default = "default_grpc_addr")]
+    pub grpc_addr: SocketAddr,
+
+    /// Flight SQL bind address.
+    #[serde(default = "default_flight_addr")]
+    pub flight_addr: SocketAddr,
 
     /// Absolute base URL clients use to reach this server, e.g.
     /// `https://metrics.example.com/chronix`.
@@ -122,18 +172,6 @@ pub struct ServerConfig {
     #[serde(default = "default_connector_backoff_ms")]
     pub connector_start_retry_backoff_ms: u64,
 
-    /// Kafka ingestion connector configuration (optional).
-    #[serde(default)]
-    pub kafka: Option<crate::connector::KafkaConfig>,
-
-    /// MQTT ingestion connector configuration (optional).
-    #[serde(default)]
-    pub mqtt: Option<crate::connector::MqttConfig>,
-
-    /// Authentication configuration (optional — unauthenticated if absent).
-    #[serde(default)]
-    pub auth: Option<AuthConfig>,
-
     /// Root directory that backup and restore paths are confined to.
     ///
     /// Defaults to `backups/` inside the data directory. Everything the
@@ -143,14 +181,6 @@ pub struct ServerConfig {
     /// could write over it.
     #[serde(default)]
     pub backup_root: Option<PathBuf>,
-
-    /// Audit log configuration.
-    ///
-    /// Absent means the audit trail exists only in the process log, which
-    /// is not an audit trail: it does not survive a restart and nothing
-    /// can prove it was not edited.
-    #[serde(default)]
-    pub audit: Option<AuditConfig>,
 
     /// Authorization — path to a directory of `.cedar` policy files.
     /// When set, the Cedar authorization engine is enabled.
@@ -171,10 +201,6 @@ pub struct ServerConfig {
     /// re-ingest, not a config change.
     #[serde(default)]
     pub multi_tenancy: bool,
-
-    /// Cluster configuration (optional — standalone if absent).
-    #[serde(default)]
-    pub cluster: Option<ClusterConfig>,
 
     /// CORS allowed origins. Empty or absent means restrictive (same-origin only).
     /// Use `["*"]` to allow all origins — requires `allow_unsafe_cors: true`.
@@ -270,14 +296,33 @@ pub struct ServerConfig {
     /// Per-user rate limit burst size (default: equals `per_user_rate_limit_rps`).
     #[serde(default)]
     pub per_user_rate_limit_burst: u32,
+}
 
-    /// Embedded database configuration.
+/// The `[tracing]` section: distributed trace export.
+///
+/// Log *format* and *level* are not here — they are `[server] log_format` and
+/// `[server] log_level`, so one setting has one home. This section only says
+/// where traces go.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracingSettings {
+    /// Service name attached to every exported span.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+
+    /// OTLP export target. A `[tracing]` section naming none is refused at
+    /// startup rather than accepted and ignored.
     #[serde(default)]
-    pub database: DatabaseConfig,
+    pub otlp: Option<crate::otel::OtlpConfig>,
+}
+
+fn default_service_name() -> String {
+    "chronix".to_string()
 }
 
 /// Database-specific configuration — mirrors `ChronixConfig` fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     /// Data directory.
     pub data_dir: PathBuf,
@@ -342,6 +387,7 @@ pub struct DatabaseConfig {
 
 /// TLS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Path to PEM-encoded certificate file.
     pub cert: PathBuf,
@@ -370,6 +416,7 @@ pub struct TlsConfig {
 /// maintenance operation nobody runs is one that runs for the first time when
 /// the disk is already full.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColdArchiveConfig {
     /// Object-store URL to archive into (`s3://`, `gs://`, `az://`, `file://`).
     pub remote_url: String,
@@ -414,6 +461,7 @@ const fn default_max_objects_per_run() -> usize {
 /// this server, so `CREATE TRIGGER` could not be reached from any protocol
 /// surface however well it worked.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TriggersConfig {
     /// Where trigger definitions are persisted so they survive a restart.
     ///
@@ -505,6 +553,7 @@ const fn default_true() -> bool {
 
 /// Audit log configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditConfig {
     /// Path to the append-only JSON-lines audit file.
     pub path: PathBuf,
@@ -538,6 +587,7 @@ impl Default for AuditConfig {
 
 /// Authentication configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// API key authentication — if present, API-key auth is enabled.
     #[serde(default)]
@@ -557,6 +607,7 @@ pub struct AuthConfig {
 /// **Security:** `Debug` output redacts the raw key to prevent credential
 /// leakage in log output or config dumps.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiKeyEntry {
     /// Human-readable name for this key.
     pub name: String,
@@ -589,6 +640,7 @@ impl std::fmt::Debug for ApiKeyEntry {
 /// **Security:** `Debug` output redacts the secret to prevent credential
 /// leakage in log output or config dumps.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtAuthConfig {
     /// Secret or PEM public key for validation.
     ///
@@ -668,6 +720,7 @@ pub enum ClusterMode {
 
 /// Cluster configuration — present only when running in cluster mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Operating mode of this node.
     pub mode: ClusterMode,
@@ -701,6 +754,7 @@ pub struct ClusterConfig {
 /// to verify peer certificates, and the client cert/key pair is presented
 /// during TLS handshake for mutual authentication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterTlsConfig {
     /// Path to the PEM-encoded CA certificate used to verify peer certs.
     pub ca_cert: PathBuf,
@@ -710,18 +764,15 @@ pub struct ClusterTlsConfig {
     pub key: PathBuf,
 }
 
-impl Default for ServerConfig {
+impl Default for ServerSettings {
     fn default() -> Self {
         Self {
-            triggers: None,
-            cold_archive: None,
             http_addr: default_http_addr(),
             grpc_addr: default_grpc_addr(),
             flight_addr: default_flight_addr(),
             multi_tenancy: false,
             connector_start_retries: 0,
             connector_start_retry_backoff_ms: default_connector_backoff_ms(),
-            tls: None,
             public_url: None,
             metrics_path: default_metrics_path(),
             metrics_require_auth: default_metrics_require_auth(),
@@ -735,11 +786,7 @@ impl Default for ServerConfig {
             stream_batch_interval_ms: default_stream_batch_interval_ms(),
             dedup_window_secs: default_dedup_window_secs(),
             max_dedup_entries: default_max_dedup_entries(),
-            kafka: None,
-            mqtt: None,
-            auth: None,
             authz_policy_dir: None,
-            cluster: None,
             cors_allowed_origins: Vec::new(),
             allow_unsafe_cors: false,
             sql_query_timeout_secs: default_sql_query_timeout_secs(),
@@ -753,10 +800,8 @@ impl Default for ServerConfig {
             rate_limit_burst: 0,
             per_user_rate_limit_rps: 0,
             per_user_rate_limit_burst: 0,
-            database: DatabaseConfig::default(),
             write_timeout_secs: default_write_timeout_secs(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
-            audit: None,
             backup_root: None,
         }
     }
@@ -795,22 +840,22 @@ impl ServerConfig {
     ///
     /// Returns [`ServerConfigError::Invalid`] describing the conflicting ports.
     pub fn validate_ports(&self) -> Result<(), ServerConfigError> {
-        if self.http_addr == self.grpc_addr {
+        if self.server.http_addr == self.server.grpc_addr {
             return Err(ServerConfigError::Invalid(format!(
                 "HTTP and gRPC addresses must be distinct, both set to {}",
-                self.http_addr,
+                self.server.http_addr,
             )));
         }
-        if self.http_addr == self.flight_addr {
+        if self.server.http_addr == self.server.flight_addr {
             return Err(ServerConfigError::Invalid(format!(
                 "HTTP and Flight SQL addresses must be distinct, both set to {}",
-                self.http_addr,
+                self.server.http_addr,
             )));
         }
-        if self.grpc_addr == self.flight_addr {
+        if self.server.grpc_addr == self.server.flight_addr {
             return Err(ServerConfigError::Invalid(format!(
                 "gRPC and Flight SQL addresses must be distinct, both set to {}",
-                self.grpc_addr,
+                self.server.grpc_addr,
             )));
         }
         Ok(())
@@ -821,9 +866,9 @@ impl ServerConfig {
     /// Rejects wildcard CORS (`["*"]`) unless `allow_unsafe_cors` is
     /// explicitly set to `true`, preventing accidental misconfiguration.
     pub fn validate_cors(&self) -> Result<(), ServerConfigError> {
-        if self.cors_allowed_origins.len() == 1
-            && self.cors_allowed_origins[0] == "*"
-            && !self.allow_unsafe_cors
+        if self.server.cors_allowed_origins.len() == 1
+            && self.server.cors_allowed_origins[0] == "*"
+            && !self.server.allow_unsafe_cors
         {
             return Err(ServerConfigError::Invalid(
                 "CORS wildcard origin ('*') requires `allow_unsafe_cors = true` in config"
@@ -873,7 +918,7 @@ impl ServerConfig {
     ///
     /// Returns an error naming every unconfined key.
     pub fn validate_tenancy(&self) -> Result<(), ServerConfigError> {
-        if !self.multi_tenancy {
+        if !self.server.multi_tenancy {
             return Ok(());
         }
         let Some(auth) = &self.auth else {
@@ -893,6 +938,58 @@ impl ServerConfig {
                 unconfined.join(", ")
             )));
         }
+        Ok(())
+    }
+
+    /// The tracing configuration `otel::init_tracing` takes.
+    ///
+    /// Composed rather than deserialised whole: the log format and level are
+    /// `[server]` settings, and having a second home for them under
+    /// `[tracing]` is how one setting comes to mean two things.
+    #[must_use]
+    pub fn tracing_config(&self) -> crate::otel::TracingConfig {
+        crate::otel::TracingConfig {
+            service_name: self
+                .tracing
+                .as_ref()
+                .map_or_else(default_service_name, |t| t.service_name.clone()),
+            log_format: self.server.log_format,
+            log_filter: self.server.log_level.clone(),
+            otlp: self.tracing.as_ref().and_then(|t| t.otlp.clone()),
+        }
+    }
+
+    /// Refuse a `[tracing]` section this build cannot honour.
+    ///
+    /// Without the `otlp` feature the exporter is not compiled in and
+    /// `init_tracing` falls through to logging only, so a configured
+    /// collector would receive nothing in silence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `[tracing]` names no `[tracing.otlp]` target, or
+    /// when it names one and this binary was built without the `otlp`
+    /// feature.
+    pub fn validate_tracing(&self) -> Result<(), ServerConfigError> {
+        let Some(tracing) = &self.tracing else {
+            return Ok(());
+        };
+        if tracing.otlp.is_none() {
+            return Err(ServerConfigError::Invalid(
+                "the [tracing] section names no export target: add a \
+                 [tracing.otlp] section with an `endpoint`, or remove \
+                 [tracing]. Log format and level are [server] settings."
+                    .into(),
+            ));
+        }
+        #[cfg(not(feature = "otlp"))]
+        return Err(ServerConfigError::Invalid(
+            "[tracing.otlp] is configured but this chronixd was built without \
+             the `otlp` feature, so nothing would be exported. Rebuild with \
+             `--features otlp`, or remove the section."
+                .into(),
+        ));
+        #[cfg(feature = "otlp")]
         Ok(())
     }
 
@@ -956,10 +1053,10 @@ impl ServerConfig {
             self.database.data_dir = PathBuf::from(dir);
         }
         if let Some(level) = get("CHRONIX_LOG_LEVEL") {
-            self.log_level = level;
+            self.server.log_level = level;
         }
         if let Some(addr) = get("CHRONIX_HTTP_ADDR") {
-            self.http_addr = addr.parse().map_err(|e| {
+            self.server.http_addr = addr.parse().map_err(|e| {
                 ServerConfigError::Invalid(format!(
                     "CHRONIX_HTTP_ADDR {addr:?} is not an address: {e}"
                 ))
@@ -1171,6 +1268,9 @@ pub enum LogFormat {
     Text,
     /// One JSON object per line, for a log pipeline.
     Json,
+    /// One dense line per event — the same fields as `text`, without the
+    /// multi-line spans.
+    Compact,
 }
 
 fn default_log_level() -> String {
@@ -1258,17 +1358,18 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         let config = ServerConfig::default();
-        assert_eq!(config.http_addr.port(), 8086);
-        assert_eq!(config.grpc_addr.port(), 8087);
-        assert_eq!(config.flight_addr.port(), 8817);
+        assert_eq!(config.server.http_addr.port(), 8086);
+        assert_eq!(config.server.grpc_addr.port(), 8087);
+        assert_eq!(config.server.flight_addr.port(), 8817);
         assert!(config.tls.is_none());
-        assert_eq!(config.max_body_size, 10 * 1024 * 1024);
-        assert_eq!(config.log_format, LogFormat::Text);
+        assert_eq!(config.server.max_body_size, 10 * 1024 * 1024);
+        assert_eq!(config.server.log_format, LogFormat::Text);
     }
 
     #[test]
     fn parse_toml_config() {
         let toml_str = r#"
+            [server]
             http_addr = "127.0.0.1:9086"
             grpc_addr = "127.0.0.1:9087"
             flight_addr = "127.0.0.1:9817"
@@ -1285,12 +1386,12 @@ mod tests {
         "#;
 
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.http_addr.port(), 9086);
-        assert_eq!(config.grpc_addr.port(), 9087);
-        assert_eq!(config.flight_addr.port(), 9817);
-        assert_eq!(config.log_format, LogFormat::Json);
-        assert_eq!(config.log_level, "debug");
-        assert_eq!(config.max_body_size, 5 * 1024 * 1024);
+        assert_eq!(config.server.http_addr.port(), 9086);
+        assert_eq!(config.server.grpc_addr.port(), 9087);
+        assert_eq!(config.server.flight_addr.port(), 9817);
+        assert_eq!(config.server.log_format, LogFormat::Json);
+        assert_eq!(config.server.log_level, "debug");
+        assert_eq!(config.server.max_body_size, 5 * 1024 * 1024);
         assert_eq!(config.database.data_dir, PathBuf::from("/var/lib/chronix"));
         assert_eq!(config.database.compression, "zstd");
         assert_eq!(config.database.retention_secs, 86400);
@@ -1391,7 +1492,7 @@ mod tests {
     #[test]
     fn validate_ports_http_grpc_conflict() {
         let mut config = ServerConfig::default();
-        config.grpc_addr = config.http_addr; // same as HTTP
+        config.server.grpc_addr = config.server.http_addr; // same as HTTP
         let err = config.validate_ports().unwrap_err();
         assert!(err.to_string().contains("HTTP and gRPC"), "{err}");
     }
@@ -1399,7 +1500,7 @@ mod tests {
     #[test]
     fn validate_ports_http_flight_conflict() {
         let mut config = ServerConfig::default();
-        config.flight_addr = config.http_addr;
+        config.server.flight_addr = config.server.http_addr;
         let err = config.validate_ports().unwrap_err();
         assert!(err.to_string().contains("HTTP and Flight SQL"), "{err}");
     }
@@ -1407,7 +1508,7 @@ mod tests {
     #[test]
     fn validate_ports_grpc_flight_conflict() {
         let mut config = ServerConfig::default();
-        config.flight_addr = config.grpc_addr;
+        config.server.flight_addr = config.server.grpc_addr;
         let err = config.validate_ports().unwrap_err();
         assert!(err.to_string().contains("gRPC and Flight SQL"), "{err}");
     }

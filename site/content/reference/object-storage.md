@@ -47,7 +47,7 @@ An incomplete group stays hot and is retried on the next pass.
 | `ParquetArchiveWriter` | Streams query-output batches into one Parquet object |
 | `TieringEngine` | Uploads one archive object and verifies it landed |
 | `ArchiveConfig` | `cold_after`, `remote_url`, `max_objects_per_run` |
-| `ArchiveOutcome` | `objects`, `segments`, `rows`, `bytes`, `failed` |
+| `ArchiveOutcome` | `objects`, `segments`, `rows`, `bytes`, `failed`, `more_pending` |
 
 ### Layout
 

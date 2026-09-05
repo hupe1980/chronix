@@ -47,13 +47,14 @@ use crate::prom_proto;
 pub async fn remote_write_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    axum::extract::Query(backfill): axum::extract::Query<crate::util::BackfillParam>,
     body: Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     // Guard against decompression bombs: check the declared decompressed
     // size before allocating memory.  We cap at `max_body_size` (default
     // 10 MB) to bound memory usage.
-    let max_decompressed = state.config.max_body_size;
+    let max_decompressed = state.config.server.max_body_size;
     let declared_len = snap::raw::decompress_len(&body)
         .map_err(|e| ServerError::BadRequest(format!("snappy frame error: {e}")))?;
     if declared_len > max_decompressed {
@@ -79,8 +80,14 @@ pub async fn remote_write_handler(
 
     let count = points.len();
 
-    crate::util::insert_with_timeout(&state.db, scope.as_deref(), points, state.write_timeout)
-        .await?;
+    crate::util::insert_batch_with_mode(
+        &state.db,
+        scope.as_deref(),
+        points,
+        state.write_timeout,
+        backfill.mode(),
+    )
+    .await?;
 
     debug!(count, "wrote points via Prometheus remote write");
     metrics::counter!("chronix_prom_remote_write_samples_total").increment(count as u64);
@@ -98,7 +105,7 @@ pub async fn remote_read_handler(
 ) -> Result<impl IntoResponse, ServerError> {
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     // Guard against decompression bombs.
-    let max_decompressed = state.config.max_body_size;
+    let max_decompressed = state.config.server.max_body_size;
     let declared_len = snap::raw::decompress_len(&body)
         .map_err(|e| ServerError::BadRequest(format!("snappy frame error: {e}")))?;
     if declared_len > max_decompressed {

@@ -97,14 +97,10 @@ fn bench_http_write(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -191,14 +187,10 @@ fn bench_http_query(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -295,6 +287,7 @@ fn bench_grpc_write(c: &mut Criterion) {
     group.bench_function("1K_points", |b| {
         b.iter(|| {
             let req = proto::WriteRequest {
+                backfill: false,
                 points: points.clone(),
             };
             let resp = rt.block_on(client.write(req)).unwrap().into_inner();
@@ -497,7 +490,10 @@ fn bench_concurrent_writers_readers(c: &mut Criterion) {
                     handles.push(tokio::spawn(async move {
                         let mut client = ChronixServiceClient::connect(ep).await.unwrap();
                         let points = generate_grpc_batch(100);
-                        let req = proto::WriteRequest { points };
+                        let req = proto::WriteRequest {
+                            points,
+                            backfill: false,
+                        };
                         client.write(req).await.unwrap();
                     }));
                 }
@@ -549,14 +545,10 @@ fn bench_scale_http_write_10k(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -627,14 +619,10 @@ fn bench_scale_multi_measurement(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -737,14 +725,10 @@ fn bench_scale_targeted_query(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -817,14 +801,10 @@ fn bench_tsbs_devops_workload(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -908,14 +888,10 @@ fn bench_replicated_write_throughput(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -1038,14 +1014,10 @@ fn bench_multi_tenant_100ns(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -1157,14 +1129,10 @@ fn bench_large_scale_targeted_query(c: &mut Criterion) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,

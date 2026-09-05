@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
@@ -27,18 +26,6 @@ use tracing::debug;
 use zeroize::Zeroize;
 
 use crate::auth::error::AuthError;
-
-/// A fresh 16-byte salt, PHC-encoded.
-///
-/// `SaltString::generate` takes a `rand_core` 0.6 generator, which nothing in
-/// this tree wires up any more; the bytes come from the same OS source as
-/// every other secret here and are encoded to the identical alphabet and
-/// length, so the stored hash format is unchanged.
-fn generate_salt() -> SaltString {
-    let mut bytes = [0u8; 16];
-    super::fill_random(&mut bytes);
-    SaltString::encode_b64(&bytes).expect("16 bytes is a valid salt length")
-}
 
 /// Compute the 8-byte prefix fingerprint of a raw API key.
 ///
@@ -169,10 +156,12 @@ impl ApiKeyStore {
         super::fill_random(&mut key_bytes);
         use base64::Engine;
         let raw_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes);
-        let salt = generate_salt();
         let argon2 = Argon2::default();
+        // `hash_password` draws its own salt from the OS. It is the salt this
+        // tree used to build by hand, from the same source, at the same
+        // length — the crate simply owns it now.
         let hash = argon2
-            .hash_password(raw_key.as_bytes(), &salt)
+            .hash_password(raw_key.as_bytes())
             .map_err(|e| AuthError::Config(format!("hash error: {e}")))?
             .to_string();
 
@@ -283,10 +272,9 @@ impl ApiKeyStore {
                 "API key with name '{name}' already exists"
             )));
         }
-        let salt = generate_salt();
         let argon2 = Argon2::default();
         let mut hash = argon2
-            .hash_password(raw_key.as_bytes(), &salt)
+            .hash_password(raw_key.as_bytes())
             .map_err(|e| AuthError::Config(format!("hash error: {e}")))?
             .to_string();
 

@@ -40,7 +40,6 @@ chronix/
 │   │   ├── authz/           #   Cedar authorization (RBAC + ABAC)
 │   │   ├── audit/           #   Tamper-evident audit trail
 │   │   └── tenant/          #   Namespaces & quotas
-│   ├── chronix-chaos/       # Fault injection (dev-only)
 │   ├── chronix-meta/        # FROZEN: Raft cluster metadata (OpenRaft)
 │   ├── chronix-cluster/     # FROZEN: DataNode lifecycle, regions, coordination
 │   └── chronix-dsim/        # FROZEN: deterministic cluster simulation

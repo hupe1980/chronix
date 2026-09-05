@@ -162,8 +162,46 @@ pub async fn error_envelope_layer(
     out
 }
 
+/// Whether an error chain bottoms out in "the disk is full".
+///
+/// Walks `source()` rather than matching a variant, because `ENOSPC` reaches
+/// the handler wrapped differently depending on which write hit it first —
+/// `DbError::Wal(WalError::Io(..))` from the WAL, or
+/// `DbError::Memtable(MemtableError::Segment(SegmentError::Io(..)))` from a
+/// flush — and a match on one shape would silently miss the others.
+fn is_storage_full(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::StorageFull {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
+}
+
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        // A full disk is the deployment's condition, not this server's bug,
+        // so it is not a redacted 500. `507` is a 5xx, so retrying clients
+        // still retry — the condition usually clears — and the message is
+        // safe to show: "No space left on device" discloses nothing.
+        if is_storage_full(&self) {
+            tracing::error!(error = %self, "write failed: no space left on device");
+            metrics::counter!("chronix_write_errors_total", "reason" => "storage_full")
+                .increment(1);
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                axum::Json(ErrorResponse {
+                    error: format!("no space left on the data volume: {self}"),
+                    code: "STORAGE_FULL",
+                }),
+            )
+                .into_response();
+        }
+
         let (status, code) = match &self {
             ServerError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
             ServerError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
@@ -211,6 +249,15 @@ impl ServerError {
     /// to avoid leaking paths, stack traces, or implementation details.
     /// The full error is logged server-side for diagnostics.
     pub fn to_grpc_status(&self) -> tonic::Status {
+        // Same reasoning as the HTTP mapping: a full disk is the deployment's
+        // condition, `RESOURCE_EXHAUSTED` is what a gRPC client retries, and
+        // the message is not redacted because it discloses nothing.
+        if is_storage_full(self) {
+            tracing::error!(error = %self, "write failed: no space left on device");
+            return tonic::Status::resource_exhausted(format!(
+                "no space left on the data volume: {self}"
+            ));
+        }
         match self {
             ServerError::BadRequest(msg) => tonic::Status::invalid_argument(msg),
             ServerError::NotFound(msg) => tonic::Status::not_found(msg),
@@ -258,6 +305,47 @@ pub type Result<T> = std::result::Result<T, ServerError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full disk is `507`, unredacted, on every shape the error arrives in.
+    ///
+    /// It used to be `500 DATABASE_ERROR: an internal error occurred` — the
+    /// reason only in the server's log, so a Telegraf agent retried against a
+    /// full volume for ever and nothing in its output said why. Verified
+    /// against a real 24 MiB volume filled by writing to it.
+    #[test]
+    fn a_full_disk_is_insufficient_storage_and_says_so() {
+        let enospc =
+            || std::io::Error::new(std::io::ErrorKind::StorageFull, "No space left on device");
+        // The two nestings ENOSPC actually reaches a handler through: the WAL
+        // append, and a memtable flush writing a segment.
+        let cases = [
+            ServerError::Db(chronix::DbError::Wal(chronix_core::WalError::Io(enospc()))),
+            ServerError::Io(enospc()),
+        ];
+        for err in cases {
+            let text = err.to_string();
+            let resp = err.into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "{text} must not be reported as the server's own fault"
+            );
+        }
+    }
+
+    /// …and an error that is *not* a full disk keeps its own mapping, so the
+    /// detector cannot quietly swallow everything 5xx.
+    #[test]
+    fn an_ordinary_io_error_is_still_internal() {
+        let err = ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ));
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn bad_request_maps_to_400() {

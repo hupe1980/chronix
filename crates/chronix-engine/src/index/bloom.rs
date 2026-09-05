@@ -71,18 +71,27 @@ impl SeriesBloomFilter {
             clippy::cast_precision_loss
         )]
         let k = ((m as f64 / n) * ln2).ceil() as u32;
-        // Clamp k to [1, 15] for u8 serialization format.
-        // Log when clamping changes the optimal k, as this inflates
-        // the actual false positive rate above the requested rate.
+        // Clamp k to [1, 15] for the u8 serialisation format.
         let k_clamped = k.clamp(1, 15);
-        if k_clamped != k {
-            // Elevated from debug! to warn! so operators notice
-            // that the actual FPR exceeds the requested rate.
+
+        // Warn on the *achieved* rate, computed — not on the clamp, which is
+        // not evidence of anything. `m` has a 64-bit floor, so a filter over
+        // three series gets ~65 bits each and an optimal `k` of 45; clamped to
+        // 15 the real rate is ~1e-11 against a request of 0.01. Warning on the
+        // clamp fired on every small segment and said the opposite of the
+        // truth.
+        #[allow(clippy::cast_precision_loss)]
+        let achieved = {
+            let exponent = -(f64::from(k_clamped) * n) / (m as f64);
+            (1.0 - exponent.exp()).powi(k_clamped as i32)
+        };
+        if achieved > p {
             tracing::warn!(
                 optimal_k = k,
                 clamped_k = k_clamped,
-                requested_fpr = fp_rate,
-                "bloom filter hash count clamped — actual FPR will exceed requested rate"
+                requested_fpr = p,
+                achieved_fpr = achieved,
+                "bloom filter hash count clamped — actual FPR exceeds the requested rate"
             );
         }
 

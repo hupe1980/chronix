@@ -103,6 +103,15 @@ pub struct ArchiveOutcome {
     /// never that data was lost. A failed upload leaves the segments exactly
     /// where they were.
     pub failed: usize,
+    /// Whether `max_objects_per_run` stopped this pass with work still
+    /// eligible.
+    ///
+    /// The bound is a rate limit rather than a truncation — the next pass
+    /// picks up where this one stopped — but a caller invoking
+    /// `archive_cold_segments` directly, rather than through the server's
+    /// periodic task, had no way to learn that one call was not the whole
+    /// job. `true` means call again.
+    pub more_pending: bool,
 }
 
 /// One `(measurement, shard)` unit of archiving.
@@ -147,6 +156,7 @@ impl Chronix {
             now_ns.saturating_sub(i64::try_from(config.cold_after.as_nanos()).unwrap_or(i64::MAX));
 
         let groups = self.cold_groups(cutoff, config.max_objects_per_run);
+        let more_pending = groups.len() >= config.max_objects_per_run;
         if groups.is_empty() {
             return Ok(ArchiveOutcome::default());
         }
@@ -252,6 +262,7 @@ impl Chronix {
             self.drop_archived(&archived, &mut outcome);
         }
 
+        outcome.more_pending = more_pending;
         metrics::counter!("chronix_cold_archive_objects_total").increment(outcome.objects as u64);
         metrics::counter!("chronix_cold_archive_rows_total").increment(outcome.rows);
         metrics::counter!("chronix_cold_archive_bytes_total").increment(outcome.bytes);

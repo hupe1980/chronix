@@ -74,7 +74,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
                 Some(ClusterState::Meta(state))
             }
             ClusterMode::Data => {
-                let grpc_addr = config.grpc_addr.to_string();
+                let grpc_addr = config.server.grpc_addr.to_string();
                 let state =
                     crate::cluster::start_data_node(cluster_cfg, &grpc_addr, db.clone()).await?;
                 Some(ClusterState::Data(state))
@@ -90,8 +90,8 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     // ── Connector manager ───────────────────────────────────────────────
     let connector_manager = Arc::new(
         crate::connector::ConnectorManager::new(db.clone())
-            .with_max_start_retries(config.connector_start_retries)
-            .with_start_retry_backoff_ms(config.connector_start_retry_backoff_ms),
+            .with_max_start_retries(config.server.connector_start_retries)
+            .with_start_retry_backoff_ms(config.server.connector_start_retry_backoff_ms),
     );
 
     // Register configured connectors
@@ -100,7 +100,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             "kafka-default",
             kafka_cfg.clone(),
             db.clone(),
-            config.multi_tenancy,
+            config.server.multi_tenancy,
         );
         connector_manager.register(consumer).await;
     }
@@ -110,7 +110,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             "mqtt-default",
             mqtt_cfg.clone(),
             db.clone(),
-            config.multi_tenancy,
+            config.server.multi_tenancy,
         );
         connector_manager.register(subscriber).await;
     }
@@ -124,10 +124,10 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     // ── Authentication (optional) ──────────────────────────────────────
     // When metrics_require_auth is false, add the metrics endpoint
     // to the auth exempt list so Prometheus can scrape without auth.
-    if !config.metrics_require_auth {
+    if !config.server.metrics_require_auth {
         if let Some(ref mut auth) = config.auth {
-            if !auth.exempt_paths.contains(&config.metrics_path) {
-                auth.exempt_paths.push(config.metrics_path.clone());
+            if !auth.exempt_paths.contains(&config.server.metrics_path) {
+                auth.exempt_paths.push(config.server.metrics_path.clone());
             }
         }
     }
@@ -158,7 +158,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     let auth_state = auth_state;
 
     // ── Authorization engine (optional) ──────────────────────────────────
-    let authz_engine = if let Some(ref policy_dir) = config.authz_policy_dir {
+    let authz_engine = if let Some(ref policy_dir) = config.server.authz_policy_dir {
         let engine = chronix_security::authz::AuthzEngine::new();
         match engine.load_policies_from_dir(policy_dir) {
             Ok(count) => {
@@ -286,20 +286,16 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         authz_engine,
         audit_logger: audit_logger.clone(),
         namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
         // Write dedup cache for idempotency keys.
         write_dedup_cache: crate::http::WriteDedupCache::new(
-            config.dedup_window_secs,
-            config.max_dedup_entries,
+            config.server.dedup_window_secs,
+            config.server.max_dedup_entries,
         ),
-        write_timeout: std::time::Duration::from_secs(config.write_timeout_secs),
+        write_timeout: std::time::Duration::from_secs(config.server.write_timeout_secs),
         openapi_json: std::sync::OnceLock::new(),
     });
 
@@ -357,17 +353,17 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         }
     });
 
-    let metrics_path = config.metrics_path.clone();
+    let metrics_path = config.server.metrics_path.clone();
     let app = build_router(
         state,
         &metrics_path,
         metrics_handle,
-        config.max_body_size,
+        config.server.max_body_size,
         auth_state,
     );
 
-    let http_addr = config.http_addr;
-    let shutdown_timeout = std::time::Duration::from_secs(config.shutdown_timeout_secs);
+    let http_addr = config.server.http_addr;
+    let shutdown_timeout = std::time::Duration::from_secs(config.server.shutdown_timeout_secs);
     let tls_config_clone = config.tls.clone();
     let http_handle = if let Some(rustls_cfg) = tls_rustls_config {
         let shutdown = shutdown_signal();
@@ -414,23 +410,28 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     };
 
     // ── gRPC server (tonic) ────────────────────────────────────────────
-    let grpc_addr = config.grpc_addr;
+    let grpc_addr = config.server.grpc_addr;
     let grpc_service = ChronixGrpcService::with_streaming_config(
         db.clone(),
         start_time,
-        config.stream_batch_size,
-        config.stream_batch_interval_ms,
-        config.dedup_window_secs,
+        config.server.stream_batch_size,
+        config.server.stream_batch_interval_ms,
+        config.server.dedup_window_secs,
     )
-    .with_multi_tenancy(config.multi_tenancy)
-    .with_max_dedup_entries(config.max_dedup_entries)
-    .with_sql_limits(config.sql_query_timeout_secs, config.sql_max_rows)
-    .with_write_timeout(std::time::Duration::from_secs(config.write_timeout_secs));
+    .with_multi_tenancy(config.server.multi_tenancy)
+    .with_max_dedup_entries(config.server.max_dedup_entries)
+    .with_sql_limits(
+        config.server.sql_query_timeout_secs,
+        config.server.sql_max_rows,
+    )
+    .with_write_timeout(std::time::Duration::from_secs(
+        config.server.write_timeout_secs,
+    ));
     let tonic_tls_grpc = tonic_tls.clone();
     let grpc_tls_acceptor_grpc = grpc_tls_acceptor.clone();
-    let grpc_keepalive_secs = config.grpc_keepalive_secs;
-    let grpc_keepalive_timeout_secs = config.grpc_keepalive_timeout_secs;
-    let grpc_reflection_enabled = config.grpc_reflection;
+    let grpc_keepalive_secs = config.server.grpc_keepalive_secs;
+    let grpc_keepalive_timeout_secs = config.server.grpc_keepalive_timeout_secs;
+    let grpc_reflection_enabled = config.server.grpc_reflection;
     let grpc_drain_timeout = shutdown_timeout;
 
     let grpc_handle = tokio::spawn(async move {
@@ -557,15 +558,17 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     });
 
     // ── Flight SQL server ──────────────────────────────────────────────
-    let flight_addr = config.flight_addr;
+    let flight_addr = config.server.flight_addr;
     let flight_drain_timeout = shutdown_timeout;
     let flight_service = ChronixFlightSqlService::new(db.clone())
-        .with_multi_tenancy(config.multi_tenancy)
+        .with_multi_tenancy(config.server.multi_tenancy)
         .with_limits(
-            std::time::Duration::from_secs(config.sql_query_timeout_secs),
-            config.sql_max_rows,
+            std::time::Duration::from_secs(config.server.sql_query_timeout_secs),
+            config.server.sql_max_rows,
         )
-        .with_write_timeout(std::time::Duration::from_secs(config.write_timeout_secs));
+        .with_write_timeout(std::time::Duration::from_secs(
+            config.server.write_timeout_secs,
+        ));
 
     let flight_handle = tokio::spawn(async move {
         // When using manual TLS (hot-reloadable), do NOT set
@@ -667,13 +670,14 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         mode = %mode_label,
-        http = %config.http_addr,
-        grpc = %config.grpc_addr,
-        flight_sql = %config.flight_addr,
+        http = %config.server.http_addr,
+        grpc = %config.server.grpc_addr,
+        flight_sql = %config.server.flight_addr,
         data_dir = %config.database.data_dir.display(),
         tls = config.tls.is_some(),
         "chronixd started"
     );
+    warn_if_exposed_without_auth(&config);
 
     // ── Wait for any server to finish ──────────────────────────────────
     tokio::select! {
@@ -976,24 +980,6 @@ pub fn build_router(
                     "/nodes/{id}/decommission",
                     post(crate::admin::decommission_node_handler),
                 );
-            // Admin — chaos injection (compiled with `--features chaos`)
-            #[cfg(feature = "chaos")]
-            let admin_routes = admin_routes
-                .route(
-                    "/chaos/inject",
-                    post(crate::admin::chaos_inject_handler),
-                )
-                .route(
-                    "/chaos",
-                    get(crate::admin::chaos_list_handler)
-                        .delete(crate::admin::chaos_clear_all_handler),
-                )
-                .route(
-                    "/chaos/{id}",
-                    delete(crate::admin::chaos_clear_handler),
-                )
-                ;
-
             admin_routes
                 // Admin — API key management (requires admin authz)
                 .route(
@@ -1075,13 +1061,13 @@ pub fn build_router(
         .layer({
             // Inject the global + per-user rate limiters into request extensions.
             let limiter = crate::rate_limit::build_limiter(
-                state.config.rate_limit_rps,
-                state.config.rate_limit_burst,
+                state.config.server.rate_limit_rps,
+                state.config.server.rate_limit_burst,
             );
             // Per-user rate limiter (None when rps == 0 → disabled).
             let user_limiter = crate::rate_limit::UserRateLimiter::new(
-                state.config.per_user_rate_limit_rps,
-                state.config.per_user_rate_limit_burst,
+                state.config.server.per_user_rate_limit_rps,
+                state.config.server.per_user_rate_limit_burst,
             );
             axum::middleware::from_fn(
                 move |mut req: axum::extract::Request, next: axum::middleware::Next| {
@@ -1126,7 +1112,7 @@ pub fn build_router(
         //   - ["*"]           → permissive (requires `allow_unsafe_cors: true`).
         //   - ["https://a.example.com", ...] → explicit allow-list.
         .layer({
-            let cors_origins = &state.config.cors_allowed_origins;
+            let cors_origins = &state.config.server.cors_allowed_origins;
             if cors_origins.is_empty() {
                 // Restrictive by default: same-origin only.
                 CorsLayer::new()
@@ -1234,6 +1220,43 @@ async fn shutdown_signal() {
 ///
 /// Restores the persisted trigger catalog before returning, so a restart does
 /// not silently stop alerting.
+/// Say so, loudly, when a listener is reachable from off the machine and
+/// nothing authenticates.
+///
+/// The three listen addresses default to `0.0.0.0` and `[auth]` defaults to
+/// absent, so `chronixd` with no configuration is an unauthenticated database
+/// on every interface — and it said nothing at all. It is still the default,
+/// because a container that had to be told to bind `0.0.0.0` is a container
+/// nobody can run; what changes is that the operator is told, once, in the
+/// line right after "started", with the two ways to fix it.
+///
+/// Not a refusal: a `chronixd` behind a firewall or a service mesh is a
+/// legitimate deployment, and a server that will not start is a server people
+/// work around with `--i-know-what-i-am-doing`.
+fn warn_if_exposed_without_auth(config: &crate::config::ServerConfig) {
+    if config.auth.is_some() {
+        return;
+    }
+    let exposed: Vec<String> = [
+        ("HTTP", config.server.http_addr),
+        ("gRPC", config.server.grpc_addr),
+        ("Flight SQL", config.server.flight_addr),
+    ]
+    .into_iter()
+    .filter(|(_, addr)| !addr.ip().is_loopback())
+    .map(|(name, addr)| format!("{name} {addr}"))
+    .collect();
+    if exposed.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        listeners = %exposed.join(", "),
+        "no [auth] section: these listeners accept reads, writes and deletes \
+         from anyone who can reach them. Add [[auth.api_keys]], or bind to \
+         127.0.0.1."
+    );
+}
+
 fn build_trigger_pipeline(
     config: &crate::config::ServerConfig,
     db: &Arc<chronix::Chronix>,
@@ -1329,6 +1352,7 @@ fn spawn_cold_archiver(
                         rows = outcome.rows,
                         bytes = outcome.bytes,
                         failed = outcome.failed,
+                        more_pending = outcome.more_pending,
                         "cold archive pass complete"
                     );
                 }

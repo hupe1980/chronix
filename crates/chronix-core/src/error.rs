@@ -91,10 +91,19 @@ pub enum WalError {
     #[error("WAL lock poisoned: {0}")]
     LockPoisoned(String),
 
-    /// WAL writer is poisoned after a previous unrecoverable I/O error
-    ///. Call `clear_poison()` after verifying WAL integrity to
-    /// resume writes.
-    #[error("WAL writer is poisoned — call clear_poison() to resume")]
+    /// The WAL writer's file is in an unknown state after a failed `fsync`
+    /// or a failed rewind, and every write is refused until the database is
+    /// reopened.
+    ///
+    /// The message names **reopening**, not `clear_poison()`. It named the
+    /// latter for a long time, and no user of the `chronix` facade can call
+    /// it: it is a `chronix-engine` method the facade does not re-export. An
+    /// error that tells the operator to do something they cannot do is worse
+    /// than one that says nothing.
+    #[error(
+        "WAL writer is poisoned after a failed fsync — the file's contents \
+         are unknown; close and reopen the database to recover"
+    )]
     Poisoned,
 }
 
@@ -126,7 +135,7 @@ pub enum SchemaError {
         label: String,
     },
 
-    /// FINDING-06: Name/value contains a character that would break
+    /// Name/value contains a character that would break
     /// the canonical form encoding (e.g. `=` in tag values).
     #[error("{label} contains invalid character '{ch}' in \"{value}\"")]
     InvalidCharacter {

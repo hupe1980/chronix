@@ -174,19 +174,13 @@ assert_eq!(sim.clock().skew_for_node(1), 1500);
 assert_eq!(sim.clock().skew_for_node(2), 1000);
 ```
 
-## Integration with chronix-chaos
+## Where this sits
 
-The simulation framework complements the `chronix-chaos` crate which provides 8 fault injection types for live clusters:
+Simulation testing is for the **frozen** distributed tier: a virtual clock and
+an in-memory network let a whole cluster's failure modes run deterministically
+and fast. The single-node engine is tested differently — with real process
+crashes and injected I/O failures — because its failures are real syscalls
+rather than message ordering ([Testing & Hardening](@/reference/testing.md)).
 
-| Fault | Simulation | Live |
-|-------|-----------|------|
-| Network partition | `SimNetwork::apply(Partition{..})` | `ChaosAgent::inject(NetworkPartition)` |
-| Node isolation | `SimNetwork::apply(Isolate(id))` | `ChaosAgent::inject(NodeIsolation)` |
-| Packet loss | `SimNetwork::apply(PacketLoss{..})` | `ChaosAgent::inject(PacketLoss)` |
-| Clock skew | `VirtualClock::set_skew()` | `ChaosAgent::inject(ClockSkew)` |
-| Latency spike | Via `VirtualClock` | `ChaosAgent::inject(LatencySpike)` |
-| Disk failure | — | `ChaosAgent::inject(DiskFailure)` |
-| Memory pressure | — | `ChaosAgent::inject(MemoryPressure)` |
-| CPU contention | — | `ChaosAgent::inject(CpuContention)` |
-
-Use simulation testing during development for rapid iteration, and chaos engineering in staging/production for runtime validation.
+There is no runtime fault-injection API — faults are injected in tests, where
+a verdict is checked.

@@ -95,8 +95,8 @@ Nine crates, three destinations:
 | Artifact | Where |
 |---|---|
 | `chronix` and its seven library crates | crates.io |
-| `chronixd` | GitHub Releases, as a binary — its `cluster` and `chaos` features depend on `publish = false` crates, and cargo requires a version for every packaged dependency, optional ones included |
-| `chronix-meta`, `chronix-cluster`, `chronix-dsim`, `chronix-chaos` | nowhere; a frozen tier and dev tooling |
+| `chronixd` | GitHub Releases, as a binary — its `cluster` feature depends on `publish = false` crates, and cargo requires a version for every packaged dependency, optional ones included |
+| `chronix-meta`, `chronix-cluster`, `chronix-dsim` | nowhere; the frozen cluster tier |
 
 **Version policy.** Every crate shares one version and they are bumped
 together — a mixed set has never been tested. Within 0.x a breaking change

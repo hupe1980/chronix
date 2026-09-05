@@ -148,9 +148,16 @@ class ServerInfo:
 
 @dataclass(slots=True)
 class QueryResult:
-    """Result of a query — a list of row dicts."""
+    """Result of a query — a list of row dicts.
+
+    ``truncated`` is ``True`` when the server's ``sql_max_rows`` cut the
+    answer short. It is not decoration: an aggregate computed over a
+    truncated scan is a **wrong** number, not a partial one, and before the
+    server reported this there was no way for a caller to tell the two apart.
+    """
 
     rows: list[dict[str, Any]]
+    truncated: bool = False
 
     def __len__(self) -> int:
         return len(self.rows)

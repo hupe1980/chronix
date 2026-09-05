@@ -130,10 +130,13 @@ re-encode and upload per segment and nothing on the read path afterwards. See
 
 ### Region Sizing
 
-```toml
-[cluster.autoscale]
-region_size_threshold = "10GB"     # Split when region exceeds this
-region_series_threshold = 100000   # Split when series count exceeds this
+The distributed tier is **frozen** and outside the default build, so these are
+`chronix_cluster::autoscale::AutoScaleConfig` defaults rather than a
+`chronixd.toml` section — there is no `[cluster.autoscale]` a server reads.
+
+```text
+region_size_threshold   = 10 GiB    # split when a region exceeds this
+region_series_threshold = 100_000   # split when its series count exceeds this
 ```
 
 **Guidelines:**

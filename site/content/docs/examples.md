@@ -4,7 +4,7 @@ description = "Runnable examples covering the embedded API, SQL and PromQL queri
 weight = 100
 +++
 
-Chronix ships with **27 runnable examples** covering every major feature. CI
+Chronix ships with **26 runnable examples** covering every major feature. CI
 compiles and runs every one of them on each change, so they cannot drift away
 from the API they demonstrate.
 
@@ -71,12 +71,11 @@ cargo run -p chronix --features object-store --example cold_tier
 | [audit_logging](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/audit_logging.rs) | Structured audit logging with multi-sink support and queryable audit trail |
 | [tenant_isolation](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/tenant_isolation.rs) | Namespace management, quota enforcement, and resource usage tracking |
 
-## Model Lifecycle & Chaos
+## Model Lifecycle
 
 | Example | Description |
 |---------|-------------|
 | [model_lifecycle](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/model_lifecycle.rs) | Model registry, A/B testing, drift detection, and accuracy tracking |
-| [chaos_testing](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/chaos_testing.rs) | Fault injection with RAII guards, multiple fault types, and introspection |
 
 ## Recently added
 

@@ -48,11 +48,6 @@ pub enum QueryPlan {
         projection: Vec<String>,
         /// Time range filter.
         time_range: TimeRange,
-        /// Maximum number of series (segments) to scan.
-        /// When set, the query engine truncates the list of matching
-        /// segments to at most this many, preventing runaway scans on
-        /// high-cardinality queries.
-        max_series: Option<usize>,
         /// Zone-map field predicates for late-materialisation row-group
         /// pruning.  Each predicate compares a numeric column against a
         /// threshold; row groups whose per-block min/max stats rule out
@@ -137,7 +132,6 @@ pub struct QueryBuilder {
     window_partition_by: Vec<String>,
     window_value_column: Option<String>,
     /// Maximum number of series (segments) to scan.
-    max_series: Option<usize>,
     /// Namespace scope for tenant isolation.
     namespace_id: Option<String>,
     /// Estimated group-key cardinality from segment stats.
@@ -161,7 +155,6 @@ impl QueryBuilder {
             window_fns: Vec::new(),
             window_partition_by: Vec::new(),
             window_value_column: None,
-            max_series: None,
             namespace_id: None,
             estimated_cardinality: None,
         }
@@ -308,18 +301,6 @@ impl QueryBuilder {
         self
     }
 
-    /// Limit the number of series (segments) scanned.
-    ///
-    /// When a query matches more segments than this limit, only the
-    /// first `n` segments are scanned and results may be truncated.
-    /// This prevents high-cardinality queries from consuming
-    /// unbounded resources.
-    #[must_use]
-    pub fn max_series(mut self, n: usize) -> Self {
-        self.max_series = Some(n);
-        self
-    }
-
     /// Set the namespace scope for tenant isolation.
     ///
     /// This embeds the `NamespaceId` structurally in the query plan AND
@@ -387,7 +368,6 @@ impl QueryBuilder {
             tag_filters: self.tag_filters,
             projection: self.fields,
             time_range,
-            max_series: self.max_series,
             field_predicates: Vec::new(),
             namespace_id: self.namespace_id,
         };
@@ -487,21 +467,6 @@ pub fn extract_namespace(plan: &QueryPlan) -> Option<&str> {
         | QueryPlan::Downsample { source, .. }
         | QueryPlan::Limit { source, .. }
         | QueryPlan::Window { source, .. } => extract_namespace(source),
-    }
-}
-
-/// Extract the `max_series` limit from the underlying `Scan` plan.
-///
-/// Traverses through `Aggregate`, `Downsample`, `Limit`, and `Window`
-/// wrappers to find the `Scan` node, then returns its `max_series`.
-#[must_use]
-pub fn extract_max_series(plan: &QueryPlan) -> Option<usize> {
-    match plan {
-        QueryPlan::Scan { max_series, .. } => *max_series,
-        QueryPlan::Aggregate { source, .. }
-        | QueryPlan::Downsample { source, .. }
-        | QueryPlan::Limit { source, .. }
-        | QueryPlan::Window { source, .. } => extract_max_series(source),
     }
 }
 
@@ -814,49 +779,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn max_series_stored_in_scan() {
-        let plan = QueryBuilder::new()
-            .measurement("cpu")
-            .range(0, 100)
-            .max_series(50)
-            .build()
-            .unwrap();
-
-        match &plan {
-            QueryPlan::Scan { max_series, .. } => {
-                assert_eq!(*max_series, Some(50));
-            }
-            _ => panic!("expected Scan"),
-        }
-
-        assert_eq!(extract_max_series(&plan), Some(50));
-    }
-
-    #[test]
-    fn max_series_none_by_default() {
-        let plan = QueryBuilder::new()
-            .measurement("cpu")
-            .range(0, 100)
-            .build()
-            .unwrap();
-
-        assert_eq!(extract_max_series(&plan), None);
-    }
-
-    #[test]
-    fn max_series_through_aggregate() {
-        let plan = QueryBuilder::new()
-            .measurement("cpu")
-            .range(0, 100)
-            .max_series(10)
-            .aggregate(AggFn::Sum)
-            .build()
-            .unwrap();
-
-        assert_eq!(extract_max_series(&plan), Some(10));
     }
 
     #[test]

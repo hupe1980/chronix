@@ -158,8 +158,8 @@ fn the_overrides_change_what_they_say_they_change() {
         config.database.data_dir,
         std::path::PathBuf::from("/tmp/chronix-env-test")
     );
-    assert_eq!(config.log_level, "trace");
-    assert_eq!(config.http_addr.to_string(), "127.0.0.1:9999");
+    assert_eq!(config.server.log_level, "trace");
+    assert_eq!(config.server.http_addr.to_string(), "127.0.0.1:9999");
 }
 
 /// An unset variable leaves the configured value alone.
@@ -168,8 +168,8 @@ fn an_unset_variable_changes_nothing() {
     let mut config = chronixd::config::ServerConfig::default();
     let before = config.clone();
     config.apply_overrides_from(env_of(&[])).unwrap();
-    assert_eq!(config.log_level, before.log_level);
-    assert_eq!(config.http_addr, before.http_addr);
+    assert_eq!(config.server.log_level, before.server.log_level);
+    assert_eq!(config.server.http_addr, before.server.http_addr);
     assert_eq!(config.database.data_dir, before.database.data_dir);
 }
 
@@ -207,6 +207,7 @@ fn the_jwt_secret_override_needs_a_jwt_section() {
 #[test]
 fn a_cold_archive_section_needs_the_object_store_feature() {
     let toml = r#"
+[server]
 http_addr = "127.0.0.1:8080"
 grpc_addr = "127.0.0.1:8081"
 flight_addr = "127.0.0.1:8082"

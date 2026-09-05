@@ -85,7 +85,13 @@ than settings, so a per-call choice stays a per-call choice.
 
 ## Server — `chronixd` Configuration
 
-The server is configured via a TOML file (default: `chronixd.toml`):
+The server is configured via a TOML file (default: `chronixd.toml`). It is a
+set of named sections: `[server]` holds the process-level scalars,
+`[database]` is the embedded database, and every other table switches a
+subsystem on by being present.
+
+**A key or a section the server does not know is a startup error naming it** —
+not a warning, and not silence.
 
 ```toml
 [server]
@@ -110,15 +116,17 @@ segment_cache_size = 536870912
 |--------|------|---------|-------------|
 | `http_addr` | `SocketAddr` | `0.0.0.0:8086` | HTTP API listen address |
 | `grpc_addr` | `SocketAddr` | `0.0.0.0:8087` | gRPC API listen address |
-| `flight_addr` | `SocketAddr` | `0.0.0.0:8817` | Arrow Flight listen address |
+| `flight_addr` | `SocketAddr` | `0.0.0.0:8817` | Arrow Flight SQL listen address |
+| `authz_policy_dir` | `Option<PathBuf>` | `None` | Directory of Cedar `.cedar` policies; absent = open mode |
+| `backup_root` | `Option<PathBuf>` | `<data_dir>/backups` | Root every admin backup/restore path is resolved inside |
+| `multi_tenancy` | `bool` | `false` | Namespace isolation on every read and write |
 | `metrics_path` | `String` | `"/metrics"` | Prometheus metrics endpoint |
 | `max_body_size` | `usize` | 10 MB | Maximum HTTP request body |
-| `log_format` | `String` | `"text"` | Log format: `text`, `json` |
+| `log_format` | enum | `"text"` | Log format: `text`, `json`, `compact`. A value that is none of these is a startup error, not plain text |
 | `log_level` | `String` | `"info"` | Log filter: `trace`, `debug`, `info`, `warn`, `error` |
 | `sql_query_timeout_secs` | `u64` | 30 | SQL query timeout |
 | `prom_query_timeout_secs` | `u64` | 30 | PromQL query timeout (0 = disabled) |
 | `sql_max_rows` | `usize` | 100,000 | Maximum rows per SQL result |
-| `per_query_memory_limit` | `usize` | 268,435,456 (256 MiB) | Per-query memory budget enforced by `MemoryTracker` |
 | `max_write_batch_size` | `usize` | 50,000 | Maximum points per write request |
 | `cors_allowed_origins` | `Vec<String>` | empty | CORS allowed origins |
 | `authz_policy_dir` | `Option<PathBuf>` | `None` | Directory containing Cedar authorization policy files. When set, the authorization engine loads `.cedar` policies from this path on startup |
@@ -229,6 +237,7 @@ history.
 ### Backup root
 
 ```toml
+[server]
 backup_root = "/var/lib/chronix/backups"   # defaults to <data_dir>/backups
 ```
 
@@ -294,6 +303,10 @@ interval_secs = 3600                 # one pass per hour
 max_objects_per_run = 8
 ```
 
+`ArchiveOutcome.more_pending` is `true` when the bound stopped a pass with work
+still eligible. The server's periodic task picks it up on the next tick; a
+caller driving `archive_cold_segments` itself should call again.
+
 Each pass archives up to `max_objects_per_run` complete `(measurement, shard)`
 groups and stops; the next pass continues. A failed pass is logged and counted
 in `chronix_cold_archive_pass_failures_total` — not fatal, and the data stays
@@ -324,16 +337,52 @@ checks.
 
 ### Observability
 
+Log format and level are `[server]` settings; `[tracing]` only says where
+traces go.
+
 ```toml
+[server]
+log_format = "json"   # text | json | compact
+log_level  = "info"
+
 [tracing]
 service_name = "chronix"
-log_format = "json"
-log_filter = "info"
 
 [tracing.otlp]
-endpoint = "http://jaeger:4317"
-sampling = { ratio = 0.01 }
+endpoint = "https://jaeger:4317"
+sampling = { ratio = 0.01 }        # or "always_on" / "always_off"
 always_sample_errors = true
+```
+
+OTLP export needs `--features otlp`. A `[tracing.otlp]` section in a build
+without it is a startup error, as is a `[tracing]` section naming no target.
+
+---
+
+## Checking a file before a deploy
+
+```bash
+chronixd --config /etc/chronix/chronixd.toml --check-config
+```
+
+Loads the file, applies the environment and the flags, runs every startup
+validation, prints what it resolved to, and exits without opening the database
+or binding a port. An unknown key, a `[tracing]` section this build cannot
+honour, an `[auth]` section that authenticates nobody and two listeners on one
+address are all refused here.
+
+```text
+configuration is valid
+  http_addr        127.0.0.1:8086
+  grpc_addr        127.0.0.1:8087
+  flight_addr      127.0.0.1:8817
+  data_dir         /var/lib/chronix
+  log_format       Json
+  log_level        info
+  sql_max_rows     100000
+  max_body_size    10485760
+  multi_tenancy    false
+  sections         tls, auth, audit
 ```
 
 ---
@@ -345,8 +394,8 @@ Precedence is **file, then environment, then CLI flags**.
 | Variable | Override |
 |----------|---------|
 | `CHRONIX_DATA_DIR` | `database.data_dir` |
-| `CHRONIX_LOG_LEVEL` | `log_level` |
-| `CHRONIX_HTTP_ADDR` | `http_addr` |
+| `CHRONIX_LOG_LEVEL` | `server.log_level` |
+| `CHRONIX_HTTP_ADDR` | `server.http_addr` |
 | `CHRONIX_JWT_SECRET` | `auth.jwt.secret` — overrides an existing `[auth.jwt]` section; with no such section the server refuses to start rather than silently ignoring it |
 | `CHRONIX_WEBHOOK_SIGNING_SECRET` | `triggers.webhook_signing_secret` |
 
@@ -361,7 +410,10 @@ Separately from the table above, any field that holds a credential accepts a
 `sasl_username`, `sasl_password`). The variable name is yours to choose:
 
 ```toml
-[[connectors.mqtt]]
+[mqtt]
+broker = "mqtt://broker.example:1883"
+topics = ["sensors/#"]
+username = "chronix"
 password = "$CHRONIX_MQTT_PASSWORD"
 ```
 

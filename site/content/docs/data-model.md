@@ -120,6 +120,12 @@ knowing before you tune anything:
 - **Writing outside the window is `backfill`.** Importing history is a
   different operation with a different cost — the shards it touches are
   opened, flushed and compacted like any other — so it has its own name.
+  Embedded, that is `db.backfill(&points)`; over the network it is
+  `?backfill=true` on every write path and `WriteRequest.backfill` on gRPC
+  ([API Reference](/docs/api-reference/#backfilling-history)). It is an
+  explicit opt-in on both, never an automatic fallback: routing anything late
+  to the backfill path would let one client with a wrong clock open a shard
+  per hour of history.
 - **Shard duration is a memory parameter, not only a compaction one.** Scans
   merge one shard-sized bucket at a time, so peak query memory tracks the shard
   size rather than the size of the result.

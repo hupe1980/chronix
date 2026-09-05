@@ -106,6 +106,7 @@ class ChronixClient:
         points: list[Point],
         *,
         idempotency_key: str | None = None,
+        backfill: bool = False,
     ) -> int:
         """Write points via JSON endpoint.
 
@@ -115,6 +116,13 @@ class ChronixClient:
             Data points to write.
         idempotency_key : str | None
             Optional idempotency key (HTTP 409 on duplicate).
+        backfill : bool
+            Write **outside** the server's out-of-order window — importing
+            history rather than ingesting live. Live writes are held to
+            ``±ooo_shard_tolerance`` shards of the newest write; anything
+            older is refused, and this is the way to store it. Off by
+            default, because the window is what keeps the number of open
+            memtables bounded.
 
         Returns
         -------
@@ -128,8 +136,8 @@ class ChronixClient:
         body = [p.to_dict() for p in points]
         # `POST /api/v1/write` answers **204 No Content** — no body to parse,
         # so the count returned here is the caller's own.
-
-        await self._post_no_content("/api/v1/write", json=body, extra_headers=headers)
+        path = "/api/v1/write?backfill=true" if backfill else "/api/v1/write"
+        await self._post_no_content(path, json=body, extra_headers=headers)
         return len(points)
 
     async def write_line_protocol(
@@ -245,7 +253,7 @@ class ChronixClient:
         data = await self._post("/api/v1/chronix/sql", json={"query": query})
         names = [c["name"] for c in data.get("columns", [])]
         rows = [dict(zip(names, row)) for row in data.get("rows", [])]
-        return QueryResult(rows=rows)
+        return QueryResult(rows=rows, truncated=bool(data.get("truncated", False)))
 
     async def explain(self, measurement: str, time_range: TimeRange) -> dict[str, Any]:
         """Get the query execution plan (EXPLAIN)."""

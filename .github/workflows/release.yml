@@ -187,7 +187,7 @@ jobs:
           path: dist/*.tar.gz*
 
   # Last, because it cannot be undone. `chronixd` is not here: its `cluster`
-  # and `chaos` features depend on `publish = false` crates, and cargo requires
+  # feature depends on `publish = false` crates, and cargo requires
   # a version for every packaged dependency, optional ones included.
   crates-io:
     name: Publish to crates.io

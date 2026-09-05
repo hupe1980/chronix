@@ -499,7 +499,7 @@ pub fn scope<'a>(
     state: &crate::http::AppState,
     ns_ctx: Option<&'a NamespaceContext>,
 ) -> Option<&'a str> {
-    if state.config.multi_tenancy {
+    if state.config.server.multi_tenancy {
         Some(ns_ctx.map_or(DEFAULT_NAMESPACE, |ctx| ctx.namespace.as_str()))
     } else {
         None

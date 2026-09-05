@@ -83,6 +83,15 @@ pub struct SqlResponse {
     pub rows: Vec<Vec<serde_json::Value>>,
     /// Number of rows returned.
     pub row_count: usize,
+    /// Whether `sql_max_rows` cut the result short.
+    ///
+    /// Always present, and `false` far more often than `true` — which is the
+    /// point. It was absent, so a query whose answer was 6 000 rows returned
+    /// the first 5 with `row_count: 5` and nothing else: an aggregate over a
+    /// truncated scan is not a partial answer, it is a **wrong** one, and the
+    /// client had no way to tell the two apart. The server logged a `warn!`,
+    /// which is not where the person reading the number is looking.
+    pub truncated: bool,
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────
@@ -100,6 +109,26 @@ pub async fn query_handler(
     // Check measurement exists
     if db.schema(&measurement).is_none() {
         return Err(ServerError::NotFound(measurement));
+    }
+
+    // The same ceiling `/api/v1/chronix/sql` enforces. This endpoint had
+    // none: `{"measurement":"cpu"}` with no `limit` materialised every row of
+    // the measurement into a JSON array, so the one query surface anybody
+    // reaches for first was also the only unbounded one.
+    //
+    // It **refuses** rather than truncating, because the documented response
+    // is a bare array with no field a `truncated` flag could go in — and
+    // because the request already carries the answer: a caller who wants the
+    // first N says `limit`.
+    let ceiling = state.config.server.sql_max_rows;
+    // A `limit` above the ceiling is refused *before* the scan: the caller
+    // has asked for something this server will not return, and answering the
+    // ceiling's worth instead would be the silent truncation this endpoint
+    // exists not to do.
+    if ceiling > 0 && body.limit.is_some_and(|n| n > ceiling) {
+        return Err(ServerError::BadRequest(format!(
+            "limit exceeds the server's sql_max_rows limit of {ceiling}"
+        )));
     }
 
     let result = tokio::task::spawn_blocking(move || {
@@ -130,6 +159,13 @@ pub async fn query_handler(
         // converting them to QueryRow, then convert only `limit` rows.
         let offset = body.offset.unwrap_or(0);
         let limit = body.limit.unwrap_or(usize::MAX);
+        // One row past the ceiling is enough to know the answer did not fit.
+        let hard_stop = if ceiling == 0 {
+            usize::MAX
+        } else {
+            ceiling.saturating_add(1)
+        };
+        let limit = limit.min(hard_stop);
 
         // `execute_iter` reads one time bucket of segments per step, so a
         // small `limit` over a huge range stops after the first bucket
@@ -165,6 +201,14 @@ pub async fn query_handler(
     .await
     .map_err(|e| ServerError::Internal(e.to_string()))?
     .map_err(ServerError::Db)?;
+
+    if ceiling > 0 && result.len() > ceiling {
+        metrics::counter!("chronix_sql_results_truncated_total").increment(1);
+        return Err(ServerError::BadRequest(format!(
+            "result exceeds the server's sql_max_rows limit of {ceiling}; \
+             pass a `limit`, narrow `range`, or add tag filters"
+        )));
+    }
 
     metrics::counter!("chronix_http_queries_total").increment(1);
     Ok(Json(result))
@@ -281,7 +325,7 @@ pub async fn sql_handler(
     // Uses execute_stream() for incremental processing — no excess data
     // is materialised beyond the max_rows limit.
     use futures::StreamExt;
-    let timeout_secs = state.config.sql_query_timeout_secs;
+    let timeout_secs = state.config.server.sql_query_timeout_secs;
     let stream_future = df.execute_stream();
     let mut stream = if timeout_secs > 0 {
         tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), stream_future)
@@ -297,7 +341,7 @@ pub async fn sql_handler(
     let mut columns = Vec::new();
     let mut rows = Vec::new();
     let mut row_count = 0;
-    let max_rows = state.config.sql_max_rows;
+    let max_rows = state.config.server.sql_max_rows;
 
     // Build column metadata from the stream schema.
     {
@@ -354,10 +398,14 @@ pub async fn sql_handler(
     }
 
     metrics::counter!("chronix_sql_queries_total").increment(1);
+    if truncated {
+        metrics::counter!("chronix_sql_results_truncated_total").increment(1);
+    }
     Ok(Json(SqlResponse {
         columns,
         rows,
         row_count,
+        truncated,
     }))
 }
 
@@ -563,7 +611,6 @@ fn query_plan_to_json(plan: &QueryPlan) -> serde_json::Value {
             tag_filters,
             projection,
             time_range,
-            max_series,
             namespace_id,
             field_predicates: _,
         } => {
@@ -577,7 +624,6 @@ fn query_plan_to_json(plan: &QueryPlan) -> serde_json::Value {
                 "tag_filters": filters,
                 "projection": if projection.is_empty() { serde_json::json!("*") } else { serde_json::json!(projection) },
                 "time_range": { "start": time_range.start, "end": time_range.end },
-                "max_series": max_series,
                 "namespace_id": namespace_id,
             })
         }

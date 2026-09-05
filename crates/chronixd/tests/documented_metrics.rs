@@ -139,7 +139,6 @@ fn not_a_metric(name: &str) -> bool {
     // Rust paths and appear throughout the prose.
     const CRATES: &[&str] = &[
         "chronix_analytics",
-        "chronix_chaos",
         "chronix_cluster",
         "chronix_core",
         "chronix_dsim",

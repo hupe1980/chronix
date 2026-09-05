@@ -48,10 +48,9 @@ crate.
   `outputs.influxdb` and `outputs.influxdb_v2` write to `/write` and
   `/api/v2/write` gzipped, as they do by default; the OTel Collector's
   `otlphttp` exporter posts to `/v1/metrics`, gzipped, as it does by
-  default. Each of those is driven by a test that sends the client's own
-  bytes — a conformance suite that builds its own requests never posts a
-  form body, never gzips, and never uses a route derived from a base URL,
-  which is how all four integrations were broken under a green suite.
+  default. Each is driven by a test that sends the client's own bytes: a
+  conformance suite that builds its own requests never posts a form body,
+  never gzips, and never uses a route derived from a base URL.
 - **Security depth** — Cedar policies (a formally verified engine),
   credential-bound namespace isolation, AES-256-GCM encryption at rest, mTLS, Argon2 API keys,
   JWT/OIDC, and a tamper-evident HMAC-chained audit trail. All feature-gated;
@@ -101,11 +100,10 @@ Nine crates in the default build:
 | `chronix` | Public facade — embedded API, SQL (DataFusion), PromQL |
 | `chronixd` | Server binary — HTTP, gRPC, Flight SQL, connectors, TLS |
 
-Additional workspace crates outside the default build: `chronix-chaos`
-(dev-only fault injection) and the **frozen** distributed tier
-(`chronix-meta`, `chronix-cluster`, `chronix-dsim` — Multi-Raft replication,
-kept compiling behind `chronixd --features cluster` but not under active
-development until the single-node engine ships v1.0).
+Additional workspace crates outside the default build: the **frozen**
+distributed tier (`chronix-meta`, `chronix-cluster`, `chronix-dsim` —
+Multi-Raft replication, kept compiling behind `chronixd --features cluster`
+but not under active development until the single-node engine ships v1.0).
 
 ## Quick Start
 
@@ -172,7 +170,9 @@ Each claim below is pinned by a test; the depth is in the
 - **Admission before durability.** The out-of-order window, the cardinality
   budget and the schema are decided *before* the WAL append, so a rejected
   write is free and cannot return through replay. `backfill` is the explicit
-  operation for history outside the window.
+  operation for history outside the window — `db.backfill(&points)` embedded,
+  `?backfill=true` on every `chronixd` write path, `WriteRequest.backfill` on
+  gRPC — and a refused write names the timestamp, the window and the remedy.
 - **Bounded, measured memory.** A lock-free skip-list memtable flushes
   straight into Arrow columns. `examples/gateway_footprint.rs` prints **under
   25 MiB peak heap** for an hour of the design partner's workload — rollups
@@ -222,7 +222,10 @@ Each claim below is pinned by a test; the depth is in the
   `db.promql(…)` or served at the paths a Prometheus client derives. A range
   query reads its window **once**, not once per step. A metric is one
   `(measurement, field)` pair, so a name a query returns is a selector that
-  returns it. Pinned by an end-to-end conformance suite.
+  returns it. `limit` is honoured on every endpoint that takes it upstream,
+  and an answer a limit cut short carries
+  `warnings: ["results truncated due to limit"]` rather than looking
+  complete. Pinned by an end-to-end conformance suite.
 
 **Analytics** — [guide](https://hupe1980.github.io/chronix/docs/analytics/)
 
@@ -323,7 +326,6 @@ cargo +nightly miri test -p chronix-core -- --skip proptests --skip config_toml_
 | `chronixd` | `kafka`, `mqtt` | off | Ingestion connectors (`krafka` / `rumqttc`, both pure Rust) |
 | `chronixd` | `object-store` | off | Periodic cold archiving to S3/GCS/Azure (`[cold_archive]`) |
 | `chronixd` | `cluster` | off | Frozen distributed tier (Meta/Data modes) |
-| `chronixd` | `chaos` | off | Fault-injection admin endpoints (dev only) |
 
 ## Server Mode
 
@@ -369,7 +371,7 @@ each against an in-process embedded database:
 `continuous_forecast`, `encoding`, `schema_exploration`,
 `storage_lifecycle`, `delete_operations`, `gateway_footprint`,
 `signal_triggers`, `data_pipeline`, `cold_tier`, `authz`, `encryption`,
-`audit_logging`, `tenant_isolation`, `compute_engine`, `chaos_testing`.
+`audit_logging`, `tenant_isolation`, `compute_engine`.
 
 ```bash
 cargo run -p chronix --example basic_usage

@@ -11,10 +11,22 @@ use parking_lot::{Condvar, Mutex};
 
 use chronix_core::{FsyncPolicy, WalConfig, WalError};
 
+use crate::wal::sink::WalSink;
 use crate::wal::{
     WalRecordType, WAL_HEADER_SIZE, WAL_MAGIC, WAL_PAYLOAD_VERSION, WAL_RECORD_HEADER_SIZE,
     WAL_VERSION,
 };
+
+/// The buffered file the WAL appends to.
+///
+/// `dyn WalSink` rather than `File` so a test can make the write fail; the
+/// dynamic call is behind the 64 KiB buffer, so it happens once per flush
+/// rather than once per record. See [`crate::wal::sink`].
+type SinkWriter = BufWriter<Box<dyn WalSink>>;
+
+/// Bytes buffered before a syscall. 64 KiB reduces syscall overhead by ~8×
+/// against the default 8 KiB, which is significant for write-heavy workloads.
+const WAL_BUF_CAPACITY: usize = 64 * 1024;
 
 /// Constructs the WAL filename for a given starting sequence number.
 pub(crate) fn wal_filename(seq_start: u64) -> String {
@@ -56,6 +68,20 @@ pub struct WalWriter {
     /// is the wear rate, which is what [`FsyncPolicy::Periodic`] bounds — and
     /// an unobservable bound is one nobody can check.
     fsync_count: AtomicU64,
+    /// Bumped every time the writer rewinds, discarding unsynced records.
+    ///
+    /// Group commit's `synced_up_to` is a **watermark**, so it assumes the
+    /// sequence space has no holes: a waiter on sequence 5 returns `Ok` as
+    /// soon as anything ≥ 5 is durable. A rewind puts a hole in it — records
+    /// 5 and 6 can be discarded while 7 is written and synced afterwards, and
+    /// the waiter on 5 would then be told its record is durable when it was
+    /// thrown away. Each writer captures the epoch when its record reaches
+    /// the buffer and refuses the acknowledgement if it has moved.
+    ///
+    /// This cannot fire spuriously: a rewind discards *everything* past the
+    /// last durable offset, so any record written before it is genuinely
+    /// gone.
+    rewind_epoch: AtomicU64,
 }
 
 /// Coordination state for group-commit syncs.
@@ -68,30 +94,45 @@ struct GroupSyncState {
 
 struct WalWriterInner {
     /// Current WAL file writer.
-    writer: BufWriter<File>,
+    writer: SinkWriter,
     /// Path of the current WAL file.
     current_path: PathBuf,
     /// First sequence number in the current file.
     file_start_seq: u64,
-    /// Current file size in bytes.
+    /// Current file size in bytes — bytes handed to the writer, buffered or
+    /// on disk.
     file_size: u64,
+    /// Bytes of the current file covered by a **successful** `fsync`, and the
+    /// offset an I/O failure rewinds to.
+    ///
+    /// Everything past it is unacknowledged: `PerWrite` and `PerBatch` sync
+    /// before returning, and `Periodic` promises only the OS's buffers. So
+    /// discarding it on a failure is honest — and keeping it would let a
+    /// record the caller was told had failed reach the disk on a later flush.
+    synced_offset: u64,
+    /// Highest sequence number covered by a **successful** `fsync`.
+    ///
+    /// The value `max_written_seq` rewinds to, so group commit's watermark
+    /// can never claim a discarded record.
+    synced_seq: u64,
     /// Highest sequence number that has been fully written to the buffer.
     /// Used by group_sync to avoid marking un-written records as durable.
     max_written_seq: u64,
-    /// Poison flag — set after an unrecoverable I/O error.
-    /// Once poisoned, all subsequent writes are rejected immediately.
+    /// Set when the file's state is **unknown**; every later write is
+    /// rejected.
     ///
-    /// # Recovery
+    /// Two things poison. A failed `fsync`, because the kernel may discard the
+    /// dirty pages *and clear the error*, so a retry can succeed over data
+    /// that is gone — there is no state to return to. And a failed rewind.
     ///
-    /// The poison flag is **not** clearable at runtime — by design.  Once
-    /// the underlying file is in an unknown state (e.g. a failed truncation
-    /// after a partial write), any further writes risk silent corruption.
-    /// The correct recovery procedure is:
+    /// A failed *write* does not: `ENOSPC` is usually transient and the file
+    /// can be restored exactly, so it rewinds
+    /// ([`rewind_to_durable`](WalWriter::rewind_to_durable)).
     ///
-    /// 1. Drop the poisoned `WalWriter`.
-    /// 2. Optionally inspect / repair the WAL directory on disk.
-    /// 3. Re-open via [`WalWriter::open`], which replays and validates
-    ///    existing records before resuming writes.
+    /// Recovery is to drop the writer and re-open via [`WalWriter::open`],
+    /// which validates existing records first;
+    /// [`clear_poison`](WalWriter::clear_poison) is the in-place version, for
+    /// an operator who has verified the WAL replays.
     poisoned: bool,
     /// Cached count of WAL files in the directory. Maintained
     /// incrementally during rotation and truncation to avoid `readdir`
@@ -144,6 +185,8 @@ impl WalWriter {
                 current_path: path,
                 file_start_seq,
                 file_size,
+                synced_offset: file_size,
+                synced_seq: if max_seq > 0 { max_seq } else { 0 },
                 max_written_seq: if max_seq > 0 { max_seq } else { 0 },
                 poisoned: false,
                 cached_file_count,
@@ -157,6 +200,7 @@ impl WalWriter {
             periodic_shutdown: periodic_shutdown.clone(),
             periodic_handle: Mutex::new(None),
             fsync_count: AtomicU64::new(0),
+            rewind_epoch: AtomicU64::new(0),
         };
 
         Ok(wal)
@@ -190,8 +234,10 @@ impl WalWriter {
             .append(true)
             .open(&inner.current_path)?;
         let file_size = file.metadata()?.len();
-        inner.writer = std::io::BufWriter::new(file);
+        inner.writer = BufWriter::with_capacity(WAL_BUF_CAPACITY, Self::sink(file));
         inner.file_size = file_size;
+        inner.synced_offset = file_size;
+        inner.synced_seq = inner.max_written_seq;
         inner.poisoned = false;
         tracing::warn!("WAL poison flag cleared — writer resumed");
         Ok(())
@@ -218,10 +264,17 @@ impl WalWriter {
 
         let seq = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.maybe_rotate(&mut inner, seq)?;
-        Self::write_record(&mut inner, seq, &prepared, false, WalRecordType::Data)?;
+        Self::write_record(
+            &mut inner,
+            seq,
+            &prepared,
+            false,
+            WalRecordType::Data,
+            &self.rewind_epoch,
+        )?;
 
         if self.config.fsync_policy == FsyncPolicy::PerWrite {
-            inner.writer.flush()?;
+            Self::flush_or_rewind(&mut inner, &self.rewind_epoch)?;
             self.sync_locked(&mut inner)?;
         }
 
@@ -268,13 +321,21 @@ impl WalWriter {
 
         // Phase 1: Write under lock, then release.
         let seq;
+        let epoch_at_write;
         {
             let mut inner = self.inner.lock();
 
             seq = self.next_sequence.fetch_add(1, Ordering::Relaxed);
 
             self.maybe_rotate(&mut inner, seq)?;
-            Self::write_record(&mut inner, seq, &prepared, false, WalRecordType::Batch)?;
+            Self::write_record(
+                &mut inner,
+                seq,
+                &prepared,
+                false,
+                WalRecordType::Batch,
+                &self.rewind_epoch,
+            )?;
 
             // `PerWrite` syncs inline; `Periodic` deliberately does not —
             // its syncs are coalesced onto the background thread. Syncing
@@ -282,7 +343,7 @@ impl WalWriter {
             // flash-wear preset bought nothing, and this path disagreed with
             // `append` about what one policy meant.
             if self.config.fsync_policy == FsyncPolicy::PerWrite {
-                inner.writer.flush()?;
+                Self::flush_or_rewind(&mut inner, &self.rewind_epoch)?;
                 self.sync_locked(&mut inner)?;
 
                 metrics::gauge!("chronix_wal_sequence_number").set(seq as f64);
@@ -296,13 +357,16 @@ impl WalWriter {
             metrics::gauge!("chronix_wal_sequence_number").set(seq as f64);
             metrics::gauge!("chronix_wal_file_count").set(inner.cached_file_count as f64);
             metrics::gauge!("chronix_wal_current_file_bytes").set(inner.file_size as f64);
+            // Read under `inner`, which a rewind also holds, so this cannot
+            // miss a rewind that has already discarded this record.
+            epoch_at_write = self.rewind_epoch.load(Ordering::SeqCst);
         }
         // Write lock released — other writers can proceed.
 
         // Phase 2: Group sync (PerBatch only) — amortises fsync across
         // concurrent callers instead of serializing through the mutex.
         if self.config.fsync_policy == FsyncPolicy::PerBatch {
-            self.group_sync(seq)?;
+            self.group_sync(seq, epoch_at_write)?;
         }
 
         Ok(seq)
@@ -339,12 +403,22 @@ impl WalWriter {
         // Phase 1: assign sequence AND write under the same lock to prevent
         // out-of-order writes that would violate group_sync durability.
         let seq;
+        let epoch_at_write;
         {
             let mut inner = self.inner.lock();
 
             seq = self.next_sequence.fetch_add(1, Ordering::Relaxed);
             self.maybe_rotate(&mut inner, seq)?;
-            Self::write_record(&mut inner, seq, &prepared, false, WalRecordType::Data)?;
+            Self::write_record(
+                &mut inner,
+                seq,
+                &prepared,
+                false,
+                WalRecordType::Data,
+                &self.rewind_epoch,
+            )?;
+            // Read under `inner`, which a rewind also holds.
+            epoch_at_write = self.rewind_epoch.load(Ordering::SeqCst);
 
             // PerWrite and Periodic: sync immediately while we still hold
             // the lock. "Durable" must mean durable regardless of
@@ -355,7 +429,7 @@ impl WalWriter {
                 self.config.fsync_policy,
                 FsyncPolicy::PerWrite | FsyncPolicy::Periodic(_)
             ) {
-                inner.writer.flush()?;
+                Self::flush_or_rewind(&mut inner, &self.rewind_epoch)?;
                 self.sync_locked(&mut inner)?;
                 return Ok(seq);
             }
@@ -364,7 +438,7 @@ impl WalWriter {
 
         // Phase 2: group sync (PerBatch only).
         if self.config.fsync_policy == FsyncPolicy::PerBatch {
-            self.group_sync(seq)?;
+            self.group_sync(seq, epoch_at_write)?;
         }
 
         Ok(seq)
@@ -379,8 +453,23 @@ impl WalWriter {
     /// Waiters use a bounded wait (5 s) to avoid indefinite hangs when the
     /// sync leader stalls on disk I/O.  On timeout the waiter promotes
     /// itself to sync leader and retries.
-    fn group_sync(&self, need_seq: u64) -> Result<(), WalError> {
+    fn group_sync(&self, need_seq: u64, epoch_at_write: u64) -> Result<(), WalError> {
         use std::time::Duration;
+
+        // Every early return below must check the epoch as well as the
+        // watermark. `synced_up_to` assumes a hole-free sequence space, and a
+        // rewind puts a hole in it.
+        let still_ours = || {
+            if self.rewind_epoch.load(Ordering::SeqCst) == epoch_at_write {
+                Ok(())
+            } else {
+                Err(WalError::Io(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "the WAL rewound after an I/O failure; this record was \
+                     discarded before it could be made durable",
+                )))
+            }
+        };
         // Use configurable timeout instead of hardcoded constant.
         let group_sync_timeout = Duration::from_secs(self.config.group_sync_timeout_secs);
 
@@ -388,7 +477,7 @@ impl WalWriter {
 
         // Another leader already synced past our sequence: nothing to do.
         if state.synced_up_to >= need_seq {
-            return Ok(());
+            return still_ours();
         }
 
         // Wait for an in-progress sync — it might cover our sequence.
@@ -398,7 +487,7 @@ impl WalWriter {
                 .wait_for(&mut state, group_sync_timeout);
 
             if state.synced_up_to >= need_seq {
-                return Ok(());
+                return still_ours();
             }
 
             // On timeout, break out and become the new sync leader. The
@@ -415,7 +504,7 @@ impl WalWriter {
         // Perform the actual flush + fsync under the write lock.
         let result = (|| -> Result<u64, WalError> {
             let mut inner = self.inner.lock();
-            inner.writer.flush()?;
+            Self::flush_or_rewind(&mut inner, &self.rewind_epoch)?;
             self.sync_locked(&mut inner)?;
             // Return the max sequence that was actually written to the buffer,
             // NOT next_sequence which may include records not yet written.
@@ -449,7 +538,7 @@ impl WalWriter {
     /// poisoned.
     pub fn sync(&self) -> Result<(), WalError> {
         let mut inner = self.inner.lock();
-        inner.writer.flush()?;
+        Self::flush_or_rewind(&mut inner, &self.rewind_epoch)?;
         self.sync_locked(&mut inner)
     }
 
@@ -468,6 +557,10 @@ impl WalWriter {
             tracing::error!(error = %e, "WAL fsync failed — writer poisoned");
             return Err(e.into());
         }
+        // Everything buffered was flushed immediately before this call, so a
+        // successful sync makes the whole file durable up to `file_size`.
+        inner.synced_offset = inner.file_size;
+        inner.synced_seq = inner.max_written_seq;
         self.fsync_count.fetch_add(1, Ordering::Relaxed);
         metrics::counter!("chronix_wal_fsync_total").increment(1);
         metrics::histogram!("chronix_wal_write_duration_seconds")
@@ -495,7 +588,7 @@ impl WalWriter {
     /// No-op if the policy is not `Periodic`.
     pub fn start_periodic_sync(self: &Arc<Self>) {
         if let FsyncPolicy::Periodic(interval) = self.config.fsync_policy {
-            // FINDING-16 fix: reject zero-duration intervals which would
+            // Reject zero-duration intervals, which would
             // create a CPU-burning busy loop.
             let interval = if interval.is_zero() {
                 tracing::warn!(
@@ -856,18 +949,98 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Rewind to the last durable offset, discarding whatever the buffer
+    /// still holds.
+    ///
+    /// It **rebuilds** the `BufWriter` rather than flushing it: a `BufWriter`
+    /// whose underlying write failed keeps the unwritten bytes, and there is
+    /// no API to drop them — so flushing before truncating fails for the same
+    /// reason the write did, and any later flush that succeeds writes a record
+    /// the caller was told had failed. `into_parts` takes the file back
+    /// *without* flushing, so the old writer's `Drop` cannot do that either.
+    ///
+    /// Returns `false` when the rewind itself failed, in which case the file
+    /// is in an unknown state and the caller must poison the writer.
+    fn rewind_to_durable(inner: &mut WalWriterInner, epoch: &AtomicU64) -> bool {
+        let good = inner.synced_offset;
+        let rebuilt = (|| -> io::Result<SinkWriter> {
+            let file = OpenOptions::new()
+                .write(true)
+                .create(false)
+                .open(&inner.current_path)?;
+            WalSink::set_len(&file, good)?;
+            let mut w = BufWriter::with_capacity(WAL_BUF_CAPACITY, Self::sink(file));
+            w.seek(io::SeekFrom::Start(good))?;
+            Ok(w)
+        })();
+
+        match rebuilt {
+            Ok(fresh) => {
+                // `into_parts` rather than a plain drop: dropping a
+                // `BufWriter` flushes it, which would write the bytes we just
+                // truncated away, at the wrong offset.
+                let (_file, _discarded) = std::mem::replace(&mut inner.writer, fresh).into_parts();
+                inner.file_size = good;
+                // Records past `good` are gone. Anything waiting on one of
+                // them must be refused rather than satisfied by a later
+                // sync's watermark.
+                inner.max_written_seq = inner.synced_seq;
+                epoch.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            Err(e) => {
+                tracing::error!(error = %e, offset = good, "WAL rewind failed");
+                false
+            }
+        }
+    }
+
+    /// Flush the buffer, rewinding to the last durable offset if it fails.
+    ///
+    /// Every `flush()` on the write path goes through here: a bare `flush()?`
+    /// leaves the failed bytes in the buffer, where the next successful flush
+    /// would write them.
+    fn flush_or_rewind(inner: &mut WalWriterInner, epoch: &AtomicU64) -> Result<(), WalError> {
+        match inner.writer.flush() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if !Self::rewind_to_durable(inner, epoch) {
+                    inner.poisoned = true;
+                    tracing::error!("WAL rewind failed after a flush error — writer poisoned");
+                }
+                Err(WalError::Io(e))
+            }
+        }
+    }
+
     // ── Internal ──────────────────────────────────────────────────────
 
-    fn create_wal_file(path: &Path) -> Result<(BufWriter<File>, u64), WalError> {
+    /// Wrap a freshly opened WAL file as the sink the writer appends to.
+    ///
+    /// The single place a test can substitute a failing file, so every other
+    /// path — rotation, reopen after poison, initial creation — gets the same
+    /// treatment without each having to remember.
+    #[cfg(not(test))]
+    fn sink(file: File) -> Box<dyn WalSink> {
+        Box::new(file)
+    }
+
+    #[cfg(test)]
+    fn sink(file: File) -> Box<dyn WalSink> {
+        match tests::write_budget() {
+            Some(budget) => Box::new(crate::wal::sink::FullDiskSink::new(file, budget)),
+            None => Box::new(file),
+        }
+    }
+
+    fn create_wal_file(path: &Path) -> Result<(SinkWriter, u64), WalError> {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path)?;
 
-        // 64 KiB buffer reduces syscall overhead by ~8× vs the
-        // default 8 KiB, which is significant for write-heavy workloads.
-        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        let mut writer = BufWriter::with_capacity(WAL_BUF_CAPACITY, Self::sink(file));
 
         // Write header
         writer.write_all(WAL_MAGIC)?;
@@ -903,6 +1076,7 @@ impl WalWriter {
         payload: &[u8],
         compress: bool,
         record_type: WalRecordType,
+        epoch: &AtomicU64,
     ) -> Result<(), WalError> {
         // Reject writes after an unrecoverable I/O error.
         if inner.poisoned {
@@ -948,27 +1122,20 @@ impl WalWriter {
         })();
 
         if let Err(e) = write_result {
-            // Attempt to truncate back to the pre-write position to prevent
-            // a partial header from corrupting the remainder of the file.
             tracing::error!(
                 seq = seq,
                 offset = saved_pos,
+                durable_offset = inner.synced_offset,
                 error = %e,
-                "WAL write_record failed mid-write, truncating to pre-write position"
+                "WAL record write failed — rewinding to the last durable offset"
             );
-            // Flush any partial data in the BufWriter before truncating.
-            let flush_ok = inner.writer.flush().is_ok();
-            // Truncate the underlying file back to the saved position.
-            let trunc_ok = inner.writer.get_mut().set_len(saved_pos).is_ok();
-            // Seek to the truncation point so subsequent writes are correct.
-            let seek_ok = inner.writer.seek(io::SeekFrom::Start(saved_pos)).is_ok();
-            inner.file_size = saved_pos;
-
-            // If recovery truncation itself failed, the file is in
-            // an unknown state — poison the writer to prevent further damage.
-            if !flush_ok || !trunc_ok || !seek_ok {
+            // To the last *durable* offset, not `saved_pos`: the records
+            // between the last successful `fsync` and here sit in the same
+            // buffer that just failed, and none of them was acknowledged.
+            if !Self::rewind_to_durable(inner, epoch) {
                 tracing::error!(
-                    "WAL recovery truncation failed — writer poisoned to prevent corruption"
+                    "WAL rewind failed after a write error — writer poisoned to \
+                     prevent corruption"
                 );
                 inner.poisoned = true;
             }
@@ -1001,8 +1168,11 @@ impl WalWriter {
             });
         }
 
-        // Flush and sync current file
-        inner.writer.flush()?;
+        // Flush and sync the current file. Through `flush_or_rewind` like
+        // every other write-path flush: a rotation that fails on a full disk
+        // must leave the writer in a known state, not with a dirty buffer for
+        // the next record to trip over.
+        Self::flush_or_rewind(inner, &self.rewind_epoch)?;
         self.sync_locked(inner)?;
 
         // Create new file
@@ -1020,6 +1190,10 @@ impl WalWriter {
         inner.current_path = new_path;
         inner.file_start_seq = next_seq;
         inner.file_size = file_size;
+        // `create_wal_file` fsyncs the header before returning, so the new
+        // file is durable up to exactly that point.
+        inner.synced_offset = file_size;
+        inner.synced_seq = inner.max_written_seq;
         inner.cached_file_count += 1;
 
         Ok(())
@@ -1134,7 +1308,152 @@ pub(crate) fn list_wal_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicI64;
     use tempfile::TempDir;
+
+    thread_local! {
+        /// Bytes the next WAL file opened on this thread will accept before
+        /// reporting the disk full. `None` — the default and every other
+        /// test — opens an ordinary file.
+        ///
+        /// Thread-local rather than global so a `--test-threads=N` run cannot
+        /// have one test's full disk reach another's writer.
+        static WRITE_BUDGET: std::cell::RefCell<Option<std::sync::Arc<AtomicI64>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn write_budget() -> Option<std::sync::Arc<AtomicI64>> {
+        WRITE_BUDGET.with(|b| b.borrow().clone())
+    }
+
+    /// Open a writer whose file accepts `bytes` more bytes and then reports
+    /// `ENOSPC`, and hand back the budget so the test can refill it.
+    fn wal_with_full_disk_after(dir: &Path, bytes: i64) -> (WalWriter, std::sync::Arc<AtomicI64>) {
+        let budget = std::sync::Arc::new(AtomicI64::new(bytes));
+        WRITE_BUDGET.with(|b| *b.borrow_mut() = Some(budget.clone()));
+        let wal = WalWriter::open(dir, test_config()).expect("open");
+        WRITE_BUDGET.with(|b| *b.borrow_mut() = None);
+        (wal, budget)
+    }
+
+    // ── A full disk ───────────────────────────────────────────────────
+    //
+    // `ENOSPC` is the failure an embedded gateway on an SD card actually
+    // meets, and nothing had ever driven it: every WAL test here was the
+    // happy path plus a process `abort()`. `chronix-chaos` published a
+    // `Fault::DiskFull` and injected nothing.
+
+    /// A caller is never told a record is durable when the disk is full —
+    /// and the writer works again once space comes back.
+    ///
+    /// The second half is the defect. `ENOSPC` cannot surface at `append`:
+    /// the record goes into a 64 KiB `BufWriter` and the syscall happens at
+    /// the flush. So the failure lands in `group_sync`'s flush, which left
+    /// the buffer holding bytes no write could place. Every later flush
+    /// retried them and failed, and the next record's `write_all` drove the
+    /// partial-write recovery, which flushes before truncating — failing for
+    /// the same reason — and **poisoned the writer**. From then on every
+    /// append returned `Poisoned`, permanently: nothing in the tree calls
+    /// `clear_poison`. A log rotation that freed a megabyte a second later
+    /// did not help; the database needed a restart to store another point.
+    #[test]
+    fn a_full_disk_is_recoverable_without_a_restart() {
+        let dir = TempDir::new().expect("tempdir");
+        // Room for the file header and one record, not two.
+        let (wal, budget) = wal_with_full_disk_after(dir.path(), 128);
+
+        let payload = vec![7u8; 32];
+        let first = wal.append_durable(&payload).expect("the first record fits");
+
+        // The disk fills.
+        budget.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            wal.append_durable(&payload).is_err(),
+            "a record that cannot be made durable must not be acknowledged"
+        );
+
+        // Space comes back — a log rotated, an old segment was archived.
+        budget.store(1 << 20, std::sync::atomic::Ordering::SeqCst);
+        let recovered = wal
+            .append_durable(&payload)
+            .expect("the writer must accept records again once space returns");
+        assert!(recovered > first);
+
+        // And what is on disk is exactly what was acknowledged: no torn tail,
+        // and no resurrection of the record the caller was told had failed.
+        wal.close().expect("close");
+        let seqs: Vec<u64> = crate::wal::replay_all(dir.path())
+            .expect("replay")
+            .iter()
+            .map(|r| r.sequence_no)
+            .collect();
+        assert_eq!(seqs, vec![first, recovered], "replay: {seqs:?}");
+    }
+
+    /// A rewind is never reported to a waiter as a successful sync.
+    ///
+    /// Group commit's `synced_up_to` is a **watermark**, so it assumes the
+    /// sequence space has no holes: a waiter on sequence 5 returns `Ok` the
+    /// moment anything ≥ 5 is durable. A rewind puts a hole in it — 5 and 6
+    /// can be discarded while 7 is written and synced afterwards — so without
+    /// the epoch check the waiter on 5 would be told its record was made
+    /// durable after it had been thrown away. That is the same defect the
+    /// rewind exists to remove, reintroduced one level up.
+    #[test]
+    fn a_rewind_refuses_the_records_it_discarded() {
+        let dir = TempDir::new().expect("tempdir");
+        let (wal, budget) = wal_with_full_disk_after(dir.path(), 128);
+        let payload = vec![7u8; 32];
+
+        let first = wal.append_durable(&payload).expect("the first fits");
+
+        // Buffer a record without syncing it, then fill the disk and force
+        // the rewind that discards it.
+        let orphan = wal.append(&payload).expect("buffered, not yet durable");
+        budget.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(wal.sync().is_err(), "the flush must fail on a full disk");
+        assert!(orphan > first);
+
+        // Space returns and a later record is made durable, moving the
+        // watermark past the discarded sequence.
+        budget.store(1 << 20, std::sync::atomic::Ordering::SeqCst);
+        let later = wal.append_durable(&payload).expect("a later write");
+        assert!(later > orphan);
+
+        // The discarded record must not be in the file.
+        wal.close().expect("close");
+        let seqs: Vec<u64> = crate::wal::replay_all(dir.path())
+            .expect("replay")
+            .iter()
+            .map(|r| r.sequence_no)
+            .collect();
+        assert!(
+            !seqs.contains(&orphan),
+            "sequence {orphan} was discarded by the rewind but replayed: {seqs:?}"
+        );
+        assert_eq!(seqs, vec![first, later]);
+    }
+
+    /// A failed `fsync` still poisons, and that is deliberate.
+    ///
+    /// The two failures are not the same. A write that fails leaves the file
+    /// in a state we can restore exactly — truncate to the offset before the
+    /// record — so it is an ordinary error. A `fsync` that fails does not:
+    /// the kernel may drop the dirty pages *and clear the error*, so a second
+    /// `fsync` can succeed over data that is gone. Refusing further writes is
+    /// the only honest state, and this pins that the distinction survives.
+    #[test]
+    fn a_failed_fsync_still_poisons() {
+        let dir = TempDir::new().expect("tempdir");
+        let wal = WalWriter::open(dir.path(), test_config()).expect("open");
+        assert!(!wal.is_poisoned());
+        wal.inner.lock().poisoned = true;
+        assert!(matches!(wal.append(b"x"), Err(WalError::Poisoned)));
+        // …and the recovery path exists and is reachable.
+        wal.clear_poison().expect("clear_poison reopens the file");
+        assert!(!wal.is_poisoned());
+        wal.append(b"x").expect("writes resume after recovery");
+    }
 
     fn test_config() -> WalConfig {
         WalConfig {

@@ -11,8 +11,6 @@ members = [
     "crates/chronix-query",
     "crates/chronix",
     "crates/chronixd",
-    # ── Dev-only tooling ───────────────────────────────────────────
-    "crates/chronix-chaos",
     # ── Frozen: distributed cluster (build with `-p` or `--workspace`;
     #    thaw is a post-v1.0 decision) ───────────────────────────────────
     "crates/chronix-meta",
@@ -20,7 +18,7 @@ members = [
     "crates/chronix-dsim",
 ]
 
-# The frozen cluster tier and dev tooling are excluded from the default
+# The frozen cluster tier is excluded from the default
 # build/test set. `cargo build` / `cargo test` covers the product;
 # `cargo test --workspace` additionally covers the frozen crates.
 default-members = [
@@ -33,7 +31,6 @@ default-members = [
     "crates/chronix-query",
     "crates/chronix",
     "crates/chronixd",
-    "crates/chronix-chaos",
 ]
 
 [workspace.package]
@@ -65,7 +62,6 @@ chronix-analytics = { path = "crates/chronix-analytics", version = "0.1.0" }
 # Frozen and dev-only: never published, so a path-only dependency is correct.
 chronix-meta = { path = "crates/chronix-meta" }
 chronix-cluster = { path = "crates/chronix-cluster" }
-chronix-chaos = { path = "crates/chronix-chaos" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -216,12 +212,11 @@ futures = "0.3"
 fs2 = "0.4"
 
 # Auth & crypto
-# Held at 0.5 deliberately. 0.6 moves to `password-hash` 0.6, which
-# restructures the PHC string types into a separate crate and changes
-# `hash_password`'s signature — that is the *stored format* of every API key,
-# not a rename, so it needs its own change with a migration path and a test
-# that an existing hash still verifies. No advisory forces it.
-argon2 = "0.5"
+#
+# The PHC string an API key is stored as is produced and verified by this
+# crate alone, so a major bump is a hard cut rather than a migration: nothing
+# is released, and there are no stored hashes in the wild to keep readable.
+argon2 = "0.6"
 # `aws_lc_rs`, never `rust_crypto`: 11.0 requires choosing a backend, and
 # `rust_crypto` pulls the `rsa` crate — **RUSTSEC-2023-0071**, the Marvin
 # timing sidechannel, key recovery over the network, with no fixed version —

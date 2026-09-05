@@ -32,9 +32,8 @@ pub struct WritePointRequest {
     pub timestamp: Option<i64>,
 }
 
-/// JSON body for write: either a single point or an array.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// JSON body for write: either a single point or an array of them.
+#[derive(Debug)]
 pub enum WriteBody {
     /// A single data point.
     Single(WritePointRequest),
@@ -42,12 +41,54 @@ pub enum WriteBody {
     Batch(Vec<WritePointRequest>),
 }
 
+impl WriteBody {
+    /// Parse a request body, dispatching on its first token.
+    ///
+    /// Hand-written rather than `#[serde(untagged)]`, for two reasons that
+    /// point the same way. An untagged enum discards its variants' errors and
+    /// reports only that none matched, so one mistyped key in a batch of
+    /// fifty thousand names nothing; and it buffers the whole body into a
+    /// `Content` tree before trying a variant, costing a full copy per write.
+    /// Dispatching on `[` versus `{` decides the shape first, so the caller
+    /// gets serde's own message with the position and the body is
+    /// deserialised once.
+    fn from_slice(body: &[u8]) -> Result<Self, ServerError> {
+        let first = body.iter().find(|b| !b.is_ascii_whitespace());
+        match first {
+            Some(b'[') => serde_json::from_slice(body)
+                .map(WriteBody::Batch)
+                .map_err(|e| ServerError::BadRequest(format!("invalid write batch: {e}"))),
+            Some(b'{') => serde_json::from_slice(body)
+                .map(WriteBody::Single)
+                .map_err(|e| ServerError::BadRequest(format!("invalid write point: {e}"))),
+            Some(other) => Err(ServerError::BadRequest(format!(
+                "a write body is a JSON object (one point) or an array of them; \
+                 this one starts with {:?}",
+                *other as char
+            ))),
+            None => Err(ServerError::BadRequest("empty write request".into())),
+        }
+    }
+}
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for WriteBody {
+    type Rejection = ServerError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|e| ServerError::BadRequest(format!("cannot read request body: {e}")))?;
+        Self::from_slice(&bytes)
+    }
+}
+
 /// `POST /api/v1/write` — write one or more points.
 pub async fn write_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     ns_ctx: Option<axum::extract::Extension<NamespaceContext>>,
-    Json(body): Json<WriteBody>,
+    axum::extract::Query(backfill): axum::extract::Query<crate::util::BackfillParam>,
+    body: WriteBody,
 ) -> Result<impl IntoResponse, ServerError> {
     // Idempotency-Key deduplication. The claim is released automatically
     // unless the write succeeds, so a failed write does not turn the
@@ -80,7 +121,7 @@ pub async fn write_handler(
         return Err(ServerError::BadRequest("empty write request".into()));
     }
 
-    let max_batch = state.config.max_write_batch_size;
+    let max_batch = state.config.server.max_write_batch_size;
     if points_raw.len() > max_batch {
         return Err(ServerError::BadRequest(format!(
             "batch size {} exceeds limit of {max_batch}",
@@ -98,8 +139,14 @@ pub async fn write_handler(
 
     let count = points.len();
 
-    crate::util::insert_with_timeout(&state.db, scope.as_deref(), points, state.write_timeout)
-        .await?;
+    crate::util::insert_batch_with_mode(
+        &state.db,
+        scope.as_deref(),
+        points,
+        state.write_timeout,
+        backfill.mode(),
+    )
+    .await?;
 
     debug!(count, "wrote points via REST");
     metrics::counter!("chronix_http_points_written_total").increment(count as u64);
@@ -123,14 +170,19 @@ pub async fn write_influx_handler(
     // in 1970. `db`, `bucket`, `org`, `rp` and `u`/`p` are accepted and
     // ignored: chronix has one database per process and scopes by namespace
     // header, and rejecting them would break a client that always sends them.
-    let precision = {
+    // `RawQuery` rather than `Query`, because a repeated key is legal here
+    // and `precision` and `backfill` sit beside parameters chronix ignores.
+    let (precision, backfill) = {
         let mut p = influx::Precision::Nanoseconds;
+        let mut backfill = false;
         for (k, v) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
-            if k == "precision" {
-                p = influx::Precision::parse(&v)?;
+            match k.as_ref() {
+                "precision" => p = influx::Precision::parse(&v)?,
+                "backfill" => backfill = v == "true" || v == "1",
+                _ => {}
             }
         }
-        p
+        (p, crate::util::WriteMode::from_flag(backfill))
     };
     // Idempotency-Key deduplication. The claim is released automatically
     // unless the write succeeds, so a failed write does not turn the
@@ -169,7 +221,7 @@ pub async fn write_influx_handler(
         };
     }
 
-    let max_batch = state.config.max_write_batch_size;
+    let max_batch = state.config.server.max_write_batch_size;
     if parsed.points.len() > max_batch {
         return Err(ServerError::BadRequest(format!(
             "batch size {} exceeds limit of {max_batch}",
@@ -179,11 +231,12 @@ pub async fn write_influx_handler(
 
     let count = parsed.points.len();
 
-    crate::util::insert_with_timeout(
+    crate::util::insert_batch_with_mode(
         &state.db,
         scope.as_deref(),
         parsed.points,
         state.write_timeout,
+        backfill,
     )
     .await?;
 
@@ -208,8 +261,11 @@ pub async fn write_influx_handler(
         }
         Ok((
             StatusCode::BAD_REQUEST,
+            // `error` and `code` first: every error this server returns
+            // carries that envelope, whichever layer rejected the line.
             Json(serde_json::json!({
                 "error": format!("partial write: {}", parsed.errors.join("; ")),
+                "code": "PARTIAL_WRITE",
                 "written": count,
                 "rejected": parsed.errors.len(),
             })),

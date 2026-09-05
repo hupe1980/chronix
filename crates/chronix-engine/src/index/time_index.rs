@@ -89,49 +89,29 @@ impl TimeIndex {
     /// Uses a BTree range scan: iterates entries with `min_ts <= end_ts`
     /// and filters by `max_ts >= start_ts`. Entries with `min_ts > end_ts`
     /// are skipped entirely via the range upper bound.
+    /// There is deliberately no bounded variant. One existed —
+    /// `segments_for_range_limited`, documented for "pagination or preview
+    /// queries" — whose only caller passed `usize::MAX`. Dropping segments
+    /// from a scan is not pagination: it returns an arbitrary subset of the
+    /// rows with no error and no way for the caller to tell.
     #[must_use]
     pub fn segments_for_range(&self, start_ts: Timestamp, end_ts: Timestamp) -> Vec<SegmentId> {
-        self.segments_for_range_limited(start_ts, end_ts, usize::MAX)
-    }
-
-    /// Find segments overlapping `[start_ts, end_ts]`, returning at most `limit`.
-    ///
-    /// Allows callers to perform partial range reads when only a
-    /// bounded number of segments are needed (e.g. pagination or preview
-    /// queries). This avoids materialising the full set when thousands
-    /// of segments match the time range.
-    #[must_use]
-    pub fn segments_for_range_limited(
-        &self,
-        start_ts: Timestamp,
-        end_ts: Timestamp,
-        limit: usize,
-    ) -> Vec<SegmentId> {
         let entries = self.entries.read();
-
         if entries.is_empty() {
             return Vec::new();
         }
-
-        // We want all entries where min_ts <= end_ts.
-        // BTreeSet range: from the start up to (end_ts, MAX segment_id).
+        // Every entry with `min_ts <= end_ts`; `max_ts >= start_ts` filters
+        // the rest.
         let upper = TimeIndexEntry {
             segment_id: SegmentId(u64::MAX),
             min_ts: end_ts,
             max_ts: Timestamp::MAX,
         };
-
-        let mut result = Vec::new();
-        for entry in entries.range((Bound::Unbounded, Bound::Included(&upper))) {
-            if entry.max_ts >= start_ts {
-                result.push(entry.segment_id);
-                if result.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        result
+        entries
+            .range((Bound::Unbounded, Bound::Included(&upper)))
+            .filter(|e| e.max_ts >= start_ts)
+            .map(|e| e.segment_id)
+            .collect()
     }
 
     /// Add a segment to the index.

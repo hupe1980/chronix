@@ -27,12 +27,22 @@ pub async fn list_measurements_handler(
 ) -> Result<Json<PaginatedResponse<MeasurementInfo>>, ServerError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    let limit = state.config.prom_series_limit;
-
+    // No cardinality cap on the *listing*. This used to pass
+    // `prom_series_limit` into `measurements_in`, so a tenant with more
+    // measurements than the cap got a truncated list whose `total` reported
+    // the truncated length — a paginated endpoint that says "total: 10000"
+    // and can never reach the rest. Pagination is the bound here, and it is
+    // exact.
+    //
+    // The cost is one `LIMIT 1` probe per measurement under tenancy, which is
+    // bounded by the number of *measurements* (tens to hundreds) rather than
+    // by series cardinality — and it was already paying up to
+    // `prom_series_limit` of them. A per-namespace measurement index would
+    // make it a lookup; that is a backlog item, not a hazard.
     let all_infos = tokio::task::spawn_blocking(move || {
         let registry = db.schema_registry();
         let names = if scope.is_some() {
-            crate::namespace::measurements_in(&db, scope.as_deref(), i64::MIN, i64::MAX, limit)
+            crate::namespace::measurements_in(&db, scope.as_deref(), i64::MIN, i64::MAX, usize::MAX)
         } else {
             registry.measurement_names()
         };
@@ -661,20 +671,25 @@ pub async fn health_handler(State(state): State<AppState>) -> impl IntoResponse 
 /// `GET /ready` — readiness probe (distinct from `/health`).
 ///
 /// Returns **200** with `{"ready": true}` when the database is open and
-/// accepting writes.  Returns **503** with `{"ready": false}` when the
-/// server is still initialising or the database is closed.
+/// accepting writes. Returns **503** with `{"ready": false, "reason": …}`
+/// when it is not — closed, or the WAL poisoned by a failed `fsync`, after
+/// which every write is refused until the database is reopened.
 ///
-/// Kubernetes `readinessProbe` should point here so traffic is only
-/// routed to instances that can actually serve requests.
+/// Transient back-pressure is deliberately **not** unready: a full memtable
+/// waiting on a flush is the moment to keep serving and let back-pressure
+/// work, not the moment to leave the load balancer.
 pub async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // If the db handle exists and isn't closed, we're ready.
-    // Try a lightweight operation to verify.
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.schema_registry().measurement_count()).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "ready": true }))),
-        _ => (
+    let verdict = tokio::task::spawn_blocking(move || db.check_writable()).await;
+    match verdict {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({ "ready": true }))),
+        Ok(Err(e)) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "ready": false })),
+            Json(serde_json::json!({ "ready": false, "reason": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ready": false, "reason": e.to_string() })),
         ),
     }
 }
@@ -726,25 +741,20 @@ pub struct UpdateLogLevelRequest {
 /// invalid filter syntax.
 pub async fn update_log_level_handler(
     Json(body): Json<UpdateLogLevelRequest>,
-) -> impl IntoResponse {
-    match crate::otel::update_log_filter(&body.filter) {
-        Ok(()) => {
-            debug!(new_filter = %body.filter, "log filter updated at runtime");
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "filter": body.filter,
-                })),
-            )
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": e.to_string(),
-            })),
-        ),
-    }
+) -> Result<impl IntoResponse, ServerError> {
+    // `ServerError` rather than a bare `{"error": …}`: this handler answered
+    // in an envelope of its own, without the `code` every other error on this
+    // server carries.
+    crate::otel::update_log_filter(&body.filter)
+        .map_err(|e| ServerError::BadRequest(format!("invalid log filter: {e}")))?;
+    debug!(new_filter = %body.filter, "log filter updated at runtime");
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "filter": body.filter,
+        })),
+    ))
 }
 
 // ── Dashboard export ───────────────────────────────────────────────────

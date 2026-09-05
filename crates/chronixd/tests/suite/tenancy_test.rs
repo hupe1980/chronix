@@ -69,17 +69,16 @@ async fn start_server_with(multi_tenancy: bool) -> (String, TempDir) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig {
-            multi_tenancy,
+            server: chronixd::config::ServerSettings {
+                multi_tenancy,
+                ..Default::default()
+            },
             ..Default::default()
         },
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -508,14 +507,10 @@ async fn start_authenticated_server() -> (String, TempDir) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
@@ -757,7 +752,10 @@ async fn a_key_confined_to_one_namespace_cannot_read_another() {
 #[test]
 fn multi_tenancy_refuses_an_unconfined_api_key() {
     let config = chronixd::config::ServerConfig {
-        multi_tenancy: true,
+        server: chronixd::config::ServerSettings {
+            multi_tenancy: true,
+            ..Default::default()
+        },
         auth: Some(chronixd::config::AuthConfig {
             api_keys: vec![chronixd::config::ApiKeyEntry {
                 name: "wide-open".to_string(),
@@ -779,7 +777,10 @@ fn multi_tenancy_refuses_an_unconfined_api_key() {
     );
 
     let single_tenant = chronixd::config::ServerConfig {
-        multi_tenancy: false,
+        server: chronixd::config::ServerSettings {
+            multi_tenancy: false,
+            ..Default::default()
+        },
         ..config
     };
     assert!(
@@ -843,17 +844,16 @@ async fn start_confined_server() -> (String, TempDir) {
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
-        #[cfg(feature = "chaos")]
-        chaos_agent: None,
         authz_engine: None,
         audit_logger: None,
         config: chronixd::config::ServerConfig {
-            multi_tenancy: true,
+            server: chronixd::config::ServerSettings {
+                multi_tenancy: true,
+                ..Default::default()
+            },
             ..Default::default()
         },
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
-        #[cfg(feature = "chaos")]
-        chaos_guards: parking_lot::Mutex::new(Vec::new()),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,

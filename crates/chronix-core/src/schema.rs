@@ -128,7 +128,7 @@ pub struct ColumnDef {
 pub struct MeasurementSchema {
     measurement: String,
     columns: Vec<ColumnDef>,
-    /// FINDING-09: O(1) column lookup index (name → position in `columns`).
+    /// O(1) column lookup index (name → position in `columns`).
     #[serde(skip)]
     column_index: HashMap<String, usize>,
 }
@@ -201,7 +201,7 @@ impl MeasurementSchema {
     /// Add a tag column if it doesn't already exist.
     ///
     /// Returns `true` if the tag was newly added, `false` if it already
-    /// exists as a tag. FINDING-25: logs a warning if the name conflicts
+    /// exists as a tag. Logs a warning if the name conflicts
     /// with an existing field column.
     #[must_use]
     pub fn add_tag(&mut self, name: &str) -> bool {
@@ -238,7 +238,7 @@ impl MeasurementSchema {
         let new_type = ColumnType::from_field_value(field_value);
 
         if let Some(existing) = self.columns.iter().find(|c| c.name == name) {
-            // FINDING-25: check for role conflict (tag with same name as field)
+            // Check for role conflict (tag with same name as field)
             if existing.role != ColumnRole::Field {
                 return Err(SchemaError::TypeConflict {
                     measurement: self.measurement.clone(),
@@ -268,7 +268,7 @@ impl MeasurementSchema {
         Ok(true)
     }
 
-    /// Look up a column by name — O(1) via FINDING-09 column index.
+    /// Look up a column by name — O(1) via the column index.
     #[inline]
     #[must_use]
     pub fn column(&self, name: &str) -> Option<&ColumnDef> {
@@ -279,7 +279,7 @@ impl MeasurementSchema {
 
     /// Push a pre-built column definition (e.g. during WAL replay).
     ///
-    /// Silently ignores duplicates (FINDING-10).
+    /// Silently ignores duplicates.
     pub fn push_column(&mut self, col: ColumnDef) {
         if self.column_index.contains_key(&col.name) {
             return; // duplicate — already present
@@ -531,7 +531,7 @@ impl SchemaRegistry {
 
     /// Look up the schema for a measurement.
     ///
-    /// FINDING-08: returns `Arc<MeasurementSchema>` for O(1) clone.
+    /// Returns `Arc<MeasurementSchema>` for an O(1) clone.
     #[must_use]
     pub fn lookup(&self, measurement: &str) -> Option<Arc<MeasurementSchema>> {
         self.schemas.get(measurement).map(|r| r.value().clone())
@@ -558,7 +558,7 @@ impl SchemaRegistry {
     /// Apply an `AddColumn` action from WAL replay.
     ///
     /// Idempotent: if the column already exists it is not duplicated.
-    /// FINDING-28: checks for role conflicts (e.g., tag vs field with same name).
+    /// Checks for role conflicts (e.g., tag vs field with same name).
     pub fn apply_add_column(&self, measurement: &str, column: ColumnDef) {
         if let Some(mut schema_arc) = self.schemas.get_mut(measurement) {
             if let Some(existing) = schema_arc
@@ -574,7 +574,7 @@ impl SchemaRegistry {
                         column = %column.name,
                         existing_role = ?existing.role,
                         new_role = ?column.role,
-                        "FINDING-28: WAL replay column role conflict — skipping"
+                        "WAL replay column role conflict — skipping"
                     );
                 }
                 // Already exists (same or conflicting role) — skip
