@@ -191,8 +191,15 @@ fn build_session_context(db: &Arc<Chronix>, namespace: Option<String>) -> Sessio
     });
     ctx.register_catalog("chronix", catalog);
 
-    // Register custom SQL functions
-    register_udfs(&ctx);
+    // Register custom SQL functions, bounded by the configured analytics
+    // limits — which used to be read nowhere at all.
+    register_udfs(
+        &ctx,
+        super::functions::ForecastLimits {
+            max_horizon: db.config().analytics.max_forecast_horizon,
+            max_training_points: db.config().analytics.max_training_points,
+        },
+    );
 
     // Register runtime UDFs added via db.register_udf() / db.register_udaf()
     for udf in db.custom_udfs() {

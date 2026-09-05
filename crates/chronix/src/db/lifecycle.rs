@@ -237,8 +237,16 @@ impl super::Chronix {
         Ok(result)
     }
 
-    /// Enforce a retention policy, dropping all shards whose data
-    /// falls entirely before `cutoff_ns`.
+    /// Enforce a retention policy, dropping every shard whose data falls
+    /// entirely before `now - retention`.
+    ///
+    /// Takes a [`Duration`](std::time::Duration), as
+    /// [`ChronixConfig::retention`](chronix_core::ChronixConfig) does. It used
+    /// to take a bare `i64` of **nanoseconds**, so the natural reading of the
+    /// configuration — `retention(Duration::from_secs(86_400))` — translated
+    /// to `enforce_retention(86_400)`, which is 86 microseconds of retention
+    /// and deletes the database. A unit a caller has to remember is not a
+    /// unit; this one cannot be got wrong.
     ///
     /// Returns the number of segments deleted.
     ///
@@ -246,8 +254,12 @@ impl super::Chronix {
     ///
     /// Returns an error if the database is closed.
     #[must_use = "retention errors must be handled"]
-    pub fn enforce_retention(&self, retention_ns: i64) -> Result<retention::RetentionResult> {
-        self.enforce_retention_inner(Some(retention_ns))
+    pub fn enforce_retention(
+        &self,
+        retention: std::time::Duration,
+    ) -> Result<retention::RetentionResult> {
+        let ns = i64::try_from(retention.as_nanos()).unwrap_or(i64::MAX);
+        self.enforce_retention_inner(Some(ns))
     }
 
     /// Enforce every configured retention rule — the global one if there is

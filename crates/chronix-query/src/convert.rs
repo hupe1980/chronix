@@ -40,6 +40,25 @@ struct Column {
     role: ColumnRole,
 }
 
+/// Arrow field metadata naming a column's role.
+///
+/// Private because `ColumnRole` is: the *value* travels on the batch, which
+/// is what a consumer reads.
+///
+/// A tag and a string field are both `Utf8`, so a schema built from types
+/// alone cannot be classified afterwards — the role has to travel with the
+/// batch. `chronix_engine::segment::metadata::roles::ARROW_ROLE_KEY` is the
+/// same key from the storage side.
+#[must_use]
+fn role_metadata(role: ColumnRole) -> std::collections::HashMap<String, String> {
+    let name = match role {
+        ColumnRole::Timestamp => "timestamp",
+        ColumnRole::Tag => "tag",
+        ColumnRole::Field(_) => "field",
+    };
+    [("role".to_string(), name.to_string())].into()
+}
+
 /// Convert a slice of [`Point`]s to an Arrow [`RecordBatch`].
 ///
 /// The resulting batch has the same columnar structure as what
@@ -66,11 +85,17 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
 
     for col in &columns {
+        // The role is known right here and used to be dropped: a tag and a
+        // string field are both `Utf8`, so a schema built from types alone
+        // cannot be classified afterwards without guessing — and four
+        // consumers guessed, three of them differently.
+        let meta = role_metadata(col.role);
         match col.role {
             ColumnRole::Timestamp => {
                 let values: Vec<i64> = points.iter().map(Point::timestamp).collect();
                 arrow_arrays.push(Arc::new(Int64Array::from(values)));
-                fields.push(Field::new(&col.name, DataType::Int64, true));
+                fields
+                    .push(Field::new(&col.name, DataType::Int64, true).with_metadata(meta.clone()));
             }
             ColumnRole::Tag => {
                 let values: Vec<Option<&str>> = points
@@ -78,7 +103,8 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                     .map(|p| p.series_key().tag(&col.name))
                     .collect();
                 arrow_arrays.push(Arc::new(StringArray::from(values)));
-                fields.push(Field::new(&col.name, DataType::Utf8, true));
+                fields
+                    .push(Field::new(&col.name, DataType::Utf8, true).with_metadata(meta.clone()));
             }
             ColumnRole::Field(ft) => match ft {
                 FieldType::I64 => {
@@ -90,7 +116,9 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                         })
                         .collect();
                     arrow_arrays.push(Arc::new(Int64Array::from(values)));
-                    fields.push(Field::new(&col.name, DataType::Int64, true));
+                    fields.push(
+                        Field::new(&col.name, DataType::Int64, true).with_metadata(meta.clone()),
+                    );
                 }
                 FieldType::U64 => {
                     let values: Vec<Option<u64>> = points
@@ -101,7 +129,9 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                         })
                         .collect();
                     arrow_arrays.push(Arc::new(UInt64Array::from(values)));
-                    fields.push(Field::new(&col.name, DataType::UInt64, true));
+                    fields.push(
+                        Field::new(&col.name, DataType::UInt64, true).with_metadata(meta.clone()),
+                    );
                 }
                 FieldType::F64 => {
                     let values: Vec<Option<f64>> = points
@@ -112,7 +142,9 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                         })
                         .collect();
                     arrow_arrays.push(Arc::new(Float64Array::from(values)));
-                    fields.push(Field::new(&col.name, DataType::Float64, true));
+                    fields.push(
+                        Field::new(&col.name, DataType::Float64, true).with_metadata(meta.clone()),
+                    );
                 }
                 FieldType::Bool => {
                     let values: Vec<Option<bool>> = points
@@ -123,7 +155,9 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                         })
                         .collect();
                     arrow_arrays.push(Arc::new(BooleanArray::from(values)));
-                    fields.push(Field::new(&col.name, DataType::Boolean, true));
+                    fields.push(
+                        Field::new(&col.name, DataType::Boolean, true).with_metadata(meta.clone()),
+                    );
                 }
                 FieldType::String => {
                     let values: Vec<Option<String>> = points
@@ -135,7 +169,9 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                         .collect();
                     let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
                     arrow_arrays.push(Arc::new(StringArray::from(refs)));
-                    fields.push(Field::new(&col.name, DataType::Utf8, true));
+                    fields.push(
+                        Field::new(&col.name, DataType::Utf8, true).with_metadata(meta.clone()),
+                    );
                 }
             },
         }

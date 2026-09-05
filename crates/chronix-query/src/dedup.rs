@@ -64,9 +64,13 @@ fn build_union_schema(batches: &[RecordBatch]) -> Arc<Schema> {
     for batch in batches {
         for field in batch.schema().fields() {
             if seen.insert(field.name().clone()) {
-                // Mark as nullable since not all batches may have this column
+                // Mark as nullable since not all batches may have this
+                // column. `with_metadata` rather than a fresh `Field`: the
+                // role travels on the field, and rebuilding it here dropped
+                // the one thing a consumer cannot recover from the type.
                 let f = if batches.len() > 1 {
                     Field::new(field.name(), field.data_type().clone(), true)
+                        .with_metadata(field.metadata().clone())
                 } else {
                     field.as_ref().clone()
                 };

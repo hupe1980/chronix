@@ -200,7 +200,7 @@ async def test_write_line_protocol_list(mock_api):
 @pytest.mark.asyncio
 async def test_query(mock_api):
     # The response is a bare JSON **array** of rows, not `{"rows": [...]}`.
-    mock_api.post("/api/v1/query").respond(
+    mock_api.post("/api/v1/chronix/query").respond(
         json=[{"timestamp": 100, "tags": {"host": "a"}, "fields": {"usage": 42.5}}]
     )
     async with ChronixClient(BASE) as c:
@@ -211,7 +211,7 @@ async def test_query(mock_api):
 
 @pytest.mark.asyncio
 async def test_query_with_filters(mock_api):
-    route = mock_api.post("/api/v1/query").respond(json=[])
+    route = mock_api.post("/api/v1/chronix/query").respond(json=[])
     async with ChronixClient(BASE) as c:
         await c.query(
             "cpu",
@@ -240,7 +240,7 @@ async def test_query_with_filters(mock_api):
 async def test_sql(mock_api):
     # SQL answers column metadata plus **positional** rows; the client zips
     # them so callers get named columns.
-    mock_api.post("/api/v1/sql").respond(
+    mock_api.post("/api/v1/chronix/sql").respond(
         json={
             "columns": [
                 {"name": "host", "data_type": "Utf8"},
@@ -400,7 +400,7 @@ async def test_server_error(mock_api):
 
 @pytest.mark.asyncio
 async def test_client_error(mock_api):
-    mock_api.post("/api/v1/query").respond(
+    mock_api.post("/api/v1/chronix/query").respond(
         status_code=400, json={"error": "bad request"}
     )
     async with ChronixClient(BASE) as c:
@@ -440,7 +440,7 @@ async def test_openapi_spec(mock_api):
 
 @pytest.mark.asyncio
 async def test_explain(mock_api):
-    mock_api.post("/api/v1/query/explain").respond(json={"plan": "scan → filter"})
+    mock_api.post("/api/v1/chronix/query/explain").respond(json={"plan": "scan → filter"})
     async with ChronixClient(BASE) as c:
         result = await c.explain("cpu", TimeRange(0, 100))
     assert "plan" in result

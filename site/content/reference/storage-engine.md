@@ -554,7 +554,8 @@ catalog.
 
 ### Retention
 
-`enforce_retention(retention_ns)` identifies shards whose `max_timestamp` falls
+`enforce_retention(retention)` takes a `Duration`, as `ChronixConfig::retention`
+does, and identifies shards whose `max_timestamp` falls
 before the cutoff and drops all segments, catalog entries, bloom filters, tag
 index entries, and metadata cache entries for those shards.
 

@@ -383,10 +383,10 @@ unsafe fn avx512_min_max(data: &[f64]) -> (f64, f64) {
         let b = i * 16;
         let a = _mm512_loadu_pd(ptr.add(b));
         let c = _mm512_loadu_pd(ptr.add(b + 8));
-        vmin0 = _mm512_min_pd(vmin0, a);
-        vmax0 = _mm512_max_pd(vmax0, a);
-        vmin1 = _mm512_min_pd(vmin1, c);
-        vmax1 = _mm512_max_pd(vmax1, c);
+        vmin0 = _mm512_min_pd(a, vmin0);
+        vmax0 = _mm512_max_pd(a, vmax0);
+        vmin1 = _mm512_min_pd(c, vmin1);
+        vmax1 = _mm512_max_pd(c, vmax1);
     }
     let vmin = _mm512_min_pd(vmin0, vmin1);
     let vmax = _mm512_max_pd(vmax0, vmax1);
@@ -555,10 +555,10 @@ unsafe fn avx2_min_max(data: &[f64]) -> (f64, f64) {
         let b = i * 8;
         let a = _mm256_loadu_pd(ptr.add(b));
         let c = _mm256_loadu_pd(ptr.add(b + 4));
-        vmin0 = _mm256_min_pd(vmin0, a);
-        vmax0 = _mm256_max_pd(vmax0, a);
-        vmin1 = _mm256_min_pd(vmin1, c);
-        vmax1 = _mm256_max_pd(vmax1, c);
+        vmin0 = _mm256_min_pd(a, vmin0);
+        vmax0 = _mm256_max_pd(a, vmax0);
+        vmin1 = _mm256_min_pd(c, vmin1);
+        vmax1 = _mm256_max_pd(c, vmax1);
     }
     let vmin = _mm256_min_pd(vmin0, vmin1);
     let vmax = _mm256_max_pd(vmax0, vmax1);
@@ -726,10 +726,10 @@ fn sse2_min_max(data: &[f64]) -> (f64, f64) {
             let b = i * 4;
             let a = _mm_loadu_pd(ptr.add(b));
             let c = _mm_loadu_pd(ptr.add(b + 2));
-            vmin0 = _mm_min_pd(vmin0, a);
-            vmax0 = _mm_max_pd(vmax0, a);
-            vmin1 = _mm_min_pd(vmin1, c);
-            vmax1 = _mm_max_pd(vmax1, c);
+            vmin0 = _mm_min_pd(a, vmin0);
+            vmax0 = _mm_max_pd(a, vmax0);
+            vmin1 = _mm_min_pd(c, vmin1);
+            vmax1 = _mm_max_pd(c, vmax1);
         }
         let vmin = _mm_min_pd(vmin0, vmin1);
         let vmax = _mm_max_pd(vmax0, vmax1);
@@ -1134,8 +1134,16 @@ pub fn simd_population_variance(data: &[f64], mean: f64) -> f64 {
 
 /// Computes the minimum and maximum of a slice simultaneously using SIMD.
 ///
-/// **NaN handling:** NaN values are skipped consistently across all tiers
-/// (x86 SSE2/AVX2/AVX-512, aarch64 NEON, scalar fallback).
+/// **NaN handling:** a `NaN` is skipped, on every tier.
+///
+/// That takes care on x86: `MINPD dst, src` returns **`src`** when either
+/// operand is `NaN`, so accumulating with `min(acc, data)` lets one `NaN` in
+/// the data poison the accumulator and the answer becomes whatever the last
+/// lane held. The accumulator is therefore the *second* operand throughout —
+/// `min(data, acc)` keeps the accumulator and drops the `NaN`, which is what
+/// aarch64's `FMINNM` and the scalar `<`/`>` comparisons do anyway. This was a
+/// real divergence: the two architectures gave different answers for the same
+/// input, and the doc comment here said they did not.
 ///
 /// On x86_64: uses `_mm_min_pd`/`_mm_max_pd` (SSE2), `_mm256_min_pd`/`_mm256_max_pd`
 /// (AVX2), or `_mm512_min_pd`/`_mm512_max_pd` (AVX-512F).
@@ -1298,6 +1306,82 @@ pub fn simd_tier() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// `simd_min_max` skips `NaN`, on whatever tier this build selected.
+    ///
+    /// It did not on x86: `MINPD dst, src` returns `src` when either operand
+    /// is `NaN`, and the accumulator was the *first* operand — so one `NaN`
+    /// poisoned it and the answer became whatever the last lane held, while
+    /// aarch64 and the scalar fallback skipped it. Two architectures, two
+    /// answers, and a doc comment saying they agreed.
+    ///
+    /// The lengths matter: the SIMD tiers process 16, 8 or 4 values per
+    /// iteration with a scalar tail, so a `NaN` has to be tried in the
+    /// vectorised body *and* in the tail.
+    #[test]
+    fn simd_min_max_skips_nan_at_every_position() {
+        /// The answer, by definition: `NaN` is not a value.
+        fn reference(data: &[f64]) -> (f64, f64) {
+            let mut min = f64::INFINITY;
+            let mut max = f64::NEG_INFINITY;
+            for &v in data.iter().filter(|v| !v.is_nan()) {
+                min = min.min(v);
+                max = max.max(v);
+            }
+            (min, max)
+        }
+
+        for len in [1_usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33, 64, 129] {
+            for nan_at in 0..len {
+                let mut data: Vec<f64> = (0..len).map(|i| i as f64 - 10.0).collect();
+                data[nan_at] = f64::NAN;
+                let (min, max) = super::simd_min_max(&data);
+                let (want_min, want_max) = reference(&data);
+                assert_eq!(
+                    (min, max),
+                    (want_min, want_max),
+                    "len {len}, NaN at {nan_at}"
+                );
+            }
+        }
+    }
+
+    /// An all-`NaN` slice has no minimum and no maximum, and says so the same
+    /// way an empty one does.
+    #[test]
+    fn simd_min_max_of_all_nan_is_the_empty_answer() {
+        for len in [1_usize, 4, 8, 16, 33] {
+            let data = vec![f64::NAN; len];
+            let (min, max) = super::simd_min_max(&data);
+            assert_eq!((min, max), (f64::INFINITY, f64::NEG_INFINITY), "len {len}");
+        }
+    }
+
+    proptest::proptest! {
+        /// Against arbitrary input, including `NaN` and the infinities.
+        #[test]
+        fn simd_min_max_matches_a_nan_skipping_reference(
+            data in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => -1e6_f64..1e6_f64,
+                    1 => proptest::strategy::Just(f64::NAN),
+                    1 => proptest::strategy::Just(f64::INFINITY),
+                    1 => proptest::strategy::Just(f64::NEG_INFINITY),
+                ],
+                0..200,
+            )
+        ) {
+            let mut want_min = f64::INFINITY;
+            let mut want_max = f64::NEG_INFINITY;
+            for &v in data.iter().filter(|v| !v.is_nan()) {
+                want_min = want_min.min(v);
+                want_max = want_max.max(v);
+            }
+            let (min, max) = super::simd_min_max(&data);
+            proptest::prop_assert_eq!(min, want_min);
+            proptest::prop_assert_eq!(max, want_max);
+        }
+    }
+
     use super::*;
 
     // ── Sum ──────────────────────────────────────────────────────────

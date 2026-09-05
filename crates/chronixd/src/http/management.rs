@@ -414,6 +414,7 @@ pub async fn refresh_rollup_handler(
 
 /// JSON body for creating a rollup configuration.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRollupRequest {
     /// Unique rollup name.
     pub name: String,
@@ -539,6 +540,7 @@ pub async fn delete_rollup_handler(
 
 /// `POST /api/v1/export/parquet` — trigger Parquet export.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportRequest {
     /// Measurement to export.
     pub measurement: String,
@@ -712,6 +714,7 @@ pub async fn list_connectors_handler(
 
 /// JSON body for `PUT /api/v1/admin/log-level`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateLogLevelRequest {
     /// New `EnvFilter` directive, e.g. `"debug"` or `"chronix=trace,tower=info"`.
     pub filter: String,

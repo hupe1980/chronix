@@ -297,6 +297,7 @@ impl SharedState {
 
 /// Time range in the query body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeRangeRequest {
     /// Start timestamp (nanoseconds, inclusive).
     pub start: i64,
@@ -451,6 +452,36 @@ pub(super) fn arrow_value_to_json(col: &dyn arrow::array::Array, idx: usize) -> 
             };
             serde_json::json!(ts)
         }
+        // A list becomes a JSON array, recursively.
+        //
+        // Every analytics aggregate returns one — `forecast`, `auto_forecast`,
+        // `multivariate_forecast` are `LIST(DOUBLE)` — so without this the
+        // documented headline feature answered
+        // `"<unsupported: List(Float64)>"` over the JSON API, which is the one
+        // surface most callers use. The fallback string is kept for a type
+        // genuinely not handled, because a silent `null` would be worse.
+        DataType::List(_) => col
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .map_or(serde_json::Value::Null, |a| {
+                let inner = a.value(idx);
+                serde_json::Value::Array(
+                    (0..inner.len())
+                        .map(|i| arrow_value_to_json(&inner, i))
+                        .collect(),
+                )
+            }),
+        DataType::LargeList(_) => col
+            .as_any()
+            .downcast_ref::<arrow::array::LargeListArray>()
+            .map_or(serde_json::Value::Null, |a| {
+                let inner = a.value(idx);
+                serde_json::Value::Array(
+                    (0..inner.len())
+                        .map(|i| arrow_value_to_json(&inner, i))
+                        .collect(),
+                )
+            }),
         _ => serde_json::Value::String(format!("<unsupported: {}>", col.data_type())),
     }
 }
@@ -462,9 +493,15 @@ pub(super) fn measurement_schema_to_info(
 ) -> MeasurementInfo {
     let mut columns = Vec::new();
 
-    // Timestamp column
+    // The timestamp column, under the name a query can use.
+    //
+    // It was reported as `timestamp`, which is the *storage* column name and
+    // the key each JSON row carries — but SQL knows it as `_time`, so a
+    // reader who did what this endpoint invites (read the schema, then write
+    // a query) got `No field named timestamp`. There is one name here, and it
+    // is the one every query surface accepts.
     columns.push(ColumnInfo {
-        name: "timestamp".to_string(),
+        name: chronix::sql::TIME_COLUMN.to_string(),
         role: "timestamp".to_string(),
         data_type: Some("int64".to_string()),
     });
@@ -514,7 +551,9 @@ mod tests {
         assert_eq!(info.name, "cpu");
         // timestamp + 2 tags + 2 fields = 5
         assert_eq!(info.columns.len(), 5);
-        assert_eq!(info.columns[0].name, "timestamp");
+        // The name a query accepts, not the storage column name: the
+        // endpoint exists to be read and then typed back in.
+        assert_eq!(info.columns[0].name, chronix::sql::TIME_COLUMN);
         assert_eq!(info.columns[0].role, "timestamp");
         assert_eq!(info.columns[1].name, "host");
         assert_eq!(info.columns[1].role, "tag");

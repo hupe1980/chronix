@@ -392,7 +392,7 @@ immediately rejected with `503 Service Unavailable` without entering the
 WAL/replication pipeline. This back-pressure mechanism prevents OOM kills
 and cascading failures during ingestion spikes.
 
-**Metric:** `chronix_admission_rejections_total`
+**Metric:** `chronix_write_admission_rejected_total`
 
 #### Circuit Breaker (Write Router)
 
@@ -409,7 +409,7 @@ and subsequent writes to that node fail fast without network round-trips:
 This prevents slow or crashed nodes from adding latency to the entire
 write path. Healthy nodes continue serving unaffected.
 
-**Metric:** `chronix_circuit_breaker_state` gauge (labels: `node_id`)
+**Metric:** `chronix_circuit_breaker_open_total` counter (labels: `node_id`) — incremented each time a node's breaker opens
 
 ### Read Path
 

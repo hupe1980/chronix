@@ -716,6 +716,27 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     connector_manager.stop_all().await;
     info!("connectors stopped");
 
+    // Let queued signals go out. Delivery runs on each channel's own worker
+    // so that a slow webhook cannot delay evaluation; the cost of that is
+    // that a signal which fired a moment before `SIGTERM` may still be
+    // queued, and dropping it silently is the one thing an alerting path
+    // must not do. Bounded, because a channel nobody can reach must not
+    // hold the process open.
+    if let Some(pipeline) = pipeline.clone() {
+        let flushed = tokio::task::spawn_blocking(move || {
+            pipeline
+                .delivery_router()
+                .flush(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap_or(false);
+        if flushed {
+            info!("signal delivery drained");
+        } else {
+            warn!("signal delivery did not drain within 5s — some signals were not sent");
+        }
+    }
+
     // Flush and close database
     let db_close = db.clone();
     if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -842,7 +863,10 @@ pub fn build_router(
             "/api/v1/triggers",
             get(http::list_triggers_handler).post(http::trigger_sql_handler),
         )
-        .route("/api/v1/triggers/{name}", delete(http::drop_trigger_handler))
+        .route(
+            "/api/v1/triggers/{name}",
+            get(http::get_trigger_handler).delete(http::drop_trigger_handler),
+        )
         .route("/api/v1/signals", get(http::list_signals_handler))
         // Grafana annotations
         .route("/api/v1/annotations", get(http::annotations_handler))
@@ -1089,6 +1113,12 @@ pub fn build_router(
     }
 
     router
+        // Outermost, so it also covers a path no route matches and a method
+        // no route accepts: every error this server returns is the same JSON
+        // envelope, whoever produced it.
+        .layer(axum::middleware::from_fn(
+            crate::error::error_envelope_layer,
+        ))
         .layer(TraceLayer::new_for_http())
         // CORS middleware for browser-based clients.
         // Configured via `cors_allowed_origins`:

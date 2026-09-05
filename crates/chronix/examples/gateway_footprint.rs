@@ -164,7 +164,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(&db),
     );
 
-    let _ = db.promql(r#"avg(rate(w{meter="m00"}[5m]))"#, base + 3_599_000_000_000)?;
+    // `power_w`, not `w`: a PromQL metric is `<measurement>_<field>`. Named
+    // `w`, this selected a measurement that does not exist and the example
+    // reported a successful rate over an empty result.
+    let rated = db.promql(
+        r#"avg(rate(power_w{meter="m00"}[5m]))"#,
+        base + 3_599_000_000_000,
+    )?;
+    assert!(
+        matches!(&rated, chronix::promql::PromQLValue::Vector(v) if !v.is_empty()),
+        "the PromQL row must measure a query that returned something: {rated:?}"
+    );
     row("PromQL rate over 5m", Some(&db));
 
     let stats = db.statistics();

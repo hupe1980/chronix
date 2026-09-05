@@ -67,6 +67,33 @@ pub struct LabelMatcher {
     pub value: String,
 }
 
+impl LabelMatcher {
+    /// Whether this matcher is satisfied by a series that does **not** carry
+    /// the label at all.
+    ///
+    /// An absent label reads as the empty string, so this is "does it match
+    /// the empty value". A selector made only of such matchers names the whole
+    /// database, which is why Prometheus refuses one.
+    ///
+    /// An invalid regex answers `false`; it is reported where the matcher is
+    /// compiled, and answering `true` here would turn a bad pattern into the
+    /// wrong error.
+    #[must_use]
+    pub fn matches_empty(&self) -> bool {
+        match self.op {
+            MatchOp::Equal => self.value.is_empty(),
+            MatchOp::NotEqual => !self.value.is_empty(),
+            MatchOp::RegexMatch | MatchOp::RegexNotMatch => {
+                // Anchored and `(?s)`, exactly as `CompiledMatcher` anchors.
+                let Ok(re) = regex::Regex::new(&format!("^(?s:{})$", self.value)) else {
+                    return false;
+                };
+                re.is_match("") == (self.op == MatchOp::RegexMatch)
+            }
+        }
+    }
+}
+
 /// Match operator for label matchers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchOp {

@@ -136,7 +136,7 @@ fn schema_to_arrow(ms: &MeasurementSchema, keep_namespace: bool) -> SchemaRef {
         .into_iter()
         .map(|col| match col.role {
             ColumnRole::Timestamp => Field::new(
-                "_time",
+                crate::sql::TIME_COLUMN,
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 false,
             ),
@@ -280,7 +280,7 @@ fn plan_predicate(
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::Operator;
 
-    if col_name == "_time" || col_name == "timestamp" || col_name == "time" {
+    if col_name == crate::sql::TIME_COLUMN || col_name == "timestamp" || col_name == "time" {
         // Only a literal that is genuinely a nanosecond instant, and only
         // the five range operators. `<>`, `IS DISTINCT FROM` and a
         // non-literal right-hand side are somebody else's job.

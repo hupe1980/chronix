@@ -277,8 +277,14 @@ impl std::fmt::Debug for GrpcAuthInterceptor {
 }
 
 impl GrpcAuthInterceptor {
-    /// Log a failed authentication attempt to the audit log.
+    /// Record a failed authentication attempt.
+    ///
+    /// The counter is unconditional; the audit event is not, because an audit
+    /// logger is optional. Without the counter a deployment that has not
+    /// configured one had no signal at all that credentials were being
+    /// refused — which is the signal the security checklist asks for.
     fn log_auth_failure(&self, reason: &str) {
+        metrics::counter!("chronix_auth_failures_total", "protocol" => "grpc").increment(1);
         if let Some(ref logger) = self.audit_logger {
             let event = chronix_security::audit::AuditEvent::new(
                 "anonymous",
@@ -623,6 +629,13 @@ pub async fn auth_layer(
                 }
             }
             warn!(path = %path, error = %mw_err, "authentication failed");
+            // A refused credential is a *rate*, not just a log line: the
+            // security checklist tells an operator to watch this for
+            // brute-force attempts, and the metric it named did not exist, so
+            // the alert was silently dead. Labelled by protocol rather than by
+            // principal — a failed credential has no trustworthy principal,
+            // and labelling by one would let an attacker mint cardinality.
+            metrics::counter!("chronix_auth_failures_total", "protocol" => "http").increment(1);
             // A refused credential is exactly the event an audit trail
             // exists for, and only the gRPC side was recording it.
             crate::audit::record(

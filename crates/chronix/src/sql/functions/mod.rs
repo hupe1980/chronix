@@ -65,8 +65,24 @@ use datafusion::prelude::SessionContext;
 
 use window::PartitionWindowUdf;
 
+/// The bounds a forecast aggregate is held to, from
+/// [`AnalyticsConfig`](chronix_core::AnalyticsConfig).
+///
+/// They were configuration nothing read. `SELECT forecast(v, _time, 2000000)`
+/// was accepted against a configured `max_forecast_horizon` of 8 760 and
+/// returned a two-million-element list in one cell — an unbounded allocation
+/// reachable from a read-only query, on a database whose target is a 512 MB
+/// gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForecastLimits {
+    /// Most predicted points one call may ask for.
+    pub max_horizon: usize,
+    /// Most input points one series may feed a model.
+    pub max_training_points: usize,
+}
+
 /// Register all Chronix custom SQL functions on a [`SessionContext`].
-pub fn register_udfs(ctx: &SessionContext) {
+pub fn register_udfs(ctx: &SessionContext, limits: ForecastLimits) {
     // ── Scalar ──────────────────────────────────────────────────────
     ctx.register_udf(ScalarUDF::new_from_impl(time_bucket::TimeBucketUdf::new()));
 
@@ -92,11 +108,13 @@ pub fn register_udfs(ctx: &SessionContext) {
     ctx.register_udaf(AggregateUDF::new_from_impl(aggregates::LastUdaf::new()));
     ctx.register_udaf(AggregateUDF::new_from_impl(aggregates::RateUdaf::new()));
     ctx.register_udaf(AggregateUDF::new_from_impl(aggregates::IRateUdaf::new()));
-    ctx.register_udaf(AggregateUDF::new_from_impl(aggregates::ForecastUdaf::new()));
+    ctx.register_udaf(AggregateUDF::new_from_impl(aggregates::ForecastUdaf::new(
+        limits,
+    )));
     ctx.register_udaf(AggregateUDF::new_from_impl(
-        aggregates::AutoForecastUdaf::new(),
+        aggregates::AutoForecastUdaf::new(limits),
     ));
     ctx.register_udaf(AggregateUDF::new_from_impl(
-        aggregates::MultivariateForecastUdaf::new(),
+        aggregates::MultivariateForecastUdaf::new(limits),
     ));
 }

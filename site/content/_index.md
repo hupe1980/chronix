@@ -48,7 +48,7 @@ curl -X POST localhost:8086/write \\
   --data-binary 'power,meter=main watts=231.45'
 
 # PromQL — the same request Grafana sends a Prometheus data source
-curl 'localhost:8086/api/v1/query?query=rate(power[5m])'
+curl 'localhost:8086/api/v1/query?query=rate(power_watts[5m])'
 ```
 """
 +++

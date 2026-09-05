@@ -621,6 +621,48 @@ impl IRateAccumulator {
 
 #[cfg(test)]
 mod tests {
+    /// `max_training_points` bounds the buffer a forecast model is fed, and
+    /// keeps the **newest** points — the ones a forecast is about.
+    ///
+    /// Tested here rather than through a query because simple exponential
+    /// smoothing converges to the recent level whatever history it is shown,
+    /// so an end-to-end assertion on the forecast's *value* cannot tell a
+    /// capped model from an uncapped one. The cap is a property of the
+    /// buffer; this is where the buffer is.
+    #[test]
+    fn ordered_keeps_only_the_newest_training_points() {
+        let limits = crate::sql::functions::ForecastLimits {
+            max_horizon: 8760,
+            max_training_points: 3,
+        };
+        let mut acc = super::SeriesAccumulator::new(super::ForecastKind::Univariate, limits);
+        for i in 0..10i64 {
+            acc.timestamps.push(i);
+            acc.values.push(i as f64);
+            acc.covariates.push(f64::NAN);
+        }
+        let (ts, v, _) = acc.ordered();
+        assert_eq!(ts, vec![7, 8, 9]);
+        assert_eq!(v, vec![7.0, 8.0, 9.0]);
+    }
+
+    /// A cap of zero means "no cap", so a configuration that does not set one
+    /// does not silently truncate to nothing.
+    #[test]
+    fn a_zero_cap_keeps_everything() {
+        let limits = crate::sql::functions::ForecastLimits {
+            max_horizon: 8760,
+            max_training_points: 0,
+        };
+        let mut acc = super::SeriesAccumulator::new(super::ForecastKind::Univariate, limits);
+        for i in 0..5i64 {
+            acc.timestamps.push(i);
+            acc.values.push(i as f64);
+            acc.covariates.push(f64::NAN);
+        }
+        assert_eq!(acc.ordered().0.len(), 5);
+    }
+
     use super::*;
     use arrow::array::{Float64Array, TimestampNanosecondArray};
     use std::sync::Arc;
@@ -815,12 +857,14 @@ mod tests {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct ForecastUdaf {
     signature: Signature,
+    limits: super::ForecastLimits,
 }
 
 impl ForecastUdaf {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(limits: super::ForecastLimits) -> Self {
         Self {
             signature: Signature::new(TypeSignature::Any(3), Volatility::Volatile),
+            limits,
         }
     }
 
@@ -843,7 +887,10 @@ impl AggregateUDFImpl for ForecastUdaf {
     }
 
     fn accumulator(&self, _acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
-        Ok(Box::new(SeriesAccumulator::new(ForecastKind::Univariate)))
+        Ok(Box::new(SeriesAccumulator::new(
+            ForecastKind::Univariate,
+            self.limits,
+        )))
     }
 
     fn state_fields(&self, _args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
@@ -862,12 +909,14 @@ impl AggregateUDFImpl for ForecastUdaf {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct MultivariateForecastUdaf {
     signature: Signature,
+    limits: super::ForecastLimits,
 }
 
 impl MultivariateForecastUdaf {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(limits: super::ForecastLimits) -> Self {
         Self {
             signature: Signature::new(TypeSignature::Any(4), Volatility::Volatile),
+            limits,
         }
     }
 }
@@ -886,7 +935,10 @@ impl AggregateUDFImpl for MultivariateForecastUdaf {
     }
 
     fn accumulator(&self, _acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
-        Ok(Box::new(SeriesAccumulator::new(ForecastKind::Multivariate)))
+        Ok(Box::new(SeriesAccumulator::new(
+            ForecastKind::Multivariate,
+            self.limits,
+        )))
     }
 
     fn state_fields(&self, _args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
@@ -910,12 +962,14 @@ impl AggregateUDFImpl for MultivariateForecastUdaf {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct AutoForecastUdaf {
     signature: Signature,
+    limits: super::ForecastLimits,
 }
 
 impl AutoForecastUdaf {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(limits: super::ForecastLimits) -> Self {
         Self {
             signature: Signature::new(TypeSignature::Any(3), Volatility::Volatile),
+            limits,
         }
     }
 }
@@ -934,7 +988,10 @@ impl AggregateUDFImpl for AutoForecastUdaf {
     }
 
     fn accumulator(&self, _acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
-        Ok(Box::new(SeriesAccumulator::new(ForecastKind::Auto)))
+        Ok(Box::new(SeriesAccumulator::new(
+            ForecastKind::Auto,
+            self.limits,
+        )))
     }
 
     fn state_fields(&self, _args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
@@ -963,16 +1020,18 @@ struct SeriesAccumulator {
     values: Vec<f64>,
     covariates: Vec<f64>,
     horizon: usize,
+    limits: super::ForecastLimits,
 }
 
 impl SeriesAccumulator {
-    fn new(kind: ForecastKind) -> Self {
+    fn new(kind: ForecastKind, limits: super::ForecastLimits) -> Self {
         Self {
             kind,
             timestamps: Vec::new(),
             values: Vec::new(),
             covariates: Vec::new(),
             horizon: 0,
+            limits,
         }
     }
 
@@ -1019,7 +1078,7 @@ impl SeriesAccumulator {
             return Ok(());
         }
         let raw = i.value(0);
-        self.horizon = usize::try_from(raw)
+        let horizon = usize::try_from(raw)
             .ok()
             .filter(|v| *v > 0)
             .ok_or_else(|| {
@@ -1027,10 +1086,29 @@ impl SeriesAccumulator {
                     "forecast: horizon must be positive, got {raw}"
                 ))
             })?;
+        // `analytics.max_forecast_horizon` was configuration nothing read, so
+        // one cell could be asked for millions of values. Refused rather than
+        // clamped: a silently shortened forecast is a wrong answer, and the
+        // caller asked for a number.
+        if horizon > self.limits.max_horizon {
+            return Err(datafusion::common::DataFusionError::Plan(format!(
+                "forecast: horizon {horizon} exceeds analytics.max_forecast_horizon \
+                 ({}); raise it in the configuration or ask for fewer points",
+                self.limits.max_horizon
+            )));
+        }
+        self.horizon = horizon;
         Ok(())
     }
 
-    /// The series, sorted by timestamp with duplicates keeping the last value.
+    /// The series, sorted by timestamp with duplicates keeping the last value,
+    /// and truncated to the most recent `max_training_points`.
+    ///
+    /// The accumulator buffers its whole input — it has to, because an
+    /// aggregate sees rows in the plan's order and a forecast needs them in
+    /// time order — so an unbounded group is an unbounded allocation. The
+    /// **newest** points are the ones a forecast wants, so the truncation
+    /// takes the tail rather than refusing the query.
     fn ordered(&self) -> (Vec<i64>, Vec<f64>, Vec<f64>) {
         let mut idx: Vec<usize> = (0..self.timestamps.len()).collect();
         idx.sort_by_key(|&i| self.timestamps[i]);
@@ -1048,6 +1126,13 @@ impl SeriesAccumulator {
             ts.push(self.timestamps[i]);
             v.push(self.values[i]);
             c.push(self.covariates.get(i).copied().unwrap_or(f64::NAN));
+        }
+        let cap = self.limits.max_training_points;
+        if cap > 0 && ts.len() > cap {
+            let drop = ts.len() - cap;
+            ts.drain(..drop);
+            v.drain(..drop);
+            c.drain(..drop);
         }
         (ts, v, c)
     }

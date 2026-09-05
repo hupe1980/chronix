@@ -63,9 +63,14 @@ pub struct ServerConfig {
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
 
-    /// Logging format: "text" or "json".
-    #[serde(default = "default_log_format")]
-    pub log_format: String,
+    /// Logging format.
+    ///
+    /// An enum rather than a `String`: the reader matched `"json"` and fell
+    /// through to the text formatter for everything else, so `log_format =
+    /// "jsom"` started the server with plain-text logs and said nothing —
+    /// and a log pipeline expecting JSON silently got none.
+    #[serde(default)]
+    pub log_format: LogFormat,
 
     /// Log level filter (e.g., "info", "debug", "chronixd=debug,chronix=info").
     #[serde(default = "default_log_level")]
@@ -721,7 +726,7 @@ impl Default for ServerConfig {
             metrics_path: default_metrics_path(),
             metrics_require_auth: default_metrics_require_auth(),
             max_body_size: default_max_body_size(),
-            log_format: default_log_format(),
+            log_format: LogFormat::default(),
             log_level: default_log_level(),
             grpc_keepalive_secs: default_grpc_keepalive_secs(),
             grpc_keepalive_timeout_secs: default_grpc_keepalive_timeout_secs(),
@@ -1147,8 +1152,25 @@ fn default_prom_max_result_bytes() -> usize {
     256 * 1024 * 1024 // matches ChronixConfig::max_query_result_bytes
 }
 
-fn default_log_format() -> String {
-    "text".to_string()
+/// How `chronixd` renders its logs.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// Human-readable, the default.
+    #[default]
+    Text,
+    /// One JSON object per line, for a log pipeline.
+    Json,
 }
 
 fn default_log_level() -> String {
@@ -1241,7 +1263,7 @@ mod tests {
         assert_eq!(config.flight_addr.port(), 8817);
         assert!(config.tls.is_none());
         assert_eq!(config.max_body_size, 10 * 1024 * 1024);
-        assert_eq!(config.log_format, "text");
+        assert_eq!(config.log_format, LogFormat::Text);
     }
 
     #[test]
@@ -1266,7 +1288,7 @@ mod tests {
         assert_eq!(config.http_addr.port(), 9086);
         assert_eq!(config.grpc_addr.port(), 9087);
         assert_eq!(config.flight_addr.port(), 9817);
-        assert_eq!(config.log_format, "json");
+        assert_eq!(config.log_format, LogFormat::Json);
         assert_eq!(config.log_level, "debug");
         assert_eq!(config.max_body_size, 5 * 1024 * 1024);
         assert_eq!(config.database.data_dir, PathBuf::from("/var/lib/chronix"));

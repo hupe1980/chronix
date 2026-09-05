@@ -298,7 +298,7 @@ async fn remote_read_applies_every_matcher_type() {
         db.insert(
             &Point::new(
                 SeriesKey::new(measurement, [("job".to_string(), job.to_string())].into()).unwrap(),
-                [("v".to_string(), FieldValue::F64(1.0))].into(),
+                [("value".to_string(), FieldValue::F64(1.0))].into(),
                 1_700_000_000_000_000_000,
             )
             .unwrap(),
@@ -361,4 +361,55 @@ async fn remote_read_applies_every_matcher_type() {
 
     // The server's own namespace tag is never returned as a label.
     assert!(series.iter().all(|s| !s.contains_key("__namespace__")));
+}
+
+/// Remote read addresses **metrics**, not measurements.
+///
+/// It resolved `__name__` to a measurement and then took "the first non-string
+/// column" as the value, so a federating Prometheus asking for `disk_read`
+/// got nothing, asking for `disk` got whichever field sorted first under the
+/// measurement's name, and the other field did not exist as far as the wire
+/// was concerned.
+#[tokio::test]
+async fn remote_read_reads_one_field_per_metric() {
+    const EQ: i32 = 0;
+    const RE: i32 = 2;
+
+    let (base, _tmp, db) = server().await;
+    db.insert(
+        &Point::new(
+            SeriesKey::new("disk", [("dev".to_string(), "sda".to_string())].into()).unwrap(),
+            [
+                ("read".to_string(), FieldValue::F64(7.0)),
+                ("write".to_string(), FieldValue::F64(11.0)),
+            ]
+            .into(),
+            1_700_000_000_000_000_000,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    db.flush().unwrap();
+
+    // The measurement is not a metric: its fields carry names of their own.
+    let series = read_series(&base, read_request(vec![matcher(EQ, "__name__", "disk")])).await;
+    assert!(series.is_empty(), "{series:?}");
+
+    let series = read_series(
+        &base,
+        read_request(vec![matcher(EQ, "__name__", "disk_read")]),
+    )
+    .await;
+    assert_eq!(series.len(), 1, "{series:?}");
+    assert_eq!(series[0]["__name__"], "disk_read");
+
+    // A regex matches the metric name, and both fields answer separately.
+    let mut names: Vec<String> =
+        read_series(&base, read_request(vec![matcher(RE, "__name__", "disk.+")]))
+            .await
+            .into_iter()
+            .map(|s| s["__name__"].clone())
+            .collect();
+    names.sort();
+    assert_eq!(names, ["disk_read", "disk_write"]);
 }

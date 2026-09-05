@@ -11,6 +11,12 @@
   "description": {{ page.description | default(value=config.description) | json_encode() | safe }},
   "url": {{ page.permalink | json_encode() | safe }},
   "inLanguage": "en",
+{#- Present when the build stamped it from git (`scripts/stamp-lastmod.sh`);
+    omitted rather than guessed on a local build, because a wrong date is
+    worse than none. -#}
+{%- if page.updated %}
+  "dateModified": {{ page.updated | json_encode() | safe }},
+{%- endif %}
   "isPartOf": {
     "@type": "WebSite",
     "name": {{ config.title | json_encode() | safe }},

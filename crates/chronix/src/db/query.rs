@@ -33,6 +33,19 @@ pub(super) struct SegmentFilterCtx<'a> {
     pub(super) tag_col_names: Option<&'a [&'a str]>,
 }
 
+/// The Arrow field-metadata key that carries a column's role.
+///
+/// Read by `chronixd`'s HTTP, gRPC and Flight SQL result encoders, and by the
+/// series-key extractor. Public so an embedded caller reading batches from
+/// `execute_iter` can tell a tag from a string field without guessing.
+pub const ROLE_KEY: &str = "role";
+
+/// `role` metadata for one column.
+#[must_use]
+pub fn role_metadata(role: chronix_core::ColumnRole) -> std::collections::HashMap<String, String> {
+    [(ROLE_KEY.to_string(), role.to_string())].into()
+}
+
 impl super::Chronix {
     /// Start building a query using the fluent builder API.
     ///
@@ -838,6 +851,59 @@ impl super::Chronix {
     ///
     /// If `projection` is non-empty, only the timestamp and projected fields
     /// (plus tags) are included.
+    /// Rewrite a scan batch's schema so every column says what it *is*.
+    ///
+    /// The producers — the memtable's builder, the segment reader, the
+    /// compaction writer — build an Arrow schema from a column's *type*, and
+    /// a role is not a type: a tag and a string field are both `Utf8`. The
+    /// role was known at write time, dropped here, and then guessed again by
+    /// four consumers with three different guesses. The HTTP and gRPC query
+    /// APIs guessed "not tag", so every tag came back as a field and `tags`
+    /// was always empty; Flight SQL guessed "not field", so a string *field*
+    /// came back as a tag; and the series-key extractor guessed the same way,
+    /// which puts a string field into a `SeriesKey`.
+    ///
+    /// So the role is stamped once, here, from the registry that owns it, and
+    /// the consumers read it. It costs a `Schema` per batch — the column
+    /// arrays are shared, not copied — and it makes the batch self-describing
+    /// for an external Flight SQL client too.
+    pub(super) fn stamp_roles(&self, measurement: &str, batch: RecordBatch) -> RecordBatch {
+        let Some(ms) = self.schema(measurement) else {
+            return batch;
+        };
+        let schema = batch.schema();
+        if schema
+            .fields()
+            .iter()
+            .all(|f| f.metadata().contains_key(ROLE_KEY))
+        {
+            return batch;
+        }
+        let fields: Vec<arrow::datatypes::Field> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let role = if f.name() == "timestamp" || f.name() == "time" || f.name() == "_time" {
+                    Some(chronix_core::ColumnRole::Timestamp)
+                } else {
+                    // A column the registry does not know is one a query node
+                    // computed — an aggregate's output, say. It is a value,
+                    // which is what `Field` means here.
+                    Some(
+                        ms.column(f.name())
+                            .map_or(chronix_core::ColumnRole::Field, |c| c.role),
+                    )
+                };
+                match role {
+                    None => f.as_ref().clone(),
+                    Some(role) => f.as_ref().clone().with_metadata(role_metadata(role)),
+                }
+            })
+            .collect();
+        let stamped = Arc::new(arrow::datatypes::Schema::new(fields));
+        RecordBatch::try_new(stamped, batch.columns().to_vec()).unwrap_or(batch)
+    }
+
     pub(super) fn measurement_to_arrow_schema(
         ms: &MeasurementSchema,
         projection: &[String],
@@ -871,7 +937,7 @@ impl super::Chronix {
                 } else {
                     col.name.clone()
                 };
-                Field::new(name, dt, true)
+                Field::new(name, dt, true).with_metadata(role_metadata(col.role))
             })
             .collect();
         Arc::new(arrow::datatypes::Schema::new(fields))
@@ -1017,20 +1083,17 @@ impl super::Chronix {
         use std::collections::BTreeMap as StdBTreeMap;
 
         let schema = batch.schema();
-        // Identify tag columns: fields with metadata role=tag, or all Utf8 except timestamp
+        // Tag columns say so. The fallback that stood here — "any `Utf8`
+        // column that is not the timestamp" — put a **string field** into the
+        // series key, because a tag and a string field are the same Arrow
+        // type. `stamp_roles` puts the answer on the batch; a column that
+        // still carries no role is one a query node computed, and a computed
+        // column is not part of a series key either.
         let tag_cols: Vec<(usize, &str)> = schema
             .fields()
             .iter()
             .enumerate()
-            .filter(|(_, f)| {
-                if f.name() == "timestamp" {
-                    return false;
-                }
-                if let Some(meta) = f.metadata().get("role") {
-                    return meta == "tag";
-                }
-                f.data_type() == &arrow::datatypes::DataType::Utf8
-            })
+            .filter(|(_, f)| f.metadata().get(super::ROLE_KEY).map(String::as_str) == Some("tag"))
             .map(|(i, f)| (i, f.name().as_str()))
             .collect();
 

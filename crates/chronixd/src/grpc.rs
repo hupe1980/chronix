@@ -831,9 +831,12 @@ fn record_batch_to_proto_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<p
                     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
                         if !arr.is_null(row_idx) {
                             let val = arr.value(row_idx).to_string();
+                            // The scan stamps the role: a tag and a string
+                            // field are the same Arrow type, so without it
+                            // every tag was reported as a field.
                             if field
                                 .metadata()
-                                .get("role")
+                                .get(chronix::db::ROLE_KEY)
                                 .map(std::string::String::as_str)
                                 == Some("tag")
                             {

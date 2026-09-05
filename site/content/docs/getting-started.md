@@ -142,8 +142,14 @@ ChronixExec: measurement=cpu, time=[1700000000000000000..9223372036854775807], f
 Grafana sends a Prometheus data source:
 
 ```bash
-curl 'localhost:8086/api/v1/query?query=rate(cpu[5m])'
+curl 'localhost:8086/api/v1/query?query=rate(cpu_usage_idle[5m])'
 ```
+
+The metric is `cpu_usage_idle`, not `cpu`: a measurement holds several fields
+and a PromQL metric holds one value, so each field is its own metric named
+`<measurement>_<field>`. A field called `value` — which is how Prometheus
+remote write and OTLP store a sample — gives the measurement name alone.
+`curl localhost:8086/api/v1/label/__name__/values` lists the names that exist.
 
 **Analytics in the query**, rather than in a service beside it:
 

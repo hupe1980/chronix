@@ -31,7 +31,11 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
+      # Full history: `stamp-lastmod.sh` reads each page's last commit date,
+      # and a shallow clone has none for most files.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Zola
         run: |
@@ -43,6 +47,13 @@ jobs:
 
       - uses: actions/configure-pages@v5
         id: pages
+
+      # `<lastmod>` in the sitemap, from git rather than from a hand-kept date
+      # that would go stale — and a `lastmod` a crawler learns to distrust is
+      # worse than none. Rewrites the checkout in place, which is why it runs
+      # here rather than as a commit.
+      - name: Stamp page dates
+        run: ./scripts/stamp-lastmod.sh
 
       # `base_url` must match where the site is actually served, or every
       # absolute URL — canonical tags, Open Graph, the sitemap — points at a

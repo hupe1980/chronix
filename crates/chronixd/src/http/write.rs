@@ -18,6 +18,7 @@ use super::types::AppState;
 
 /// JSON body for a single write point.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WritePointRequest {
     /// Target measurement name.
     pub measurement: String,

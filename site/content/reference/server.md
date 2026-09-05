@@ -255,7 +255,7 @@ Common parsing and conversion utilities shared across HTTP, Kafka, and MQTT:
 | `chronix_grpc_points_written_total` | Counter | Points written via gRPC |
 | `chronix_grpc_queries_total` | Counter | Queries executed via gRPC |
 | `chronix_kafka_messages_consumed_total` | Counter | Messages consumed from Kafka topics |
-| `chronix_kafka_consumer_lag` | Gauge | Kafka consumer lag (messages behind) |
+| `chronix_kafka_consumer_lag` | Gauge | Kafka consumer lag in messages, summed over the connector's assigned partitions and labelled `connector`. Read from the watermarks the last fetch response already carried, so it costs no broker round trip |
 | `chronix_kafka_deserialization_errors_total` | Counter | Kafka payload deserialization failures |
 | `chronix_mqtt_messages_received_total` | Counter | Messages received from MQTT topics |
 | `chronix_mqtt_reconnections_total` | Counter | MQTT broker reconnection count |
@@ -307,7 +307,7 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | `chronix_cold_archive_rows_total` | Counter | `archive_cold_segments()` | Rows written to the archive, after dedup and tombstones |
 | `chronix_rollup_points_written_total` | Counter | `materialise_rollups()` | Rollup points written by materialisation |
 | `chronix_retention_segments_awaiting_rollup_total` | Counter | `enforce_retention()` | Expired segments preserved because a rollup they feed is not yet materialised past them |
-| `chronix_rollup_rows_processed_total` | Counter | `compact()` | Number of input rows processed for rollup aggregation |
+| `chronix_rollup_points_written_total` | Counter | `compact()` | Number of input rows processed for rollup aggregation |
 | `chronix_forecast_fit_duration_seconds` | Histogram | `chronix-analytics::forecast` | Duration of model fit operations |
 | `chronix_forecast_predict_duration_seconds` | Histogram | `chronix-analytics::forecast` | Duration of model predict operations |
 | `chronix_anomaly_fit_duration_seconds` | Histogram | `chronix-analytics::anomaly` | Duration of anomaly detector fit |
@@ -331,6 +331,14 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | `chronix_multivariate_anomaly_detect_duration_seconds` | Histogram | `chronix-analytics::multivariate` | Duration of MV anomaly detection |
 | `chronix_derived_series_eval_duration_seconds` | Histogram | `chronix-analytics::multivariate` | Duration of derived series evaluation |
 | `chronix_composite_signal_fired_total` | Counter | `chronix-analytics::multivariate` | Composite signals fired |
+| `chronix_signal_delivery_queued_total` | Counter | `DeliveryRouter::deliver` | Signals queued for delivery. Delivery runs on each channel's own worker, so this counts what was handed over, not what was sent |
+| `chronix_signal_delivery_total` | Counter | delivery worker | Signals delivered, labelled `channel` |
+| `chronix_signal_delivery_failed_total` | Counter | delivery worker | Delivery attempts that failed, labelled `channel`. A retried signal counts once per attempt |
+| `chronix_signal_delivery_duration_seconds` | Histogram | delivery worker | Time from queueing to a successful delivery, **including retries**, labelled `channel`. A channel that only succeeds on its third attempt looks healthy by the success counter and is not |
+| `chronix_signal_delivery_queue_depth` | Gauge | `DeliveryRouter::deliver` | Signals waiting on a channel's worker, labelled `channel`. A channel that is slow or unreachable grows here first |
+| `chronix_signal_delivery_dropped_total` | Counter | `DeliveryRouter::deliver` | Signals discarded because a channel's queue was full, labelled `channel`. **Any non-zero rate means alerts are being lost** — raise the capacity or fix the channel |
+| `chronix_signal_delivery_unrouted_total` | Counter | `DeliveryRouter::deliver` | Signals naming a channel that is not registered, so they fired and went nowhere |
+| `chronix_signal_evicted_total` | Counter | `SignalStore::store` | Signals evicted from a namespace's ring to make room. The ring is per namespace, so this never means another tenant pushed yours out |
 
 **Tracing instrumentation** – All forecast `fit()`/`predict()` and anomaly `fit()`/`detect()` operations are annotated with `#[tracing::instrument]` spans at debug level, enabling timing analysis via any `tracing-subscriber` backend.
 ## Distributed Tracing (`chronixd::otel`)

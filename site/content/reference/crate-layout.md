@@ -126,6 +126,8 @@ let config = ChronixConfig::builder()
 ```
 
 Configuration is also loadable from TOML files via `ChronixConfig::from_toml()`.
+A file sets only what it changes — every field defaults — while a *misspelled*
+key is an error rather than a setting that is silently ignored.
 Both builder and TOML paths apply the same validation rules (flush threshold,
 memory limits, shard duration, retention, concurrency, WAL settings, and
 max series cardinality must all be > 0 and internally consistent). Invalid

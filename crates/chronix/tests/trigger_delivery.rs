@@ -57,6 +57,10 @@ fn signal_for(trigger: &str, targets: &[&str]) -> SignalEvent {
 }
 
 /// Two triggers naming two channels must reach one each, not both.
+/// Long enough that a loaded machine does not fail the test, short enough
+/// that a genuinely stuck worker does not hang the suite.
+const FLUSH: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[test]
 fn a_signal_goes_only_to_the_channels_its_trigger_named() {
     let pipeline = Pipeline::with_config(PipelineConfig {
@@ -75,15 +79,18 @@ fn a_signal_goes_only_to_the_channels_its_trigger_named() {
         seen: b.clone(),
     }));
 
+    // `deliver` queues on the channel's own worker; `flush` waits for it.
     pipeline
         .delivery_router()
         .deliver(&signal_for("t1", &["chan-a"]));
+    assert!(pipeline.delivery_router().flush(FLUSH));
     assert_eq!(a.load(Ordering::SeqCst), 1);
     assert_eq!(b.load(Ordering::SeqCst), 0, "chan-b was not asked for");
 
     pipeline
         .delivery_router()
         .deliver(&signal_for("t2", &["chan-b"]));
+    assert!(pipeline.delivery_router().flush(FLUSH));
     assert_eq!(a.load(Ordering::SeqCst), 1);
     assert_eq!(b.load(Ordering::SeqCst), 1);
 }
@@ -109,6 +116,7 @@ fn a_signal_with_no_targets_goes_to_every_channel() {
     pipeline
         .delivery_router()
         .deliver(&signal_for("alert", &[]));
+    assert!(pipeline.delivery_router().flush(FLUSH));
     assert_eq!(a.load(Ordering::SeqCst), 1);
     assert_eq!(b.load(Ordering::SeqCst), 1);
 }
@@ -230,6 +238,7 @@ fn a_write_reaches_the_channel_the_trigger_named() {
     });
 
     assert_eq!(fired, 1, "the trigger must fire on a breaching write");
+    assert!(pipeline.delivery_router().flush(FLUSH));
     assert_eq!(
         hot.load(Ordering::SeqCst),
         1,
@@ -298,6 +307,7 @@ fn a_scoped_trigger_only_sees_its_own_namespace() {
 
     // Tenant B breaches the threshold. Tenant A's trigger must ignore it.
     pipeline.process_cdc_event(&point_event(Some("tenant-b"), 99.0, 1));
+    assert!(pipeline.delivery_router().flush(FLUSH));
     assert_eq!(
         seen.load(Ordering::SeqCst),
         0,
@@ -306,6 +316,7 @@ fn a_scoped_trigger_only_sees_its_own_namespace() {
 
     // Tenant A breaches it.
     pipeline.process_cdc_event(&point_event(Some("tenant-a"), 99.0, 2));
+    assert!(pipeline.delivery_router().flush(FLUSH));
     assert_eq!(seen.load(Ordering::SeqCst), 1);
 }
 
@@ -476,5 +487,104 @@ fn a_signal_is_stored_even_when_delivery_fails() {
         pipeline.signal_store().all().len(),
         1,
         "the signal must be recorded even though every delivery attempt failed"
+    );
+}
+
+/// A trigger can watch a **rollup tier**, not only a raw measurement.
+///
+/// The backlog said it could not. It can: materialisation writes its points
+/// through the ordinary write path, so the target measurement publishes the
+/// same `PointWritten` events any other write does, and the DSL's
+/// `<field> <op> <value>` names a rollup's aggregate column as readily as a
+/// raw field. What was missing was a test saying so.
+#[test]
+fn a_trigger_can_watch_a_rollup_tier() {
+    use chronix::prelude::*;
+    use std::time::Duration;
+
+    const MIN: i64 = 60_000_000_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        Chronix::open(
+            ChronixConfig::builder()
+                .data_dir(dir.path())
+                .shard_duration(Duration::from_secs(600))
+                .build()
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    db.create_rollup(
+        RollupBuilder::new()
+            .name("r")
+            .source("raw")
+            .target("raw_1m")
+            .interval_ns(MIN)
+            .aggregation(RollupAggFn::Avg)
+            .group_by("h")
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let pipeline = Pipeline::with_config(PipelineConfig {
+        enable_log_delivery: false,
+        enable_metric_delivery: false,
+        ..PipelineConfig::default()
+    });
+    let seen = Arc::new(AtomicUsize::new(0));
+    pipeline.delivery_router().add_channel(Box::new(Recorder {
+        // Named `log` because that is the channel the DSL accepts; the
+        // recorder stands in for it, as the other tests here do.
+        name: "log".into(),
+        seen: seen.clone(),
+    }));
+    // The rollup's own column, `v_avg` — an aggregate, not a raw field.
+    pipeline
+        .execute_signal_sql("CREATE TRIGGER hot_avg ON raw_1m WHEN v_avg > 100.0 DELIVER log")
+        .expect("a trigger on a rollup target must be accepted");
+
+    // A minute whose average is well over the threshold.
+    let mut points = Vec::new();
+    for i in 0..60i64 {
+        points.push(
+            Point::new(
+                SeriesKey::new("raw", chronix::tags! { "h" => "a" }).unwrap(),
+                chronix::fields! { "v" => 500.0 + i as f64 },
+                i * 1_000_000_000,
+            )
+            .unwrap(),
+        );
+    }
+    db.insert_batch(&points).unwrap().into_complete().unwrap();
+    // A point far ahead, so the first minute is past the live floor and final.
+    db.insert(
+        &Point::new(
+            SeriesKey::new("raw", chronix::tags! { "h" => "a" }).unwrap(),
+            chronix::fields! { "v" => 1.0 },
+            40 * MIN,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    db.flush().unwrap();
+
+    // Feed the materialisation's own CDC events through the pipeline, which is
+    // what `spawn_cdc_listener` does in the server.
+    let mut sub = db.event_bus().try_subscribe().expect("subscribe");
+    let written = db.materialise_rollups().unwrap();
+    assert!(written > 0, "the rollup must have materialised something");
+
+    let mut fired = 0;
+    while let Some(event) = sub.try_recv() {
+        fired += pipeline.process_cdc_event(&event);
+    }
+    assert!(pipeline.delivery_router().flush(FLUSH));
+
+    assert!(fired > 0, "a trigger on a rollup tier must fire");
+    assert!(
+        seen.load(Ordering::SeqCst) > 0,
+        "and its signal must reach the channel it named"
     );
 }

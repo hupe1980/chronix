@@ -6,6 +6,7 @@
 use chronix::prelude::*;
 use chronix::rollup::{RollupAggFn, RollupBuilder};
 use chronix::{fields, tags, Chronix};
+use std::time::Duration;
 
 const HOUR: i64 = 3_600_000_000_000;
 const MINUTE: i64 = 60_000_000_000;
@@ -558,7 +559,9 @@ fn retention_waits_for_a_pending_repair() {
 
     // A retention pass that runs before the repair must keep the raw data.
     let raw_before = scan(&db, "raw").num_rows();
-    let result = db.enforce_retention(24 * 3600 * 1_000_000_000).unwrap();
+    let result = db
+        .enforce_retention(Duration::from_secs(24 * 3600))
+        .unwrap();
     assert!(
         scan(&db, "raw").num_rows() > 0,
         "raw data was dropped while its rollup was still stale ({} segments deleted, {} rows before)",

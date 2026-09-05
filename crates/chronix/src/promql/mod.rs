@@ -13,6 +13,7 @@
 pub mod ast;
 pub mod eval;
 mod lexer;
+pub mod metric;
 mod parser;
 
 // Named rather than globbed: `pub use ast::*` makes every future item in
@@ -23,4 +24,5 @@ pub use ast::{
     MatchOp, PromQLValue, Sample, Series, UnaryOp, VectorMatching, VectorMatchingCardinality,
 };
 pub use eval::{compile_label_matchers, label_set_matches, CompiledMatcher, PromQLEvaluator};
+pub use metric::{all_metrics, metric_name, metrics_of, MetricRef, VALUE_FIELD};
 pub use parser::{parse, ParseError};

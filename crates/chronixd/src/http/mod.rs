@@ -44,7 +44,7 @@ pub use prom_params::{parse_duration_ns, parse_time_ns, PromParams};
 pub use query::{query_explain_handler, query_handler, sql_handler};
 pub use streaming::{annotations_handler, annotations_stream_handler, cdc_stream_handler};
 pub use triggers::{
-    drop_trigger_handler, list_signals_handler, list_triggers_handler, trigger_sql_handler,
-    SignalView, TriggerResponse, TriggerSqlRequest, TriggerView,
+    drop_trigger_handler, get_trigger_handler, list_signals_handler, list_triggers_handler,
+    trigger_sql_handler, SignalView, TriggerResponse, TriggerSqlRequest, TriggerView,
 };
 pub use write::{write_handler, write_influx_handler};

@@ -202,82 +202,6 @@ impl Default for AnalyticsConfig {
 
 // ─── Per-measurement Analytics Overrides ────────────────────────────
 
-/// Per-measurement analytics configuration overrides.
-/// Only fields set to `Some(…)` override the global defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AnalyticsOverride {
-    /// Override for the default forecast model.
-    pub forecast_model: Option<String>,
-    /// Override for the default anomaly method.
-    pub anomaly_method: Option<String>,
-    /// Override for the default confidence level.
-    pub confidence_level: Option<f64>,
-    /// Override for the default anomaly threshold.
-    pub anomaly_threshold: Option<f64>,
-    /// Override for the max forecast horizon.
-    pub max_forecast_horizon: Option<usize>,
-}
-
-// ─── Multivariate Analysis Configuration ────────────────────────────
-
-/// Configuration for the multivariate analysis engine.
-///
-/// Configurable via TOML under the `[multivariate]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MultivariateConfig {
-    /// Maximum number of series per analysis context (default: 100).
-    #[serde(default = "mv_default_max_series")]
-    pub max_series_per_context: usize,
-    /// Default interpolation strategy for time alignment (linear, nearest, spline, nan).
-    #[serde(default = "mv_default_interpolation")]
-    pub default_interpolation: String,
-    /// Default rolling window size for rolling correlation (default: 1000).
-    #[serde(default = "mv_default_rolling_window")]
-    pub rolling_window_size: usize,
-    /// Composite signal cooldown in seconds (default: 60).
-    #[serde(default = "mv_default_cooldown_secs")]
-    pub composite_signal_cooldown_secs: u64,
-    /// PCA variance retention threshold (default: 0.95).
-    #[serde(default = "mv_default_pca_threshold")]
-    pub pca_variance_threshold: f64,
-    /// Maximum VAR lag order (default: 10).
-    #[serde(default = "mv_default_var_max_lag")]
-    pub var_max_lag: usize,
-}
-
-fn mv_default_max_series() -> usize {
-    100
-}
-fn mv_default_interpolation() -> String {
-    "linear".into()
-}
-fn mv_default_rolling_window() -> usize {
-    1000
-}
-fn mv_default_cooldown_secs() -> u64 {
-    60
-}
-fn mv_default_pca_threshold() -> f64 {
-    0.95
-}
-fn mv_default_var_max_lag() -> usize {
-    10
-}
-
-impl Default for MultivariateConfig {
-    fn default() -> Self {
-        Self {
-            max_series_per_context: mv_default_max_series(),
-            default_interpolation: mv_default_interpolation(),
-            rolling_window_size: mv_default_rolling_window(),
-            composite_signal_cooldown_secs: mv_default_cooldown_secs(),
-            pca_variance_threshold: mv_default_pca_threshold(),
-            var_max_lag: mv_default_var_max_lag(),
-        }
-    }
-}
-
 /// Default Zstd compression level.
 const fn default_zstd_level() -> i32 {
     3
@@ -286,8 +210,19 @@ const fn default_zstd_level() -> i32 {
 /// Top-level database configuration.
 ///
 /// Constructed via the builder pattern: `ChronixConfig::builder()`.
+/// Every field defaults, so a TOML file may set only what it changes.
+///
+/// Without this, `from_toml` required **all twenty-five** settings to be
+/// present and answered a file that set only `data_dir` with `TOML parse
+/// error at line 1, column 1` — no field named, no hint. There is no such
+/// thing as a config file a person writes that lists every setting, so the
+/// loader could not load anything anybody would write.
+///
+/// `deny_unknown_fields` stays: a key that is *misspelled* must still be an
+/// error, because a silently ignored setting is the failure this whole file
+/// has been bitten by.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct ChronixConfig {
     /// Path to the data directory.
     pub data_dir: PathBuf,
@@ -383,12 +318,6 @@ pub struct ChronixConfig {
     /// Analytics engine configuration.
     #[serde(default)]
     pub analytics: AnalyticsConfig,
-    /// Multivariate analysis engine configuration.
-    #[serde(default)]
-    pub multivariate: MultivariateConfig,
-    /// Per-measurement analytics configuration overrides.
-    #[serde(default)]
-    pub measurement_analytics: HashMap<String, AnalyticsOverride>,
     /// Soft-delete TTL for dropped measurements.
     ///
     /// When set, `drop_measurement` marks the measurement as "pending
@@ -411,6 +340,18 @@ pub struct ChronixConfig {
     /// the next restart.
     #[serde(default = "default_future_write_tolerance")]
     pub future_write_tolerance: Duration,
+}
+
+impl Default for ChronixConfig {
+    fn default() -> Self {
+        // Through the builder, so the defaults have one definition rather
+        // than two that can disagree. `data_dir` matches the server's own
+        // default, which is what an operator who omits it expects.
+        ChronixConfigBuilder::default()
+            .data_dir("./chronix-data")
+            .build()
+            .expect("the builder's own defaults must be valid")
+    }
 }
 
 impl ChronixConfig {
@@ -453,33 +394,6 @@ impl ChronixConfig {
     #[must_use]
     pub fn builder() -> ChronixConfigBuilder {
         ChronixConfigBuilder::default()
-    }
-
-    /// Returns effective analytics config for a measurement, applying any per-measurement overrides.
-    #[must_use]
-    pub fn effective_analytics(&self, measurement: &str) -> AnalyticsConfig {
-        let base = &self.analytics;
-        match self.measurement_analytics.get(measurement) {
-            None => base.clone(),
-            Some(ov) => AnalyticsConfig {
-                default_forecast_model: ov
-                    .forecast_model
-                    .clone()
-                    .unwrap_or_else(|| base.default_forecast_model.clone()),
-                default_anomaly_method: ov
-                    .anomaly_method
-                    .clone()
-                    .unwrap_or_else(|| base.default_anomaly_method.clone()),
-                default_confidence_level: ov
-                    .confidence_level
-                    .unwrap_or(base.default_confidence_level),
-                default_anomaly_threshold: ov
-                    .anomaly_threshold
-                    .unwrap_or(base.default_anomaly_threshold),
-                max_forecast_horizon: ov.max_forecast_horizon.unwrap_or(base.max_forecast_horizon),
-                max_training_points: base.max_training_points,
-            },
-        }
     }
 
     /// Load configuration from a TOML file, then apply builder overrides.
@@ -570,29 +484,6 @@ impl ChronixConfig {
                 message: "analytics.max_training_points must be > 0".into(),
             });
         }
-        if self.analytics.default_anomaly_threshold <= 0.0 {
-            return Err(ConfigError::Validation {
-                message: format!(
-                    "analytics.default_anomaly_threshold must be > 0.0, got {}",
-                    self.analytics.default_anomaly_threshold
-                ),
-            });
-        }
-        if self.multivariate.max_series_per_context == 0 {
-            return Err(ConfigError::Validation {
-                message: "multivariate.max_series_per_context must be > 0".into(),
-            });
-        }
-        if self.multivariate.rolling_window_size == 0 {
-            return Err(ConfigError::Validation {
-                message: "multivariate.rolling_window_size must be > 0".into(),
-            });
-        }
-        if self.multivariate.var_max_lag == 0 {
-            return Err(ConfigError::Validation {
-                message: "multivariate.var_max_lag must be > 0".into(),
-            });
-        }
         Ok(())
     }
 }
@@ -623,8 +514,6 @@ pub struct ChronixConfigBuilder {
     per_query_memory_limit: usize,
     query_timeout: Duration,
     analytics: AnalyticsConfig,
-    multivariate: MultivariateConfig,
-    measurement_analytics: HashMap<String, AnalyticsOverride>,
     soft_delete_ttl: Option<Duration>,
     future_write_tolerance: Duration,
 }
@@ -655,8 +544,6 @@ impl Default for ChronixConfigBuilder {
             per_query_memory_limit: default_per_query_memory_limit(),
             query_timeout: default_query_timeout(),
             analytics: AnalyticsConfig::default(),
-            multivariate: MultivariateConfig::default(),
-            measurement_analytics: HashMap::new(),
             soft_delete_ttl: None,
             future_write_tolerance: default_future_write_tolerance(),
         }
@@ -852,13 +739,6 @@ impl ChronixConfigBuilder {
         self
     }
 
-    /// Set the multivariate analysis engine configuration.
-    #[must_use]
-    pub fn multivariate(mut self, config: MultivariateConfig) -> Self {
-        self.multivariate = config;
-        self
-    }
-
     /// Set the soft-delete TTL for dropped measurements.
     ///
     /// When set, `drop_measurement` marks the measurement as pending
@@ -876,18 +756,6 @@ impl ChronixConfigBuilder {
         self
     }
 
-    /// Add a per-measurement analytics override.
-    #[must_use]
-    pub fn measurement_analytics_override(
-        mut self,
-        measurement: &str,
-        override_config: AnalyticsOverride,
-    ) -> Self {
-        self.measurement_analytics
-            .insert(measurement.to_string(), override_config);
-        self
-    }
-
     /// Build the configuration, validating all constraints.
     ///
     /// # Errors
@@ -895,23 +763,6 @@ impl ChronixConfigBuilder {
     /// Returns [`ConfigError`] if a required field is missing or a constraint
     /// is violated.
     pub fn build(self) -> Result<ChronixConfig, ConfigError> {
-        const VALID_FORECAST_MODELS: &[&str] = &[
-            "ses",
-            "holt",
-            "holt_winters",
-            "arima",
-            "sarima",
-            "linear_regression",
-        ];
-        const VALID_ANOMALY_METHODS: &[&str] = &[
-            "zscore",
-            "modified_zscore",
-            "iqr",
-            "forecast_residual",
-            "moving_average",
-            "dynamic_threshold",
-        ];
-
         let data_dir = self
             .data_dir
             .ok_or(ConfigError::MissingField { field: "data_dir" })?;
@@ -942,8 +793,6 @@ impl ChronixConfigBuilder {
             per_query_memory_limit: self.per_query_memory_limit,
             query_timeout: self.query_timeout,
             analytics: self.analytics,
-            multivariate: self.multivariate,
-            measurement_analytics: self.measurement_analytics,
             soft_delete_ttl: self.soft_delete_ttl,
             future_write_tolerance: self.future_write_tolerance,
         };
@@ -958,42 +807,6 @@ impl ChronixConfigBuilder {
             tracing::warn!("segment_cache_size is 0 — segment caching is effectively disabled");
         }
 
-        // FINDING-14: Validate confidence level is in (0, 1].
-        let cl = config.analytics.default_confidence_level;
-        if !(0.0..=1.0).contains(&cl) || cl == 0.0 {
-            return Err(ConfigError::Validation {
-                message: format!("default_confidence_level must be in (0.0, 1.0], got {cl}"),
-            });
-        }
-
-        // FINDING-15: Validate PCA variance_threshold is in (0, 1].
-        let vt = config.multivariate.pca_variance_threshold;
-        if !(0.0..=1.0).contains(&vt) || vt == 0.0 {
-            return Err(ConfigError::Validation {
-                message: format!("pca_variance_threshold must be in (0.0, 1.0], got {vt}"),
-            });
-        }
-
-        // FINDING-13: Validate analytics config string fields against
-        // known values to catch typos at startup rather than at runtime.
-        if !VALID_FORECAST_MODELS.contains(&config.analytics.default_forecast_model.as_str()) {
-            return Err(ConfigError::Validation {
-                message: format!(
-                    "unknown default_forecast_model '{}', valid values: {VALID_FORECAST_MODELS:?}",
-                    config.analytics.default_forecast_model
-                ),
-            });
-        }
-
-        if !VALID_ANOMALY_METHODS.contains(&config.analytics.default_anomaly_method.as_str()) {
-            return Err(ConfigError::Validation {
-                message: format!(
-                    "unknown default_anomaly_method '{}', valid values: {VALID_ANOMALY_METHODS:?}",
-                    config.analytics.default_anomaly_method
-                ),
-            });
-        }
-
         Ok(config)
     }
 }
@@ -1001,6 +814,38 @@ impl ChronixConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TOML file may set only what it changes.
+    ///
+    /// `from_toml` used to require **all** of `ChronixConfig`'s fields and
+    /// answered a file that set only `data_dir` with `TOML parse error at
+    /// line 1, column 1` — so it could not load any file a person would
+    /// write, and it had no callers.
+    #[test]
+    fn a_partial_toml_file_loads_with_defaults_for_the_rest() {
+        let toml = r#"
+            data_dir = "/var/lib/chronix"
+            memtable_flush_threshold = 8388608
+
+            [analytics]
+            max_forecast_horizon = 720
+        "#;
+        let config: ChronixConfig = toml::from_str(toml).expect("a partial file must load");
+        assert_eq!(config.data_dir, PathBuf::from("/var/lib/chronix"));
+        assert_eq!(config.memtable_flush_threshold, 8 * 1024 * 1024);
+        assert_eq!(config.analytics.max_forecast_horizon, 720);
+        // Untouched settings keep their defaults.
+        assert_eq!(config.shard_duration, Duration::from_secs(3600));
+        assert_eq!(config.analytics.max_training_points, 1_000_000);
+    }
+
+    /// A *misspelled* key is still an error, because a silently ignored
+    /// setting is the failure this file has been bitten by.
+    #[test]
+    fn a_misspelled_key_is_refused() {
+        let toml = "data_dir = \"/tmp\"\nmemtable_flush_threshhold = 1\n";
+        assert!(toml::from_str::<ChronixConfig>(toml).is_err());
+    }
 
     #[test]
     fn builder_defaults_valid() {
@@ -1232,90 +1077,7 @@ mod tests {
         assert_eq!(config, back);
     }
 
-    // ── MultivariateConfig tests ────────────────────────────────────────
-
-    #[test]
-    fn multivariate_config_defaults() {
-        let config = MultivariateConfig::default();
-        assert_eq!(config.max_series_per_context, 100);
-        assert_eq!(config.default_interpolation, "linear");
-        assert_eq!(config.rolling_window_size, 1000);
-        assert_eq!(config.composite_signal_cooldown_secs, 60);
-        assert!((config.pca_variance_threshold - 0.95).abs() < 1e-9);
-        assert_eq!(config.var_max_lag, 10);
-    }
-
-    #[test]
-    fn multivariate_config_serde_roundtrip() {
-        let config = MultivariateConfig {
-            max_series_per_context: 50,
-            default_interpolation: "nearest".into(),
-            rolling_window_size: 500,
-            composite_signal_cooldown_secs: 120,
-            pca_variance_threshold: 0.99,
-            var_max_lag: 5,
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let back: MultivariateConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config.max_series_per_context, back.max_series_per_context);
-        assert_eq!(config.default_interpolation, back.default_interpolation);
-        assert_eq!(config.rolling_window_size, back.rolling_window_size);
-        assert_eq!(
-            config.composite_signal_cooldown_secs,
-            back.composite_signal_cooldown_secs
-        );
-        assert!((config.pca_variance_threshold - back.pca_variance_threshold).abs() < 1e-9);
-        assert_eq!(config.var_max_lag, back.var_max_lag);
-    }
-
-    #[test]
-    fn multivariate_config_in_chronix_config() {
-        let config = ChronixConfig::builder().data_dir("./data").build().unwrap();
-        assert_eq!(config.multivariate.max_series_per_context, 100);
-        assert_eq!(config.multivariate.var_max_lag, 10);
-    }
-
-    #[test]
-    fn per_measurement_analytics_override() {
-        let config = ChronixConfig::builder()
-            .data_dir(std::path::Path::new("/tmp/test"))
-            .measurement_analytics_override(
-                "cpu",
-                AnalyticsOverride {
-                    forecast_model: Some("holt_winters".to_string()),
-                    anomaly_threshold: Some(2.5),
-                    ..Default::default()
-                },
-            )
-            .build()
-            .unwrap();
-
-        let cpu_cfg = config.effective_analytics("cpu");
-        assert_eq!(cpu_cfg.default_forecast_model, "holt_winters");
-        assert!((cpu_cfg.default_anomaly_threshold - 2.5).abs() < 1e-10);
-        // Non-overridden fields use global defaults
-        assert_eq!(cpu_cfg.default_anomaly_method, "zscore");
-
-        // Measurement without override gets global defaults
-        let mem_cfg = config.effective_analytics("memory");
-        assert_eq!(mem_cfg.default_forecast_model, "ses");
-    }
-
-    #[test]
-    fn multivariate_config_builder_override() {
-        let mv = MultivariateConfig {
-            max_series_per_context: 25,
-            ..MultivariateConfig::default()
-        };
-        let config = ChronixConfig::builder()
-            .data_dir("./data")
-            .multivariate(mv)
-            .build()
-            .unwrap();
-        assert_eq!(config.multivariate.max_series_per_context, 25);
-    }
-
-    // ── Compaction / analytics / multivariate validation tests ────
+    // ── Analytics validation ─────────────────────────────────────
 
     #[test]
     fn validate_zero_max_forecast_horizon() {
@@ -1343,62 +1105,6 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("max_training_points"));
-    }
-
-    #[test]
-    fn validate_negative_anomaly_threshold() {
-        let analytics = AnalyticsConfig {
-            default_anomaly_threshold: -1.0,
-            ..AnalyticsConfig::default()
-        };
-        let err = ChronixConfig::builder()
-            .data_dir("./data")
-            .analytics(analytics)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("default_anomaly_threshold"));
-    }
-
-    #[test]
-    fn validate_zero_max_series_per_context() {
-        let mv = MultivariateConfig {
-            max_series_per_context: 0,
-            ..MultivariateConfig::default()
-        };
-        let err = ChronixConfig::builder()
-            .data_dir("./data")
-            .multivariate(mv)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("max_series_per_context"));
-    }
-
-    #[test]
-    fn validate_zero_rolling_window_size() {
-        let mv = MultivariateConfig {
-            rolling_window_size: 0,
-            ..MultivariateConfig::default()
-        };
-        let err = ChronixConfig::builder()
-            .data_dir("./data")
-            .multivariate(mv)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("rolling_window_size"));
-    }
-
-    #[test]
-    fn validate_zero_var_max_lag() {
-        let mv = MultivariateConfig {
-            var_max_lag: 0,
-            ..MultivariateConfig::default()
-        };
-        let err = ChronixConfig::builder()
-            .data_dir("./data")
-            .multivariate(mv)
-            .build()
-            .unwrap_err();
-        assert!(err.to_string().contains("var_max_lag"));
     }
 
     #[test]

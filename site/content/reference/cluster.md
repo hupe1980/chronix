@@ -102,7 +102,7 @@ All cluster components emit metrics via the `metrics` facade:
 |-------------------------------------------|-----------|------------------------------|
 | `chronix_cluster_nodes_total`             | Gauge     | Total node count by state    |
 | `chronix_cluster_regions_total`           | Gauge     | Total region count           |
-| `chronix_raft_leader_changes_total`       | Counter   | Raft leader elections        |
+| `chronix_cluster_leader_changes_total`       | Counter   | Raft leader elections        |
 | `chronix_cluster_under_replicated_regions`| Gauge     | Regions below target RF      |
 | `chronix_cluster_heartbeat_latency_seconds`| Histogram | Heartbeat round-trip time   |
 | `chronix_cluster_write_latency_seconds`   | Histogram | Distributed write latency    |

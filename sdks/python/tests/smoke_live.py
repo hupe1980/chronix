@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pathlib
+import re
 import sys
 import time
 
@@ -25,6 +27,36 @@ from chronix_client import ChronixClient, Point, TimeRange
 
 URL = os.environ.get("CHRONIX_URL", "http://127.0.0.1:4242")
 MEASUREMENT = "sdk_smoke"
+
+
+def client_paths() -> set[str]:
+    """Every server path the client names, with path parameters erased.
+
+    Read out of the source rather than listed by hand: a list maintained
+    beside the calls is a second inventory that drifts from the first, which
+    is exactly how `/api/v1/query` survived a route rename to
+    `/api/v1/chronix/query` under a green mocked suite.
+    """
+    source = (
+        pathlib.Path(__file__).resolve().parent.parent / "chronix_client" / "client.py"
+    ).read_text()
+    return {
+        re.sub(r"\{[^}]*\}", "{}", m)
+        for m in re.findall(r'"(/(?:api/v[12]|health|ready)[^"]*)"', source)
+    }
+
+
+async def assert_every_client_path_exists(c: ChronixClient) -> None:
+    """The server declares every route the client calls.
+
+    A mocked unit suite asserts the contract its author imagined; this asserts
+    the one the server publishes. Without it a renamed route is a 404 (or, as
+    it was, a 400 from an unrelated handler that happens to share the path).
+    """
+    spec = await c.openapi_spec()
+    declared = {re.sub(r"\{[^}]*\}", "{}", p) for p in spec.get("paths", {})}
+    missing = sorted(client_paths() - declared)
+    assert not missing, f"client calls paths the server does not declare: {missing}"
 
 
 async def main() -> int:
@@ -37,6 +69,8 @@ async def main() -> int:
 
         info = await c.server_info()
         assert info.version, "server_info must report a version"
+
+        await assert_every_client_path_exists(c)
 
         # ── write ───────────────────────────────────────────────────
         points = [

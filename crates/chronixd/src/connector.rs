@@ -35,6 +35,14 @@ pub enum ConnectorStatus {
 }
 
 /// Runtime statistics for a connector.
+///
+/// `lag` is an `Option` because it is not a signal every source has: Kafka
+/// has a broker-side high watermark to be behind, MQTT does not. It reported
+/// `0` on both — a hard-coded zero on every implementation, published on
+/// `/api/v1/connectors` and documented as "consumer lag", so a connector that
+/// had fallen an hour behind read as perfectly caught up. `None` says "this
+/// source has no such measure"; `Some(0)` says "caught up", and only one of
+/// those is a claim.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnectorMetrics {
     /// Total messages consumed / received.
@@ -43,10 +51,26 @@ pub struct ConnectorMetrics {
     pub points_total: u64,
     /// Total deserialization / decode errors.
     pub decode_errors: u64,
-    /// Consumer lag (Kafka) or pending messages (MQTT).
-    pub lag: u64,
-    /// Points per second (approximate).
+    /// Messages behind the source's newest offset, where the source has one.
+    ///
+    /// `None` for a source with no such measure — MQTT, which pushes.
+    pub lag: Option<u64>,
+    /// Points per second since the connector started.
     pub throughput: f64,
+}
+
+/// Points per second since `started_at`.
+///
+/// Cumulative rather than windowed, which is what "since it started" means and
+/// what an operator asking "is this connector doing anything" needs. A
+/// windowed rate belongs in Prometheus, over `chronix_*_points_total`.
+#[must_use]
+pub fn throughput(points_total: u64, started_at: std::time::Instant) -> f64 {
+    let secs = started_at.elapsed().as_secs_f64();
+    if secs <= 0.0 {
+        return 0.0;
+    }
+    points_total as f64 / secs
 }
 
 /// Information about a running connector, returned by the status API.
@@ -777,7 +801,7 @@ mod tests {
         assert_eq!(m.messages_total, 0);
         assert_eq!(m.points_total, 0);
         assert_eq!(m.decode_errors, 0);
-        assert_eq!(m.lag, 0);
+        assert_eq!(m.lag, None);
         assert!((m.throughput - 0.0).abs() < f64::EPSILON);
     }
 

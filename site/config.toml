@@ -59,5 +59,16 @@ docsrs_url = "https://docs.rs/chronix"
 # Shown in the footer and used for the JSON-LD `softwareVersion`.
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-# Default social preview; pages may override with `extra.image`.
-og_image = "/og-image.svg"
+# Default social preview.
+#
+# **PNG, not the SVG it is drawn from.** Facebook, LinkedIn, Slack, Discord and
+# X all refuse an SVG `og:image` and render the card with no picture at all —
+# silently, which is why it survived. `og-image.svg` is kept as the source and
+# rasterised to `og-image.png` with `rsvg-convert -w 1200 -h 630`; regenerate
+# it when the SVG changes.
+og_image = "/og-image.png"
+# Declared so a card renderer can lay out the space before the image loads,
+# and so a crawler need not fetch the file to learn its aspect ratio.
+og_image_width = "1200"
+og_image_height = "630"
+og_image_alt = "Chronix — a time-series database you add with Cargo"

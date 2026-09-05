@@ -221,7 +221,7 @@ class ChronixClient:
         # `QueryRequest` does not define — and it ignores unknown fields, so
         # the query silently ran unfiltered and unprojected before failing on
         # the response shape.
-        rows = await self._post("/api/v1/query", json=body)
+        rows = await self._post("/api/v1/chronix/query", json=body)
         return QueryResult(rows=rows if isinstance(rows, list) else [])
 
     async def sql(self, query: str) -> QueryResult:
@@ -242,7 +242,7 @@ class ChronixClient:
         # "row_count": n}`. `QueryResult` holds row dicts, so the two are
         # zipped here; handing the raw arrays through would give callers rows
         # with no column names and a `to_dataframe()` with integer headers.
-        data = await self._post("/api/v1/sql", json={"query": query})
+        data = await self._post("/api/v1/chronix/sql", json={"query": query})
         names = [c["name"] for c in data.get("columns", [])]
         rows = [dict(zip(names, row)) for row in data.get("rows", [])]
         return QueryResult(rows=rows)
@@ -250,7 +250,7 @@ class ChronixClient:
     async def explain(self, measurement: str, time_range: TimeRange) -> dict[str, Any]:
         """Get the query execution plan (EXPLAIN)."""
         body = {"measurement": measurement, "range": time_range.to_dict()}
-        return await self._post("/api/v1/query/explain", json=body)
+        return await self._post("/api/v1/chronix/query/explain", json=body)
 
     # ── Schema ────────────────────────────────────────────────────
 

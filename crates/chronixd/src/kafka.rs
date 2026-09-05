@@ -74,7 +74,10 @@ pub struct KafkaConsumer {
     ///
     /// Decides whether points get a namespace tag: without it a
     /// multi-tenant deployment could not read its own connector data.
-    #[cfg_attr(not(any(feature = "kafka", feature = "mqtt")), allow(dead_code))]
+    // Read only by this connector's own loop, which is feature-gated. The
+    // guard used to name *both* connector features, so building with only the
+    // other one warned.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     multi_tenancy: bool,
     running: AtomicBool,
     stopped: AtomicBool,
@@ -82,6 +85,12 @@ pub struct KafkaConsumer {
     messages_total: AtomicU64,
     points_total: AtomicU64,
     decode_errors: AtomicU64,
+    /// Messages behind the newest broker offset, or `-1` before the first
+    /// poll has told us. Refreshed from the consumer's **cached** watermarks
+    /// after each batch, so reading it costs no broker round trip.
+    lag: std::sync::atomic::AtomicI64,
+    /// When the connector was constructed, for the throughput figure.
+    started_at: std::time::Instant,
 }
 
 impl KafkaConsumer {
@@ -125,6 +134,8 @@ impl KafkaConsumer {
             messages_total: AtomicU64::new(0),
             points_total: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
+            lag: std::sync::atomic::AtomicI64::new(-1),
+            started_at: std::time::Instant::now(),
         });
         let _ = arc.self_ref.set(Arc::downgrade(&arc));
         arc
@@ -147,6 +158,8 @@ impl KafkaConsumer {
             messages_total: AtomicU64::new(0),
             points_total: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
+            lag: std::sync::atomic::AtomicI64::new(-1),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -393,6 +406,25 @@ mod consumer_impl {
                     if let Err(e) = consumer.commit().await {
                         warn!(name = %this.name, %e, "Kafka offset commit failed");
                     }
+
+                    // How far behind the broker we are, from the watermarks
+                    // the last fetch response already carried — no extra
+                    // round trip. This is the number that used to be a
+                    // hard-coded zero on `/api/v1/connectors`, so a connector
+                    // an hour behind read as caught up.
+                    let lag = consumer.lag().await;
+                    let total: u64 = lag.lag.values().sum();
+                    this.lag
+                        .store(i64::try_from(total).unwrap_or(i64::MAX), Ordering::Relaxed);
+                    metrics::gauge!("chronix_kafka_consumer_lag", "connector" => this.name.clone())
+                        .set(total as f64);
+                    if !lag.stale_partitions.is_empty() {
+                        debug!(
+                            name = %this.name,
+                            stale = lag.stale_partitions.len(),
+                            "some partitions' lag is from a stale watermark"
+                        );
+                    }
                 }
 
                 if let Err(e) = consumer.close().await {
@@ -476,12 +508,14 @@ impl IngestionConnector for KafkaConsumer {
     }
 
     async fn metrics(&self) -> ConnectorMetrics {
+        let points = self.points_total.load(Ordering::Relaxed);
+        let lag = self.lag.load(Ordering::Relaxed);
         ConnectorMetrics {
             messages_total: self.messages_total.load(Ordering::Relaxed),
-            points_total: self.points_total.load(Ordering::Relaxed),
+            points_total: points,
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
-            lag: 0,
-            throughput: 0.0,
+            lag: u64::try_from(lag).ok(),
+            throughput: crate::connector::throughput(points, self.started_at),
         }
     }
 }

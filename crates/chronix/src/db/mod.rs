@@ -14,6 +14,7 @@ mod rollup;
 mod stream;
 mod write;
 
+pub use query::{role_metadata, ROLE_KEY};
 pub use stream::BatchStream;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2319,7 +2320,7 @@ mod tests {
         // Enforce retention with a generous global retention (1 hour)
         // → only "metrics" with its 1ns override should expire.
         let result = db
-            .enforce_retention(3_600_000_000_000) // 1 hour in nanos
+            .enforce_retention(std::time::Duration::from_secs(3600))
             .unwrap();
 
         // "metrics" segments should have been dropped

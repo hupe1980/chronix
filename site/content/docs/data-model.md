@@ -33,6 +33,23 @@ timestamp:    1700000000000000000                  ← i64, nanoseconds
 Timestamps are always **nanoseconds since the Unix epoch**, as a signed 64-bit
 integer. Negative values (before 1970) are valid and handled throughout.
 
+### What the timestamp column is called
+
+One column, and each surface spells it the way that surface's users expect:
+
+| Surface | Name |
+|---------|------|
+| SQL (`/api/v1/chronix/sql`, Flight SQL, `db.sql`) | `_time`, typed `TIMESTAMP(nanosecond)` |
+| `GET /api/v1/measurements/{name}/schema` | `_time` — the name a query accepts |
+| A JSON query row, and an Arrow batch from `execute_iter` | `timestamp`, `Int64` |
+| The embedded `MeasurementSchema` | `time` |
+
+In SQL the column is `_time` and only `_time` — in `SELECT` and in `WHERE`
+alike. `WHERE timestamp > …` is a planning error naming the columns that
+exist, which is the right failure: it is loud, and it says what to type.
+Writes reject `time`, `timestamp` and `_time` as *user* column names, so
+nothing you send can collide with it.
+
 ### Tag or field?
 
 The question is whether you will ever *filter or group by* it.
@@ -43,6 +60,27 @@ The question is whether you will ever *filter or group by* it.
 Putting a high-cardinality value in a tag — a request id, a timestamp, a user
 id — creates one series per distinct value. That is the single most common way
 to make a time-series database unusable, and it is not specific to Chronix.
+
+### How a field is named in PromQL
+
+SQL and the query builder address a measurement and pick columns from it.
+PromQL addresses a **metric**, which carries one value per sample, so each
+field is its own metric:
+
+```text
+power,meter=main watts=231.45,volts=229.8
+                 ↓
+PromQL:  power_watts{meter="main"}   power_volts{meter="main"}
+```
+
+The rule is `<measurement>_<field>`, with one exception: a field named `value`
+gives the measurement name alone. That is how the Prometheus remote-write and
+OTLP ingestion paths store a sample, so a scraped `up{job="api"}` is queried
+as `up`, not `up_value`.
+
+A metric's name depends only on its own measurement and field, so writing a
+new field to a measurement never renames the metrics already in it. Ask
+`/api/v1/label/__name__/values` for the names that exist.
 
 ## Cardinality is the number that matters
 

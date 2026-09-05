@@ -47,6 +47,17 @@ For multi-tenant deployments, also add:
 - **Header:** `X-Namespace`
 - **Value:** `<namespace>`
 
+### Metric names
+
+A Chronix measurement holds several fields; a PromQL metric holds one value.
+The metric name is `<measurement>_<field>` — except that a field named `value`
+gives the measurement name alone, which is how Prometheus remote write and
+OTLP store a sample, so scraped metrics keep their names.
+
+So `cpu,host=a usage=42,load=0.7` is queried as `cpu_usage` and `cpu_load`,
+not as `cpu`. The metric browser lists exactly the names that answer, and
+adding a field to a measurement never renames the metrics already there.
+
 ### PromQL Examples
 
 ```promql
@@ -57,10 +68,10 @@ rate(cpu_usage{host=~"server-.*"}[5m])
 histogram_quantile(0.95, rate(query_duration_seconds_bucket[5m]))
 
 # Active series count
-chronix_active_series_total
+chronix_series_count
 
 # ingestion rate
-rate(chronix_ingested_points_total[1m])
+rate(chronix_points_written_total[1m])
 ```
 
 ## 2. Flight SQL Data Source

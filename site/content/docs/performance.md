@@ -363,7 +363,7 @@ chronixd bench query --concurrent 16 --queries queries.sql --duration 60s
 3. Compaction uses `arrow::compute::interleave()` instead of `concat_batches` +
    `take` — peak memory is proportional to the largest single batch, not the
    sum of all inputs
-4. Monitor compaction throughput via `chronix_compaction_cycle_duration_seconds`
+4. Monitor compaction throughput via `chronix_compaction_duration_seconds`
 
 ### Rebalancing Too Slow
 

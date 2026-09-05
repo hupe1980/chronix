@@ -91,9 +91,9 @@ struct Cli {
     #[arg(long, env = "CHRONIXD_TLS_RELOAD_INTERVAL", default_value = "0")]
     tls_reload_interval_secs: u64,
 
-    /// Log format: "text" or "json".
-    #[arg(long, env = "CHRONIXD_LOG_FORMAT", default_value = "text")]
-    log_format: String,
+    /// Log format. `--log-format jsom` is a usage error, not plain text.
+    #[arg(long, env = "CHRONIXD_LOG_FORMAT", default_value = "text", value_enum)]
+    log_format: chronixd::config::LogFormat,
 
     /// Log level filter.
     #[arg(long, env = "CHRONIXD_LOG_LEVEL", default_value = "info")]
@@ -242,11 +242,13 @@ fn setup_logging(config: &ServerConfig) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
 
-    match config.log_format.as_str() {
-        "json" => {
+    // Exhaustive: a format the server does not have is refused when the
+    // configuration is parsed, not silently rendered as text here.
+    match config.log_format {
+        chronixd::config::LogFormat::Json => {
             fmt::fmt().with_env_filter(filter).json().init();
         }
-        _ => {
+        chronixd::config::LogFormat::Text => {
             fmt::fmt().with_env_filter(filter).init();
         }
     }

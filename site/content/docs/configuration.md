@@ -72,24 +72,17 @@ let config = ChronixConfig::builder()
 
 ### Analytics
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `analytics.default_forecast_model` | `String` | `"ses"` | Default forecast model (`ses`, `holt`, `holtwinters`, `arima`) |
-| `analytics.default_anomaly_method` | `String` | `"zscore"` | Default anomaly detector (`zscore`, `mad`, `iqr`) |
-| `analytics.default_confidence_level` | `f64` | 0.95 | Forecast prediction interval confidence |
-| `analytics.max_forecast_horizon` | `usize` | 8760 | Maximum forecast steps |
-| `analytics.max_training_points` | `usize` | 1,000,000 | Maximum training data points |
-| `analytics.default_anomaly_threshold` | `f64` | 3.0 | Default Z-score threshold |
-
-### Multivariate
+Two bounds, both enforced by the SQL forecast aggregates. There is no
+`[multivariate]` section and no per-measurement analytics override: those
+were eleven settings that were parsed, validated and read by nothing, so a
+value set there changed no behaviour and reported no error. The analytics
+API takes its model, method and confidence level as arguments, which is where
+that choice belongs.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `multivariate.max_series_per_context` | `usize` | 100 | Max variables in a multivariate context |
-| `multivariate.default_interpolation` | `String` | `"linear"` | Default interpolation for alignment |
-| `multivariate.rolling_window_size` | `usize` | 1000 | Default rolling window length |
-| `multivariate.pca_variance_threshold` | `f64` | 0.95 | PCA explained variance cutoff |
-| `multivariate.var_max_lag` | `usize` | 10 | Maximum VAR lag order to test |
+| `analytics.max_forecast_horizon` | `usize` | 8760 | Most points one `forecast()` may predict. A call over it is a planning error naming this setting — refused rather than clamped, because a silently shortened forecast is a wrong answer |
+| `analytics.max_training_points` | `usize` | 1,000,000 | Most input points one series feeds a model; the **newest** are kept. `0` means no bound |
 
 ---
 

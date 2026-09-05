@@ -59,6 +59,7 @@ use chronix_encoding::{ColumnDecoder, DecodedColumn, EncodedBlock};
 use crate::segment::compression::decompress_block_with_optional_dict;
 use crate::segment::error::{Result, SegmentError};
 use crate::segment::header::{SegmentFooter, SegmentHeader, FOOTER_SIZE, HEADER_SIZE};
+use crate::segment::metadata::roles;
 use crate::segment::metadata::{data_types, ColumnBlockMeta, SegmentMetadata};
 use crate::segment::stats::ordered_i64_to_f64;
 
@@ -489,7 +490,7 @@ impl SegmentReader {
                     data_types::BOOL => DataType::Boolean,
                     _ => DataType::Utf8,
                 };
-                Ok(Field::new(name, dt, true))
+                Ok(Field::new(name, dt, true).with_metadata(roles::arrow_metadata(col_meta.role)))
             })
             .collect::<Result<Vec<_>>>()?;
         let schema = std::sync::Arc::new(Schema::new(fields));
@@ -686,7 +687,8 @@ impl SegmentReader {
                                         data_types::BOOL => DataType::Boolean,
                                         _ => DataType::Utf8,
                                     };
-                                    Ok(Field::new(n, dt, true))
+                                    Ok(Field::new(n, dt, true)
+                                        .with_metadata(roles::arrow_metadata(cm2.role)))
                                 })
                                 .collect::<Result<Vec<_>>>()?;
                             let schema = Schema::new(fields);
@@ -906,7 +908,7 @@ impl SegmentReader {
                     data_types::BOOL => DataType::Boolean,
                     _ => DataType::Utf8,
                 };
-                Ok(Field::new(name, dt, true))
+                Ok(Field::new(name, dt, true).with_metadata(roles::arrow_metadata(col_meta.role)))
             })
             .collect::<Result<Vec<Field>>>()?;
 

@@ -137,7 +137,7 @@ for batch in db.sql(
 
 // PromQL, exactly as chronixd serves it to Grafana.
 let now = 1_700_000_000_000_000_000;
-let series = db.promql(r#"rate(usage_system{host="server-01"}[5m])"#, now)?;
+let series = db.promql(r#"rate(cpu_usage_system{host="server-01"}[5m])"#, now)?;
 
 // Or the typed builder, with bounded-memory streaming for large windows.
 let plan = db.query().measurement("cpu").tag("host", "server-01").field("usage_idle").build()?;
@@ -159,157 +159,108 @@ db.close()?;
 
 ## Feature Highlights
 
-**Storage engine**
+Each claim below is pinned by a test; the depth is in the
+[internals](https://hupe1980.github.io/chronix/internals/) and
+[reference](https://hupe1980.github.io/chronix/reference/) sections.
 
-- Crash-safe WAL: CRC32c records, group commit, LZ4, configurable fsync
-  (`PerWrite` / `PerBatch` / `Periodic` — the last is flash-friendly for
-  eMMC/SD gateways), rotation + truncation, corrupted-tail tolerance. The
-  catalog records the **WAL floor**, so a clean `close()` is a replay-free
-  restart and a crash replays only what was never flushed
-- Admission before durability: the out-of-order window, the cardinality
-  budget and the schema are decided per point *before* the WAL append, so a
-  rejected write is free and can never come back through replay.
-  `insert_batch` reports `InsertResult { accepted, rejected }`; `backfill`
-  is the explicit operation for writing history outside the window
-- Lock-free skip-list memtable with freeze-and-swap flush and time-shard
-  routing; out-of-order and late-arrival handling with last-write-wins
-  dedup. Its memory accounting is calibrated against a counting allocator
-  in the test suite, and a flush builds Arrow columns straight off the skip
-  list — the small preset's budget is a measured number:
-  `examples/gateway_footprint.rs` prints under 25 MiB peak heap for an hour of the
-  design partner's workload, rollups and dashboards included, and 1.6 MiB
-  live once it settles. `DatabaseStatistics::resident_memory_bytes` breaks
-  that down into memtables, interners, WAL buffer and catalog
-- Immutable columnar `.csx` segments: row groups, per-column stats and
-  encodings, per-block validity bitmaps, LZ4/Zstd (+ dictionary training),
-  mmap reads with `MADV` hints, atomic temp→fsync→rename writes. Segment
-  metadata is proportional to the data — a segment holding a few KB of
-  columns costs a few hundred bytes of footer, not a fixed sketch.
-- Hybrid TWCS + size-tiered compaction: streaming K-way merge
-  (O(N log K) time, O(chunk+K) memory), tombstone cleanup,
-  write-amplification budgeting, backpressure — never blocks writes
-- Layered pruning: time index → series blooms → inverted tag index →
-  column stats → row-group zone maps / per-row-group tag blooms. Each level
-  can only ever keep a segment it could have dropped, never the reverse — the
-  series bloom holds complete series keys, so it is consulted only when the
-  query's tag filters cover every tag, and skipped otherwise
-- Every segment carries a `.series` sidecar — its distinct series keys — from
-  which the blooms, the tag index and the exact cardinality count are rebuilt
-  at open without decoding a single segment
-- Caches: last-value cache (opt-in per measurement; ~400 ns on a hit),
-  TinyLFU segment cache, metadata cache
-- Deletes are **ranged tombstones persisted in the catalog manifest**: a
-  delete names an interval (resolved to the series' newest stored timestamp
-  when you do not name one), survives a flush and a restart, and is reclaimed
-  only once compaction has rewritten every segment it was issued against — so
-  writing to a series after deleting it re-creates it, rather than being
-  swallowed
-- **Rollups are materialised and repaired, never approximated**
-  (`first`/`last`/`min`/`max`/`avg`/`sum`/`count`, grouped by tags): each
-  bucket is aggregated over every row that reaches it as soon as the
-  out-of-order window has closed over it, with a persisted watermark per
-  rollup and a cascade (1 s → 1 min → 15 min) that is consistent by
-  construction. Because "the window has closed" is not a proof of finality,
-  a backfill, a delete or an import into an already-aggregated range records
-  an **invalidation** that the next pass recomputes — so an offline device's
-  backlog and a deletion both reach the derived tiers, instead of leaving
-  them silently stale for ever. `refresh_rollup()` does the same on demand.
-  Retention with per-measurement overrides drops raw data only once every
-  tier it feeds is materialised past it *and* has no repair pending.
-  Streaming Parquet export (explicit dictionary encoding for tags, a
-  `max_bytes` budget that reports truncation rather than filling the device)
-- **Parquet cold archive**: `archive_cold_segments()` reads each cold
-  `(measurement, shard)` group **through the read path** — deduplicated, with
-  tombstones applied — writes it as one Hive-partitioned Parquet object
-  (`measurement=…/shard=…/…parquet`) to S3/GCS/Azure, verifies it, and only
-  then drops the source segments. The object carries the hot tier's schema,
-  `_time` included, so a query moved to the archive is the same query. DuckDB,
-  Polars and Spark read it directly and prune on the partition columns;
-  `register_cold_tier()` brings it back as a SQL table here, one table per
-  measurement. `chronixd` runs a pass periodically behind `[cold_archive]`.
-  The hot tier stays `.csx`: specialised core, standard edges
+**Storage engine** — [details](https://hupe1980.github.io/chronix/internals/storage-engine/)
 
-**Query**
+- **Crash-safe WAL** with CRC32c records, group commit and a configurable
+  fsync policy (`Periodic` is the flash-friendly one for eMMC/SD). The catalog
+  records a **WAL floor**, so a clean `close()` restarts without replaying and
+  a crash replays only what was never flushed.
+- **Admission before durability.** The out-of-order window, the cardinality
+  budget and the schema are decided *before* the WAL append, so a rejected
+  write is free and cannot return through replay. `backfill` is the explicit
+  operation for history outside the window.
+- **Bounded, measured memory.** A lock-free skip-list memtable flushes
+  straight into Arrow columns. `examples/gateway_footprint.rs` prints **under
+  25 MiB peak heap** for an hour of the design partner's workload — rollups
+  and dashboards included — settling at 1.6 MiB, and
+  `DatabaseStatistics::resident_memory_bytes` breaks that down term by term.
+- **Immutable `.csx` segments**: row groups, per-column stats, validity
+  bitmaps, LZ4/Zstd with dictionary training, mmap reads, atomic
+  temp→fsync→rename. Footer size is proportional to the data, not a fixed
+  sketch.
+- **Compaction never blocks writes** — hybrid TWCS + size-tiered, streaming
+  K-way merge in `O(chunk + K)` memory, with write-amplification budgeting and
+  backpressure.
+- **Layered pruning**: time index → series blooms → inverted tag index →
+  column stats → zone maps. Each level can only keep a segment it could have
+  dropped, never the reverse. Every segment carries a `.series` sidecar, so
+  blooms, the tag index and the exact cardinality are rebuilt at open without
+  decoding a segment.
+- **Deletes are ranged tombstones persisted in the catalog manifest.** They
+  survive a flush, a restart and a compaction, and are reclaimed only once
+  every segment they were issued against has been rewritten — so writing to a
+  series after deleting it re-creates it rather than being swallowed.
+- **Rollups are materialised and repaired, never approximated.** A cascade
+  (1 s → 1 min → 15 min) with a persisted watermark per tier. Because "the
+  out-of-order window closed" is not proof of finality, a backfill, a delete
+  or an import into an aggregated range records an **invalidation** that the
+  next pass recomputes. Retention drops raw data only once every tier it feeds
+  is materialised past it and has no repair pending.
+- **Parquet cold archive** reads each cold `(measurement, shard)` group
+  *through the read path* — deduplicated, tombstones applied — writes one
+  Hive-partitioned object to S3/GCS/Azure, verifies it, and only then drops
+  the source. DuckDB, Polars and Spark read it directly;
+  `register_cold_tier()` brings it back as a SQL table.
 
-- Fluent `QueryBuilder` → vectorized Arrow execution, streaming 64 Ki-row
-  batches, cardinality-aware grouping, projection pushdown to disk reads
-- **One read path.** `execute_iter()` streams a scan in bounded memory:
-  surviving segments are swept into time-disjoint buckets and merged one
-  bucket at a time, so exporting or scanning a window far larger than RAM
-  costs the busiest bucket rather than the whole result set. Everything else
-  folds over it — aggregates into accumulators (memory proportional to the
-  group count, not the row count), downsampling with one open bucket across
-  batches, `LIMIT` stopping the scan — and `execute()` is a convenience over
-  `execute_stream()`, so no two entry points can disagree
-- **SQL** via DataFusion, one call away — `db.sql("…")` from synchronous
-  code, `db.sql_async` from async, `db.session_context()` for DataFusion's
-  own API: predicate pushdown, cost statistics for the
-  optimizer, spill-to-disk, read-only enforcement at plan level, and
-  23 analytics functions — one scalar (`time_bucket`), fifteen **window**
-  functions (`diff`, `zscore`, `rolling_*`, `stl_*`, `anomaly_score`, …) that
-  take a `PARTITION BY … ORDER BY`, and seven **aggregates** (`first`,
-  `last`, `rate`, `irate`, `forecast`, `auto_forecast`,
-  `multivariate_forecast`)
-- **PromQL** — `db.promql("…", at)` / `db.promql_range(…)` embedded, the
-  `/api/v1/query[_range]` endpoints served: full parser/evaluator tracking **Prometheus 3.x** — 50+
-  functions including the eight UTC date functions, all matcher operators, vector matching
-  (`on`/`ignoring`/`group_left`/`group_right`), subqueries, the `@` modifier
-  (`@ start()`/`@ end()`), negative offsets, instant + range queries.
-  Left-open range and lookback windows; every range-vector function
-  stamps the evaluation timestamp, so a range query returns exactly one point
-  per step; `rate`/`increase`/`delta` implement `extrapolatedRate` including
-  counter-reset correction and zero-clamping; `histogram_quantile` follows
-  `bucketQuantile`; `double_exponential_smoothing`, `mad_over_time` and
-  `sort_by_label`/`sort_by_label_desc` follow the 3.x definitions, natural
-  label ordering included. A subquery evaluates on an absolute step grid,
-  stamps step timestamps, and is a range vector — `rate(x[5m:15s])`
-  extrapolates as `rate(x[5m])` does. A range query reads its window **once**,
-  not once per step, subqueries included, and
-  `chronix_promql_scan_cache_hits_total` says so at runtime. All
-  of it is covered by an end-to-end conformance suite that drives the real
-  query path
+**Query** — [details](https://hupe1980.github.io/chronix/internals/query-engine/)
 
-**Analytics**
+- **One read path.** `execute_iter()` streams a scan in bounded memory —
+  time-disjoint buckets merged one at a time — and everything else folds over
+  it: aggregates into accumulators sized by group count, downsampling with one
+  open bucket, `LIMIT` stopping the scan. No two entry points can disagree.
+- **SQL** through DataFusion, one call away: `db.sql("…")` synchronously,
+  `db.sql_async` from async, `db.session_context()` for DataFusion's own API.
+  Predicate pushdown, cost statistics, spill-to-disk, read-only enforcement at
+  plan level, and **23 analytics functions** — `time_bucket`, fifteen window
+  functions (`diff`, `zscore`, `rolling_*`, `stl_*`, `anomaly_score`, …) and
+  seven aggregates (`first`, `last`, `rate`, `irate`, `forecast`,
+  `auto_forecast`, `multivariate_forecast`).
+- **PromQL tracking Prometheus 3.x** — 50+ functions, all matcher operators,
+  vector matching, subqueries, `@` and negative offsets, embedded via
+  `db.promql(…)` or served at the paths a Prometheus client derives. A range
+  query reads its window **once**, not once per step. A metric is one
+  `(measurement, field)` pair named `<measurement>_<field>` — or the
+  measurement alone when the field is `value`, which is how remote write and
+  OTLP store a sample — so a name a query returns is a selector that returns
+  it, and adding a field never renames an existing metric. An end-to-end
+  conformance suite drives the real query path.
 
-- Preprocessing: gap detection, six interpolators, smoothing, resampling,
-  clock-drift correction, STL decomposition (Cleveland et al., with the
-  low-pass step that keeps the seasonal component from vanishing), auto
-  feature generation
-- Forecast: SES, Holt (damped), Holt-Winters (additive/multiplicative),
-  ARIMA, SARIMA, linear regression — auto-ARIMA via AIC, O(1) online
-  updates, model persistence
-- Quantile forecasting: prediction intervals from the empirical
+**Analytics** — [guide](https://hupe1980.github.io/chronix/docs/analytics/)
+
+- **Forecasting**: SES, Holt (damped), Holt-Winters, ARIMA, SARIMA, linear
+  regression, with auto-ARIMA by AIC, `O(1)` online updates and persistence.
+  `auto_forecast` picks the model by cross-validation and reports why.
+- **Quantile forecasting** builds prediction intervals from the empirical
   distribution of walk-forward residuals, bucketed per horizon step, so
-  interval shape and growth are learned from the data instead of assumed
-  Gaussian. Optional split-conformal correction — applied outward on both
-  tails — for finite-sample coverage, plus explicit physical bounds that
-  hold for the point forecast as well as the quantiles
-- Anomaly: Z-score, modified Z-score (MAD), IQR, forecast-residual
-  (strict walk-forward), moving-average residual, seasonal dynamic
-  threshold, CUSUM; multivariate: Mahalanobis, Isolation Forest, PCA with
-  per-series contributions
-- Lifecycle: versioned model registry, champion/challenger A/B testing,
-  drift detection (PSI, KS, ADWIN), retroactive MAPE/RMSE/MAE tracking,
-  anomaly-precision feedback loop
-- Streaming: CDC-fed per-series anomaly scoring (< 10 ms ingest-to-score),
-  continuous forecasts, materialized forecast views, alert engine
-- Custom models: pure-Rust registry for user `ForecastModel` /
-  `AnomalyDetector` implementations
-- Compute: runtime-dispatched SIMD (AVX-512F → AVX2+FMA → SSE2 / NEON)
-  with Kahan summation, rayon batch parallelism, buffer pools
+  interval shape and growth are learned rather than assumed Gaussian —
+  with optional split-conformal correction and explicit physical bounds.
+- **Anomaly detection**: Z-score, modified Z-score (MAD), IQR,
+  forecast-residual (strict walk-forward), moving-average residual, seasonal
+  dynamic threshold, CUSUM; multivariate Mahalanobis, Isolation Forest and PCA
+  with per-series contributions.
+- **Model lifecycle**: versioned registry, champion/challenger A/B testing,
+  drift detection (PSI, KS, ADWIN), retroactive error tracking.
+- **Preprocessing and compute**: gap detection, six interpolators, clock-drift
+  correction, STL decomposition; runtime-dispatched SIMD (AVX-512F → AVX2+FMA
+  → SSE2 / NEON) with Kahan summation and rayon batch parallelism.
 
-**Streaming & signals**
+**Streaming and signals** — [details](https://hupe1980.github.io/chronix/reference/analytics-and-streaming/)
 
-- CDC event bus (bounded broadcast, lazy event construction), filtered and
-  resumable subscriptions, persistent subscriptions with replay
-- Trigger engine: anomaly-score, forecast-deviation, threshold, MA-crossover
-  (golden/death cross), rate-of-change, composite conditions; SQL management
-  (`CREATE/SHOW/DROP/ALTER TRIGGER`) embedded or over HTTP behind
-  `[triggers]`, namespace-scoped per tenant; webhook delivery with HMAC-SHA256
-  signing, SSRF protection at parse *and* connect time, retry + dead-letter
-  queue
+- A bounded CDC event bus with filtered, resumable and persistent
+  subscriptions, feeding per-series anomaly scoring in under 10 ms from
+  ingest to score.
+- A **trigger engine** — anomaly score, forecast deviation, threshold,
+  MA crossover, rate of change, composite — managed with
+  `CREATE/SHOW/DROP/ALTER TRIGGER`, embedded or over HTTP, scoped per tenant.
+  Webhook delivery is HMAC-SHA256 signed with SSRF protection at parse *and*
+  connect time. Each channel has its own worker and bounded queue, so a
+  webhook that is retrying delays nothing but itself.
 
-**Server (`chronixd`)**
+**Server (`chronixd`)** — [API reference](https://hupe1980.github.io/chronix/docs/api-reference/)
 
 | Protocol | Default port | Description |
 |----------|-------------|---------------------------------|
@@ -319,26 +270,23 @@ db.close()?;
 | Prometheus | 8086 | Remote write/read, `/api/v1/query[_range]`, series/labels, `status/buildinfo` — at the paths a client derives from a base URL |
 | OTLP | 8086 | OpenTelemetry metrics ingestion |
 
-Non-finite samples — Prometheus staleness markers, OTLP quantiles with
-nothing observed yet — are skipped and counted rather than failing the batch
-they arrived in, because both are routine traffic and a `400` stalls a
-remote-write queue indefinitely.
+Non-finite samples — Prometheus staleness markers, OTLP quantiles with nothing
+observed yet — are skipped and counted rather than failing the batch, because
+both are routine traffic and a `400` stalls a remote-write queue indefinitely.
 
-Plus: Kafka/MQTT ingestion connectors (feature-gated, hot-reload, credential
+Plus Kafka/MQTT ingestion connectors (feature-gated, hot-reload, credential
 rotation, SASL + TLS), TLS with certificate hot-reload, graceful shutdown,
-per-request timeouts and row/batch limits, SSE annotations and bundled
-Grafana dashboards in [`dashboards/`](dashboards/).
+per-request timeouts and row limits, SSE annotations, and bundled Grafana
+dashboards in [`dashboards/`](dashboards/).
 
-Both connectors are **pure Rust** — `krafka` and `rumqttc` — so turning them
-on adds no C build step. One dependency does compile C: `aws-lc-rs`, the
-single rustls crypto provider the whole workspace shares rather than
-inheriting each dependency's default. Nothing is shipped precompiled — crates
-carry source — but `aws-lc-sys` ships a *pregenerated build configuration* for
-`linux_aarch64` among others, so it drives `cc` directly instead of invoking
-CMake. A C compiler for the target architecture is therefore the whole
-requirement: no cmake, no Fortran, no system libraries. That is why CI builds
-the embedded target on a native arm64 runner rather than cross-compiling —
-`cargo build` there needs nothing a stock runner lacks.
+**No C toolchain for the connectors.** `krafka` and `rumqttc` are pure Rust.
+One dependency does compile C — `aws-lc-rs`, the single rustls crypto provider
+the whole workspace shares rather than inheriting each dependency's default —
+and it ships a pregenerated build configuration for `linux_aarch64` among
+others, so it drives `cc` directly instead of invoking CMake. A C compiler for
+the target is the whole requirement: no cmake, no Fortran, no system
+libraries.
+
 
 ## Building
 
@@ -409,7 +357,7 @@ curl -X POST http://localhost:8086/api/v1/chronix/sql \
   -d '{"query":"SELECT time_bucket('\''5m'\'', _time) AS t, avg(usage) FROM cpu GROUP BY t"}'
 
 # PromQL, at the path a Prometheus client derives
-curl 'http://localhost:8086/api/v1/query?query=rate(cpu[5m])'
+curl 'http://localhost:8086/api/v1/query?query=rate(cpu_usage[5m])'
 
 # Health check
 curl http://localhost:8086/health
@@ -439,9 +387,9 @@ Full documentation: **<https://hupe1980.github.io/chronix>** — built from
 
 | Section | What is in it |
 |---------|---------------|
-| [Guide](site/content/docs/) | Getting started, API reference, analytics, operations, performance, security, client SDKs, Grafana |
-| [Internals](site/content/internals/) | How it works — storage engine, encoding, forecasting and anomaly algorithms, query execution |
-| [Reference](site/content/reference/) | The implementation, subsystem by subsystem |
+| [Guide](https://hupe1980.github.io/chronix/docs/) | Getting started, API reference, analytics, operations, performance, security, client SDKs, Grafana |
+| [Internals](https://hupe1980.github.io/chronix/internals/) | How it works — storage engine, encoding, forecasting and anomaly algorithms, query execution |
+| [Reference](https://hupe1980.github.io/chronix/reference/) | The implementation, subsystem by subsystem |
 
 API documentation for the published crates is on
 [docs.rs/chronix](https://docs.rs/chronix).
@@ -451,7 +399,7 @@ API documentation for the published crates is on
 Pre-release, under active development. The engine is extensively hardened —
 a green default-build suite (`cargo test` prints the count), property tests
 on every codec, three fuzz targets run nightly, crash-recovery integration
-tests that really crash (a child process that `abort()`s), and 37 deep
+tests that really crash (a child process that `abort()`s), and 40 deep
 audit passes — but the on-disk format and public API are **not yet
 stable**. The first tagged release will declare both.
 

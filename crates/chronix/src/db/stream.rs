@@ -287,7 +287,12 @@ impl Iterator for BatchStream<'_> {
                         ))));
                     }
                 }
-                return Some(Ok(batch));
+                // Stamped here rather than in each producer: the memtable
+                // builder, the segment reader and the compaction writer all
+                // build a schema from a column's *type*, and a role is not a
+                // type — a tag and a string field are both `Utf8`. One place,
+                // reading the registry that owns the answer.
+                return Some(Ok(self.db.stamp_roles(&self.measurement, batch)));
             }
             if self.remaining == Some(0) {
                 self.done = true;

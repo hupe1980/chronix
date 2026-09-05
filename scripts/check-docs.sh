@@ -37,6 +37,19 @@ for c in $cited; do
   fi
 done
 
+# ── 1b. Crate *paths* in code samples must resolve too ──────────────────
+# `use chronix_anomaly::…` and `use chronix_compaction::…` sat in the internals
+# pages long after those crates were merged away. Check 1 could not see them:
+# it matches the hyphenated package name, and a Rust path is underscored.
+echo "checking crate paths in code samples…"
+existing_paths=$(ls crates | tr '-' '_' | sort -u)
+for path in $(grep -rhoE '\buse chronix_[a-z_]+' site/content README.md 2>/dev/null \
+              | sed 's/^use //' | sort -u); do
+  if ! grep -qx "$path" <<<"$existing_paths"; then
+    note "a code sample imports '$path', which is not a crate in crates/"
+  fi
+done
+
 # ── 2. Documented default ports must match the code ─────────────────────
 # The docs claimed 4242 and 5555/5556/5557 in different files while the server
 # listened on 8086/8087/8817, so every copy-pasteable example failed.
@@ -167,6 +180,34 @@ for page in site/content/docs/*.md; do
     leaf=${key##*.}
     grep -qx "$leaf" <<<"$config_fields" \
       || note "$page documents setting '$key', which is not a field of any config struct"
+  done
+done
+
+# ── 8. A documented setting must be *read* somewhere ────────────────────
+# Check 7 asks whether a documented key names a real field; this asks whether
+# anything ever looks at it. Eleven did not — the whole `[multivariate]`
+# section, four `[analytics]` defaults and the per-measurement overrides were
+# parsed, validated and documented, and read by nothing, so a value set there
+# changed no behaviour and raised no error. That is the failure mode of every
+# setting: it does not fail, it is simply ignored.
+echo "checking that documented settings are read…"
+declaring_files=$(grep -rlE '^[[:space:]]+pub [a-z_0-9]+:' crates/ | grep -E 'config\.rs$' | sort -u)
+for page in site/content/docs/*.md; do
+  case "$page" in
+    */cluster.md|*/api-reference.md) continue ;;
+  esac
+  [ -f "$page" ] || continue
+  keys=$(awk '/^```toml/ {t=1; next} /^```/ {t=0} t' "$page" \
+         | { grep -oE '^[a-z_0-9.]+[[:space:]]*=' || true; } \
+         | sed -E 's/[[:space:]]*=$//' | sort -u)
+  for key in $keys; do
+    leaf=${key##*.}
+    # Where is it named, other than in a `config.rs` that declares it?
+    users=$(grep -rl "\b${leaf}\b" crates/ --include='*.rs' 2>/dev/null \
+            | grep -vE 'config\.rs$' | head -1)
+    if [ -z "$users" ]; then
+      note "$page documents setting '$key', which no code outside a config module reads"
+    fi
   done
 done
 

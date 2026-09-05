@@ -76,7 +76,7 @@ time window:
 ### Configuration
 
 ```rust
-use chronix_compaction::{CompactionPolicy, CompactionStrategy, SizeTier};
+use chronix_engine::compaction::{CompactionPolicy, CompactionStrategy, SizeTier};
 
 let policy = CompactionPolicy::new(CompactionStrategy::Hybrid {
     time_window: Duration::from_secs(3600),

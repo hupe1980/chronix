@@ -80,7 +80,7 @@ Higher $h$ reduces false alarms at the cost of slower detection.
 ### Batch Detection
 
 ```rust
-use chronix_anomaly::CusumDetector;
+use chronix_analytics::anomaly::CusumDetector;
 
 let mut detector = CusumDetector::new(None, None); // auto-tune h, k
 detector.fit(&timestamps, &values)?;

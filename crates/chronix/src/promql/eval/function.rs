@@ -14,6 +14,95 @@ use super::{EvalError, HistogramBuckets, PromQLEvaluator, QueryParams};
 
 // ── PromQLEvaluator method ─────────────────────────────────────────────
 
+/// Every function name [`PromQLEvaluator::eval_function`] dispatches.
+///
+/// The parser consults it so an unknown name is a **parse** error — a 400 with
+/// `errorType: bad_data`, as upstream reports it — rather than an evaluation
+/// error at 422. A client branches on that difference, and a typo in a
+/// function name is one of the most ordinary things a query editor sends.
+///
+/// Aggregation operators (`sum`, `topk`, …) are not here: they are parsed as
+/// aggregations, not calls. `functions::every_listed_function_dispatches`
+/// pins the list against the dispatcher.
+pub(crate) const FUNCTIONS: &[&str] = &[
+    "abs",
+    "absent",
+    "absent_over_time",
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atanh",
+    "avg_over_time",
+    "ceil",
+    "changes",
+    "clamp",
+    "clamp_max",
+    "clamp_min",
+    "cos",
+    "cosh",
+    "count_over_time",
+    "day_of_month",
+    "day_of_week",
+    "day_of_year",
+    "days_in_month",
+    "deg",
+    "delta",
+    "deriv",
+    "double_exponential_smoothing",
+    "exp",
+    "floor",
+    "histogram_quantile",
+    "hour",
+    "idelta",
+    "increase",
+    "irate",
+    "label_join",
+    "label_replace",
+    "last_over_time",
+    "ln",
+    "log10",
+    "log2",
+    "mad_over_time",
+    "max_over_time",
+    "min_over_time",
+    "minute",
+    "month",
+    "pi",
+    "predict_linear",
+    "present_over_time",
+    "quantile_over_time",
+    "rad",
+    "rate",
+    "resets",
+    "round",
+    "scalar",
+    "sgn",
+    "sin",
+    "sinh",
+    "sort",
+    "sort_by_label",
+    "sort_by_label_desc",
+    "sort_desc",
+    "sqrt",
+    "stddev_over_time",
+    "stdvar_over_time",
+    "sum_over_time",
+    "tan",
+    "tanh",
+    "time",
+    "timestamp",
+    "vector",
+    "year",
+];
+
+/// Whether `name` is a PromQL function this engine implements.
+#[must_use]
+pub fn is_known_function(name: &str) -> bool {
+    FUNCTIONS.contains(&name)
+}
+
 impl PromQLEvaluator {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn eval_function(
@@ -1836,6 +1925,42 @@ pub(crate) fn apply_scalar_fn(
 
 #[cfg(test)]
 mod tests {
+    /// [`FUNCTIONS`] is the parser's view of what this dispatcher implements,
+    /// and the two live in one file precisely so this test can read both. A
+    /// name the dispatcher handles but the list omits is the dangerous
+    /// direction: the parser would reject a query this engine can answer.
+    #[test]
+    fn every_dispatched_function_is_listed() {
+        let source = include_str!("function.rs");
+        let mut missing = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            // A match arm: one or more quoted names, then `=>`.
+            let Some(arrow) = trimmed.find("=>") else {
+                continue;
+            };
+            let head = &trimmed[..arrow];
+            if !head.starts_with('"') {
+                continue;
+            }
+            for name in head.split('|') {
+                let name = name.trim().trim_matches('"');
+                if name.is_empty() || name.contains(char::is_whitespace) {
+                    continue;
+                }
+                if !super::FUNCTIONS.contains(&name) {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "dispatched but not listed, so the parser would reject them: {missing:?}"
+        );
+    }
+
     use super::*;
     use crate::promql::ast::{Duration, LabelMatcher};
 

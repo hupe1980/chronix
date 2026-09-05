@@ -119,7 +119,7 @@ async fn a_trigger_can_be_created_listed_and_dropped() {
 
     let resp = client()
         .post(format!("{base}/api/v1/triggers"))
-        .json(&json!({ "sql": "CREATE TRIGGER hot_cpu ON cpu WHEN value > 90.0 DELIVER log" }))
+        .json(&json!({ "query": "CREATE TRIGGER hot_cpu ON cpu WHEN value > 90.0 DELIVER log" }))
         .send()
         .await
         .unwrap();
@@ -136,6 +136,29 @@ async fn a_trigger_can_be_created_listed_and_dropped() {
     assert_eq!(body["triggers"].as_array().unwrap().len(), 1);
     assert_eq!(body["triggers"][0]["name"], "hot_cpu");
     assert_eq!(body["triggers"][0]["measurement"], "cpu");
+
+    // One trigger, read back by name — `SHOW TRIGGERS` used to be the only
+    // way, so a client that had just created one had to list everything and
+    // search for it.
+    let one: Value = client()
+        .get(format!("{base}/api/v1/triggers/hot_cpu"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["name"], "hot_cpu");
+    assert_eq!(one["measurement"], "cpu");
+    assert_eq!(one["enabled"], true);
+
+    // A name nobody owns is a 404, not an empty body.
+    let resp = client()
+        .get(format!("{base}/api/v1/triggers/no_such_trigger"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let resp = client()
         .delete(format!("{base}/api/v1/triggers/hot_cpu"))
@@ -161,7 +184,7 @@ async fn a_malformed_statement_is_a_bad_request() {
     let (base, _db, _tmp) = start_with_triggers(Some(test_pipeline())).await;
     let resp = client()
         .post(format!("{base}/api/v1/triggers"))
-        .json(&json!({ "sql": "CREATE TRIGGER" }))
+        .json(&json!({ "query": "CREATE TRIGGER" }))
         .send()
         .await
         .unwrap();
@@ -176,7 +199,7 @@ async fn an_unsignable_webhook_trigger_is_refused() {
     let resp = client()
         .post(format!("{base}/api/v1/triggers"))
         .json(&json!({
-            "sql": "CREATE TRIGGER t ON cpu WHEN value > 1.0 \
+            "query": "CREATE TRIGGER t ON cpu WHEN value > 1.0 \
                     DELIVER webhook('https://alerts.example.com/hook')"
         }))
         .send()
@@ -197,7 +220,7 @@ async fn a_write_fires_a_trigger_and_the_signal_is_readable() {
 
     client()
         .post(format!("{base}/api/v1/triggers"))
-        .json(&json!({ "sql": "CREATE TRIGGER hot ON cpu WHEN value > 90.0 DELIVER log" }))
+        .json(&json!({ "query": "CREATE TRIGGER hot ON cpu WHEN value > 90.0 DELIVER log" }))
         .send()
         .await
         .unwrap()

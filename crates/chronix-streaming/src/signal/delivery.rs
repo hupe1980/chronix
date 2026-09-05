@@ -13,14 +13,28 @@
 //!                      │
 //!                      └── Retry + Dead Letter Queue
 //! ```
+//!
+//! ## Delivery does not block evaluation
+//!
+//! Each channel owns a **bounded queue and a worker thread**, and
+//! [`DeliveryRouter::deliver`] only enqueues. It used to run the retry
+//! schedule inline, on the same task that processes the CDC event — so one
+//! unreachable webhook backing off for seven seconds delayed every trigger
+//! evaluation behind it, and a sustained write rate overran the event bus.
+//! Evaluation stays ordered because the CDC listener is; delivery is
+//! per-channel, so a broken webhook cannot slow a healthy one.
+//!
+//! A full queue **drops the oldest event** and counts it. That is the honest
+//! failure: the alternative is blocking ingestion on a channel nobody can
+//! reach.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use metrics::counter;
+use metrics::{counter, gauge};
 use parking_lot::RwLock;
-use tokio::time as tokio_time;
 use tracing::{debug, error, warn};
 
 use crate::signal::error::{Result, SignalError};
@@ -545,15 +559,250 @@ impl DeadLetterQueue {
 /// Maximum backoff cap to prevent overflow with high retry counts.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+/// How many events one channel may have waiting.
+///
+/// Per channel, so a broken webhook cannot consume a healthy one's headroom.
+/// Deep enough to ride out a retry schedule (a minute at the backoff cap),
+/// shallow enough that a channel nobody can reach is not a memory leak.
+const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+
+/// One registered channel, with the queue and worker that serve it.
+struct ChannelWorker {
+    channel: Arc<dyn DeliveryChannel>,
+    /// Pending events, oldest first, plus a flag the worker sets while it is
+    /// mid-delivery so `flush` waits for the event in flight too.
+    queue: Arc<(Mutex<WorkerState>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the worker and its producers share.
+struct WorkerState {
+    pending: VecDeque<SignalEvent>,
+    /// Set while an event is being delivered, so "empty queue" does not mean
+    /// "nothing in flight".
+    in_flight: bool,
+    /// Set on drop so the worker stops rather than blocking for ever.
+    stopping: bool,
+}
+
+impl ChannelWorker {
+    fn spawn(
+        channel: Arc<dyn DeliveryChannel>,
+        retry_policy: RetryPolicy,
+        dlq: Arc<DeadLetterQueue>,
+        capacity: usize,
+    ) -> Self {
+        let queue = Arc::new((
+            Mutex::new(WorkerState {
+                pending: VecDeque::new(),
+                in_flight: false,
+                stopping: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_queue = Arc::clone(&queue);
+        let worker_channel = Arc::clone(&channel);
+        let name = channel.name().to_string();
+        let handle = std::thread::Builder::new()
+            .name(format!("chronix::deliver::{name}"))
+            .spawn(move || {
+                run_worker(&worker_channel, &worker_queue, &retry_policy, &dlq);
+            })
+            .ok();
+        let _ = capacity;
+        Self {
+            channel,
+            queue,
+            handle,
+        }
+    }
+
+    /// Queue an event. Returns `false` when the queue was full and the oldest
+    /// waiting event was dropped to make room.
+    fn enqueue(&self, event: SignalEvent, capacity: usize) -> bool {
+        let (lock, cv) = &*self.queue;
+        let mut state = match lock.lock() {
+            Ok(s) => s,
+            // A worker that panicked mid-delivery poisons the lock. The queue
+            // is still structurally sound, so keep serving rather than
+            // dropping every later signal.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut accepted = true;
+        while state.pending.len() >= capacity {
+            state.pending.pop_front();
+            accepted = false;
+        }
+        state.pending.push_back(event);
+        let depth = state.pending.len();
+        drop(state);
+        cv.notify_one();
+        gauge!("chronix_signal_delivery_queue_depth", "channel" => self.channel.name().to_string())
+            .set(depth as f64);
+        if !accepted {
+            counter!("chronix_signal_delivery_dropped_total",
+                "channel" => self.channel.name().to_string())
+            .increment(1);
+            warn!(
+                channel = self.channel.name(),
+                capacity, "delivery queue full — dropped the oldest waiting signal"
+            );
+        }
+        accepted
+    }
+
+    /// Whether nothing is waiting and nothing is being delivered.
+    fn is_idle(&self) -> bool {
+        let (lock, _) = &*self.queue;
+        let state = match lock.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.pending.is_empty() && !state.in_flight
+    }
+}
+
+impl Drop for ChannelWorker {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.queue;
+            let mut state = match lock.lock() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.stopping = true;
+            cv.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The retry schedule, run off the evaluation path.
+///
+/// One implementation. There were two — `deliver` with `std::thread::sleep`
+/// and `deliver_async` with `tokio::time::sleep` — and they had already
+/// drifted: only the blocking one recorded
+/// `chronix_signal_delivery_duration_seconds`, so the documented latency
+/// histogram was blank for anything that used the async path.
+fn run_worker(
+    channel: &Arc<dyn DeliveryChannel>,
+    queue: &Arc<(Mutex<WorkerState>, Condvar)>,
+    retry_policy: &RetryPolicy,
+    dlq: &Arc<DeadLetterQueue>,
+) {
+    let (lock, cv) = &**queue;
+    loop {
+        let event = {
+            let mut state = match lock.lock() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            loop {
+                if let Some(event) = state.pending.pop_front() {
+                    state.in_flight = true;
+                    break event;
+                }
+                if state.stopping {
+                    return;
+                }
+                state = match cv.wait(state) {
+                    Ok(s) => s,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+        };
+
+        deliver_with_retries(channel, &event, retry_policy, dlq);
+
+        let (lock, cv) = &**queue;
+        let mut state = match lock.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.in_flight = false;
+        cv.notify_all();
+    }
+}
+
+/// Deliver one event to one channel, retrying on the policy's schedule.
+fn deliver_with_retries(
+    channel: &Arc<dyn DeliveryChannel>,
+    event: &SignalEvent,
+    retry_policy: &RetryPolicy,
+    dlq: &Arc<DeadLetterQueue>,
+) {
+    let mut last_error = None;
+    // Delivery latency including retries: a channel that succeeds only on its
+    // third attempt is healthy by the success counter and useless in practice,
+    // and nothing measured the difference.
+    let started = std::time::Instant::now();
+
+    for attempt in 0..=retry_policy.max_retries {
+        match channel.deliver(event) {
+            Ok(()) => {
+                counter!("chronix_signal_delivery_total",
+                    "channel" => channel.name().to_string())
+                .increment(1);
+                metrics::histogram!(
+                    "chronix_signal_delivery_duration_seconds",
+                    "channel" => channel.name().to_string()
+                )
+                .record(started.elapsed().as_secs_f64());
+                return;
+            }
+            Err(e) => {
+                let backoff =
+                    (retry_policy.base_backoff * 2u32.saturating_pow(attempt)).min(MAX_BACKOFF);
+                warn!(
+                    channel = channel.name(),
+                    attempt = attempt + 1,
+                    max_retries = retry_policy.max_retries,
+                    error = %e,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "Delivery failed, retrying"
+                );
+                last_error = Some(e);
+                counter!("chronix_signal_delivery_failed_total",
+                    "channel" => channel.name().to_string())
+                .increment(1);
+                // Sleeping here parks the *channel's own* worker thread and
+                // nothing else — which is the whole point of the worker.
+                if attempt < retry_policy.max_retries {
+                    std::thread::sleep(backoff);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = last_error {
+        error!(
+            channel = channel.name(),
+            trigger_id = %event.trigger_id,
+            "All delivery attempts exhausted, moving to DLQ"
+        );
+        dlq.push(DeadLetter {
+            event: event.clone(),
+            channel: channel.name().to_string(),
+            error: err.to_string(),
+            attempts: retry_policy.max_retries + 1,
+        });
+    }
+}
+
 /// Routes signal events to registered delivery channels with retry
 /// and dead-letter support.
 ///
 /// Thread-safe — channels can be added at any time, even after
 /// wrapping in `Arc`.
 pub struct DeliveryRouter {
-    channels: parking_lot::RwLock<Vec<Arc<dyn DeliveryChannel>>>,
+    channels: parking_lot::RwLock<Vec<Arc<ChannelWorker>>>,
     retry_policy: RetryPolicy,
-    dlq: DeadLetterQueue,
+    dlq: Arc<DeadLetterQueue>,
+    queue_capacity: usize,
+    /// Events queued since start, for the flush-on-shutdown log line.
+    queued: AtomicUsize,
 }
 
 impl DeliveryRouter {
@@ -563,21 +812,38 @@ impl DeliveryRouter {
         Self {
             channels: RwLock::new(Vec::new()),
             retry_policy: RetryPolicy::default(),
-            dlq: DeadLetterQueue::new(10_000),
+            dlq: Arc::new(DeadLetterQueue::new(10_000)),
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            queued: AtomicUsize::new(0),
         }
     }
 
-    /// Set the retry policy.
+    /// Set the retry policy. Applies to channels added afterwards.
     #[must_use]
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
     }
 
+    /// Set the per-channel queue capacity. Applies to channels added
+    /// afterwards.
+    #[must_use]
+    pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
+        self.queue_capacity = capacity.max(1);
+        self
+    }
+
     /// Add a delivery channel. Can be called at any time, including
     /// after wrapping in `Arc`.
     pub fn add_channel(&self, channel: Box<dyn DeliveryChannel>) {
-        self.channels.write().push(Arc::from(channel));
+        let channel: Arc<dyn DeliveryChannel> = Arc::from(channel);
+        let worker = ChannelWorker::spawn(
+            channel,
+            self.retry_policy.clone(),
+            Arc::clone(&self.dlq),
+            self.queue_capacity,
+        );
+        self.channels.write().push(Arc::new(worker));
     }
 
     /// Whether a channel of this name is registered.
@@ -587,24 +853,27 @@ impl DeliveryRouter {
     /// runtime, a thread and a connection pool.
     #[must_use]
     pub fn has_channel(&self, name: &str) -> bool {
-        self.channels.read().iter().any(|c| c.name() == name)
+        self.channels
+            .read()
+            .iter()
+            .any(|c| c.channel.name() == name)
     }
 
     /// The channels a signal is for.
     ///
     /// See [`deliver`](Self::deliver) for why this exists.
-    fn route(&self, event: &SignalEvent) -> Vec<Arc<dyn DeliveryChannel>> {
-        let all: Vec<Arc<dyn DeliveryChannel>> = self.channels.read().clone();
+    fn route(&self, event: &SignalEvent) -> Vec<Arc<ChannelWorker>> {
+        let all: Vec<Arc<ChannelWorker>> = self.channels.read().clone();
         if event.delivery_targets.is_empty() {
             return all;
         }
 
         let mut routed = Vec::with_capacity(event.delivery_targets.len());
         for target in &event.delivery_targets {
-            match all.iter().find(|c| c.name() == target) {
-                Some(channel) => routed.push(Arc::clone(channel)),
+            match all.iter().find(|c| c.channel.name() == target) {
+                Some(worker) => routed.push(Arc::clone(worker)),
                 None => {
-                    metrics::counter!("chronix_signal_delivery_unrouted_total").increment(1);
+                    counter!("chronix_signal_delivery_unrouted_total").increment(1);
                     warn!(
                         trigger = %event.trigger_name,
                         target = %target,
@@ -617,7 +886,7 @@ impl DeliveryRouter {
         routed
     }
 
-    /// Deliver a signal event to the channels its trigger named.
+    /// Queue a signal event for the channels its trigger named.
     ///
     /// [`SignalEvent::delivery_targets`] is matched against
     /// [`DeliveryChannel::name`]. An empty list means every channel, which is
@@ -628,143 +897,41 @@ impl DeliveryRouter {
     /// logged, because a webhook that was configured and never fires is the
     /// failure this subsystem exists to avoid.
     ///
-    /// Returns the number of successful deliveries.
+    /// **This returns as soon as the event is queued.** Retries run on each
+    /// channel's own worker, so an unreachable webhook delays nothing but
+    /// itself. Use [`flush`](Self::flush) to wait for delivery — a test, or a
+    /// shutdown.
     ///
-    /// **Note:** Retry backoff uses `std::thread::yield_now()` instead of
-    /// `std::thread::sleep()` to avoid blocking the calling thread for
-    /// extended periods. For production use with exponential backoff,
-    /// prefer [`deliver_async`](Self::deliver_async).
+    /// Returns the number of channels the event was queued to.
     pub fn deliver(&self, event: &SignalEvent) -> usize {
-        let mut success_count = 0;
-        // Snapshot Arc refs and release the RwLock so retries with backoff
-        // don't block add_channel or other deliver calls.
-        let channels = self.route(event);
-
-        for channel in channels.iter() {
-            let mut last_error = None;
-            // Delivery latency including retries: a channel that succeeds
-            // only on its third attempt is healthy by the success counter
-            // and useless in practice, and nothing measured the difference.
-            let started = std::time::Instant::now();
-
-            for attempt in 0..=self.retry_policy.max_retries {
-                match channel.deliver(event) {
-                    Ok(()) => {
-                        success_count += 1;
-                        last_error = None;
-                        metrics::histogram!(
-                            "chronix_signal_delivery_duration_seconds",
-                            "channel" => channel.name().to_string()
-                        )
-                        .record(started.elapsed().as_secs_f64());
-                        break;
-                    }
-                    Err(e) => {
-                        let backoff = (self.retry_policy.base_backoff
-                            * 2u32.saturating_pow(attempt))
-                        .min(MAX_BACKOFF);
-                        warn!(
-                            channel = channel.name(),
-                            attempt = attempt + 1,
-                            max_retries = self.retry_policy.max_retries,
-                            error = %e,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "Delivery failed, retrying"
-                        );
-                        last_error = Some(e);
-
-                        counter!("chronix_signal_delivery_failed_total",
-                            "channel" => channel.name().to_string()
-                        )
-                        .increment(1);
-
-                        // Actually sleep for the computed backoff
-                        // duration instead of merely yielding the CPU timeslice.
-                        if attempt < self.retry_policy.max_retries {
-                            std::thread::sleep(backoff);
-                        }
-                    }
-                }
-            }
-
-            if let Some(err) = last_error {
-                error!(
-                    channel = channel.name(),
-                    trigger_id = %event.trigger_id,
-                    "All delivery attempts exhausted, moving to DLQ"
-                );
-                self.dlq.push(DeadLetter {
-                    event: event.clone(),
-                    channel: channel.name().to_string(),
-                    error: err.to_string(),
-                    attempts: self.retry_policy.max_retries + 1,
-                });
-            }
+        let workers = self.route(event);
+        for worker in &workers {
+            worker.enqueue(event.clone(), self.queue_capacity);
         }
-
-        success_count
+        self.queued.fetch_add(workers.len(), Ordering::Relaxed);
+        counter!("chronix_signal_delivery_queued_total").increment(workers.len() as u64);
+        workers.len()
     }
 
-    /// Asynchronous delivery with proper non-blocking exponential backoff.
+    /// Wait until every channel has drained, or `timeout` elapses.
     ///
-    /// This is the preferred method when running inside a Tokio runtime.
-    /// Uses `tokio::time::sleep` for backoff instead of blocking the OS thread.
-    pub async fn deliver_async(&self, event: &SignalEvent) -> usize {
-        let mut success_count = 0;
-        let channels = self.route(event);
-
-        for channel in channels.iter() {
-            let mut last_error = None;
-
-            for attempt in 0..=self.retry_policy.max_retries {
-                match channel.deliver(event) {
-                    Ok(()) => {
-                        success_count += 1;
-                        last_error = None;
-                        break;
-                    }
-                    Err(e) => {
-                        let backoff = (self.retry_policy.base_backoff
-                            * 2u32.saturating_pow(attempt))
-                        .min(MAX_BACKOFF);
-                        warn!(
-                            channel = channel.name(),
-                            attempt = attempt + 1,
-                            max_retries = self.retry_policy.max_retries,
-                            error = %e,
-                            backoff_ms = backoff.as_millis() as u64,
-                            "Delivery failed, retrying (async)"
-                        );
-                        last_error = Some(e);
-
-                        counter!("chronix_signal_delivery_failed_total",
-                            "channel" => channel.name().to_string()
-                        )
-                        .increment(1);
-
-                        if attempt < self.retry_policy.max_retries {
-                            tokio_time::sleep(backoff).await;
-                        }
-                    }
-                }
+    /// Returns `true` if everything drained. Used by shutdown — a signal that
+    /// fired a millisecond before `SIGTERM` should still go out — and by tests,
+    /// which is what keeps [`deliver`](Self::deliver) free of a second
+    /// synchronous code path.
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let workers: Vec<Arc<ChannelWorker>> = self.channels.read().clone();
+            if workers.iter().all(|w| w.is_idle()) {
+                return true;
             }
-
-            if let Some(err) = last_error {
-                error!(
-                    channel = channel.name(),
-                    trigger_id = %event.trigger_id,
-                    "All delivery attempts exhausted, moving to DLQ"
-                );
-                self.dlq.push(DeadLetter {
-                    event: event.clone(),
-                    channel: channel.name().to_string(),
-                    error: err.to_string(),
-                    attempts: self.retry_policy.max_retries + 1,
-                });
+            if std::time::Instant::now() >= deadline {
+                debug!("delivery flush timed out with events still queued");
+                return false;
             }
+            std::thread::sleep(Duration::from_millis(1));
         }
-
-        success_count
     }
 
     /// Access the dead letter queue.
@@ -778,6 +945,12 @@ impl DeliveryRouter {
     pub fn channel_count(&self) -> usize {
         self.channels.read().len()
     }
+
+    /// Events queued for delivery since start.
+    #[must_use]
+    pub fn queued_total(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for DeliveryRouter {
@@ -788,86 +961,123 @@ impl Default for DeliveryRouter {
 
 // ── SignalStore ──────────────────────────────────────────────────────
 
-/// Persists fired signals for later querying.
+/// Persists fired signals for later querying, **one bounded ring per
+/// namespace**.
 ///
-/// In a full deployment this writes to the `_signals` measurement in
-/// Chronix. Here we provide the in-memory representation and serialization
-/// for the integration layer.
+/// The capacity is per namespace, not shared. It used to be one process-wide
+/// deque filtered on the way out, so a tenant firing signals quickly evicted
+/// a quiet tenant's — and the quiet tenant saw fewer of its own signals with
+/// nothing to say why. Total memory is `max_size × namespaces`, which is what
+/// isolation costs and what the namespace registry bounds.
+///
+/// A signal's namespace is the `__namespace__` tag on the series it is about —
+/// the same thing the trigger's own scoping matched on. A deployment that is
+/// not multi-tenant has one unnamed bucket and behaves exactly as before.
 pub struct SignalStore {
-    signals: RwLock<VecDeque<SignalEvent>>,
+    /// `None` is the unnamed bucket a single-tenant deployment uses.
+    signals: RwLock<std::collections::BTreeMap<Option<String>, VecDeque<SignalEvent>>>,
     max_size: usize,
 }
 
 impl SignalStore {
-    /// Create a new signal store.
+    /// Create a new signal store holding `max_size` signals **per namespace**.
     #[must_use]
     pub fn new(max_size: usize) -> Self {
         Self {
-            signals: RwLock::new(VecDeque::with_capacity(max_size.min(10_000))),
+            signals: RwLock::new(std::collections::BTreeMap::new()),
             max_size,
         }
     }
 
-    /// Persist a signal event.
+    /// The namespace a signal belongs to.
+    fn namespace_of(event: &SignalEvent) -> Option<String> {
+        event.tags.get(chronix_core::NAMESPACE_TAG).cloned()
+    }
+
+    /// Persist a signal event in its namespace's ring.
     pub fn store(&self, event: SignalEvent) {
+        let ns = Self::namespace_of(&event);
         let mut store = self.signals.write();
-        if store.len() >= self.max_size {
-            // FIFO eviction — O(1) with VecDeque
-            store.pop_front();
+        let ring = store.entry(ns).or_default();
+        if ring.len() >= self.max_size {
+            // FIFO eviction — O(1) with VecDeque, and confined to the
+            // namespace that overflowed.
+            ring.pop_front();
+            counter!("chronix_signal_evicted_total").increment(1);
         }
-        store.push_back(event);
+        ring.push_back(event);
         counter!("chronix_signal_persisted_total").increment(1);
     }
 
-    /// Query signals by measurement.
+    /// Every signal matching `predicate`, in the given scope.
+    fn query(
+        &self,
+        scope: Option<&str>,
+        predicate: impl Fn(&SignalEvent) -> bool,
+    ) -> Vec<SignalEvent> {
+        let store = self.signals.read();
+        let rings: Vec<&VecDeque<SignalEvent>> = match scope {
+            Some(ns) => store.get(&Some(ns.to_string())).into_iter().collect(),
+            None => store.values().collect(),
+        };
+        rings
+            .into_iter()
+            .flat_map(|r| r.iter())
+            .filter(|s| predicate(s))
+            .cloned()
+            .collect()
+    }
+
+    /// Query signals by measurement, across every namespace.
     #[must_use]
     pub fn query_by_measurement(&self, measurement: &str) -> Vec<SignalEvent> {
-        self.signals
-            .read()
-            .iter()
-            .filter(|s| s.measurement == measurement)
-            .cloned()
-            .collect()
+        self.query(None, |s| s.measurement == measurement)
     }
 
-    /// Query signals by severity.
+    /// Query signals by severity, across every namespace.
     #[must_use]
     pub fn query_by_severity(&self, severity: crate::signal::model::Severity) -> Vec<SignalEvent> {
-        self.signals
-            .read()
-            .iter()
-            .filter(|s| s.severity == severity)
-            .cloned()
-            .collect()
+        self.query(None, |s| s.severity == severity)
     }
 
-    /// Query signals within a time range.
+    /// Query signals within a time range, across every namespace.
     #[must_use]
     pub fn query_by_time_range(&self, min_ts: i64, max_ts: i64) -> Vec<SignalEvent> {
-        self.signals
-            .read()
-            .iter()
-            .filter(|s| s.timestamp >= min_ts && s.timestamp <= max_ts)
-            .cloned()
-            .collect()
+        self.query(None, |s| s.timestamp >= min_ts && s.timestamp <= max_ts)
     }
 
-    /// All signals.
+    /// All signals, across every namespace.
     #[must_use]
     pub fn all(&self) -> Vec<SignalEvent> {
-        self.signals.read().iter().cloned().collect()
+        self.query(None, |_| true)
     }
 
-    /// Signal count.
+    /// All signals in one namespace, or — with `None` — across every one.
+    ///
+    /// This is what the `/api/v1/signals` handler calls: reading one tenant's
+    /// ring rather than reading everything and filtering is the difference
+    /// between isolation and a filter that hides a capacity it still shares.
+    #[must_use]
+    pub fn all_in(&self, scope: Option<&str>) -> Vec<SignalEvent> {
+        self.query(scope, |_| true)
+    }
+
+    /// Signal count across every namespace.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.signals.read().len()
+        self.signals.read().values().map(VecDeque::len).sum()
     }
 
     /// Whether the store is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.signals.read().is_empty()
+        self.len() == 0
+    }
+
+    /// How many namespaces have signals.
+    #[must_use]
+    pub fn namespace_count(&self) -> usize {
+        self.signals.read().len()
     }
 }
 
@@ -1055,8 +1265,8 @@ mod tests {
         assert_eq!(router.channel_count(), 2);
 
         let event = test_signal("t1", "cpu", Severity::Warning);
-        let ok = router.deliver(&event);
-        assert_eq!(ok, 2);
+        assert_eq!(router.deliver(&event), 2);
+        assert!(router.flush(Duration::from_secs(5)));
         assert!(router.dlq().is_empty());
     }
 
@@ -1073,8 +1283,9 @@ mod tests {
         }));
 
         let event = test_signal("t1", "cpu", Severity::Warning);
-        let ok = router.deliver(&event);
-        assert_eq!(ok, 1);
+        // `deliver` queues; `flush` is how a caller waits for the outcome.
+        assert_eq!(router.deliver(&event), 1, "queued to one channel");
+        assert!(router.flush(Duration::from_secs(5)));
         assert!(router.dlq().is_empty());
     }
 
@@ -1091,8 +1302,8 @@ mod tests {
         }));
 
         let event = test_signal("t1", "cpu", Severity::Critical);
-        let ok = router.deliver(&event);
-        assert_eq!(ok, 0);
+        assert_eq!(router.deliver(&event), 1, "queued to one channel");
+        assert!(router.flush(Duration::from_secs(5)));
         assert_eq!(router.dlq().len(), 1);
 
         let dls = router.dlq().drain();
@@ -1176,22 +1387,73 @@ mod tests {
         assert_eq!(backoff, Duration::from_secs(60));
     }
 
-    #[tokio::test]
-    async fn deliver_async_succeeds() {
+    /// A noisy tenant cannot evict a quiet one's signals.
+    ///
+    /// The store was one process-wide ring filtered on the way out, so its
+    /// capacity was shared: a tenant firing signals quickly pushed out a quiet
+    /// tenant's, and the quiet tenant simply saw fewer of its own with nothing
+    /// to say why.
+    #[test]
+    fn one_namespace_cannot_evict_anothers_signals() {
+        let store = SignalStore::new(4);
+
+        let with_ns = |ns: &str, trigger: &str| {
+            let mut e = test_signal(trigger, "cpu", Severity::Warning);
+            e.tags
+                .insert(chronix_core::NAMESPACE_TAG.to_string(), ns.to_string());
+            e
+        };
+
+        // A quiet tenant stores one signal.
+        store.store(with_ns("quiet", "q1"));
+        // A noisy one fills and overflows its own ring many times over.
+        for i in 0..50 {
+            store.store(with_ns("noisy", &format!("n{i}")));
+        }
+
+        let quiet = store.all_in(Some("quiet"));
+        assert_eq!(quiet.len(), 1, "the quiet tenant's signal was evicted");
+        assert!(
+            quiet[0].trigger_name.ends_with("q1"),
+            "{}",
+            quiet[0].trigger_name
+        );
+
+        // The noisy tenant is bounded by its own capacity, not by the total.
+        assert_eq!(store.all_in(Some("noisy")).len(), 4);
+        assert_eq!(store.namespace_count(), 2);
+    }
+
+    /// A single-tenant deployment has one unnamed ring and behaves as before.
+    #[test]
+    fn an_untagged_signal_uses_the_unnamed_ring() {
+        let store = SignalStore::new(2);
+        for i in 0..5 {
+            store.store(test_signal(&format!("t{i}"), "cpu", Severity::Info));
+        }
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.all_in(None).len(), 2);
+        assert_eq!(store.namespace_count(), 1);
+    }
+
+    /// Delivery is queued, and `flush` is how a caller waits for it.
+    #[test]
+    fn deliver_queues_and_flush_waits() {
         let router = DeliveryRouter::new();
         router.add_channel(Box::new(LogChannel));
 
         let event = test_signal("t1", "cpu", Severity::Warning);
-        let ok = router.deliver_async(&event).await;
-        assert_eq!(ok, 1);
+        assert_eq!(router.deliver(&event), 1, "queued to one channel");
+        assert!(router.flush(Duration::from_secs(5)), "the queue must drain");
     }
 
-    #[tokio::test]
-    async fn deliver_async_exhausts_retries_into_dlq() {
+    /// Retries happen on the channel's worker and end in the DLQ.
+    #[test]
+    fn exhausted_retries_reach_the_dlq_without_blocking_the_caller() {
         let fail_count = Arc::new(AtomicU32::new(0));
         let router = DeliveryRouter::new().with_retry_policy(RetryPolicy {
             max_retries: 2,
-            base_backoff: Duration::from_millis(1),
+            base_backoff: Duration::from_millis(400),
         });
         router.add_channel(Box::new(FailingChannel {
             fail_count: Arc::clone(&fail_count),
@@ -1199,40 +1461,120 @@ mod tests {
         }));
 
         let event = test_signal("t1", "cpu", Severity::Critical);
-        let ok = router.deliver_async(&event).await;
-        assert_eq!(ok, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(router.deliver(&event), 1);
+        // The backoff schedule is 400 ms + 800 ms and `deliver` must not have
+        // paid for any of it — this is the defect the worker exists for. The
+        // budget is an order of magnitude under the first sleep rather than
+        // just under it, because a wall-clock assertion with a thin margin is
+        // a test that fails on a busy machine and teaches people to re-run.
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "deliver blocked for {:?}",
+            started.elapsed()
+        );
+
+        assert!(router.flush(Duration::from_secs(5)));
         assert_eq!(router.dlq().len(), 1);
     }
 
-    #[tokio::test]
-    async fn deliver_async_does_not_block_runtime() {
-        // Verify that deliver_async with backoff does NOT block the tokio
-        // runtime — we can run other tasks concurrently.
-        let fail_count = Arc::new(AtomicU32::new(0));
-        let router = Arc::new(DeliveryRouter::new().with_retry_policy(RetryPolicy {
-            max_retries: 2,
-            base_backoff: Duration::from_millis(10),
-        }));
+    /// A slow channel does not hold up a healthy one.
+    #[test]
+    fn a_failing_channel_does_not_delay_a_healthy_one() {
+        let delivered = Arc::new(AtomicU32::new(0));
+        let router = DeliveryRouter::new().with_retry_policy(RetryPolicy {
+            max_retries: 3,
+            base_backoff: Duration::from_millis(50),
+        });
         router.add_channel(Box::new(FailingChannel {
-            fail_count: Arc::clone(&fail_count),
+            fail_count: Arc::new(AtomicU32::new(0)),
             fail_first_n: 100,
         }));
+        router.add_channel(Box::new(CountingChannel {
+            name: "healthy".to_string(),
+            count: Arc::clone(&delivered),
+        }));
 
+        // Targets both channels.
         let event = test_signal("t1", "cpu", Severity::Info);
-        let router2 = Arc::clone(&router);
+        router.deliver(&event);
 
-        // Spawn delivery and a concurrent task
-        let (delivery_result, concurrent_ok) =
-            tokio::join!(async move { router2.deliver_async(&event).await }, async {
-                // This should complete while deliver_async is sleeping
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                true
+        // The healthy channel lands long before the failing one has finished
+        // its 50+100+200 ms schedule.
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while delivered.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the healthy channel waited on the failing one"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A queue that fills drops the oldest rather than blocking ingestion.
+    #[test]
+    fn a_full_queue_drops_the_oldest_and_keeps_accepting() {
+        let router = DeliveryRouter::new()
+            .with_queue_capacity(4)
+            .with_retry_policy(RetryPolicy {
+                max_retries: 0,
+                base_backoff: Duration::from_millis(1),
             });
+        router.add_channel(Box::new(BlockingChannel {
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+        }));
 
-        assert_eq!(delivery_result, 0);
-        assert!(
-            concurrent_ok,
-            "concurrent task should complete while delivery retries"
-        );
+        // The worker is stuck on the first event; the rest pile up behind it.
+        for _ in 0..50 {
+            let event = test_signal("t1", "cpu", Severity::Info);
+            assert_eq!(
+                router.deliver(&event),
+                1,
+                "a full queue must keep accepting"
+            );
+        }
+    }
+
+    /// A channel that blocks until told otherwise, for the queue tests.
+    struct BlockingChannel {
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl DeliveryChannel for BlockingChannel {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+        fn deliver(&self, _event: &SignalEvent) -> Result<()> {
+            let (lock, cv) = &*self.release;
+            let mut released = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut waited = Duration::ZERO;
+            while !*released && waited < Duration::from_secs(2) {
+                let (guard, _) = cv
+                    .wait_timeout(released, Duration::from_millis(20))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                released = guard;
+                waited += Duration::from_millis(20);
+            }
+            Ok(())
+        }
+    }
+
+    /// A channel that counts what reaches it.
+    struct CountingChannel {
+        name: String,
+        count: Arc<AtomicU32>,
+    }
+
+    impl DeliveryChannel for CountingChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn deliver(&self, _event: &SignalEvent) -> Result<()> {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
     }
 }

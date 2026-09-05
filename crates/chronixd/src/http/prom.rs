@@ -320,15 +320,24 @@ pub async fn prom_labels_handler(
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let params = PromSeriesQuery::from_params(&prom_params)?;
     let (start_ns, end_ns) = params.window()?;
-    let selectors = parse_selectors(&params.matchers)?;
+    let matchers = params.matchers;
     let limit = state.config.prom_series_limit;
 
     let labels = tokio::task::spawn_blocking(move || -> Result<Vec<String>, ServerError> {
+        let selectors = parse_selectors(&db, &matchers)?;
         let mut label_set = std::collections::BTreeSet::new();
-        label_set.insert("__name__".to_string());
-        for (key, _) in observed_labels(&db, scope.as_deref(), start_ns, end_ns, limit, &selectors)?
-        {
-            label_set.insert(key);
+        for set in observed_label_sets(
+            &db,
+            scope.as_deref(),
+            start_ns,
+            end_ns,
+            limit,
+            &selectors,
+            false,
+        )? {
+            for (key, _) in set {
+                label_set.insert(key);
+            }
         }
         Ok(label_set.into_iter().collect())
     })
@@ -341,6 +350,11 @@ pub async fn prom_labels_handler(
 }
 
 /// `GET /api/v1/prom/label/{name}/values` — label values for a given label.
+///
+/// `__name__` is answered from the same enumeration as every other label, so
+/// the names Grafana's metric browser offers are the names a query returns.
+/// Listing measurements here instead is what made the browser offer `cpu` for
+/// a measurement whose series are `cpu_usage` and `cpu_load`.
 pub async fn prom_label_values_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
@@ -351,29 +365,25 @@ pub async fn prom_label_values_handler(
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let params = PromSeriesQuery::from_params(&prom_params)?;
     let (start_ns, end_ns) = params.window()?;
-    let selectors = parse_selectors(&params.matchers)?;
+    let matchers = params.matchers;
     let limit = state.config.prom_series_limit;
 
     let values = tokio::task::spawn_blocking(move || -> Result<Vec<String>, ServerError> {
-        if label_name == "__name__" {
-            let names =
-                crate::namespace::measurements_in(&db, scope.as_deref(), start_ns, end_ns, limit);
-            if selectors.is_empty() {
-                return Ok(names);
-            }
-            // With matchers, `__name__`'s values are the measurements the
-            // selectors actually name.
-            return Ok(names
-                .into_iter()
-                .filter(|m| selectors.iter().any(|sel| sel.measurement == *m))
-                .collect());
-        }
+        let selectors = parse_selectors(&db, &matchers)?;
         let mut values = std::collections::BTreeSet::new();
-        for (key, value) in
-            observed_labels(&db, scope.as_deref(), start_ns, end_ns, limit, &selectors)?
-        {
-            if key == label_name {
-                values.insert(value);
+        for set in observed_label_sets(
+            &db,
+            scope.as_deref(),
+            start_ns,
+            end_ns,
+            limit,
+            &selectors,
+            false,
+        )? {
+            for (key, value) in set {
+                if key == label_name {
+                    values.insert(value);
+                }
             }
         }
         Ok(values.into_iter().collect())
@@ -386,22 +396,34 @@ pub async fn prom_label_values_handler(
     )))
 }
 
-/// One parsed `match[]` selector: the measurement it names and the rest of its
+/// One parsed `match[]` selector: the metrics it names and the rest of its
 /// matchers, compiled.
+///
+/// A metric is a `(measurement, field)` pair, so a selector names a *set* of
+/// them: `{__name__=~"cpu.+"}` may reach two fields of one measurement and one
+/// of another. `chronix::promql::metric` owns the mapping, and the evaluator
+/// resolves a selector through the same function — the two having their own
+/// answers is what let `/series?match[]={__name__=~".+"}` return nothing while
+/// `/query` with that selector returned every series.
 struct Selector {
-    measurement: String,
+    /// The metrics the selector names.
+    targets: Vec<chronix::promql::MetricRef>,
     /// Equality matchers, pushed into the scan.
     pushdown: Vec<(String, String)>,
     /// Every matcher except `__name__`, applied to the label sets produced.
     compiled: Vec<chronix::promql::CompiledMatcher>,
 }
 
-/// Parse `match[]` selectors into measurements plus compiled matchers.
+/// Parse `match[]` selectors into metrics plus compiled matchers.
 ///
-/// A selector that names no measurement is dropped rather than treated as
+/// A selector that constrains no metric name is dropped rather than treated as
 /// "everything": `match[]={host="a"}` cannot be answered without scanning every
 /// measurement, and Prometheus requires at least one non-empty matcher anyway.
-fn parse_selectors(matchers: &[String]) -> Result<Vec<Selector>, ServerError> {
+fn parse_selectors(
+    db: &chronix::Chronix,
+    matchers: &[String],
+) -> Result<Vec<Selector>, ServerError> {
+    let registry = db.schema_registry();
     let mut out = Vec::new();
     for raw in matchers {
         let expr =
@@ -411,16 +433,31 @@ fn parse_selectors(matchers: &[String]) -> Result<Vec<Selector>, ServerError> {
                 "match[] must be a series selector, got: {raw}"
             )));
         };
-        let Some(measurement) = name.as_deref().or_else(|| {
+        let named = name.as_deref().or_else(|| {
             matchers
                 .iter()
                 .find(|m| m.name == "__name__" && m.op == chronix::promql::MatchOp::Equal)
                 .map(|m| m.value.as_str())
-        }) else {
-            continue;
+        });
+        let name_filters: Vec<chronix::promql::CompiledMatcher> = matchers
+            .iter()
+            .filter(|m| m.name == "__name__" && m.op != chronix::promql::MatchOp::Equal)
+            .map(chronix::promql::CompiledMatcher::compile)
+            .collect::<Result<_, _>>()
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+        let mut targets = match named {
+            Some(n) => chronix::promql::metric::resolve(registry, n),
+            None if name_filters.is_empty() => continue,
+            None => chronix::promql::all_metrics(registry),
         };
+        targets.retain(|t| {
+            let labels = [("__name__".to_string(), t.name.clone())];
+            name_filters.iter().all(|f| f.matches(&labels))
+        });
+
         out.push(Selector {
-            measurement: measurement.to_string(),
+            targets,
             pushdown: matchers
                 .iter()
                 .filter(|m| {
@@ -494,43 +531,74 @@ impl PromSeriesQuery {
     }
 }
 
-/// Distinct `(label, value)` pairs actually present for `namespace`, restricted
-/// to the given selectors when there are any.
+/// Every distinct label set present in a window, for the metrics the
+/// selectors name — or for every metric, when there are none.
 ///
-/// Derived from the data rather than from the tag inverted index, which is
-/// built from *segments*: a label whose only points are still in the memtable
-/// was missing from every Grafana dropdown until the first flush, and the
-/// index carries no namespace dimension, so it answered with every tenant's
-/// values.
-fn observed_labels(
+/// One scan behind `/series`, `/labels` and `/label/{name}/values`, because
+/// three near-identical enumerations is the shape that drifts: they answered
+/// the same selector syntax and disagreed about what a metric is.
+///
+/// `project_value` decides how precise the answer is, and it is a real
+/// trade-off rather than an oversight:
+///
+/// - `true` (`/series`) projects each metric's own field and skips a row where
+///   it is null, so a series is listed only if it has a sample. A measurement
+///   gains fields over its life, and the rows written before `free` existed
+///   are not `mem_free` series. One scan per metric.
+/// - `false` (the label endpoints, which Grafana calls to fill a dropdown on
+///   every keystroke) projects tag columns only and scans once per
+///   *measurement*, attributing every row to each of that measurement's
+///   metrics. Decoding one dictionary block per tag instead of every sample in
+///   the window is the difference between a responsive editor and a scan, and
+///   the label names and values it reports are the same set.
+fn observed_label_sets(
     db: &std::sync::Arc<chronix::Chronix>,
     namespace: Option<&str>,
     start_ns: i64,
     end_ns: i64,
     limit: usize,
     selectors: &[Selector],
-) -> Result<Vec<(String, String)>, ServerError> {
-    let mut out = std::collections::BTreeSet::new();
+    project_value: bool,
+) -> Result<Vec<Vec<(String, String)>>, ServerError> {
+    let mut out: std::collections::BTreeSet<Vec<(String, String)>> =
+        std::collections::BTreeSet::new();
 
-    // With no selector, every measurement is in scope; with selectors, only
-    // the ones they name — which is what makes a Grafana label dropdown show
-    // the values for the metric being edited rather than for the whole
-    // database.
-    let scanned: Vec<(String, Option<&Selector>)> = if selectors.is_empty() {
-        db.schema_registry()
-            .measurement_names()
-            .into_iter()
-            .map(|m| (m, None))
-            .collect()
+    // With no selector every metric is in scope; with selectors, only the ones
+    // they name — which is what makes a Grafana label dropdown show the values
+    // for the metric being edited rather than for the whole database.
+    let all;
+    let targets: Vec<(&chronix::promql::MetricRef, Option<usize>)> = if selectors.is_empty() {
+        all = chronix::promql::all_metrics(db.schema_registry());
+        all.iter().map(|t| (t, None)).collect()
     } else {
         selectors
             .iter()
-            .map(|sel| (sel.measurement.clone(), Some(sel)))
+            .enumerate()
+            .flat_map(|(idx, sel)| sel.targets.iter().map(move |t| (t, Some(idx))))
             .collect()
     };
 
-    for (measurement, selector) in scanned {
-        let Some(schema) = db.schema(&measurement) else {
+    // One scan per group. Reading the value column forces a group per metric;
+    // without it the metrics of one measurement share a scan and differ only
+    // in the `__name__` they contribute.
+    let mut groups: Vec<Scan<'_>> = Vec::new();
+    for (target, selector) in targets {
+        let field = project_value.then_some(target.field.as_str());
+        let key = (target.measurement.as_str(), field, selector);
+        if let Some(existing) = groups.iter_mut().find(|g| g.key == key) {
+            existing.names.push(target.name.as_str());
+        } else {
+            groups.push(Scan {
+                key,
+                names: vec![target.name.as_str()],
+            });
+        }
+    }
+
+    for group in &groups {
+        let (measurement, field, selector_idx) = group.key;
+        let selector = selector_idx.and_then(|i| selectors.get(i));
+        let Some(schema) = db.schema(measurement) else {
             continue;
         };
         let tag_names: Vec<String> = schema
@@ -539,20 +607,17 @@ fn observed_labels(
             .map(std::string::ToString::to_string)
             .filter(|t| t != crate::namespace::NAMESPACE_TAG)
             .collect();
-        if tag_names.is_empty() {
-            continue;
-        }
 
-        // Project the tag columns only: field values are never inspected, and
-        // not decoding them is the difference between reading a handful of
-        // dictionary blocks and reading every sample in the window.
         let mut builder = db
             .query()
-            .measurement(&measurement)
+            .measurement(measurement)
             .namespace_scope(namespace)
             .range(start_ns, end_ns);
         for tag in &tag_names {
             builder = builder.field(tag);
+        }
+        if let Some(field) = field {
+            builder = builder.field(field);
         }
         if let Some(sel) = selector {
             for (key, value) in &sel.pushdown {
@@ -579,27 +644,37 @@ fn observed_labels(
                     )
                 })
                 .collect();
+            let value_col = field.and_then(|f| batch.column_by_name(f));
+            if field.is_some() && value_col.is_none() {
+                // The batch predates the field: no sample of this metric.
+                continue;
+            }
 
             for row in 0..batch.num_rows() {
+                if value_col.is_some_and(|c| arrow::array::Array::is_null(c.as_ref(), row)) {
+                    continue;
+                }
                 // Build the whole label set before testing it: a non-equality
                 // matcher on one tag decides whether the *other* tags' values
                 // on this row exist at all.
-                let mut pairs: Vec<(String, String)> =
-                    vec![("__name__".to_string(), measurement.clone())];
+                let mut tags: Vec<(String, String)> = Vec::with_capacity(tag_names.len() + 1);
                 for (tag, arr) in &columns {
                     if let Some(arr) = arr {
                         if !arr.is_null(row) {
-                            pairs.push(((*tag).clone(), arr.value(row).to_string()));
+                            tags.push(((*tag).clone(), arr.value(row).to_string()));
                         }
                     }
                 }
-                if let Some(sel) = selector {
-                    if !chronix::promql::label_set_matches(&sel.compiled, &pairs) {
-                        continue;
+                for name in &group.names {
+                    let mut pairs = tags.clone();
+                    pairs.push(("__name__".to_string(), (*name).to_string()));
+                    pairs.sort();
+                    if let Some(sel) = selector {
+                        if !chronix::promql::label_set_matches(&sel.compiled, &pairs) {
+                            continue;
+                        }
                     }
-                }
-                for (key, value) in pairs.into_iter().skip(1) {
-                    out.insert((key, value));
+                    out.insert(pairs);
                     if out.len() >= limit {
                         tracing::warn!(
                             "prom label enumeration hit the series limit ({limit}), truncating"
@@ -614,10 +689,22 @@ fn observed_labels(
     Ok(out.into_iter().collect())
 }
 
+/// One scan of `observed_label_sets`: a measurement, optionally a value
+/// column, and the metric names its rows are attributed to.
+struct Scan<'a> {
+    /// Measurement, the value column when one is projected, and the index of
+    /// the selector this scan answers.
+    key: (&'a str, Option<&'a str>, Option<usize>),
+    /// The metric names every row of the scan is attributed to.
+    names: Vec<&'a str>,
+}
+
 /// `GET /api/v1/prom/series` handler.
 ///
 /// Enumerates the distinct label-sets present in the data for the given
-/// matchers — conforming to the Prometheus `/api/v1/series` contract.
+/// matchers — conforming to the Prometheus `/api/v1/series` contract, and
+/// through the same metric resolution the evaluator uses, so a selector that
+/// answers here answers there.
 pub async fn prom_series_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
@@ -626,151 +713,32 @@ pub async fn prom_series_handler(
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let params = PromSeriesQuery::from_params(&prom_params)?;
+    let (start_ns, end_ns) = params.window()?;
     let matchers = params.matchers;
     let series_limit = state.config.prom_series_limit;
 
-    // Convert optional Prometheus time bounds (seconds since
-    // epoch, f64) to nanosecond timestamps for query range filtering.
-    // When no range is provided, default to the last hour to prevent
-    // accidental full-table scans on large datasets (Prometheus convention).
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64;
-    let one_hour_ns: i64 = 3_600_000_000_000;
-    let start_ns = params.start.unwrap_or(now_ns - one_hour_ns);
-    let end_ns = params.end.unwrap_or(now_ns);
-
     let series_list =
         tokio::task::spawn_blocking(move || -> Result<Vec<serde_json::Value>, ServerError> {
-            let mut result = Vec::new();
-
-            for matcher_str in &matchers {
-                // Parse the matcher as a PromQL selector
-                let expr = chronix::promql::parse(matcher_str)
-                    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-
-                if let chronix::promql::Expr::VectorSelector { name, matchers, .. } = &expr {
-                    // Resolve the measurement name from either the explicit
-                    // name or a `__name__="..."` equality matcher.
-                    let measurement = name.as_deref().or_else(|| {
-                        matchers
-                            .iter()
-                            .find(|m| {
-                                m.name == "__name__" && m.op == chronix::promql::MatchOp::Equal
-                            })
-                            .map(|m| m.value.as_str())
-                    });
-                    let Some(measurement) = measurement else {
-                        continue;
-                    };
-
-                    // Everything except `__name__` still has to be applied:
-                    // resolving only the measurement and enumerating the whole
-                    // of it answers `{__name__="cpu",host="a"}` with every
-                    // host.
-                    let compiled = chronix::promql::compile_label_matchers(matchers)
-                        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-                    // Equality matchers go into the scan; the rest are applied
-                    // to the label sets it produces.
-                    let pushdown: Vec<(String, String)> = matchers
-                        .iter()
-                        .filter(|m| {
-                            m.name != "__name__"
-                                && m.op == chronix::promql::MatchOp::Equal
-                                && m.name != crate::namespace::NAMESPACE_TAG
-                        })
-                        .map(|m| (m.name.clone(), m.value.clone()))
-                        .collect();
-
-                    let tag_names: Vec<String> = db
-                        .schema(measurement)
-                        .map(|s| {
-                            s.tag_names()
-                                .iter()
-                                .map(std::string::ToString::to_string)
-                                .filter(|t| t != crate::namespace::NAMESPACE_TAG)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    // Query actual data to discover real label-sets.
-                    // Bounded by the requested time range (default 1h).
-                    //
-                    // Only the tag columns are projected — field values are
-                    // never inspected here, and not decoding them is the
-                    // difference between reading a handful of dictionary
-                    // blocks and reading every sample in the window.
-                    let mut builder = db
-                        .query()
-                        .measurement(measurement)
-                        .namespace_scope(scope.as_deref())
-                        .range(start_ns, end_ns);
-                    for tag in &tag_names {
-                        builder = builder.field(tag);
-                    }
-                    for (key, value) in &pushdown {
-                        builder = builder.tag(key, value);
-                    }
-                    let plan = builder.build().map_err(|e| {
-                        ServerError::Internal(format!(
-                            "failed to build query for '{measurement}': {e}"
-                        ))
-                    })?;
-                    let stream = db.execute_iter(&plan).map_err(|e| {
-                        ServerError::Internal(format!(
-                            "failed to execute query for '{measurement}': {e}"
-                        ))
-                    })?;
-
-                    // Collect distinct label-sets from the actual data,
-                    // enforcing the cardinality limit for safety. Streaming
-                    // means hitting the limit stops the scan rather than
-                    // stopping the loop over an already-materialised result.
-                    let mut seen = std::collections::HashSet::new();
-                    'batches: for batch in stream {
-                        let batch = batch.map_err(|e| {
-                            ServerError::Internal(format!("failed to read '{measurement}': {e}"))
-                        })?;
-                        for row in 0..batch.num_rows() {
-                            if result.len() >= series_limit {
-                                tracing::warn!(
-                                "prom /series hit cardinality limit ({series_limit}), truncating"
-                            );
-                                break 'batches;
-                            }
-
-                            let mut pairs: Vec<(String, String)> =
-                                vec![("__name__".to_string(), measurement.to_owned())];
-                            for tag in &tag_names {
-                                if let Some(col) = batch.column_by_name(tag) {
-                                    if let Some(arr) =
-                                        col.as_any().downcast_ref::<arrow::array::StringArray>()
-                                    {
-                                        if !arr.is_null(row) {
-                                            pairs.push((tag.clone(), arr.value(row).to_string()));
-                                        }
-                                    }
-                                }
-                            }
-                            if !chronix::promql::label_set_matches(&compiled, &pairs) {
-                                continue;
-                            }
-                            let key = format!("{pairs:?}");
-                            if seen.insert(key) {
-                                result.push(serde_json::Value::Object(
-                                    pairs
-                                        .into_iter()
-                                        .map(|(k, v)| (k, serde_json::Value::String(v)))
-                                        .collect(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            Ok(result)
+            let selectors = parse_selectors(&db, &matchers)?;
+            Ok(observed_label_sets(
+                &db,
+                scope.as_deref(),
+                start_ns,
+                end_ns,
+                series_limit,
+                &selectors,
+                true,
+            )?
+            .into_iter()
+            .map(|pairs| {
+                serde_json::Value::Object(
+                    pairs
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect(),
+                )
+            })
+            .collect())
         })
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;
@@ -812,19 +780,19 @@ pub async fn prom_metadata_handler(
 
             let mut result = serde_json::Map::new();
             for name in &names {
-                if let Some(schema) = registry.lookup(name) {
-                    let fields: Vec<serde_json::Value> = schema
-                        .field_names()
-                        .iter()
-                        .map(|f| {
-                            serde_json::json!({
-                                "type": "gauge",
-                                "help": format!("Field {f} in measurement {name}"),
-                                "unit": ""
-                            })
-                        })
-                        .collect();
-                    result.insert(name.clone(), serde_json::Value::Array(fields));
+                for metric in chronix::promql::metrics_of(registry, name) {
+                    // Keyed by the **metric** name, which is what a query
+                    // returns and what a selector accepts. Keying by
+                    // measurement told Grafana's browser about `cpu` when the
+                    // series are `cpu_usage` and `cpu_load`.
+                    result.insert(
+                        metric.name,
+                        serde_json::json!([{
+                            "type": "gauge",
+                            "help": format!("Field {} in measurement {name}", metric.field),
+                            "unit": ""
+                        }]),
+                    );
                 }
             }
 

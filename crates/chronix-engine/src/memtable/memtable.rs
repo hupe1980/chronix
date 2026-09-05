@@ -1320,16 +1320,26 @@ impl MeasurementBuilder {
         if self.rows == 0 {
             return None;
         }
-        let mut fields = vec![Field::new("timestamp", DataType::Int64, false)];
+        use crate::segment::metadata::roles;
+        // A tag and a string field are the same Arrow type, so the schema has
+        // to carry the role or every consumer guesses at it.
+        let mut fields = vec![Field::new("timestamp", DataType::Int64, false)
+            .with_metadata(roles::arrow_metadata(roles::TIMESTAMP))];
         let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(self.timestamps.finish())];
         let tag_columns: Vec<String> = self.tags.keys().map(ToString::to_string).collect();
         for (name, mut b) in self.tags {
-            fields.push(Field::new(name.as_ref(), DataType::Utf8, true));
+            fields.push(
+                Field::new(name.as_ref(), DataType::Utf8, true)
+                    .with_metadata(roles::arrow_metadata(roles::TAG)),
+            );
             columns.push(Arc::new(b.finish()));
         }
         for (name, b) in self.fields {
             let (dt, arr) = b.finish();
-            fields.push(Field::new(name.as_ref(), dt, true));
+            fields.push(
+                Field::new(name.as_ref(), dt, true)
+                    .with_metadata(roles::arrow_metadata(roles::FIELD)),
+            );
             columns.push(arr);
         }
         let batch =

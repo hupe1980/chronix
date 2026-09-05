@@ -377,7 +377,7 @@ Chronix exposes Prometheus metrics at `/metrics` (default port 8086).
 | `chronix_cluster_query_latency_seconds` | Histogram | Query latency |
 | `chronix_cluster_write_latency_seconds` | Histogram | Write latency |
 | `chronix_cluster_heartbeat_latency_seconds` | Histogram | Heartbeat RTT |
-| `chronix_cluster_replication_lag_seconds` | Histogram | Replication lag |
+| `chronix_raft_log_replication_lag` | Histogram | Replication lag |
 
 #### Object Store
 
@@ -399,7 +399,7 @@ Chronix exposes Prometheus metrics at `/metrics` (default port 8086).
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `chronix_stream_non_finite_values_dropped` | Counter | NaN/Infinity values dropped from streaming aggregation |
+| `chronix_wire_non_finite_samples_skipped_total` | Counter | NaN/Infinity values dropped from streaming aggregation |
 
 ### Grafana Dashboards
 
@@ -561,7 +561,7 @@ circuit; a failed probe re-opens it.
 | `circuit_breaker.failure_threshold` | `5` | Consecutive failures before opening |
 | `circuit_breaker.recovery_timeout_secs` | `30` | Seconds before half-open probe |
 
-**Metric:** `chronix_circuit_breaker_state` gauge (labels: `node_id`, state: `0`=closed, `1`=open, `2`=half-open).
+**Metric:** `chronix_circuit_breaker_open_total` counter (labels: `node_id`) — incremented each time a node's breaker opens. There is no gauge of the current state; `rate(...[5m]) > 0` is how you alert on a node that keeps tripping.
 
 ### Analytics Model Management
 
@@ -641,7 +641,7 @@ container stack.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| High replication lag | Network or I/O bottleneck | Check `chronix_cluster_replication_lag_seconds` p99 |
+| High replication lag | Network or I/O bottleneck | Check `chronix_raft_log_replication_lag` p99 |
 | Quota exceeded (429) | Tenant over limit | Increase quota or add retention policies |
 | Slow cold storage reads | Cache cold | Pre-warm cache or increase `cache.max_size_bytes` |
 | TLS `failed to configure` | Invalid certs/keys | Check file paths and cert/key pairing; server starts without TLS on failure |

@@ -79,6 +79,89 @@ pub struct ErrorResponse {
     pub code: &'static str,
 }
 
+/// Give every error response the same JSON envelope, whoever produced it.
+///
+/// [`ServerError`] already renders `{"error":…,"code":…}`, but the framework
+/// answers before a handler runs and does not: a body that fails to
+/// deserialise came back as the plain sentence *"Failed to deserialize the
+/// JSON body into the target type: missing field `measurement`"*, an unknown
+/// path as a **404 with no body at all**, and a wrong method as a bare 405. A
+/// client that parses `error` and branches on `code` — the SDK does, and so
+/// does anything generated from the OpenAPI document — got a parse failure
+/// instead of an error message.
+///
+/// This runs outermost, so it covers routes that do not exist yet as well as
+/// every extractor rejection. Responses that already carry JSON are passed
+/// through untouched, which is what leaves the Prometheus endpoints' own
+/// `{"status":"error","errorType":…}` shape alone — clients branch on that
+/// one too.
+pub async fn error_envelope_layer(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let response = next.run(req).await;
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if is_json {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    // An error body is a sentence, not a stream; the cap is there so a
+    // streaming route that fails mid-flight cannot be buffered whole.
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (parts.status, "").into_response(),
+    };
+    let message = String::from_utf8_lossy(&bytes);
+    let message = message.trim();
+    let message = if message.is_empty() {
+        status.canonical_reason().unwrap_or("error").to_string()
+    } else {
+        message.to_string()
+    };
+
+    let code = match status {
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::METHOD_NOT_ALLOWED => "METHOD_NOT_ALLOWED",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "UNSUPPORTED_MEDIA_TYPE",
+        StatusCode::PAYLOAD_TOO_LARGE => "PAYLOAD_TOO_LARGE",
+        // Valid JSON, wrong shape — axum's `Json` distinguishes this from a
+        // body that is not JSON at all, and so should the code a client
+        // branches on.
+        StatusCode::UNPROCESSABLE_ENTITY => "INVALID_BODY",
+        StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
+        StatusCode::FORBIDDEN => "FORBIDDEN",
+        StatusCode::TOO_MANY_REQUESTS => "RATE_LIMITED",
+        s if s.is_server_error() => "INTERNAL_ERROR",
+        _ => "BAD_REQUEST",
+    };
+
+    let mut out = (
+        parts.status,
+        axum::Json(ErrorResponse {
+            error: message,
+            code,
+        }),
+    )
+        .into_response();
+    // Keep whatever the inner response set — a request id, `Retry-After`,
+    // `WWW-Authenticate` — and let the JSON content type win.
+    for (name, value) in &parts.headers {
+        if name != axum::http::header::CONTENT_TYPE && name != axum::http::header::CONTENT_LENGTH {
+            out.headers_mut().insert(name, value.clone());
+        }
+    }
+    out
+}
+
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {

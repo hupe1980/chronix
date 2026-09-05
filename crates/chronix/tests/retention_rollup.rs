@@ -6,6 +6,7 @@ use chronix::prelude::*;
 use chronix::rollup::{RollupAggFn, RollupBuilder};
 use chronix::{fields, tags, Chronix};
 use std::sync::Arc;
+use std::time::Duration;
 
 const HOUR: i64 = 3_600_000_000_000;
 const MINUTE: i64 = 60_000_000_000;
@@ -98,7 +99,7 @@ fn unreadable_segment_is_not_dropped_by_rollup_aware_retention() {
     assert_eq!(segs.len(), 1, "expected exactly one segment");
     std::fs::write(&segs[0], b"NOT A SEGMENT").unwrap();
 
-    let result = db.enforce_retention(1).unwrap();
+    let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
     // The clock segment goes; the raw segment must stay.
     assert_eq!(result.segments_deleted, 1, "only the clock segment may go");
     assert!(
@@ -132,7 +133,7 @@ fn readable_segment_is_dropped_after_rollup() {
     db.flush().unwrap();
     advance_clock(&db, 10 * HOUR);
 
-    let result = db.enforce_retention(1).unwrap();
+    let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
     assert_eq!(result.segments_deleted, 2, "raw and clock");
     assert!(db
         .catalog()
@@ -167,7 +168,7 @@ fn retention_materialises_the_whole_cascade_before_dropping_raw() {
     db.flush().unwrap();
     advance_clock(&db, 10 * HOUR);
 
-    let result = db.enforce_retention(1).unwrap();
+    let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
     assert_eq!(result.segments_deleted, 2, "raw and clock");
 
     let m1 = scan(&db, "raw_1m");
@@ -225,7 +226,7 @@ fn retention_rolls_a_bucket_up_over_every_segment_that_feeds_it() {
     );
     advance_clock(&db, 10 * HOUR);
 
-    let result = db.enforce_retention(1).unwrap();
+    let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
     assert_eq!(
         result.segments_deleted, 4,
         "three raw segments and the clock"
@@ -264,7 +265,7 @@ fn retention_preserves_raw_data_whose_rollup_is_not_final() {
     db.flush().unwrap();
     // No clock advance: the window is still open over this shard.
 
-    let result = db.enforce_retention(1).unwrap();
+    let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
     assert_eq!(result.segments_deleted, 0);
     assert_eq!(scan(&db, "raw_1m").num_rows(), 0, "nothing is final yet");
     assert_eq!(scan(&db, "raw").num_rows(), 50);

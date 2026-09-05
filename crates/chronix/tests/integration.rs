@@ -1890,11 +1890,11 @@ fn retention_enforcement_removes_old_data() {
     }
     db.flush().unwrap();
 
-    // enforce_retention takes a retention *duration* in nanoseconds.
-    // A very small duration means "keep almost nothing" — any data older
-    // than (now - duration) is eligible for removal.
-    let retention_ns = 1i64; // 1 ns retention → everything is expired
-    let result = db.enforce_retention(retention_ns).unwrap();
+    // A very small retention means "keep almost nothing" — any data older
+    // than (now - retention) is eligible for removal.
+    let result = db
+        .enforce_retention(std::time::Duration::from_nanos(1))
+        .unwrap();
     // All data should be eligible for removal since timestamps are near 0
     // and the retention window is only 1ns from current wall-clock time.
     assert!(

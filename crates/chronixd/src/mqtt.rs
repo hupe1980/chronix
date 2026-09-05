@@ -67,7 +67,10 @@ pub struct MqttSubscriber {
     ///
     /// Decides whether points get a namespace tag: without it a
     /// multi-tenant deployment could not read its own connector data.
-    #[cfg_attr(not(any(feature = "kafka", feature = "mqtt")), allow(dead_code))]
+    // Read only by this connector's own loop, which is feature-gated. The
+    // guard used to name *both* connector features, so building with only the
+    // other one warned.
+    #[cfg_attr(not(feature = "mqtt"), allow(dead_code))]
     multi_tenancy: bool,
     running: AtomicBool,
     stopped: AtomicBool,
@@ -75,6 +78,8 @@ pub struct MqttSubscriber {
     messages_total: AtomicU64,
     points_total: AtomicU64,
     decode_errors: AtomicU64,
+    /// When the connector was constructed, for the throughput figure.
+    started_at: std::time::Instant,
     /// Reconnection counter — used by the subscriber loop when the `mqtt`
     /// feature is enabled.
     #[cfg_attr(not(feature = "mqtt"), allow(dead_code))]
@@ -122,6 +127,7 @@ impl MqttSubscriber {
             messages_total: AtomicU64::new(0),
             points_total: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
+            started_at: std::time::Instant::now(),
             reconnections: AtomicU64::new(0),
         });
         let _ = arc.self_ref.set(Arc::downgrade(&arc));
@@ -145,6 +151,7 @@ impl MqttSubscriber {
             messages_total: AtomicU64::new(0),
             points_total: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
+            started_at: std::time::Instant::now(),
             reconnections: AtomicU64::new(0),
         }
     }
@@ -427,12 +434,16 @@ impl IngestionConnector for MqttSubscriber {
     }
 
     async fn metrics(&self) -> ConnectorMetrics {
+        let points = self.points_total.load(Ordering::Relaxed);
         ConnectorMetrics {
             messages_total: self.messages_total.load(Ordering::Relaxed),
-            points_total: self.points_total.load(Ordering::Relaxed),
+            points_total: points,
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
-            lag: 0,
-            throughput: 0.0,
+            // MQTT is a push protocol: there is no broker-side offset to be
+            // behind, so there is no lag to report. `None` says that; `0`
+            // used to claim "caught up", which is a different statement.
+            lag: None,
+            throughput: crate::connector::throughput(points, self.started_at),
         }
     }
 }

@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // data that still feeds an unmaterialised bucket is preserved.
     // (Retention is evaluated against the wall clock, which is why the
     // data above is seeded relative to `now`.)
-    let retention_result = db.enforce_retention(3 * hour_ns)?;
+    let retention_result = db.enforce_retention(Duration::from_secs(3 * 3600))?;
     println!("   Shards dropped   : {}", retention_result.shards_dropped);
     println!(
         "   Segments deleted  : {}",

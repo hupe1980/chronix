@@ -236,15 +236,23 @@ impl PostFilter {
     }
 }
 
-/// Which measurements a query's `__name__` matchers select.
+/// Which **metrics** a query's `__name__` matchers select.
 ///
-/// An equality matcher names one; a regex selects from the measurements the
-/// namespace holds. `{__name__=~"a|b"}` used to be a flat 400.
-fn resolve_measurements(
+/// A metric is one `(measurement, field)` pair, resolved through
+/// `promql::metric` — the same function the evaluator and the discovery
+/// endpoints use. Resolving a *measurement* here meant a federating Prometheus
+/// asking for `cpu_usage` got nothing, and asking for `cpu` got whichever
+/// field happened to sort first, under the measurement's name, with the other
+/// fields invisible.
+///
+/// The candidate set is restricted to measurements the namespace holds, so the
+/// schema registry — which is process-wide — cannot tell one tenant what
+/// another is writing.
+fn resolve_metrics(
     db: &Arc<Chronix>,
     namespace: Option<&str>,
     query: &prom_proto::Query,
-) -> Result<Vec<String>, ServerError> {
+) -> Result<Vec<chronix::promql::MetricRef>, ServerError> {
     let mut exact: Option<String> = None;
     let mut patterns: Vec<(regex::Regex, bool)> = Vec::new();
     for matcher in &query.matchers {
@@ -272,25 +280,33 @@ fn resolve_measurements(
         }
     }
 
-    if let Some(name) = exact {
-        // An equality matcher pins the measurement; any regex beside it just
-        // has to agree.
-        let keep = patterns.iter().all(|(re, neg)| re.is_match(&name) != *neg);
-        return Ok(if keep { vec![name] } else { Vec::new() });
-    }
-    if patterns.is_empty() {
+    if exact.is_none() && patterns.is_empty() {
         return Err(ServerError::BadRequest(
             "read query must include a __name__ matcher".into(),
         ));
     }
+
     let start_ns = query.start_timestamp_ms.saturating_mul(1_000_000);
     let end_ns = query.end_timestamp_ms.saturating_mul(1_000_000);
-    Ok(
+    let held: std::collections::HashSet<String> =
         crate::namespace::measurements_in(db, namespace, start_ns, end_ns, usize::MAX)
             .into_iter()
-            .filter(|m| patterns.iter().all(|(re, neg)| re.is_match(m) != *neg))
-            .collect(),
-    )
+            .collect();
+    let registry = db.schema_registry();
+
+    let candidates = match &exact {
+        Some(name) => chronix::promql::metric::resolve(registry, name),
+        None => chronix::promql::all_metrics(registry),
+    };
+    Ok(candidates
+        .into_iter()
+        .filter(|m| held.contains(&m.measurement))
+        .filter(|m| {
+            patterns
+                .iter()
+                .all(|(re, neg)| re.is_match(&m.name) != *neg)
+        })
+        .collect())
 }
 
 /// Execute a single Prometheus read query, over every measurement its
@@ -301,19 +317,20 @@ fn execute_single_query(
     query: &prom_proto::Query,
 ) -> Result<Vec<prom_proto::TimeSeries>, ServerError> {
     let mut out = Vec::new();
-    for measurement in resolve_measurements(db, namespace, query)? {
-        out.extend(read_one_measurement(db, namespace, query, &measurement)?);
+    for metric in resolve_metrics(db, namespace, query)? {
+        out.extend(read_one_metric(db, namespace, query, &metric)?);
     }
     Ok(out)
 }
 
-/// Read one measurement, applying every matcher.
-fn read_one_measurement(
+/// Read one metric, applying every matcher.
+fn read_one_metric(
     db: &Arc<Chronix>,
     namespace: Option<&str>,
     query: &prom_proto::Query,
-    measurement: &str,
+    metric: &chronix::promql::MetricRef,
 ) -> Result<Vec<prom_proto::TimeSeries>, ServerError> {
+    let measurement = metric.measurement.as_str();
     // Equality matchers are pushed into the scan; the rest are applied per
     // series below. They used to be collected and dropped, behind a comment
     // claiming a post-filter that did not exist — so `job!="a"` returned
@@ -391,10 +408,12 @@ fn read_one_measurement(
             .position(|f| f.name() == "timestamp")
             .unwrap_or(0);
 
-        // Find value column (first float64 field)
-        let val_idx = schema.fields().iter().position(|f| {
-            f.name() != "timestamp" && !matches!(f.data_type(), arrow::datatypes::DataType::Utf8)
-        });
+        // The metric's own field. Taking "the first non-string column"
+        // returned one field of a multi-field measurement and hid the rest.
+        let val_idx = schema
+            .fields()
+            .iter()
+            .position(|f| *f.name() == metric.field);
 
         // Find tag columns
         let tag_indices: Vec<(String, usize)> = schema
@@ -419,6 +438,11 @@ fn read_one_measurement(
 
             let value = if let Some(vi) = val_idx {
                 let col = batch.column(vi);
+                // A row written before this field existed carries a null, and
+                // a null is not a sample of zero.
+                if arrow::array::Array::is_null(col.as_ref(), row) {
+                    continue;
+                }
                 if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
                     arr.value(row)
                 } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
@@ -462,7 +486,7 @@ fn read_one_measurement(
         }
         let mut labels = vec![prom_proto::Label {
             name: "__name__".to_string(),
-            value: measurement.to_string(),
+            value: metric.name.clone(),
         }];
         for (k, v) in tags {
             labels.push(prom_proto::Label { name: k, value: v });

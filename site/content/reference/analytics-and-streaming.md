@@ -352,22 +352,30 @@ memory growth (default capacity: `DEFAULT_SIGNAL_CHANNEL_CAPACITY = 1024`):
 - **`SignalReceiver::try_recv()`** — non-blocking attempt
 - **`SignalReceiver::drain()`** — collects all pending signals
 
-### Per-Measurement Analytics Overrides
+### Analytics bounds
 
-`AnalyticsOverride` allows per-measurement customization of analytics config:
+`[analytics]` carries two settings, and both are enforced by the SQL forecast
+aggregates:
 
 ```rust
 let config = ChronixConfig::builder()
-    .measurement_analytics_override("cpu", AnalyticsOverride {
-        forecast_model: Some(ModelType::HoltWinters),
-        anomaly_method: Some(DetectorType::DynamicThreshold),
-        ..Default::default()
+    .analytics(AnalyticsConfig {
+        max_forecast_horizon: 720,     // most points one forecast() may return
+        max_training_points: 100_000,  // most input points a model is fed
     })
     .build()?;
 ```
 
-`effective_analytics(measurement)` merges overrides onto global defaults — any
-`None` fields in the override fall through to the global `AnalyticsConfig`.
+A `forecast(v, _time, h)` with `h` over the limit is a planning error naming
+the setting; the training cap keeps the **newest** points, which is what a
+forecast is about.
+
+There is no per-measurement override and no `[multivariate]` section. They
+existed as configuration — parsed, validated, documented — and nothing read
+them, so setting one changed no behaviour and raised no error. The model, the
+detector and the confidence level are arguments to the analytics API, which is
+where a per-call choice belongs.
+
 ## Real-Time Analytics (`chronix-analytics`)
 
 Streaming analytics engines that run on the CDC ingest path.

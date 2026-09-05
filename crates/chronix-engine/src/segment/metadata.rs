@@ -102,6 +102,24 @@ pub mod roles {
     pub const TAG: u8 = 1;
     /// Field column (any data type).
     pub const FIELD: u8 = 2;
+
+    /// The Arrow field-metadata key a decoded batch carries its role under.
+    ///
+    /// A tag and a string field are the same Arrow type, so a schema built
+    /// from types alone loses the distinction — and every consumer then
+    /// guesses, differently.
+    pub const ARROW_ROLE_KEY: &str = "role";
+
+    /// Arrow field metadata for one stored role.
+    #[must_use]
+    pub fn arrow_metadata(role: u8) -> std::collections::HashMap<String, String> {
+        let name = match role {
+            TIMESTAMP => "timestamp",
+            TAG => "tag",
+            _ => "field",
+        };
+        [(ARROW_ROLE_KEY.to_string(), name.to_string())].into()
+    }
 }
 
 /// Per-row-group column block location and metadata.

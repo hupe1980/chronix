@@ -19,7 +19,13 @@ use super::types::{
 // ── Request / response types ───────────────────────────────────────────
 
 /// JSON body for a query request.
+///
+/// `deny_unknown_fields`: a misspelled or stale key used to be dropped in
+/// silence, so a body carrying `start`/`end` at the top level — which is what
+/// the documentation showed — ran unfiltered and answered the whole
+/// measurement as though it had understood the range.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     /// Measurement to query.
     pub measurement: String,
@@ -53,6 +59,7 @@ pub struct QueryRow {
 
 /// JSON body for SQL query.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SqlRequest {
     /// The SQL query string.
     pub query: String,
@@ -163,6 +170,33 @@ pub async fn query_handler(
     Ok(Json(result))
 }
 
+/// Map a DataFusion execution error to the right status.
+///
+/// A query that fails *while running* is not automatically the server's fault:
+/// an aggregate can reject its own arguments only once it has seen them, and
+/// `forecast(v, _time, 2000000)` — over the configured
+/// `analytics.max_forecast_horizon` — did exactly that. Mapping every
+/// execution error to `Internal` made it a `500` whose body is redacted to
+/// "an internal error occurred", so the message naming the setting to change
+/// never reached the caller.
+fn sql_execution_error(e: &datafusion::error::DataFusionError) -> ServerError {
+    match e {
+        // The caller's query is wrong: planning, resolution, or an argument a
+        // function refuses.
+        datafusion::error::DataFusionError::Plan(_)
+        | datafusion::error::DataFusionError::SchemaError(..)
+        | datafusion::error::DataFusionError::SQL(..)
+        | datafusion::error::DataFusionError::NotImplemented(_) => {
+            ServerError::BadRequest(format!("SQL error: {e}"))
+        }
+        // The query asked for more than this server will give it.
+        datafusion::error::DataFusionError::ResourcesExhausted(_) => {
+            ServerError::BadRequest(format!("SQL error: {e}"))
+        }
+        _ => ServerError::Internal(format!("SQL execution error: {e}")),
+    }
+}
+
 /// `POST /api/v1/chronix/sql` — execute a read-only SQL query.
 pub async fn sql_handler(
     State(state): State<AppState>,
@@ -255,11 +289,9 @@ pub async fn sql_handler(
             .map_err(|_| {
                 ServerError::Internal(format!("SQL query timed out after {timeout_secs}s"))
             })?
-            .map_err(|e| ServerError::Internal(format!("SQL execution error: {e}")))?
+            .map_err(|e| sql_execution_error(&e))?
     } else {
-        stream_future
-            .await
-            .map_err(|e| ServerError::Internal(format!("SQL execution error: {e}")))?
+        stream_future.await.map_err(|e| sql_execution_error(&e))?
     };
 
     let mut columns = Vec::new();
@@ -302,8 +334,7 @@ pub async fn sql_handler(
             stream.next().await
         }
     } {
-        let batch =
-            batch_result.map_err(|e| ServerError::Internal(format!("SQL execution error: {e}")))?;
+        let batch = batch_result.map_err(|e| sql_execution_error(&e))?;
         for row_idx in 0..batch.num_rows() {
             if row_count >= max_rows {
                 tracing::warn!(max_rows, "SQL result truncated to max_rows limit");
@@ -423,9 +454,13 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
             match field.data_type() {
                 DataType::Utf8 => {
                     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        // The scan stamps the role, because a tag and a
+                        // string field are the same Arrow type. Without it
+                        // every tag fell through to `fields` and `tags` came
+                        // back empty on every row.
                         let is_tag = field
                             .metadata()
-                            .get("role")
+                            .get(chronix::db::ROLE_KEY)
                             .map(std::string::String::as_str)
                             == Some("tag");
                         if is_tag {

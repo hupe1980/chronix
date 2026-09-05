@@ -38,7 +38,7 @@ pub(crate) fn convert_timestamp_column(batch: RecordBatch) -> Result<RecordBatch
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             new_fields.push(
                 arrow::datatypes::Field::new(
-                    "_time",
+                    crate::sql::TIME_COLUMN,
                     DataType::Timestamp(TimeUnit::Nanosecond, None),
                     false,
                 )
@@ -74,13 +74,14 @@ pub(crate) fn align_batch_to_schema(
     let src = batch.schema();
 
     // Fast path: already identical, no work to do.
-    if src.fields().len() == target.fields().len()
-        && src
-            .fields()
-            .iter()
-            .zip(target.fields())
-            .all(|(a, b)| a.name() == b.name())
-    {
+    //
+    // Identical means the *whole* schema, not just the column names. A scan
+    // batch carries each column's role in its field metadata, and returning
+    // it here left the caller with a batch whose schema is not the one it
+    // asked to align to — which a Parquet writer built for `target` then
+    // refuses, silently, because the cold archive counts an encode failure
+    // and leaves the group hot.
+    if src.as_ref() == target.as_ref() {
         return Ok(batch.clone());
     }
 
@@ -140,6 +141,48 @@ pub(crate) fn to_archive_batch(
 ) -> Result<RecordBatch, DataFusionError> {
     let converted = convert_timestamp_column(batch.clone())?;
     align_batch_to_schema(&converted, target)
+}
+
+#[cfg(test)]
+mod align_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{Field, Schema};
+
+    /// Aligning a batch to a schema yields a batch **with that schema**.
+    ///
+    /// The fast path compared column *names* and returned the input, so a
+    /// batch whose fields carry metadata the target does not — a scan batch
+    /// carries each column's role — came back with the wrong schema. A
+    /// Parquet writer built for the target then refused it, and the cold
+    /// archive counts an encode failure and leaves the group hot: nothing was
+    /// archived, and nothing said so louder than a warning.
+    #[test]
+    fn the_result_carries_the_target_schema_even_when_the_names_match() {
+        let src = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)
+            .with_metadata([("role".to_string(), "field".to_string())].into())]));
+        let batch =
+            RecordBatch::try_new(src, vec![Arc::new(Int64Array::from(vec![1_i64, 2]))]).unwrap();
+
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let aligned = align_batch_to_schema(&batch, &target).unwrap();
+        assert_eq!(aligned.schema().as_ref(), target.as_ref());
+        assert_eq!(aligned.num_rows(), 2);
+    }
+
+    #[test]
+    fn an_identical_schema_is_returned_unchanged() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        let aligned = align_batch_to_schema(&batch, &schema).unwrap();
+        assert_eq!(aligned.schema().as_ref(), schema.as_ref());
+    }
 }
 
 // The archive conversion only exists behind `object-store`, and so do its

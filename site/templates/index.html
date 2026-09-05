@@ -2,6 +2,21 @@
 
 {% block structured_data %}
 {{ super() }}
+{#- `WebSite` with a `SearchAction` is what lets a search engine offer a
+    sitelinks search box against this site's own search rather than sending
+    the reader back to its results. Declared only on the home page, which is
+    where the specification says it belongs. -#}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": {{ config.title | json_encode() | safe }},
+  "alternateName": {{ config.extra.tagline | json_encode() | safe }},
+  "url": {{ config.base_url | json_encode() | safe }},
+  "description": {{ config.description | json_encode() | safe }},
+  "inLanguage": "en"
+}
+</script>
 {#- A landing page benefits from a second, product-shaped entity: it is what
     populates a rich result rather than a plain blue link. -#}
 <script type="application/ld+json">

@@ -38,3 +38,10 @@ site/public/
 
 # Staged by .github/actions/setup-cross so the cross container can see it.
 .protoc/
+
+# Python SDK working files. The compiled bytecode and the local virtualenv
+# were committed once; nothing reads them and they go stale on every edit.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+sdks/python/.venv/

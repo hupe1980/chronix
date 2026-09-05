@@ -134,20 +134,20 @@ fn strings(v: &Value) -> Vec<String> {
 async fn series_applies_every_matcher_not_only_the_name() {
     let (base, _tmp) = server_with_data().await;
 
-    let all = data(&base, "/api/v1/prom/series?match[]=cpu").await;
+    let all = data(&base, "/api/v1/prom/series?match[]=cpu_usage").await;
     assert_eq!(all.as_array().unwrap().len(), 2, "{all}");
 
     for (query, expected_host) in [
         (
-            "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu%22%2Chost%3D%22a%22%7D",
+            "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu_usage%22%2Chost%3D%22a%22%7D",
             "a",
         ),
         (
-            "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu%22%2Chost%3D~%22b%22%7D",
+            "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu_usage%22%2Chost%3D~%22b%22%7D",
             "b",
         ),
         (
-            "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu%22%2Chost!%3D%22a%22%7D",
+            "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu_usage%22%2Chost!%3D%22a%22%7D",
             "b",
         ),
     ] {
@@ -163,7 +163,7 @@ async fn series_unions_repeated_match_parameters() {
     let (base, _tmp) = server_with_data().await;
     let got = data(
         &base,
-        "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu%22%2Chost%3D%22a%22%7D&match[]=mem",
+        "/api/v1/prom/series?match[]=%7B__name__%3D%22cpu_usage%22%2Chost%3D%22a%22%7D&match[]=mem_used",
     )
     .await;
     let arr = got.as_array().unwrap();
@@ -172,7 +172,10 @@ async fn series_unions_repeated_match_parameters() {
         .iter()
         .map(|s| s["__name__"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"cpu") && names.contains(&"mem"), "{got}");
+    assert!(
+        names.contains(&"cpu_usage") && names.contains(&"mem_used"),
+        "{got}"
+    );
 }
 
 #[tokio::test]
@@ -184,14 +187,14 @@ async fn label_values_are_scoped_by_the_matcher() {
     assert_eq!(hosts, vec!["a", "b"]);
 
     // `mem` only has host a.
-    let mem_hosts = strings(&data(&base, "/api/v1/prom/label/host/values?match[]=mem").await);
+    let mem_hosts = strings(&data(&base, "/api/v1/prom/label/host/values?match[]=mem_used").await);
     assert_eq!(mem_hosts, vec!["a"]);
 
     // The dc of cpu{host="a"} is eu, not both.
     let dcs = strings(
         &data(
             &base,
-            "/api/v1/prom/label/dc/values?match[]=%7B__name__%3D%22cpu%22%2Chost%3D%22a%22%7D",
+            "/api/v1/prom/label/dc/values?match[]=%7B__name__%3D%22cpu_usage%22%2Chost%3D%22a%22%7D",
         )
         .await,
     );
@@ -206,26 +209,99 @@ async fn label_names_are_scoped_by_the_matcher() {
     assert_eq!(all, vec!["__name__", "dc", "host"]);
 
     // `mem` carries no `dc`.
-    let mem = strings(&data(&base, "/api/v1/prom/labels?match[]=mem").await);
+    let mem = strings(&data(&base, "/api/v1/prom/labels?match[]=mem_used").await);
     assert_eq!(mem, vec!["__name__", "host"]);
 }
 
 /// The two calls Grafana's metric browser makes. Both sit on the `LIMIT 1`
 /// existence probe, so both go dark if it cannot stream.
+///
+/// They list **metrics**, not measurements: the browser's job is to offer
+/// names the user can then type into a query, and `cpu` is not one — the
+/// series of a measurement `cpu` holding a field `usage` is `cpu_usage`.
 #[tokio::test]
-async fn name_values_and_metadata_list_the_measurements() {
+async fn name_values_and_metadata_list_the_metrics() {
     let (base, _tmp) = server_with_data().await;
 
     let names = strings(&data(&base, "/api/v1/prom/label/__name__/values").await);
-    assert_eq!(names, vec!["cpu", "mem"]);
+    assert_eq!(names, vec!["cpu_usage", "mem_used"]);
 
-    let scoped = strings(&data(&base, "/api/v1/prom/label/__name__/values?match[]=cpu").await);
-    assert_eq!(scoped, vec!["cpu"]);
+    let scoped = strings(
+        &data(
+            &base,
+            "/api/v1/prom/label/__name__/values?match[]=cpu_usage",
+        )
+        .await,
+    );
+    assert_eq!(scoped, vec!["cpu_usage"]);
 
     let metadata = data(&base, "/api/v1/prom/metadata").await;
     let obj = metadata.as_object().expect("a metadata object");
-    assert!(obj.contains_key("cpu"), "{metadata}");
-    assert!(obj.contains_key("mem"), "{metadata}");
+    assert!(obj.contains_key("cpu_usage"), "{metadata}");
+    assert!(obj.contains_key("mem_used"), "{metadata}");
+    assert!(
+        !obj.contains_key("cpu"),
+        "a measurement is not a metric: {metadata}"
+    );
+}
+
+/// Discovery and evaluation answer the same question the same way.
+///
+/// This is the test the whole subsystem was missing. `/label/__name__/values`
+/// listed *measurements*, `/query` returned series named
+/// `measurement_field`, and `/series` reported a third thing — so a user could
+/// pick a name out of Grafana's metric browser, paste it into a query and get
+/// nothing, and the name the query *did* return was not selectable either.
+/// Each endpoint had a passing test of its own.
+#[tokio::test]
+async fn every_name_discovery_offers_is_a_selector_that_answers() {
+    let (base, _tmp) = server_with_data().await;
+
+    let names = strings(&data(&base, "/api/v1/prom/label/__name__/values").await);
+    assert!(!names.is_empty());
+
+    for name in &names {
+        // The metric browser's name, typed into the query field.
+        let result = data(&base, &format!("/api/v1/prom/query?query={name}")).await;
+        let series = result["result"].as_array().expect("a vector");
+        assert!(
+            !series.is_empty(),
+            "/label/__name__/values offers {name}, which /query answers with nothing"
+        );
+        for s in series {
+            assert_eq!(s["metric"]["__name__"], name.as_str(), "{s}");
+        }
+
+        // …and `/series`, which is what a dashboard variable reads.
+        let listed = data(&base, &format!("/api/v1/prom/series?match[]={name}")).await;
+        let listed = listed.as_array().expect("an array");
+        assert_eq!(
+            listed.len(),
+            series.len(),
+            "/series and /query disagree about {name}: {listed:?} vs {series:?}"
+        );
+        for s in listed {
+            assert_eq!(s["__name__"], name.as_str(), "{s}");
+        }
+    }
+
+    // A `__name__` regex is answered by both, and by the same resolution:
+    // `/series` used to drop the selector entirely and return an empty array
+    // while `/query` returned every series in the database.
+    let all = data(
+        &base,
+        "/api/v1/prom/series?match[]=%7B__name__%3D~%22.%2B%22%7D",
+    )
+    .await;
+    let mut listed_names: Vec<&str> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["__name__"].as_str().unwrap())
+        .collect();
+    listed_names.sort_unstable();
+    listed_names.dedup();
+    assert_eq!(listed_names, names, "{all}");
 }
 
 #[tokio::test]
@@ -260,7 +336,7 @@ async fn grafana_posts_a_form_body_to_the_derived_path() {
     let resp = c
         .post(format!("{base}/api/v1/query"))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body("query=cpu&time=1725364800")
+        .body("query=cpu_usage&time=1725364800")
         .send()
         .await
         .unwrap();
@@ -276,7 +352,7 @@ async fn grafana_posts_a_form_body_to_the_derived_path() {
     // The same query as a GET, which is what `httpMethod: GET` sends.
     let body: Value = c
         .get(format!("{base}/api/v1/query"))
-        .query(&[("query", "cpu")])
+        .query(&[("query", "cpu_usage")])
         .send()
         .await
         .unwrap()
@@ -290,7 +366,7 @@ async fn grafana_posts_a_form_body_to_the_derived_path() {
     let resp = c
         .post(format!("{base}/api/v1/query_range"))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body("query=cpu&start=1725364800&end=1725365100&step=15s")
+        .body("query=cpu_usage&start=1725364800&end=1725365100&step=15s")
         .send()
         .await
         .unwrap();
@@ -434,7 +510,7 @@ async fn discovery_endpoints_accept_a_posted_form() {
     let body: Value = c
         .post(format!("{base}/api/v1/labels"))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body("match%5B%5D=cpu")
+        .body("match%5B%5D=cpu_usage")
         .send()
         .await
         .unwrap()
@@ -453,7 +529,7 @@ async fn discovery_endpoints_accept_a_posted_form() {
     let body: Value = c
         .post(format!("{base}/api/v1/series"))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body("match%5B%5D=cpu")
+        .body("match%5B%5D=cpu_usage")
         .send()
         .await
         .unwrap()
@@ -466,7 +542,7 @@ async fn discovery_endpoints_accept_a_posted_form() {
     let body: Value = c
         .post(format!("{base}/api/v1/label/host/values"))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body("match%5B%5D=cpu")
+        .body("match%5B%5D=cpu_usage")
         .send()
         .await
         .unwrap()

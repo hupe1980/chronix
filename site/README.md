@@ -25,11 +25,25 @@ anything.
 | `content/reference/` | **Reference** — the implementation, subsystem by subsystem |
 | `templates/` | Tera templates. `base.html` carries every piece of page metadata |
 | `sass/main.scss` | The whole stylesheet |
-| `static/` | Favicon, social image, `robots.txt`, search script |
+| `static/` | Favicon, `robots.txt`, the search controller, and the social card — `og-image.svg` is the source, `og-image.png` is what ships |
 
 Ordering inside a section comes from each page's `weight`. Adding a page needs
 nothing else — the sidebar, the section index, the previous/next pager, the
 sitemap and the search index all derive from the content tree.
+
+## Two things the deploy does that a local build does not
+
+**`scripts/stamp-lastmod.sh` writes each page's `updated` date** from the last
+commit that touched it, so the sitemap carries `<lastmod>`. It runs in CI
+against an ephemeral checkout and rewrites files in place — never commit its
+output. A hand-kept date would go stale, and a `lastmod` a crawler learns to
+distrust is worse than none, which is why it is not front matter you maintain.
+
+**The social card is a PNG.** Facebook, LinkedIn, Slack, Discord and X all
+refuse an SVG `og:image` and render the card with no picture at all, silently.
+`og-image.svg` is the source; regenerate the PNG with
+`rsvg-convert -w 1200 -h 630 -f png -o og-image.png og-image.svg` when it
+changes.
 
 ## Conventions
 
@@ -47,6 +61,13 @@ rather than with relative paths. Zola resolves and *verifies* those, so a
 rename breaks the build instead of shipping a 404. `zola check` validates
 anchors too, which is how the site catches a heading being renamed out from
 under a deep link.
+
+**The search index is loaded on demand.** It is 3.4 MB — elasticlunr indexes
+the full text of every page — and it used to be a `<script defer>` in the head,
+so every visitor to every page downloaded and parsed it whether or not they
+ever searched. `search.js` now fetches it on the first sign that someone means
+to search. Keep it that way: `defer` keeps a script off the critical rendering
+path, it does not make it free.
 
 **Numbers name their evidence.** A performance or compression figure in these
 pages should say which test or benchmark pins it. Unsourced numbers rot: this

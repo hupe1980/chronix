@@ -33,6 +33,22 @@ pub async fn openapi_handler(State(state): State<AppState>) -> impl IntoResponse
     )
 }
 
+/// The OpenAPI document as JSON, for a given server URL.
+///
+/// Exposed so the route-inventory test can compare the document against the
+/// router without standing a server up.
+///
+/// # Panics
+///
+/// If the document cannot be serialised, which is a construction bug rather
+/// than a runtime condition.
+#[must_use]
+pub fn spec_json(server_url: &str) -> String {
+    build_openapi(server_url)
+        .to_json()
+        .expect("the OpenAPI document must serialise")
+}
+
 /// Resolve the `servers[0].url` the spec should advertise.
 ///
 /// A bind address is not a client-reachable URL: the common `0.0.0.0:8086`
@@ -683,9 +699,289 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
 
+    // ── Prometheus discovery ───────────────────────────────────────
+    for (path, tag, summary, desc) in [
+        (
+            "/api/v1/prom/series",
+            "Prometheus",
+            "Series matching a selector",
+            "The label sets present in the window, for each repeated `match[]` selector.",
+        ),
+        (
+            "/api/v1/prom/labels",
+            "Prometheus",
+            "Label names",
+            "Every label name in the window, narrowed by any `match[]` selectors.",
+        ),
+        (
+            "/api/v1/prom/metadata",
+            "Prometheus",
+            "Metric metadata",
+            "One entry per metric name — the shape Grafana's metric browser reads.",
+        ),
+        (
+            "/api/v1/status/buildinfo",
+            "Prometheus",
+            "Build information",
+            "Version and revision, in the shape a Prometheus client expects.",
+        ),
+        (
+            "/api/v1/rules",
+            "Prometheus",
+            "Recording and alerting rules",
+            "Always an empty group list: chronix has no rules, and its triggers are a \
+             different feature with its own API.",
+        ),
+        (
+            "/api/v1/alerts",
+            "Prometheus",
+            "Active alerts",
+            "Always empty, for the same reason as `/api/v1/rules`.",
+        ),
+        (
+            "/api/v1/query_exemplars",
+            "Prometheus",
+            "Exemplars",
+            "Always empty: exemplars are not stored.",
+        ),
+    ] {
+        paths = paths.path(
+            path,
+            PathItem::new(
+                HttpMethod::Get,
+                OperationBuilder::new()
+                    .tag(tag)
+                    .summary(Some(summary))
+                    .description(Some(desc))
+                    .response("200", ok_json("Prometheus response", obj_schema()))
+                    .build(),
+            ),
+        );
+    }
+    paths = paths.path(
+        "/api/v1/prom/label/{name}/values",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Prometheus")
+                .summary(Some("Values of one label"))
+                .description(Some(
+                    "The values `name` takes in the window. `__name__` answers the metric \
+                     names — `measurement_field`, or the measurement alone when the field \
+                     is called `value`.",
+                ))
+                .parameter(
+                    ParameterBuilder::new()
+                        .name("name")
+                        .parameter_in(ParameterIn::Path)
+                        .required(utoipa::openapi::Required::True)
+                        .build(),
+                )
+                .response("200", ok_json("Label values", obj_schema()))
+                .build(),
+        ),
+    );
+
+    // ── Rollups, annotations, dashboards ───────────────────────────
+    paths = paths.path(
+        "/api/v1/rollups/{name}",
+        PathItem::new(
+            HttpMethod::Delete,
+            OperationBuilder::new()
+                .tag("Rollups")
+                .summary(Some("Drop a rollup rule"))
+                .response("200", ok_json("Rollup dropped", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/rollups/{name}/refresh",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Rollups")
+                .summary(Some("Materialise a rollup now"))
+                .description(Some(
+                    "Runs the rule's materialisation immediately instead of waiting for the \
+                     next maintenance pass.",
+                ))
+                .response("200", ok_json("Refresh result", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/annotations",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Streaming")
+                .summary(Some("Annotations for a time range"))
+                .description(Some("Fired signals in the Grafana annotation shape."))
+                .response("200", ok_json("Annotations", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/annotations/stream",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Streaming")
+                .summary(Some("Annotation stream (SSE)"))
+                .response("200", ok_empty("SSE stream"))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/dashboards/export",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Streaming")
+                .summary(Some("Bundled Grafana dashboards"))
+                .description(Some(
+                    "The dashboards shipped with the server, as a Grafana provisioning payload.",
+                ))
+                .response("200", ok_json("Dashboards", obj_schema()))
+                .build(),
+        ),
+    );
+
+    // ── Namespaces ─────────────────────────────────────────────────
+    paths = paths.path(
+        "/api/v1/namespaces",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("List namespaces"))
+                .response("200", ok_json("Namespaces", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/namespaces/{name}",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Read one namespace"))
+                .response("200", ok_json("Namespace", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/namespaces/{name}/usage",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Namespace resource usage"))
+                .response("200", ok_json("Usage", obj_schema()))
+                .build(),
+        ),
+    );
+
+    // ── Admin: keys, models, PITR ──────────────────────────────────
+    paths = paths.path(
+        "/api/v1/admin/auth/keys",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("List API keys"))
+                .response("200", ok_json("Keys", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/admin/auth/keys/{name}",
+        PathItem::new(
+            HttpMethod::Delete,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Revoke an API key"))
+                .response("200", ok_json("Revoked", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/admin/analytics/models",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("List fitted models"))
+                .response("200", ok_json("Models", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/admin/analytics/models/{measurement}/{name}",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Read or delete one fitted model"))
+                .response("200", ok_json("Model", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/admin/analytics/retrain",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Refit a model now"))
+                .response("200", ok_json("Retrain result", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/admin/restore/pitr",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Point-in-time restore"))
+                .response("200", ok_json("Restore result", obj_schema()))
+                .build(),
+        ),
+    );
+
+    // ── Aliases ────────────────────────────────────────────────────
+    //
+    // A client derives these rather than being told them: a Prometheus
+    // datasource appends `/api/v1/query` to its base URL, Telegraf and the
+    // Influx clients post to `/write` or `/api/v2/write`, and the OTel
+    // Collector's `otlphttp` exporter posts to `/v1/metrics`. They are the
+    // paths real traffic arrives on, so a document that omits them describes
+    // an API nobody calls. Cloned from the canonical entry rather than
+    // rewritten, so the two cannot drift.
+    let mut built = paths.build();
+    for (alias, canonical) in [
+        ("/api/v1/query", "/api/v1/prom/query"),
+        ("/api/v1/query_range", "/api/v1/prom/query_range"),
+        ("/api/v1/series", "/api/v1/prom/series"),
+        ("/api/v1/labels", "/api/v1/prom/labels"),
+        (
+            "/api/v1/label/{name}/values",
+            "/api/v1/prom/label/{name}/values",
+        ),
+        ("/api/v1/metadata", "/api/v1/prom/metadata"),
+        ("/write", "/api/v1/write/influx"),
+        ("/api/v2/write", "/api/v1/write/influx"),
+        ("/v1/metrics", "/api/v1/otlp/metrics"),
+    ] {
+        if let Some(item) = built.paths.get(canonical).cloned() {
+            built.paths.insert(alias.to_string(), item);
+        }
+    }
+
     OpenApiBuilder::new()
         .info(info)
         .servers(Some(vec![server]))
-        .paths(paths.build())
+        .paths(built)
         .build()
 }

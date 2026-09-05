@@ -15,6 +15,7 @@ weight = 20
 
 ## Table of Contents
 
+- [Errors](#errors)
 - [Health & Metrics](#health-metrics)
 - [Write Endpoints](#write-endpoints)
 - [Query Endpoints](#query-endpoints)
@@ -30,6 +31,43 @@ weight = 20
 - [gRPC API](#grpc-api)
 - [Flight SQL API](#flight-sql-api)
 - [Embedded Rust API](#embedded-rust-api)
+
+---
+
+## Errors
+
+Every failing request answers the same JSON envelope, whatever produced it —
+a handler, a body that will not deserialise, a path no route matches, a method
+no route accepts:
+
+```json
+{"error": "measurement not found: nope", "code": "NOT_FOUND"}
+```
+
+`code` is the machine-readable half; branch on it rather than on the message.
+
+| Status | `code` | Means |
+|--------|--------|-------|
+| `400` | `BAD_REQUEST` | Malformed request — bad JSON, an unparseable parameter, invalid SQL |
+| `400` | `CARDINALITY_EXCEEDED` | The write would exceed `max_series_cardinality` |
+| `400` | `SCHEMA_ERROR` | A field's type conflicts with the measurement's schema |
+| `400` | `PARTIAL_WRITE` | Some points of the batch were rejected; the body names them |
+| `401` | `UNAUTHORIZED` | Missing or invalid credentials |
+| `403` | `FORBIDDEN` | Authenticated, but not permitted |
+| `404` | `NOT_FOUND` | No such measurement, trigger, namespace — or no such route |
+| `405` | `METHOD_NOT_ALLOWED` | The path exists; this method does not |
+| `409` | `CONFLICT` | The resource already exists |
+| `413` | `PAYLOAD_TOO_LARGE` | Body over `max_body_size` |
+| `415` | `UNSUPPORTED_MEDIA_TYPE` | A JSON endpoint without `Content-Type: application/json` |
+| `422` | `INVALID_BODY` | Valid JSON, wrong shape — a required field is missing |
+| `429` | `RATE_LIMITED` | Rate limit exceeded |
+| `500` | `INTERNAL_ERROR` | Logged in full server-side; the response says only that it happened |
+| `503` | `BACKPRESSURE`, `DATABASE_CLOSED` | The server cannot accept the write right now |
+| `504` | `WRITE_TIMEOUT` | The write did not complete within `write_timeout` |
+
+The **PromQL endpoints are the one exception**, deliberately: they answer
+Prometheus's own error shape, `{"status":"error","errorType":…,"error":…}`,
+because every Prometheus client branches on that instead.
 
 ---
 
@@ -162,22 +200,30 @@ Query time-series data using the native query plan format.
 ```json
 {
   "measurement": "cpu",
+  "range": {"start": 1700000000000000000, "end": 1700100000000000000},
   "tags": {"host": "srv1"},
   "fields": ["usage"],
-  "start": 1700000000000000000,
-  "end": 1700100000000000000
+  "limit": 100,
+  "offset": 0
 }
 ```
 
-**Response:**
+The time bounds live under `range`, and every key is checked: an unknown one
+is a `400` rather than a field quietly dropped, because a dropped `start`
+answers the whole measurement as though it had understood.
+
+**Response** — a JSON **array** of rows. Each row separates the tags that
+identify the series from the fields that carry values, and a string *field*
+stays a field:
 
 ```json
-{
-  "columns": ["timestamp", "usage"],
-  "rows": [
-    {"timestamp": 1700000000000000000, "fields": {"usage": 72.5}}
-  ]
-}
+[
+  {
+    "timestamp": 1700000000000000000,
+    "tags": {"host": "srv1"},
+    "fields": {"usage": 72.5}
+  }
+]
 ```
 
 ### `POST /api/v1/chronix/sql`
@@ -187,10 +233,20 @@ Execute a SQL query via DataFusion.
 **Request Body:**
 
 ```json
-{"sql": "SELECT * FROM cpu WHERE host = 'srv1' ORDER BY _time DESC LIMIT 10"}
+{"query": "SELECT * FROM cpu WHERE host = 'srv1' ORDER BY _time DESC LIMIT 10"}
 ```
 
-**Response:** JSON array of row objects with column names as keys.
+**Response** — column metadata plus **positional** rows, so a client can build
+a frame without re-deriving the schema:
+
+```json
+{
+  "columns": [{"name": "_time", "data_type": "Timestamp(ns)"},
+              {"name": "usage", "data_type": "Float64"}],
+  "rows": [[1700000000000000000, 72.5]],
+  "row_count": 1
+}
+```
 
 **Time predicates.** The timestamp column is `_time`, typed
 `TIMESTAMP(nanosecond)`. Three forms compare against it:
@@ -289,6 +345,28 @@ is refused at creation. The URL must be `https`, carry no userinfo, and name
 neither an internal host nor a non-routable address — see
 [Webhook URL SSRF Protection](/docs/security/#webhook-url-ssrf-protection).
 
+**Delivery does not block evaluation.** Each channel owns a bounded queue and
+a worker; a trigger's evaluation hands the signal over and returns. One
+unreachable webhook backing off for seven seconds therefore delays nothing but
+itself — it used to delay every trigger evaluation behind it, and a sustained
+write rate overran the event bus.
+
+A queue that fills **drops the oldest waiting signal** and counts it in
+`chronix_signal_delivery_dropped_total{channel}`. That is the honest failure:
+the alternative is blocking ingestion on a channel nobody can reach. Watch
+that counter — a non-zero rate means alerts are being lost. On shutdown the
+server waits up to five seconds for the queues to drain, so a signal that
+fired just before `SIGTERM` still goes out.
+
+**A trigger may watch a rollup tier.** Materialisation writes through the
+ordinary write path, so a rollup's target measurement publishes the same
+change events any other write does, and the `WHEN` clause names an aggregate
+column as readily as a raw field:
+
+```sql
+CREATE TRIGGER hot_avg ON cpu_1m WHEN usage_avg > 90 DELIVER log;
+```
+
 ## Trigger Endpoints
 
 Served only when the server configuration has a `[triggers]` section;
@@ -303,7 +381,7 @@ Runs one trigger DSL statement.
 ```bash
 curl -X POST localhost:8080/api/v1/triggers \
   -H 'Content-Type: application/json' \
-  -d '{"sql": "CREATE TRIGGER hot_cpu ON cpu WHEN value > 90 DELIVER log"}'
+  -d '{"query": "CREATE TRIGGER hot_cpu ON cpu WHEN value > 90 DELIVER log"}'
 ```
 
 `400` with the parser's message when the statement is refused — including a
@@ -320,6 +398,17 @@ The caller's triggers, under the names they were created with.
   ]
 }
 ```
+
+### `GET /api/v1/triggers/{name}`
+
+One trigger, without listing them all.
+
+```json
+{ "name": "hot_cpu", "measurement": "cpu", "enabled": true, "delivery": ["log"] }
+```
+
+A name the caller does not own is a `404`, which is also the answer when
+another tenant owns it — a tenant must not be able to learn that.
 
 ### `DELETE /api/v1/triggers/{name}`
 
@@ -375,7 +464,13 @@ of seconds. An unparseable value is a 400 rather than a silent default.
 
 Errors carry Prometheus's status codes, because clients branch on them:
 `400` for `bad_data`, `422` for `execution`, `503` for `timeout`. The body is
-`{"status":"error","errorType":…,"error":…}`.
+`{"status":"error","errorType":…,"error":…}` — not the envelope the rest of the
+API uses, for the same reason.
+
+A **parse** error is `bad_data`, and that includes the two things upstream
+also catches in its parser: an unknown function name, and a selector whose
+every matcher would be satisfied by an absent label (`{}`, `{host=~".*"}`).
+`{host="a"}` is legal and reaches every metric carrying that label.
 
 `/query` and `/query_range` answer `{"status":"success","data":{"resultType":…,"result":…}}`.
 `/labels`, `/label/{name}/values` and `/series` answer a **bare array** under
@@ -386,17 +481,52 @@ repeated **`match[]`** series selectors. Every matcher in a selector is
 applied, not only `__name__`:
 
 ```
-GET /api/v1/label/dc/values?match[]={__name__="cpu",host="a"}
+GET /api/v1/label/dc/values?match[]={__name__="cpu_usage",host="a"}
 → {"status":"success","data":["eu"]}
 ```
 
 Repeated `match[]` parameters are a **union**, as in Prometheus. A selector
-that names no metric is skipped rather than treated as "everything", since it
-cannot be answered without scanning every measurement.
+that constrains no metric name is skipped rather than treated as
+"everything", since it cannot be answered without scanning every measurement —
+but a `__name__` **regex** does constrain it, so `match[]={__name__=~".+"}`
+is answered here exactly as it is by `/query`.
 
-`/label/__name__/values` lists the measurements holding data in the window, and
-`/metadata` describes each one's fields — the two calls Grafana makes to
-populate a metric browser.
+`/label/__name__/values` lists the **metric names** holding data in the
+window, and `/metadata` describes each one — the two calls Grafana makes to
+populate a metric browser. Every name they offer is a selector that answers.
+
+### Metric names
+
+Chronix stores a *measurement* with many *fields*; PromQL addresses a
+*metric*, which carries one value per sample. A metric is one
+`(measurement, field)` pair:
+
+| Written as | PromQL metric |
+|------------|---------------|
+| `cpu,host=a usage=42,load=0.7` | `cpu_usage`, `cpu_load` |
+| `temperature,room=hall value=21` | `temperature` |
+| Prometheus remote write / OTLP `up{job="api"}` | `up` |
+
+The rule is `<measurement>_<field>`, except that a field named `value` gives
+the measurement name alone — which is how the Prometheus remote-write and
+OTLP paths store a sample, so a scraped metric round-trips under its own
+name.
+
+Two consequences worth knowing:
+
+- **A bare measurement name is not a metric.** `cpu` selects nothing when the
+  measurement's fields are `usage` and `load`; `cpu_usage` selects the series.
+  Ask `/api/v1/label/__name__/values` — or Grafana's metric browser — for the
+  names that exist.
+- **Adding a field never renames an existing metric.** A name depends only on
+  its own `(measurement, field)` pair, so writing `cpu,host=a temp=61` for the
+  first time leaves `cpu_usage` and `cpu_load` exactly where they were.
+
+A vector may not hold two series with the same label set, and a query that
+would produce one is an error — `vector cannot contain metrics with the same
+labelset`, as in Prometheus. `rate({__name__=~"cpu.+"}[5m])` is the usual way
+to hit it: `rate` drops `__name__`, and `cpu_usage` and `cpu_load` then have
+identical labels. Aggregate or select one metric instead.
 
 ### Semantics
 
@@ -470,7 +600,7 @@ curl 'http://localhost:8086/api/v1/query_range?query=cpu_usage&start=1700000000&
 ### Label Values
 
 ```bash
-# List all measurement names
+# List all metric names
 curl http://localhost:8086/api/v1/label/__name__/values
 
 # List all values for the "host" tag
@@ -744,6 +874,35 @@ have it retry the same doomed batch for ever.
 | `POST` | `/api/v1/rollups/{name}/refresh` | Recompute a range now (`?start=&end=`, nanoseconds) |
 | `POST` | `/api/v1/export/parquet` | Export data as Apache Parquet |
 | `GET` | `/api/v1/connectors` | List active ingestion connectors |
+
+### Connectors
+
+`GET /api/v1/connectors` reports each running connector's counters:
+
+```json
+[
+  {
+    "name": "kafka-main",
+    "connector_type": "kafka",
+    "status": "Running",
+    "metrics": {
+      "messages_total": 128034,
+      "points_total": 512136,
+      "decode_errors": 2,
+      "lag": 417,
+      "throughput": 842.6
+    }
+  }
+]
+```
+
+`lag` is **messages behind the source's newest offset**, and it is `null` for a
+source that has no such measure — MQTT, which pushes rather than being polled.
+Kafka's figure comes from the watermarks the last fetch response already
+carried, so reading it costs no broker round trip, and it is also exported as
+the `chronix_kafka_consumer_lag` gauge. `throughput` is points per second since
+the connector started; for a windowed rate, take `rate()` over the
+`chronix_*_points_total` counters.
 
 ### Rollups
 

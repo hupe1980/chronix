@@ -25,8 +25,8 @@ pub mod types;
 pub mod wal_codec;
 
 pub use config::{
-    AnalyticsConfig, AnalyticsOverride, ChronixConfig, ChronixConfigBuilder, CompressionCodec,
-    FloatEncoding, FsyncPolicy, MultivariateConfig, WalConfig,
+    AnalyticsConfig, ChronixConfig, ChronixConfigBuilder, CompressionCodec, FloatEncoding,
+    FsyncPolicy, WalConfig,
 };
 pub use error::{ChronixError, ConfigError, SchemaError, WalError};
 pub use schema::{

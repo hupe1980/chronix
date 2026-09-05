@@ -229,8 +229,12 @@ fn main() {
 
     // Create a sample signal event and deliver
     if !all_signals.is_empty() {
-        let delivered = router.deliver(&all_signals[0]);
-        println!("  Delivered signal to {delivered} channel(s)");
+        // `deliver` queues on each channel's own worker; `flush` waits, so
+        // the line below reports what actually went out rather than what was
+        // handed over.
+        let queued = router.deliver(&all_signals[0]);
+        let drained = router.flush(std::time::Duration::from_secs(5));
+        println!("  Queued signal to {queued} channel(s), delivered: {drained}");
     }
 
     // ── 8. Dead Letter Queue ──────────────────────────────────────

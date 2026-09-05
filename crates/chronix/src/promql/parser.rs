@@ -424,6 +424,20 @@ impl Parser {
             Token::LeftBrace => {
                 // {label="value"} selector without metric name
                 let matchers = self.parse_label_matchers()?;
+                // Prometheus's rule, and it is about matchers rather than
+                // about the name: at least one must not be satisfied by an
+                // absent label. So `{host="a"}` is legal and reaches every
+                // metric carrying that label, while `{}` and `{host=~".*"}`
+                // name the whole database and are refused — here, in the
+                // parser, so the client sees a 400 `bad_data` rather than a
+                // 422 execution error.
+                if matchers.iter().all(LabelMatcher::matches_empty) {
+                    return Err(ParseError {
+                        msg: "vector selector must contain at least one non-empty matcher"
+                            .to_string(),
+                        pos: self.pos,
+                    });
+                }
                 Ok(Expr::VectorSelector {
                     name: None,
                     matchers,
@@ -443,6 +457,19 @@ impl Parser {
                 match self.peek() {
                     Token::LeftParen => {
                         // Function call: func(args...)
+                        //
+                        // An unknown name is rejected here rather than at
+                        // evaluation, because that is where upstream reports
+                        // it — a 400 with `errorType: bad_data`, not a 422
+                        // execution error. A misspelled function is one of
+                        // the most ordinary things a query editor sends, and
+                        // clients branch on the difference.
+                        if !crate::promql::eval::function::is_known_function(&name) {
+                            return Err(ParseError {
+                                msg: format!("unknown function with name \"{name}\""),
+                                pos: self.pos,
+                            });
+                        }
                         self.advance();
                         let args = self.parse_call_args()?;
                         self.expect(&Token::RightParen)?;

@@ -13,6 +13,24 @@
 //! exactly the shape of divergence that has produced wrong answers here
 //! before.
 //!
+//! # One metric, one field
+//!
+//! A selector names a *metric*, and a metric is one `(measurement, field)`
+//! pair — [`crate::promql::metric`] owns that mapping and is the only place
+//! that knows it. A selector that names nothing storable resolves to no
+//! targets and evaluates to an empty vector, which is what PromQL expects of
+//! an unknown metric.
+//!
+//! The scheme this replaced named a series after its *measurement* when the
+//! measurement held one field and after `measurement_field` when it held
+//! more. Three things followed, and all three were wrong: writing a second
+//! field renamed the first one's whole history; the `measurement_field` names
+//! a query returned could not be typed back in, because a `__name__` matcher
+//! only ever resolved a measurement; and a bare measurement selector produced
+//! one series per field with identical labels, so `sum(cpu)` added a
+//! percentage to a load average and `rate(cpu[5m])` returned a vector holding
+//! duplicate label sets — which PromQL cannot represent.
+//!
 //! # Window boundaries
 //!
 //! Range selectors and the lookback window are **left-open and
@@ -29,6 +47,7 @@ use arrow::record_batch::RecordBatch;
 use crate::promql::ast::{
     AtModifier, Duration, Expr, LabelMatcher, MatchOp, PromQLValue, Sample, Series,
 };
+use crate::promql::metric::{self, MetricRef};
 
 use super::{compile_post_filters, CompiledMatcher, EvalError, PromQLEvaluator, QueryParams};
 use super::{ScanKey, SCAN_CACHE_CAPACITY};
@@ -106,6 +125,64 @@ impl PromQLEvaluator {
         Ok(batches)
     }
 
+    /// The metrics a selector reads.
+    ///
+    /// One resolver for every `__name__` shape — a bare name, an equality
+    /// matcher, a regex, a negation — because the discovery endpoints answer
+    /// the same syntax and the two disagreeing is what let
+    /// `/series?match[]={__name__=~".+"}` return nothing while `/query` with
+    /// that selector returned every series.
+    fn resolve_targets(
+        &self,
+        name: &Option<String>,
+        matchers: &[LabelMatcher],
+    ) -> Result<Vec<MetricRef>, EvalError> {
+        let registry = self.db.schema_registry();
+
+        let named = name.as_deref().or_else(|| {
+            matchers
+                .iter()
+                .find(|m| m.name == "__name__" && m.op == MatchOp::Equal)
+                .map(|m| m.value.as_str())
+        });
+
+        let name_matchers: Vec<_> = matchers
+            .iter()
+            .filter(|m| m.name == "__name__" && m.op != MatchOp::Equal)
+            .map(CompiledMatcher::compile)
+            .collect::<Result<_, _>>()?;
+
+        // A name-less selector reaches every metric. The parser has already
+        // refused the shape that means "the whole database" — one whose every
+        // matcher is satisfied by an absent label — which is Prometheus's rule
+        // and the reason `{host="a"}` is legal here.
+        let mut candidates = match named {
+            Some(n) => metric::resolve(registry, n),
+            None => metric::all_metrics(registry),
+        };
+
+        if !name_matchers.is_empty() {
+            candidates.retain(|m| {
+                let labels = [("__name__".to_string(), m.name.clone())];
+                name_matchers.iter().all(|f| f.matches(&labels))
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Read one metric's samples over `(window_start, window_end]`.
+    fn read_metric(
+        &self,
+        target: &MetricRef,
+        matchers: &[LabelMatcher],
+        post_filters: &[CompiledMatcher],
+        fetch: (i64, i64),
+        window: (i64, i64),
+    ) -> Result<SeriesMap, EvalError> {
+        let batches = self.fetch_scan(&target.measurement, matchers, fetch.0, fetch.1)?;
+        collect_series(&batches, target, post_filters, window.0, window.1)
+    }
+
     pub(crate) fn eval_vector_selector(
         &self,
         name: &Option<String>,
@@ -114,46 +191,12 @@ impl PromQLEvaluator {
         at: Option<AtModifier>,
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
-        // Check for __name__ regex/not-equal matchers — they require
-        // iterating over all known measurements.
-        let name_regex_matcher = matchers.iter().find(|m| {
-            m.name == "__name__"
-                && matches!(
-                    m.op,
-                    MatchOp::RegexMatch | MatchOp::RegexNotMatch | MatchOp::NotEqual
-                )
-        });
-
-        if let (None, Some(matcher)) = (name.as_ref(), name_regex_matcher) {
-            // Multi-measurement query: resolve matching measurements
-            // and union the results.
-            let all_measurements = self.db.schema_registry().measurement_names();
-            let name_filter = CompiledMatcher::compile(matcher)
-                .map_err(|e| EvalError(format!("invalid __name__ matcher: {e}")))?;
-
-            let mut all_series = Vec::new();
-            for measurement in &all_measurements {
-                let fake_labels = vec![("__name__".to_string(), measurement.clone())];
-                if !name_filter.matches(&fake_labels) {
-                    continue;
-                }
-                // Evaluate with this specific measurement
-                let sub_name = Some(measurement.clone());
-                if let PromQLValue::Vector(series) =
-                    self.eval_vector_selector(&sub_name, matchers, offset, at, params)?
-                {
-                    all_series.extend(series);
-                }
-            }
-            return Ok(PromQLValue::Vector(all_series));
-        }
-
-        let measurement = resolve_measurement(name, matchers, "vector selector")?;
+        let targets = self.resolve_targets(name, matchers)?;
         let offset_ns = offset.map_or(0, |d| d.as_nanos());
         let eval_time = pinned_eval_time(params, at).saturating_sub(offset_ns);
         let lookback_start = eval_time - params.lookback_delta;
 
-        let (fetch_start, fetch_end) = fetch_window(
+        let fetch = fetch_window(
             params,
             offset_ns,
             params.lookback_delta,
@@ -161,27 +204,26 @@ impl PromQLEvaluator {
             eval_time,
             at.is_some(),
         );
-        let batches = self.fetch_scan(measurement, matchers, fetch_start, fetch_end)?;
         let post_filters = compile_post_filters(matchers)?;
-        let series_map = collect_series(
-            &batches,
-            measurement,
-            &post_filters,
-            lookback_start,
-            eval_time,
-        )?;
 
-        // An instant vector is the newest sample in the lookback window.
-        let result: Vec<Series> = series_map
-            .into_iter()
-            .filter_map(|(labels, samples)| {
+        let mut result = Vec::new();
+        for target in &targets {
+            let series_map = self.read_metric(
+                target,
+                matchers,
+                &post_filters,
+                fetch,
+                (lookback_start, eval_time),
+            )?;
+            // An instant vector is the newest sample in the lookback window.
+            result.extend(series_map.into_iter().filter_map(|(labels, samples)| {
                 let latest = samples.last().copied()?;
                 Some(Series {
                     labels,
                     samples: vec![latest],
                 })
-            })
-            .collect();
+            }));
+        }
 
         Ok(PromQLValue::Vector(result))
     }
@@ -203,12 +245,12 @@ impl PromQLEvaluator {
             return Err(EvalError("matrix selector requires vector selector".into()));
         };
 
-        let measurement = resolve_measurement(name, matchers, "matrix selector")?;
+        let targets = self.resolve_targets(name, matchers)?;
         let offset_ns = offset.map_or(0, |d| d.as_nanos());
         let eval_time = pinned_eval_time(params, *at).saturating_sub(offset_ns);
         let range_start = eval_time - range.as_nanos();
 
-        let (fetch_start, fetch_end) = fetch_window(
+        let fetch = fetch_window(
             params,
             offset_ns,
             range.as_nanos(),
@@ -216,38 +258,29 @@ impl PromQLEvaluator {
             eval_time,
             at.is_some(),
         );
-        let batches = self.fetch_scan(measurement, matchers, fetch_start, fetch_end)?;
         let post_filters = compile_post_filters(matchers)?;
-        let series_map =
-            collect_series(&batches, measurement, &post_filters, range_start, eval_time)?;
 
-        let result: Vec<Series> = series_map
-            .into_iter()
-            .map(|(labels, samples)| Series { labels, samples })
-            .collect();
+        let mut result = Vec::new();
+        for target in &targets {
+            let series_map = self.read_metric(
+                target,
+                matchers,
+                &post_filters,
+                fetch,
+                (range_start, eval_time),
+            )?;
+            result.extend(
+                series_map
+                    .into_iter()
+                    .map(|(labels, samples)| Series { labels, samples }),
+            );
+        }
 
         Ok(PromQLValue::Matrix(result))
     }
 }
 
 // ── Helper functions ───────────────────────────────────────────────────
-
-/// The measurement a selector reads, from either the bare name or a
-/// `__name__="…"` matcher.
-fn resolve_measurement<'a>(
-    name: &'a Option<String>,
-    matchers: &'a [LabelMatcher],
-    what: &str,
-) -> Result<&'a str, EvalError> {
-    name.as_deref()
-        .or_else(|| {
-            matchers
-                .iter()
-                .find(|m| m.name == "__name__" && m.op == MatchOp::Equal)
-                .map(|m| m.value.as_str())
-        })
-        .ok_or_else(|| EvalError(format!("{what} requires metric name")))
-}
 
 /// The window actually read from storage.
 ///
@@ -311,12 +344,17 @@ fn pinned_eval_time(params: &QueryParams, at: Option<AtModifier>) -> i64 {
 
 /// Turn scan batches into per-series samples inside `(window_start, window_end]`.
 ///
+/// Reads exactly one field — `target.field` — and labels every series with
+/// `target.name`. A batch that does not carry the field contributes nothing:
+/// a measurement gains columns over its life, and a segment written before
+/// the field existed has no value to report, not a zero.
+///
 /// The window is **left-open**: a sample landing exactly on the older
 /// boundary belongs to the previous window, so that evenly spaced samples
 /// produce a constant count per range (Prometheus 3.0).
 fn collect_series(
     batches: &[RecordBatch],
-    measurement: &str,
+    target: &MetricRef,
     post_filters: &[CompiledMatcher],
     window_start: i64,
     window_end: i64,
@@ -333,10 +371,17 @@ fn collect_series(
             .position(|f| f.name() == "timestamp" || f.name() == "_time" || f.name() == "time")
             .ok_or_else(|| EvalError("no timestamp column".into()))?;
 
+        let Some(value_col_idx) = schema
+            .fields()
+            .iter()
+            .position(|f| *f.name() == target.field)
+        else {
+            continue;
+        };
+
         let mut tag_cols = Vec::new();
-        let mut field_cols = Vec::new();
         for (idx, field) in schema.fields().iter().enumerate() {
-            if idx == ts_col_idx {
+            if idx == ts_col_idx || idx == value_col_idx {
                 continue;
             }
             // The namespace marker is internal: it must not become a label,
@@ -348,8 +393,6 @@ fn collect_series(
             }
             if matches!(field.data_type(), arrow::datatypes::DataType::Utf8) {
                 tag_cols.push((idx, field.name().clone()));
-            } else {
-                field_cols.push((idx, field.name().clone()));
             }
         }
 
@@ -358,15 +401,19 @@ fn collect_series(
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
             .ok_or_else(|| EvalError("timestamp column is not Int64".into()))?;
+        let value_col = batch.column(value_col_idx);
 
         for row in 0..num_rows {
             let timestamp = ts_values.value(row);
             if timestamp <= window_start || timestamp > window_end {
                 continue;
             }
+            if arrow::array::Array::is_null(value_col.as_ref(), row) {
+                continue;
+            }
 
             let mut labels: Vec<(String, String)> =
-                vec![("__name__".to_string(), measurement.to_string())];
+                vec![("__name__".to_string(), target.name.clone())];
             for (idx, name) in &tag_cols {
                 if let Some(arr) = batch
                     .column(*idx)
@@ -384,23 +431,11 @@ fn collect_series(
                 continue;
             }
 
-            for (idx, field_name) in &field_cols {
-                let col = batch.column(*idx);
-                if arrow::array::Array::is_null(col.as_ref(), row) {
-                    continue;
-                }
-                let value = extract_f64(col, row)?;
-                let mut field_labels = labels.clone();
-                if field_cols.len() > 1 {
-                    if let Some(entry) = field_labels.iter_mut().find(|(k, _)| k == "__name__") {
-                        entry.1 = format!("{measurement}_{field_name}");
-                    }
-                }
-                series_map
-                    .entry(field_labels)
-                    .or_default()
-                    .push(Sample { timestamp, value });
-            }
+            let value = extract_f64(value_col, row)?;
+            series_map
+                .entry(labels)
+                .or_default()
+                .push(Sample { timestamp, value });
         }
     }
 

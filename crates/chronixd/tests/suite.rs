@@ -7,8 +7,9 @@
 #[path = "suite/client_compat.rs"]
 mod client_compat;
 
-#[path = "suite/dashboards.rs"]
-mod dashboards;
+#[path = "suite/errors_test.rs"]
+mod errors_test;
+
 #[path = "suite/flight_test.rs"]
 mod flight_test;
 #[path = "suite/grpc_test.rs"]

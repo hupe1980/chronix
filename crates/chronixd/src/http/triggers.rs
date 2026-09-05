@@ -25,11 +25,17 @@ use crate::error::ServerError;
 use crate::http::types::AppState;
 
 /// Body of `POST /api/v1/triggers`.
+///
+/// The key is `query`, as it is on `/api/v1/chronix/sql` and as the
+/// Prometheus endpoints' `?query=` parameter is: one name for "the statement
+/// to run" across the whole API. It was `sql`, which is both a second name
+/// and the wrong one — the trigger DSL is not SQL.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TriggerSqlRequest {
     /// A trigger DSL statement: `CREATE TRIGGER`, `ALTER TRIGGER`,
     /// `DROP TRIGGER` or `SHOW TRIGGERS`.
-    pub sql: String,
+    pub query: String,
 }
 
 /// One trigger, as the tenant that created it sees it.
@@ -135,7 +141,7 @@ pub async fn trigger_sql_handler(
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
 
     let result = pipeline
-        .execute_signal_sql_scoped(&req.sql, scope.as_deref())
+        .execute_signal_sql_scoped(&req.query, scope.as_deref())
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
     Ok(Json(to_response(result)))
 }
@@ -162,6 +168,51 @@ pub async fn list_triggers_handler(
         .execute_signal_sql_scoped("SHOW TRIGGERS", scope.as_deref())
         .map_err(|e| ServerError::Internal(e.to_string()))?;
     Ok(Json(to_response(result)))
+}
+
+/// `GET /api/v1/triggers/{name}` — read one of the caller's triggers.
+///
+/// `SHOW TRIGGERS` was the only way to read a trigger back, so a client that
+/// had just created one had to list everything and search for it — and a
+/// deployment with many triggers paid for the whole listing to answer a
+/// question about one.
+///
+/// # Errors
+///
+/// Returns 404 when triggers are not configured **and** when the caller has no
+/// trigger of that name — which is also the answer when another tenant has
+/// one, because a tenant must not be able to learn that.
+#[utoipa::path(
+    get,
+    path = "/api/v1/triggers/{name}",
+    params(("name" = String, Path, description = "Trigger name")),
+    responses(
+        (status = 200, description = "The trigger", body = TriggerView),
+        (status = 404, description = "No such trigger in this namespace"),
+    ),
+    tag = "triggers"
+)]
+pub async fn get_trigger_handler(
+    State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    Path(name): Path<String>,
+) -> Result<Json<TriggerView>, ServerError> {
+    let pipeline = pipeline(&state)?;
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
+
+    let result = pipeline
+        .execute_signal_sql_scoped("SHOW TRIGGERS", scope.as_deref())
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let TriggerResponse::Triggers { triggers } = to_response(result) else {
+        return Err(ServerError::Internal(
+            "SHOW TRIGGERS answered a listing".into(),
+        ));
+    };
+    triggers
+        .into_iter()
+        .find(|t| t.name == name)
+        .map(Json)
+        .ok_or_else(|| ServerError::NotFound(format!("trigger '{name}'")))
 }
 
 /// `DELETE /api/v1/triggers/{name}` — drop one of the caller's triggers.
@@ -212,17 +263,14 @@ pub async fn list_signals_handler(
     let pipeline = pipeline(&state)?;
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0));
 
+    // One ring per namespace, so this reads the caller's own rather than
+    // reading everything and filtering. The filter hid the fact that the
+    // capacity was still shared: a noisy tenant evicted a quiet one's signals,
+    // and the quiet one just saw fewer of its own.
     let signals = pipeline
         .signal_store()
-        .all()
+        .all_in(scope)
         .into_iter()
-        // The store is process-wide, so it is filtered on the way out. The
-        // namespace is a tag on the series the signal is about, which is the
-        // same thing the trigger's own scoping matched on.
-        .filter(|s| match scope {
-            None => true,
-            Some(ns) => s.tags.get(chronix_core::NAMESPACE_TAG).map(String::as_str) == Some(ns),
-        })
         .map(|s| SignalView {
             event_id: s.event_id,
             trigger_name: s.trigger_name,

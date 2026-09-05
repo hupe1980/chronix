@@ -231,6 +231,76 @@
         },
         "overrides": []
       }
+    },
+    {
+      "title": "Delivery Queue Depth",
+      "description": "Signals waiting on each channel's worker. A channel that is slow or unreachable grows here first; a sustained climb means the queue will start dropping.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "chronix_signal_delivery_queue_depth",
+          "legendFormat": "{{channel}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Signals Dropped (queue full)",
+      "description": "A full queue drops the oldest waiting signal rather than blocking ingestion. Any non-zero rate here means alerts are being discarded \u2014 raise the channel's capacity or fix the channel.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "rate(chronix_signal_delivery_dropped_total[5m])",
+          "legendFormat": "{{channel}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 50
+          },
+          "color": {
+            "fixedColor": "dark-red",
+            "mode": "fixed"
+          }
+        },
+        "overrides": []
+      }
     }
   ],
   "schemaVersion": 39,

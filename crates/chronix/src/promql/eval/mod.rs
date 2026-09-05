@@ -129,6 +129,23 @@ pub fn compile_label_matchers(
         .collect()
 }
 
+/// Refuse a vector holding two series with the same label set.
+///
+/// Prometheus's message, verbatim, because clients and dashboards match on it:
+/// `vector cannot contain metrics with the same labelset`.
+fn check_no_duplicate_labels(series: &[Series]) -> Result<(), EvalError> {
+    let mut seen: std::collections::HashSet<&[(String, String)]> =
+        std::collections::HashSet::with_capacity(series.len());
+    for s in series {
+        if !seen.insert(s.labels.as_slice()) {
+            return Err(EvalError(
+                "vector cannot contain metrics with the same labelset".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a label set satisfies every matcher in `compiled`.
 #[must_use]
 pub fn label_set_matches(compiled: &[CompiledMatcher], labels: &[(String, String)]) -> bool {
@@ -434,6 +451,21 @@ impl PromQLEvaluator {
     }
 
     pub(crate) fn eval(&self, expr: &Expr, params: &QueryParams) -> Result<PromQLValue, EvalError> {
+        let value = self.eval_node(expr, params)?;
+        // Prometheus checks every node's output, not only the query's: a
+        // vector holding two series with one label set has no meaning, and
+        // whichever operator consumes it next would silently pick one. The
+        // shapes that produce it here are a function that drops `__name__`
+        // from a selector spanning several metrics —
+        // `rate({__name__=~"cpu.+"}[1m])` over `cpu_usage` and `cpu_load` —
+        // and two `(measurement, field)` pairs that spell the same name.
+        if let PromQLValue::Vector(series) = &value {
+            check_no_duplicate_labels(series)?;
+        }
+        Ok(value)
+    }
+
+    fn eval_node(&self, expr: &Expr, params: &QueryParams) -> Result<PromQLValue, EvalError> {
         match expr {
             Expr::NumberLiteral(n) => Ok(PromQLValue::Scalar(*n)),
             Expr::StringLiteral(s) => Ok(PromQLValue::String(s.clone())),
