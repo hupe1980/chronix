@@ -35,6 +35,9 @@ let config = ChronixConfig::builder()
 | `retention` | `Option<Duration>` | `None` (keep forever) | Global data retention period. The maintenance pass enforces **every** configured rule — this one, `measurement_retention`, and each rollup's own `retention_ns` — so per-measurement rules take effect whether or not a global one is set |
 | `measurement_retention` | `HashMap<String, Duration>` | empty | Per-measurement retention overrides |
 | `max_series_cardinality` | `usize` | 1,000,000 | Maximum number of unique series |
+| `query_timeout` | `Duration` | 60 s | Deadline for one read. Checked before each time bucket's segment I/O, so a scan that runs out of time stops rather than finishing and then reporting. `Duration::ZERO` disables |
+| `per_query_memory_limit` | `usize` | 256 MiB | Memory budget for one query's intermediate state |
+| `max_query_result_bytes` | `usize` | 256 MiB | Ceiling on the bytes one collected result may hold |
 
 ### WAL Settings
 

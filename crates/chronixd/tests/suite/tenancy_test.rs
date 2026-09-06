@@ -650,7 +650,7 @@ async fn rollups_are_per_namespace() {
                 "name": "hourly",
                 "source_measurement": "cpu",
                 "target_measurement": "cpu_hourly",
-                "interval_seconds": 3600,
+                "every": "1h",
                 "aggregations": ["avg"],
                 "group_by_tags": []
             }))

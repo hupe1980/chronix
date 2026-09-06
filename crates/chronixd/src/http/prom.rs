@@ -199,14 +199,20 @@ pub async fn prom_instant_query_handler(
     let evaluator = chronix::promql::PromQLEvaluator::new(state.db.clone()).with_namespace(scope);
     // The same bounds the range query sets. One selector must not have a
     // series cap and a memory budget on `/query_range` and neither here.
+    let timeout_secs = state.config.server.prom_query_timeout_secs;
     let params = chronix::promql::eval::QueryParams {
         time: eval_time_ns,
         max_series: state.config.server.prom_series_limit,
         max_memory_bytes: state.config.server.prom_max_result_bytes,
+        // The evaluation carries its own deadline. The `tokio::time::timeout`
+        // below stays as a backstop, but it only cancels the *wait*: a
+        // blocking task cannot be cancelled, so without this the scan ran on
+        // after the client had been answered.
+        deadline: chronix::promql::eval::Deadline::after(std::time::Duration::from_secs(
+            timeout_secs,
+        )),
         ..Default::default()
     };
-
-    let timeout_secs = state.config.server.prom_query_timeout_secs;
     // The evaluator carries the scan counters, and it moves into the blocking
     // task — so the stats have to come back out with the result. Without this
     // the counters existed, were asserted by a test, and were visible to
@@ -297,6 +303,12 @@ pub async fn prom_range_query_handler(
         max_series: state.config.server.prom_series_limit,
         max_memory_bytes: state.config.server.prom_max_result_bytes,
         max_points: usize::try_from(max_points).unwrap_or(usize::MAX),
+        // As on the instant query: the deadline travels with the evaluation
+        // so a step boundary can stop it, rather than only cancelling the
+        // wait for a task that keeps scanning.
+        deadline: chronix::promql::eval::Deadline::after(std::time::Duration::from_secs(
+            state.config.server.prom_query_timeout_secs,
+        )),
         ..Default::default()
     };
 

@@ -60,6 +60,18 @@ $$
 
 A common rule: choose $k$ such that $\text{Var}_k \geq 0.95$ (95%).
 
+### What Chronix computes
+
+Not an exact eigendecomposition: the top components come from a **randomized
+SVD** (Halko–Martinsson–Tropp 2011) — a Gaussian sketch of $k + 2$ columns
+followed by two power iterations — which is $O(p^2 k)$ rather than $O(p^3)$ and
+accurate to well within the tolerance an anomaly score needs.
+
+The sketch is drawn from a **fixed seed**, so fitting the same data twice gives
+the same components and the same score. The bound holds with high probability
+for any draw, so nothing is lost by fixing one — and an alert an operator
+cannot re-derive is worth less than a slightly better basis.
+
 ## PCA for Anomaly Detection
 
 ### Reconstruction Error

@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("net_1m")
         .source("network_traffic")
         .target("network_traffic_1m")
-        .interval_ns(60_000_000_000) // 1 minute
+        .every("1m") // 1 minute
         .aggregation(RollupAggFn::Avg)
         .aggregation(RollupAggFn::Max)
         .aggregation(RollupAggFn::Sum)
@@ -110,8 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rollups = db.list_rollups()?;
     for r in &rollups {
         println!(
-            "   Rollup '{}': {} → {} ({}ns interval, {:?})",
-            r.name, r.source_measurement, r.target_measurement, r.interval_ns, r.aggregations
+            "   Rollup '{}': {} → {} (every {}, {:?})",
+            r.name, r.source_measurement, r.target_measurement, r.bucket, r.aggregations
         );
     }
 

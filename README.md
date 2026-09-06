@@ -25,22 +25,18 @@ crate.
   programmable triggers run against zero-copy Arrow buffers, with automatic
   cross-validated model selection and a SQL surface of window functions and
   aggregates. No Python sidecar.
-- **State-of-the-art compression** — Pcodec (`pco`, 2025) as the primary
-  codec for every numeric column, with ALP (SIGMOD 2024), Chimp/Chimp128,
-  Gorilla and Patas behind it, plus delta-of-delta, PFOR, dictionary and
-  bitmap codecs under adaptive per-block selection — the winner is chosen
-  per block by trial encoding, and recorded, so a workload the leaders are
-  bad at costs one sample encode rather than a bad ratio. Most metric values
-  started life as decimals — a meter reporting `231.45` W — and both pco
-  and ALP recover the integer instead of XOR-ing bit patterns; pco then
-  entropy-codes the deltas. On realistic meter and inverter data — sensor
-  noise, plateaus, dropouts — that is worth **5–29×**, against 3–9× for ALP
-  and 1.0–2.5× for the XOR codecs; on clean low-precision counters it
-  reaches 46–85×. Timestamps use pco too: a jittered 1-second sampler
-  compresses 2.7× where delta-of-delta managed 0.9×, i.e. worse than plain.
-  Every number is pinned by a test, and one of those tests pins the *gap*
-  between the realistic and synthetic figures so the easy number cannot
-  quietly become the headline again.
+- **State-of-the-art compression** — Pcodec (`pco`, 2025) is the primary codec
+  for every numeric column, with ALP (SIGMOD 2024), Chimp/Chimp128, Gorilla,
+  Patas, delta-of-delta, PFOR, dictionary and bitmap behind it; the winner is
+  chosen per block by trial encoding. Most metric values started life as
+  decimals — a meter reporting `231.45` W — and pco recovers the integer
+  instead of XOR-ing bit patterns, then entropy-codes the deltas. On realistic
+  meter and inverter data (noise, plateaus, dropouts) that is worth **5–29×**,
+  against 3–9× for ALP and 1.0–2.5× for the XOR codecs; on clean
+  low-precision counters it reaches 46–85×. Timestamps use pco too: a jittered
+  1-second sampler compresses 2.7× where delta-of-delta manages 0.9×, worse
+  than plain. Every number here is pinned by a test — including the *gap*
+  between the realistic and the synthetic figures.
 - **Wire-compatible, at the routes the clients actually use** — InfluxDB Line
   Protocol, Prometheus remote write/read + full PromQL, OpenTelemetry OTLP
   metrics, Arrow Flight SQL. Point a Grafana **Prometheus** data source at
@@ -199,6 +195,11 @@ Each claim below is pinned by a test; the depth is in the
   delete or an import into an already-aggregated range records an
   **invalidation** that the next pass recomputes, and retention drops raw data
   only once every tier it feeds has caught up.
+- **A tier can be a calendar tier.** `every("1d").timezone("Europe/Berlin")`
+  runs local midnight to local midnight — 23 or 25 hours on a daylight-saving
+  day — and `every("1mo")` is a calendar month. The **unit decides**: sub-day
+  widths are a fixed span, super-day widths follow the calendar. `time_bucket()`
+  in SQL takes the same widths and the same zone.
 - **Parquet cold archive** reads each cold `(measurement, shard)` group
   *through the read path* — deduplicated, tombstones applied — writes one
   Hive-partitioned object to S3/GCS/Azure, verifies it, and only then drops
@@ -272,10 +273,18 @@ Non-finite samples — Prometheus staleness markers, OTLP quantiles with nothing
 observed yet — are skipped and counted rather than failing the batch, because
 both are routine traffic and a `400` stalls a remote-write queue indefinitely.
 
+Every error carries a machine-readable `code`, and conditions that describe the
+deployment are shown rather than redacted: `503 BACKPRESSURE` with a
+`Retry-After` for a full memtable, `503 OVERLOADED` for a WAL poisoned by a
+failed `fsync`, `507 STORAGE_FULL`, `504 QUERY_TIMEOUT` naming the setting that
+bound it. Only chronix's own machinery is a redacted `500`. Read deadlines are
+enforced inside the scan, so a query that runs out of time stops.
+
 Plus Kafka/MQTT ingestion connectors (feature-gated, hot-reload, credential
-rotation, SASL + TLS), TLS with certificate hot-reload, graceful shutdown,
-per-request timeouts and row limits, SSE annotations, and bundled Grafana
-dashboards in [`dashboards/`](dashboards/).
+rotation, SASL + TLS), TLS with certificate hot-reload, graceful shutdown that
+waits for every protocol surface before closing the database, per-request
+timeouts and row limits, SSE annotations, and bundled Grafana dashboards in
+[`dashboards/`](dashboards/).
 
 **No C toolchain for the connectors.** `krafka` and `rumqttc` are pure Rust.
 One dependency does compile C — `aws-lc-rs`, the single rustls crypto provider

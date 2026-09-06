@@ -566,15 +566,20 @@ Per-measurement retention follows the same ordering principle.
 
 ### Rollup
 
-`RollupConfig` defines source → target measurement downsampling. `RollupBuilder`
-provides fluent construction with validation (including `interval_ns > 0`).
+`RollupConfig` defines source → target measurement downsampling. Its bucketing
+is a **`TimeBucket`**: a fixed span for sub-day widths, the local calendar for
+`d`/`w`/`mo`/`y`, so a daily tier runs local midnight to local midnight and a
+monthly one is a calendar month. `RollupBuilder` takes `every("15m")` /
+`every("1mo")` with an optional `timezone("Europe/Berlin")`, and refuses a
+width or a zone it cannot parse at `build()`.
 `RollupRegistry` manages CRUD via `add()`, `remove()`, `list()`, `get()` and
 `rollups_for_source()`, refuses a definition that would make a measurement
 feed itself (`would_cycle()`), and carries a
 `RollupState { materialised_until, invalid }` per rollup. Both the
 definitions and the state are persisted in the **catalog manifest**, which
-is fsynced per append and CRC-32C framed — losing them silently disables
-every rollup, so they get the same durability as the segment list.
+is fsynced before the call that changed it returns and CRC-32C framed —
+losing them silently disables every rollup, so they get the same durability as
+the segment list.
 
 `RollupAccumulator` folds time-ordered batches into buckets and emits a
 bucket once a later one has started, so memory is one open bucket per tag
@@ -583,8 +588,15 @@ materialisation rather than writing a partial bucket. `RollupAccumulator::unorde
 holds everything until `finish()` for callers whose input is complete but
 unsorted. `BucketAccumulator` holds the per-field running stats (Avg, Min,
 Max, First, Sum, Count, Last) and skips NaN; every numeric column is
-aggregated, `Int64` and `UInt64` included. `align_to_bucket()` uses
-Euclidean remainder, clamps `interval_ns` to at least 1, and saturates at
+aggregated, `Int64` and `UInt64` included.
+
+**Every boundary comes from `TimeBucket`.** `start_of(ts)` gives the bucket
+holding an instant and `next(start)` the one after it — never `start + width`,
+which is not the next bucket when the width is a month or the day is a
+transition day. The materialisation watermark, the invalidation range a late
+write produces, the live half of the rollup view and the boundary retention
+waits for all go through it. A fixed width floors by Euclidean remainder, so a
+negative timestamp snaps down rather than towards zero, and saturates at
 `i64::MIN`.
 
 **Materialisation** — `db.materialise_rollups()` does two things per rollup,

@@ -51,6 +51,9 @@ no route accepts:
 | `400` | `CARDINALITY_EXCEEDED` | The write would exceed `max_series_cardinality` |
 | `400` | `SCHEMA_ERROR` | A field's type conflicts with the measurement's schema |
 | `400` | `PARTIAL_WRITE` | Some points of the batch were rejected; the body names them |
+| `400` | `FUTURE_TIMESTAMP` | A point's timestamp is beyond `future_write_tolerance` — usually a device clock |
+| `400` | `INVALID_POINT` | A measurement, tag or field name the engine refuses |
+| `400` | `SQL_ERROR`, `PROMQL_ERROR` | The query did not plan |
 | `401` | `UNAUTHORIZED` | Missing or invalid credentials |
 | `403` | `FORBIDDEN` | Authenticated, but not permitted |
 | `404` | `NOT_FOUND` | No such measurement, trigger, namespace — or no such route |
@@ -60,13 +63,35 @@ no route accepts:
 | `415` | `UNSUPPORTED_MEDIA_TYPE` | A JSON endpoint without `Content-Type: application/json` |
 | `422` | `INVALID_BODY` | Valid JSON, wrong shape — a required field is missing |
 | `429` | `RATE_LIMITED` | Rate limit exceeded |
-| `500` | `INTERNAL_ERROR` | Logged in full server-side; the response says only that it happened |
-| `503` | `BACKPRESSURE`, `DATABASE_CLOSED` | The server cannot accept the write right now |
-| `504` | `WRITE_TIMEOUT` | The write did not complete within `write_timeout` |
+| `500` | `INTERNAL_ERROR`, `DATABASE_ERROR` | chronix's own fault. Logged in full server-side; the response says only that it happened |
+| `503` | `BACKPRESSURE` | The memtable is at capacity; the flush that clears it is already running. Carries `Retry-After: 1` |
+| `503` | `OVERLOADED` | A condition that needs an operator — a WAL poisoned by a failed `fsync`. Carries `Retry-After: 60` |
+| `503` | `DATABASE_CLOSED` | The server is shutting down |
+| `504` | `WRITE_TIMEOUT` | The write did not finish within `write_timeout`. **Its outcome is unknown** — see below |
+| `504` | `QUERY_TIMEOUT` | The read exceeded `sql_query_timeout_secs` or `query_timeout_secs` |
+| `507` | `STORAGE_FULL` | No space left on the data volume. Carries `Retry-After: 5` |
 
 The **PromQL endpoints are the one exception**, deliberately: they answer
 Prometheus's own error shape, `{"status":"error","errorType":…,"error":…}`,
 because every Prometheus client branches on that instead.
+
+### Which errors are redacted
+
+A `5xx` caused by chronix's own machinery is redacted to
+`"DATABASE_ERROR: an internal error occurred"`, with the detail in the server
+log. A `5xx` that describes the **deployment** is shown in full — a full disk,
+a full memtable, a poisoned WAL, a query that ran out of time — because each
+has a remedy and none discloses anything.
+
+### `504 WRITE_TIMEOUT` means *unknown*, not *no*
+
+`write_timeout` bounds how long the server waits, not how long the write
+takes: a durable write is not abandoned half-way, so when the deadline fires
+the write is still running and will probably land.
+
+**Retry it.** A point is identified by its series and its timestamp, so
+writing it twice stores it once. Concurrent writes are bounded by admission
+control, which answers `503 BACKPRESSURE`.
 
 ---
 
@@ -975,6 +1000,38 @@ the connector started; for a windowed rate, take `rate()` over the
 
 ### Rollups
 
+A rollup is declared by a **bucket width** and, optionally, the **time zone**
+its calendar is read against:
+
+```bash
+curl -X POST http://localhost:8086/api/v1/rollups \
+  -H 'content-type: application/json' \
+  -d '{
+        "name": "energy_monthly",
+        "source_measurement": "energy",
+        "target_measurement": "energy_monthly",
+        "every": "1mo",
+        "timezone": "Europe/Berlin",
+        "aggregations": ["first", "last"],
+        "group_by_tags": ["meter"]
+      }'
+```
+
+**The unit decides what a bucket means.** Sub-day units (`ns`, `us`, `ms`,
+`s`, `m`/`min`, `h`) are a fixed span that never varies — an hour bucket is
+always an hour, and in a zone they are aligned to that zone's *standard*
+offset so the boundaries stay evenly spaced across a daylight-saving change.
+Super-day units (`d`, `w`, `mo`, `y`) follow the **local calendar**: a day
+runs from local midnight to local midnight, which is 23 or 25 hours on a
+transition day, and a month is 28, 29, 30 or 31 days. The month is `mo`; `m`
+is always the minute.
+
+Without a `timezone` a `1d` tier buckets on **UTC** midnight — which is 02:00
+local in Berlin in summer and 01:00 in winter, so a "daily" total is a day's
+worth of somebody else's day, and the two halves of the year do not agree with
+each other. Set the zone whenever the buckets are meant to line up with what a
+person calls a day.
+
 A rollup's listing reports where it has got to and whether it is behind:
 
 ```bash
@@ -988,7 +1045,8 @@ curl http://localhost:8086/api/v1/rollups
       "name": "energy_15m",
       "source_measurement": "energy",
       "target_measurement": "energy_15m",
-      "window_seconds": 900,
+      "every": "15m",
+      "timezone": null,
       "aggregations": ["Avg", "Max"],
       "materialised_until": 1700000000000000000,
       "pending_repairs": [[1699900000000000000, 1699903600000000000]]
@@ -998,8 +1056,10 @@ curl http://localhost:8086/api/v1/rollups
 }
 ```
 
-`materialised_until` is the exclusive end of the newest bucket aggregated so
-far. `pending_repairs` are bucket ranges *below* that watermark whose input
+`every` is the width, spelled the way it was written, so what this endpoint
+reports can be typed straight back into a create request. `timezone` is the
+calendar it is read against, or `null` for UTC. `materialised_until` is the
+exclusive end of the newest bucket aggregated so far. `pending_repairs` are bucket ranges *below* that watermark whose input
 changed afterwards — a `backfill`, an import, or a delete — and which the
 next maintenance pass will recompute. **A non-empty list is why retention is
 holding raw data**: the tier does not yet agree with the raw data, so the raw

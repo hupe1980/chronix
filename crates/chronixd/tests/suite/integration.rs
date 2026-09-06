@@ -437,7 +437,7 @@ async fn rollup_state_is_reported_and_a_range_can_be_refreshed() {
             "name": "cpu_1m",
             "source_measurement": "cpu",
             "target_measurement": "cpu_1m",
-            "interval_seconds": 60,
+            "every": "1m",
             "aggregations": ["avg"],
         }))
         .send()

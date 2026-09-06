@@ -392,7 +392,7 @@ Registered as DataFusion UDFs/UDAFs:
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `time_bucket(interval, timestamp)` | UDF | Truncate timestamps to buckets |
+| `time_bucket(width, timestamp [, timezone])` | UDF | Bucket timestamps. Sub-day widths are a fixed span; `d`/`w`/`mo`/`y` follow the calendar of `timezone` |
 | `first(field, timestamp)` | UDAF | First value ordered by timestamp |
 | `last(field, timestamp)` | UDAF | Last value ordered by timestamp |
 | `rate(field, timestamp)` | UDAF | Per-second rate of change |

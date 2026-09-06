@@ -6,7 +6,14 @@ from typing import Any
 
 import httpx
 
-from chronix_client.exceptions import ChronixError, ConnectionError, QueryError, WriteError
+from chronix_client.exceptions import (
+    BackpressureError,
+    ChronixError,
+    ConnectionError,
+    DeadlineExceeded,
+    QueryError,
+    WriteError,
+)
 from chronix_client.models import (
     ColumnSchema,
     DeleteResult,
@@ -479,19 +486,45 @@ class ChronixClient:
 
     @staticmethod
     def _check_response(resp: httpx.Response) -> None:
+        """Turn an error response into the exception that says what to do.
+
+        The server's `code` is the machine-readable half of every error and
+        the API reference tells clients to branch on it; this used to discard
+        it, so `503 BACKPRESSURE` — back off a second, the flush clearing it
+        is already running — was indistinguishable from a bug in the server.
+        """
         if resp.is_success:
             return
         status = resp.status_code
+        code: str | None = None
+        detail = resp.text
         try:
-            detail = resp.json().get("error", resp.text)
+            body = resp.json()
+            detail = body.get("error", resp.text)
+            code = body.get("code")
         except Exception:  # noqa: BLE001
-            detail = resp.text
+            pass
+
+        retry_after: float | None = None
+        header = resp.headers.get("retry-after")
+        if header is not None:
+            try:
+                retry_after = float(header)
+            except ValueError:
+                # An HTTP-date is legal here and chronix never sends one;
+                # ignoring it is better than failing the error path.
+                retry_after = None
+
+        kwargs = {"status_code": status, "code": code, "retry_after": retry_after}
 
         if status == 409:
             raise WriteError(
-                f"duplicate write (idempotency conflict): {detail}",
-                status_code=status,
+                f"duplicate write (idempotency conflict): {detail}", **kwargs
             )
+        if status in (503, 507):
+            raise BackpressureError(f"server unavailable {status}: {detail}", **kwargs)
+        if status == 504:
+            raise DeadlineExceeded(f"deadline exceeded {status}: {detail}", **kwargs)
         if 400 <= status < 500:
-            raise QueryError(f"client error {status}: {detail}", status_code=status)
-        raise ChronixError(f"server error {status}: {detail}", status_code=status)
+            raise QueryError(f"client error {status}: {detail}", **kwargs)
+        raise ChronixError(f"server error {status}: {detail}", **kwargs)

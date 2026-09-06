@@ -117,6 +117,21 @@ GROUP BY bucket
 ORDER BY bucket;
 ```
 
+`time_bucket` takes an optional time zone, and then a day means a day:
+
+```sql
+SELECT time_bucket('1d', _time, 'Europe/Berlin') AS day,
+       avg(usage_idle)                           AS avg_idle
+FROM cpu
+GROUP BY day
+ORDER BY day;
+```
+
+The **unit decides**: `'30s'`, `'5m'` and `'1h'` are a fixed span that never
+varies, while `'1d'`, `'1w'`, `'1mo'` and `'1y'` follow that zone's calendar —
+so a transition day is 23 or 25 hours and February is February. The month is
+`'mo'`; `'m'` is always the minute.
+
 The time column is `_time` — the same name the schema endpoint, an Arrow
 batch and a `.csx` segment use, so what you read back is what you type. It
 compares against an epoch-nanosecond integer, an RFC 3339 string and `now()`

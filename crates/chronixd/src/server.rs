@@ -365,13 +365,21 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     let http_addr = config.server.http_addr;
     let shutdown_timeout = std::time::Duration::from_secs(config.server.shutdown_timeout_secs);
     let tls_config_clone = config.tls.clone();
+    // Every server drains on this one signal, and every server fires it when
+    // it stops — see `Shutdown`.
+    let shutdown = Shutdown::new();
+    shutdown.on_os_signal();
     let http_handle = if let Some(rustls_cfg) = tls_rustls_config {
-        let shutdown = shutdown_signal();
+        let shutdown_guard = shutdown.guard();
+        let drain_signal = shutdown.wait();
         let tls_reload_interval = tls_config_clone
             .as_ref()
             .map_or(0, |t| t.reload_interval_secs);
         let tls_config_for_watcher = tls_config_clone.clone();
         tokio::spawn(async move {
+            // Held for the life of this task: dropping it — on a clean
+            // return, an error or a panic — tells the other servers to drain.
+            let _shutdown_guard = shutdown_guard;
             info!(%http_addr, "HTTPS server listening");
             let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_cfg);
 
@@ -391,7 +399,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             let server_handle = handle.clone();
             let http_drain_timeout = shutdown_timeout;
             tokio::spawn(async move {
-                shutdown.await;
+                drain_signal.await;
                 server_handle.graceful_shutdown(Some(http_drain_timeout));
             });
             axum_server::bind_rustls(http_addr, rustls_config)
@@ -400,12 +408,37 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
                 .await
         })
     } else {
+        let shutdown_guard = shutdown.guard();
+        let drain_signal = shutdown.wait();
+        let drain_deadline = shutdown.wait();
+        let http_drain_timeout = shutdown_timeout;
         tokio::spawn(async move {
+            let _shutdown_guard = shutdown_guard;
             let listener = tokio::net::TcpListener::bind(http_addr).await?;
             info!(%http_addr, "HTTP server listening");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
+            // `axum::serve`'s graceful shutdown waits for every open
+            // connection **without a deadline**, and `/api/v1/cdc/stream` and
+            // the annotations SSE stream do not end on their own — so one
+            // subscriber would hold the process open for ever. The TLS,
+            // gRPC and Flight SQL paths each carry `shutdown_timeout`; this
+            // one did not, and only got away with it because the old outer
+            // `select!` returned as soon as *another* server drained and let
+            // the process exit out from under it. Waiting for all three, as
+            // the database's lifetime requires, makes the missing deadline a
+            // hang.
+            tokio::select! {
+                res = axum::serve(listener, app).with_graceful_shutdown(drain_signal) => res,
+                () = async {
+                    drain_deadline.await;
+                    tokio::time::sleep(http_drain_timeout).await;
+                } => {
+                    warn!(
+                        timeout = ?http_drain_timeout,
+                        "HTTP drain timeout exceeded, forcing shutdown"
+                    );
+                    Ok(())
+                }
+            }
         })
     };
 
@@ -434,7 +467,11 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     let grpc_reflection_enabled = config.server.grpc_reflection;
     let grpc_drain_timeout = shutdown_timeout;
 
+    let grpc_shutdown = shutdown.clone();
+    let grpc_guard = shutdown.guard();
     let grpc_handle = tokio::spawn(async move {
+        let _shutdown_guard = grpc_guard;
+        let shutdown = grpc_shutdown;
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
         health_reporter
             .set_serving::<proto::chronix_service_server::ChronixServiceServer<ChronixGrpcService>>(
@@ -529,12 +566,13 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             });
 
             let incoming = tokio_stream::wrappers::ReceiverStream::new(rx);
+            let drain_deadline = shutdown.wait();
             tokio::select! {
-                res = router.serve_with_incoming_shutdown(incoming, shutdown_signal()) => {
+                res = router.serve_with_incoming_shutdown(incoming, shutdown.wait()) => {
                     res.map_err(std::io::Error::other)
                 }
                 _ = async {
-                    shutdown_signal().await;
+                    drain_deadline.await;
                     tokio::time::sleep(grpc_drain_timeout).await;
                 } => {
                     warn!(timeout = ?grpc_drain_timeout, "gRPC drain timeout exceeded, forcing shutdown");
@@ -542,12 +580,13 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
                 }
             }
         } else {
+            let drain_deadline = shutdown.wait();
             tokio::select! {
-                res = router.serve_with_shutdown(grpc_addr, shutdown_signal()) => {
+                res = router.serve_with_shutdown(grpc_addr, shutdown.wait()) => {
                     res.map_err(std::io::Error::other)
                 }
                 _ = async {
-                    shutdown_signal().await;
+                    drain_deadline.await;
                     tokio::time::sleep(grpc_drain_timeout).await;
                 } => {
                     warn!(timeout = ?grpc_drain_timeout, "gRPC drain timeout exceeded, forcing shutdown");
@@ -570,7 +609,11 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             config.server.write_timeout_secs,
         ));
 
+    let flight_shutdown = shutdown.clone();
+    let flight_guard = shutdown.guard();
     let flight_handle = tokio::spawn(async move {
+        let _shutdown_guard = flight_guard;
+        let shutdown = flight_shutdown;
         // When using manual TLS (hot-reloadable), do NOT set
         // tonic's built-in TLS — we handle it at the connection level.
         let mut builder = tonic::transport::Server::builder();
@@ -634,12 +677,13 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             });
 
             let incoming = tokio_stream::wrappers::ReceiverStream::new(rx);
+            let drain_deadline = shutdown.wait();
             tokio::select! {
-                res = router.serve_with_incoming_shutdown(incoming, shutdown_signal()) => {
+                res = router.serve_with_incoming_shutdown(incoming, shutdown.wait()) => {
                     res.map_err(std::io::Error::other)
                 }
                 _ = async {
-                    shutdown_signal().await;
+                    drain_deadline.await;
                     tokio::time::sleep(flight_drain_timeout).await;
                 } => {
                     warn!(timeout = ?flight_drain_timeout, "Flight SQL drain timeout exceeded, forcing shutdown");
@@ -647,12 +691,13 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
                 }
             }
         } else {
+            let drain_deadline = shutdown.wait();
             tokio::select! {
-                res = router.serve_with_shutdown(flight_addr, shutdown_signal()) => {
+                res = router.serve_with_shutdown(flight_addr, shutdown.wait()) => {
                     res.map_err(std::io::Error::other)
                 }
                 _ = async {
-                    shutdown_signal().await;
+                    drain_deadline.await;
                     tokio::time::sleep(flight_drain_timeout).await;
                 } => {
                     warn!(timeout = ?flight_drain_timeout, "Flight SQL drain timeout exceeded, forcing shutdown");
@@ -679,29 +724,35 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     );
     warn_if_exposed_without_auth(&config);
 
-    // ── Wait for any server to finish ──────────────────────────────────
-    tokio::select! {
-        res = http_handle => {
-            match res {
-                Err(e) => error!(%e, "HTTP server task panicked"),
-                Ok(Err(e)) => error!(%e, "HTTP server error"),
-                Ok(Ok(())) => {}
-            }
-        }
-        res = grpc_handle => {
-            match res {
-                Err(e) => error!(%e, "gRPC server task panicked"),
-                Ok(Err(e)) => error!(%e, "gRPC server error"),
-                Ok(Ok(())) => {}
-            }
-        }
-        res = flight_handle => {
-            match res {
-                Err(e) => error!(%e, "Flight SQL server task panicked"),
-                Ok(Err(e)) => error!(%e, "Flight SQL server error"),
-                Ok(Ok(())) => {}
-            }
-        }
+    // ── Wait for every server to finish ────────────────────────────────
+    //
+    // All three drain on the same `SIGTERM`, but they do not finish together:
+    // one with no open connections returns at once while another is still
+    // streaming a Flight SQL result. This used to be a `tokio::select!` over
+    // the three handles, which returns on the **first** and drops the other
+    // two — and dropping a `JoinHandle` does not stop its task. So the
+    // database was flushed, closed and its directory lock released while gRPC
+    // and Flight SQL were still serving requests against it, and a write in
+    // flight at that moment met a closed database.
+    //
+    // `join!` waits for all three. Each already carries its own drain
+    // deadline (`shutdown_timeout`), so this cannot wait for ever; what it
+    // adds is that the database outlives every surface that reads it.
+    let (http_res, grpc_res, flight_res) = tokio::join!(http_handle, grpc_handle, flight_handle);
+    match http_res {
+        Err(e) => error!(%e, "HTTP server task panicked"),
+        Ok(Err(e)) => error!(%e, "HTTP server error"),
+        Ok(Ok(())) => {}
+    }
+    match grpc_res {
+        Err(e) => error!(%e, "gRPC server task panicked"),
+        Ok(Err(e)) => error!(%e, "gRPC server error"),
+        Ok(Ok(())) => {}
+    }
+    match flight_res {
+        Err(e) => error!(%e, "Flight SQL server task panicked"),
+        Ok(Err(e)) => error!(%e, "Flight SQL server error"),
+        Ok(Ok(())) => {}
     }
 
     // ── Graceful shutdown ──────────────────────────────────────────────
@@ -1172,20 +1223,93 @@ pub fn setup_prometheus() -> Result<metrics_exporter_prometheus::PrometheusHandl
         .map_err(|e| ServerError::Internal(format!("failed to install Prometheus recorder: {e}")))
 }
 
+/// The one shutdown signal, shared by every server task.
+///
+/// Each of the three servers used to build its own `shutdown_signal()` future
+/// over the OS signal, which coordinated a `SIGTERM` correctly and nothing
+/// else. Two things need the same broadcast:
+///
+/// - **A server that stops on its own must stop the others.** A gRPC listener
+///   that cannot bind used to leave `chronixd` running as an HTTP-only server
+///   with an error in the log, because the outer wait was a `select!` that
+///   noticed the first exit and the process then closed the database under the
+///   two survivors. Now the exit of any server — clean, failed or panicking —
+///   triggers this, so the others drain and the shutdown sequence is the same
+///   one a `SIGTERM` takes.
+/// - **Nothing may close the database before the last server has drained.**
+///   That is the caller's job (`join!` on all three handles), and it is only
+///   sound because every server is reachable by this signal.
+#[derive(Clone, Debug)]
+pub struct Shutdown(tokio::sync::watch::Sender<bool>);
+
+impl Shutdown {
+    /// A signal nothing has fired yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+
+    /// Fire it. Idempotent: later calls are no-ops.
+    ///
+    /// `send_replace`, not `send`: `watch::Sender::send` returns `Err` and
+    /// **leaves the value unchanged** when no receiver is currently
+    /// subscribed, so a trigger that arrives before a server task has called
+    /// `wait()` would be lost and that task would never drain. The unit test
+    /// below is what found it.
+    pub fn trigger(&self) {
+        let _ = self.0.send_replace(true);
+    }
+
+    /// A future that resolves once the signal has fired.
+    ///
+    /// Owned and `'static`, so it can be handed to `serve_with_shutdown`.
+    pub fn wait(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.0.subscribe();
+        async move {
+            // `Err` means every sender is gone, which can only happen once
+            // the server is being torn down — treat it as fired.
+            let _ = rx.wait_for(|fired| *fired).await;
+        }
+    }
+
+    /// Fire the signal when this guard drops.
+    ///
+    /// Put one inside a server task and its exit — returning, erroring or
+    /// panicking — brings the other servers down with it.
+    #[must_use]
+    pub fn guard(&self) -> ShutdownGuard {
+        ShutdownGuard(self.clone())
+    }
+
+    /// Spawn the task that fires this signal on `SIGTERM` or `SIGINT`.
+    pub fn on_os_signal(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            wait_for_os_signal().await;
+            info!("shutdown signal received");
+            this.trigger();
+        });
+    }
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fires a [`Shutdown`] when dropped.
+#[derive(Debug)]
+pub struct ShutdownGuard(Shutdown);
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        self.0.trigger();
+    }
+}
+
 /// Wait for SIGTERM or SIGINT (Ctrl-C).
-///
-/// # Multiple `shutdown_signal()` futures
-///
-/// Each server task (HTTP, gRPC, Flight SQL) creates its own independent
-/// `shutdown_signal()` future. This is intentional: every `tokio::select!`
-/// branch needs its own future because `Signal::recv()` is **not** `Clone`
-/// and a single shared future cannot be polled from multiple tasks.
-///
-/// All futures resolve on the **same** OS signal, so shutdown is
-/// coordinated even though the futures are independent. A
-/// `tokio::sync::watch` or `CancellationToken` could consolidate this,
-/// but the current approach is zero-allocation and correct.
-async fn shutdown_signal() {
+async fn wait_for_os_signal() {
     let ctrl_c = async {
         if let Err(e) = signal::ctrl_c().await {
             tracing::error!(error = %e, "failed to install Ctrl+C handler");
@@ -1393,4 +1517,50 @@ fn spawn_cold_archiver(
         ));
     }
     Ok(())
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::Shutdown;
+
+    /// Every waiter resolves once the signal fires.
+    #[tokio::test]
+    async fn a_trigger_releases_every_waiter() {
+        let shutdown = Shutdown::new();
+        let a = shutdown.wait();
+        let b = shutdown.wait();
+        shutdown.trigger();
+        tokio::join!(a, b);
+    }
+
+    /// A server that stops on its own stops the others.
+    ///
+    /// The guard is what turns "the gRPC listener could not bind" into a
+    /// clean shutdown of the whole process instead of an HTTP-only server
+    /// with an error in the log — and it fires on a panicking task too,
+    /// because a panic unwinds through the guard's `Drop`.
+    #[tokio::test]
+    async fn a_dropped_guard_triggers_the_shutdown() {
+        let shutdown = Shutdown::new();
+        let waiter = shutdown.wait();
+        drop(shutdown.guard());
+        waiter.await;
+    }
+
+    /// A waiter created *after* the signal fired does not hang.
+    ///
+    /// The reason `join!` on the three server handles is safe: a task that
+    /// subscribes late — a TLS acceptor spawned during startup, say — must
+    /// see the signal that has already been sent, or shutdown deadlocks and
+    /// the drain timeout never applies because nothing reaches it.
+    #[tokio::test]
+    async fn a_late_waiter_sees_a_signal_that_already_fired() {
+        let shutdown = Shutdown::new();
+        shutdown.trigger();
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown.wait())
+            .await
+            .expect("a late waiter must not hang");
+    }
 }

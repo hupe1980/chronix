@@ -204,19 +204,37 @@ pub struct SegmentCatalog {
     next_segment_id: u64,
     /// Persistent WAL file handle (kept open for append).
     manifest_wal_file: Option<std::fs::File>,
-    /// Number of appends since last `sync_data()`. When this reaches
-    /// [`SYNC_BATCH_SIZE`], an automatic fsync is issued. Callers can
-    /// also call [`sync_manifest()`](Self::sync_manifest) explicitly.
+    /// Number of appends written but not yet `sync_data()`d.
+    ///
+    /// Normally at most one: every append syncs. It grows only inside
+    /// [`in_one_sync`](Self::in_one_sync).
     pending_sync: u64,
+    /// Depth of the [`in_one_sync`](Self::in_one_sync) nesting.
+    ///
+    /// Non-zero means "this transition is not finished; do not fsync yet".
+    defer_sync: u32,
+    /// How many times the manifest has actually been fsynced.
+    ///
+    /// Exported as `chronix_catalog_fsync_total`, beside the WAL's own
+    /// counter: on flash-backed storage the fsync rate *is* the wear rate,
+    /// and the catalog was paying one per row of bookkeeping. It is also what
+    /// makes the batching testable — a claim about a number of syscalls that
+    /// nothing counts is a claim that rots.
+    manifest_syncs: u64,
 }
 
 /// Snapshot interval: take a snapshot every N changes.
 const SNAPSHOT_INTERVAL: u64 = 1000;
 
-/// Sync on every manifest append to guarantee zero
-/// catalog mutations are lost on power failure. Catalog mutations
-/// (segment register, soft-delete, schema update) are infrequent
-/// enough that the extra fsync cost is negligible.
+/// Sync on **every** manifest append, so no catalog mutation is lost to a
+/// power failure.
+///
+/// A single mutation — registering a segment, updating a schema — is
+/// infrequent enough that its fsync is free. What is not free is a mutation
+/// made of *many* appends: a compaction of four segments is six, and a delete
+/// producing a hundred tombstones is a hundred. Those are batched by
+/// [`SegmentCatalog::in_one_sync`], which is where the count belongs — a
+/// global batch size would defer the appends nobody is going to sync.
 const SYNC_BATCH_SIZE: u64 = 1;
 
 // Compile-time guarantee: SegmentCatalog is safe to share across threads.
@@ -247,6 +265,8 @@ impl SegmentCatalog {
             next_segment_id: 1,
             manifest_wal_file: None,
             pending_sync: 0,
+            defer_sync: 0,
+            manifest_syncs: 0,
         })
     }
 
@@ -289,6 +309,8 @@ impl SegmentCatalog {
                 next_segment_id: snapshot.next_segment_id,
                 manifest_wal_file: None,
                 pending_sync: 0,
+                defer_sync: 0,
+                manifest_syncs: 0,
             }
         } else {
             Self {
@@ -303,6 +325,8 @@ impl SegmentCatalog {
                 next_segment_id: 1,
                 manifest_wal_file: None,
                 pending_sync: 0,
+                defer_sync: 0,
+                manifest_syncs: 0,
             }
         };
 
@@ -605,11 +629,15 @@ impl SegmentCatalog {
     ///
     /// Returns an error if the manifest cannot be written or synced.
     pub fn record_tombstones(&mut self, tombstones: &[Tombstone]) -> Result<()> {
-        for tombstone in tombstones {
-            self.append_manifest(&ManifestEntry::AddTombstone(tombstone.clone()))?;
-            self.tombstones.insert(tombstone.clone());
-        }
-        self.sync_manifest()?;
+        // One fsync for the delete, not one per tombstone: a delete over a
+        // measurement with a hundred series produces a hundred of them.
+        self.in_one_sync(|catalog| {
+            for tombstone in tombstones {
+                catalog.append_manifest(&ManifestEntry::AddTombstone(tombstone.clone()))?;
+                catalog.tombstones.insert(tombstone.clone());
+            }
+            Ok(())
+        })?;
         self.maybe_snapshot()?;
         Ok(())
     }
@@ -634,18 +662,20 @@ impl SegmentCatalog {
         now_ms: u64,
     ) -> Result<()> {
         let output_id = output.segment_id.0;
-        self.add_segment(output)?;
-        for input in inputs {
-            self.soft_delete_segment(*input, now_ms)?;
-        }
-        let inputs: Vec<u64> = inputs.iter().map(|id| id.0).collect();
-        self.append_manifest(&ManifestEntry::Compacted {
-            inputs: inputs.clone(),
-            output: output_id,
+        let input_ids: Vec<u64> = inputs.iter().map(|id| id.0).collect();
+        // One fsync for the whole transition, not one per input segment.
+        self.in_one_sync(|catalog| {
+            catalog.add_segment(output)?;
+            for input in inputs {
+                catalog.soft_delete_segment(*input, now_ms)?;
+            }
+            catalog.append_manifest(&ManifestEntry::Compacted {
+                inputs: input_ids.clone(),
+                output: output_id,
+            })
         })?;
         self.tombstones
-            .extend_to_compaction_output(&inputs, output_id);
-        self.sync_manifest()?;
+            .extend_to_compaction_output(&input_ids, output_id);
         self.maybe_snapshot()?;
         Ok(())
     }
@@ -797,17 +827,60 @@ impl SegmentCatalog {
         // Always flush to kernel buffers so data is ordered.
         file.flush()?;
 
-        // Batch sync — only issue sync_data() every SYNC_BATCH_SIZE
-        // appends to reduce fsync syscall overhead during compaction/flush
-        // bursts.  Data is still flushed to kernel buffers on every write.
+        // Synced here unless a caller has declared that this append is one
+        // step of a larger transition (`in_one_sync`), in which case that
+        // caller's single `sync_manifest()` covers it. Data reaches the
+        // kernel either way.
         self.pending_sync += 1;
-        if self.pending_sync >= SYNC_BATCH_SIZE {
+        if self.defer_sync == 0 && self.pending_sync >= SYNC_BATCH_SIZE {
             file.sync_data()?;
             self.pending_sync = 0;
+            self.manifest_syncs += 1;
+            metrics::counter!("chronix_catalog_fsync_total").increment(1);
         }
 
         self.changes_since_snapshot += 1;
         Ok(())
+    }
+
+    /// How many times the manifest has been fsynced since this catalog was
+    /// opened.
+    ///
+    /// One per catalog *transition*, not per append: a compaction retiring
+    /// four segments is one, and so is a delete however many tombstones it
+    /// produces. Also exported as `chronix_catalog_fsync_total`.
+    #[must_use]
+    pub fn manifest_syncs(&self) -> u64 {
+        self.manifest_syncs
+    }
+
+    /// Run `body` as one durable manifest transition: the appends it makes are
+    /// written but fsynced **once**, when it returns.
+    ///
+    /// A compaction of four segments is six appends — the output, four
+    /// soft-deletes and the `Compacted` record — and a delete is one per
+    /// tombstone. On flash-backed storage the fsync rate *is* the wear rate,
+    /// which is why the WAL has a periodic policy.
+    ///
+    /// Everything `body` appended is durable when this returns, on the error
+    /// path as much as the success path, so a transition that failed half-way
+    /// is as persistent as it would be if each append had synced. A crash
+    /// *during* `body` leaves what it always could: the manifest is a replayed
+    /// log, so a partial transition means an input segment still live beside
+    /// its compaction output, which reads deduplicate and the next compaction
+    /// clears.
+    ///
+    /// **Only for a transition that ends in a sync.** The retention, GC and
+    /// cold-tier loops call `remove_segment` without one and rely on the
+    /// per-append fsync, which is why this is opt-in rather than a batch size.
+    fn in_one_sync<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.defer_sync += 1;
+        let out = body(self);
+        self.defer_sync -= 1;
+        // Before `out?`: a half-finished transition must be as durable as it
+        // was when each of its appends synced on its own.
+        self.sync_manifest()?;
+        out
     }
 
     /// Flush any pending manifest writes to durable storage.
@@ -821,6 +894,8 @@ impl SegmentCatalog {
                 f.sync_data()?;
             }
             self.pending_sync = 0;
+            self.manifest_syncs += 1;
+            metrics::counter!("chronix_catalog_fsync_total").increment(1);
         }
         Ok(())
     }
@@ -1139,6 +1214,88 @@ mod tests {
             column_stats: Vec::new(),
             state: SegmentState::default(),
         }
+    }
+
+    /// A compaction is **one** fsync, whatever it retires.
+    ///
+    /// It used to be one per append: the output, one per input segment, and
+    /// the `Compacted` record — six for a four-segment merge, and compaction
+    /// runs every maintenance interval. On the flash the design partner
+    /// writes to, the fsync rate is the wear rate.
+    #[test]
+    fn a_compaction_costs_one_manifest_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = SegmentCatalog::new(dir.path()).unwrap();
+
+        let inputs: Vec<SegmentId> = (1..=4i64)
+            .map(|i| {
+                #[allow(clippy::cast_sign_loss)]
+                let e = test_entry(i as u64, 0, i * 100, i * 100 + 50);
+                let id = e.segment_id;
+                catalog.add_segment(e).unwrap();
+                id
+            })
+            .collect();
+
+        let before = catalog.manifest_syncs();
+        catalog
+            .complete_compaction(test_entry(99, 0, 100, 450), &inputs, 0)
+            .unwrap();
+        assert_eq!(
+            catalog.manifest_syncs() - before,
+            1,
+            "one transition, one fsync — it was six"
+        );
+
+        // …and it is durable: a reopen sees the output live and the inputs
+        // soft-deleted, which is the property the per-append fsync bought.
+        drop(catalog);
+        let reopened = SegmentCatalog::open(dir.path()).unwrap();
+        let live: Vec<u64> = reopened
+            .active_segments_for_measurement("cpu")
+            .iter()
+            .map(|e| e.segment_id.0)
+            .collect();
+        assert_eq!(live, vec![99], "only the compaction output survives");
+    }
+
+    /// A delete is one fsync, not one per tombstone.
+    #[test]
+    fn a_delete_costs_one_manifest_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = SegmentCatalog::new(dir.path()).unwrap();
+        let tombstones: Vec<Tombstone> = (0..25)
+            .map(|i| Tombstone::ranged(format!("cpu,host=h{i}"), 0, 1_000))
+            .collect();
+
+        let before = catalog.manifest_syncs();
+        catalog.record_tombstones(&tombstones).unwrap();
+        assert_eq!(
+            catalog.manifest_syncs() - before,
+            1,
+            "25 tombstones, 1 fsync"
+        );
+
+        drop(catalog);
+        let reopened = SegmentCatalog::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.tombstones().len(),
+            25,
+            "every tombstone survived the reopen"
+        );
+    }
+
+    /// A single mutation still syncs on its own — the batching is opt-in, and
+    /// the retention, GC and cold-tier loops rely on that.
+    #[test]
+    fn a_lone_append_still_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = SegmentCatalog::new(dir.path()).unwrap();
+        let before = catalog.manifest_syncs();
+        catalog.add_segment(test_entry(1, 0, 100, 200)).unwrap();
+        assert_eq!(catalog.manifest_syncs() - before, 1);
+        catalog.soft_delete_segment(SegmentId(1), 0).unwrap();
+        assert_eq!(catalog.manifest_syncs() - before, 2);
     }
 
     #[test]

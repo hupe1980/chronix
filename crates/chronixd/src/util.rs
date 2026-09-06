@@ -74,12 +74,28 @@ impl BackfillParam {
 /// the namespace stamp an invariant rather than something each handler has to
 /// remember. The namespace is applied, not merged.
 ///
-/// Prevents a stuck downstream write from exhausting the tokio thread
-/// pool. A zero timeout disables the deadline and waits indefinitely.
+/// # The deadline bounds the wait, not the write
+///
+/// `timeout` stops this task waiting; it does **not** stop the write. The
+/// insert runs on a blocking thread, a blocking task cannot be cancelled, and
+/// a durable write must not be abandoned half-way in any case — so when the
+/// deadline fires the write is still running and will very likely land. The
+/// only honest answer is that the outcome is *unknown*, which is what
+/// [`ServerError::WriteTimeout`] says; a retry is safe because a point is
+/// identified by its series and its timestamp.
+///
+/// What actually bounds concurrent writes is admission control in the engine:
+/// a memtable at capacity refuses the batch with `DbError::TransientOverload`,
+/// which reaches the client as `503 BACKPRESSURE` with a `Retry-After`. This
+/// deadline used to claim it "prevents a stuck downstream write from
+/// exhausting the tokio thread pool", which it never did — the thread is held
+/// either way.
+///
+/// A zero timeout disables the deadline and waits indefinitely.
 ///
 /// # Errors
 /// - `ServerError::BadRequest` if a point cannot carry the namespace tag.
-/// - `ServerError::WriteTimeout` if the operation exceeds `timeout`.
+/// - `ServerError::WriteTimeout` if the wait exceeds `timeout`.
 /// - `ServerError::Internal` if the blocking task panics.
 /// - `ServerError::Db` (or cardinality-specific variants) on database errors.
 pub async fn insert_with_timeout(
@@ -128,12 +144,12 @@ pub async fn insert_batch_with_mode(
     };
     metrics::histogram!("chronix_write_duration_seconds").record(started.elapsed().as_secs_f64());
 
-    // A cardinality rejection is **permanent**: the limit does not change on
-    // its own, so the same batch will be refused again. It used to be mapped
-    // to `Backpressure`, which is a 503, and Prometheus retries a 503 for
-    // ever — so a remote-write sender that crossed the limit spent the rest
-    // of its life resending a batch that could never be accepted. `Db`
-    // renders it as a 400, which Prometheus treats as permanent and drops.
+    // Every database error keeps its identity here and is classified once, in
+    // `error::classify_db` — a cardinality rejection as a permanent `400`, a
+    // full memtable as a retryable `503`, a poisoned WAL as a `503` an
+    // operator has to clear. Flattening them here is how a full memtable
+    // spent several milestones reaching clients as `500 DATABASE_ERROR: an
+    // internal error occurred`.
     let insert_result = join_result
         .map_err(|e| {
             metrics::counter!("chronix_write_errors_total", "reason" => "panic").increment(1);

@@ -184,11 +184,20 @@ impl super::Chronix {
 
     /// Whether the database can accept writes at all, and why not.
     ///
-    /// **Persistent** conditions only: closed, or a WAL poisoned by a failed
-    /// `fsync`, which refuses every write until the database is reopened.
-    /// Transient back-pressure — a full memtable waiting on a flush — is
-    /// deliberately not unready: that is the moment to keep serving and let
-    /// back-pressure work, not the moment to leave the load balancer.
+    /// **Persistent** conditions only: closed, a WAL poisoned by a failed
+    /// `fsync`, or a maintenance thread that has ended — each refuses every
+    /// write until the database is reopened. Transient back-pressure — a full
+    /// memtable waiting on a flush — is deliberately not unready: that is the
+    /// moment to keep serving and let back-pressure work, not the moment to
+    /// leave the load balancer.
+    ///
+    /// The maintenance thread is here because a database that has lost it
+    /// looks perfectly healthy right up to the moment it stops accepting
+    /// writes for ever: nothing flushes, compacts, materialises a rollup or
+    /// expires a shard again, and the memtable fills at whatever rate the
+    /// workload writes. Reporting it while writes still succeed is what gives
+    /// an orchestrator time to restart the process instead of discovering it
+    /// through a wall of refusals.
     ///
     /// `chronixd`'s `/ready` is the caller.
     ///
@@ -201,6 +210,14 @@ impl super::Chronix {
         if self.wal.is_poisoned() {
             return Err(DbError::PersistentOverload {
                 reason: "the WAL writer is poisoned after a failed fsync; the \
+                         database must be closed and reopened"
+                    .into(),
+            });
+        }
+        if !self.maintenance_alive.load(Ordering::Acquire) {
+            return Err(DbError::PersistentOverload {
+                reason: "the maintenance thread is not running, so nothing flushes, \
+                         compacts, materialises a rollup or expires a shard; the \
                          database must be closed and reopened"
                     .into(),
             });
@@ -241,7 +258,14 @@ impl super::Chronix {
         self.check_open()?;
 
         let result = if matches!(plan, QueryPlan::Scan { .. }) {
-            crate::export::write_parquet(self.execute_iter(plan)?, output_path, parquet_config)?
+            // An export is explicitly for a window larger than RAM, so it is
+            // *meant* to outlast a request deadline; `query_timeout` is a
+            // bound on somebody's patience and there is nobody here.
+            crate::export::write_parquet(
+                self.execute_iter(plan)?.without_deadline(),
+                output_path,
+                parquet_config,
+            )?
         } else {
             let batches = self.execute_stream(plan)?.into_iter().map(Ok);
             crate::export::write_parquet(batches, output_path, parquet_config)?

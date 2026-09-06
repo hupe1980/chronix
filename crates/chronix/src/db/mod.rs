@@ -266,6 +266,21 @@ pub struct DbInner {
     /// Tells the maintenance thread to exit. Shared by `Arc` so the thread
     /// can read it without taking a handle.
     pub(crate) stop_maintenance: Arc<AtomicBool>,
+    /// Whether the maintenance thread is still running.
+    ///
+    /// **Consulted on the write path, which is the only reason it exists.**
+    /// Everything a database does for itself happens on that thread — the
+    /// flush that a full memtable is waiting for, compaction, rollup
+    /// materialisation, retention — and if it ends, none of it happens again
+    /// for the life of the process. Nothing reported that: writes kept being
+    /// accepted until the memtable filled, then were refused as
+    /// `TransientOverload`, whose message promises that "a flush is
+    /// signalled and will resolve it" — a promise nothing was left to keep.
+    /// `/ready` stayed `200` throughout, so an orchestrator never restarted
+    /// the one process that needed restarting.
+    ///
+    /// Cleared by a guard inside the thread, so a panic clears it too.
+    pub(crate) maintenance_alive: Arc<AtomicBool>,
     /// The maintenance thread, joined by `close()`.
     pub(crate) maintenance_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Its id, so `close()` running *on* that thread does not join itself.
@@ -615,6 +630,7 @@ impl Chronix {
                     parking_lot::Condvar::new(),
                 )),
                 stop_maintenance: Arc::new(AtomicBool::new(false)),
+                maintenance_alive: Arc::new(AtomicBool::new(false)),
                 maintenance_thread: parking_lot::Mutex::new(None),
                 maintenance_thread_id: std::sync::OnceLock::new(),
                 lifecycle: Arc::new(parking_lot::Mutex::new(())),
@@ -1732,7 +1748,7 @@ mod tests {
             .name("cpu_hourly")
             .source("cpu")
             .target("cpu_1h")
-            .interval_ns(3_600_000_000_000) // 1 hour in ns
+            .every("1h") // 1 hour in ns
             .aggregation(crate::rollup::RollupAggFn::Avg)
             .aggregation(crate::rollup::RollupAggFn::Max)
             .group_by("host")
@@ -1781,7 +1797,7 @@ mod tests {
             .name("cpu_5min")
             .source("cpu")
             .target("cpu_5min")
-            .interval_ns(300_000_000_000) // 5 minutes
+            .every("5m") // 5 minutes
             .aggregation(crate::rollup::RollupAggFn::Avg)
             .build()
             .unwrap();
@@ -1803,7 +1819,7 @@ mod tests {
             .name("cpu_hourly")
             .source("cpu")
             .target("cpu_1h")
-            .interval_ns(3_600_000_000_000)
+            .every("1h")
             .aggregation(crate::rollup::RollupAggFn::Max)
             .build()
             .unwrap();
@@ -1830,7 +1846,7 @@ mod tests {
             .name("test")
             .source("cpu")
             .target("cpu_5m")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(crate::rollup::RollupAggFn::Avg)
             .build()
             .unwrap();

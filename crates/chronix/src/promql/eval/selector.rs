@@ -71,6 +71,7 @@ impl PromQLEvaluator {
         matchers: &[LabelMatcher],
         start: i64,
         end: i64,
+        deadline: Option<super::Deadline>,
     ) -> Result<Arc<Vec<RecordBatch>>, EvalError> {
         let mut tags: Vec<(String, String)> = matchers
             .iter()
@@ -103,6 +104,13 @@ impl PromQLEvaluator {
         let mut stats = self.scan_stats.get();
         stats.scans += 1;
         self.scan_stats.set(stats);
+
+        // A cache miss means segment I/O — the other unit of work an
+        // evaluation is made of, and the one a single-step instant query is
+        // entirely made of.
+        if let Some(deadline) = deadline {
+            deadline.check()?;
+        }
 
         let mut builder = self.db.query().measurement(measurement);
         for (k, v) in &key.tags {
@@ -178,8 +186,9 @@ impl PromQLEvaluator {
         post_filters: &[CompiledMatcher],
         fetch: (i64, i64),
         window: (i64, i64),
+        deadline: Option<super::Deadline>,
     ) -> Result<SeriesMap, EvalError> {
-        let batches = self.fetch_scan(&target.measurement, matchers, fetch.0, fetch.1)?;
+        let batches = self.fetch_scan(&target.measurement, matchers, fetch.0, fetch.1, deadline)?;
         collect_series(&batches, target, post_filters, window.0, window.1)
     }
 
@@ -214,6 +223,7 @@ impl PromQLEvaluator {
                 &post_filters,
                 fetch,
                 (lookback_start, eval_time),
+                params.deadline,
             )?;
             // An instant vector is the newest sample in the lookback window.
             result.extend(series_map.into_iter().filter_map(|(labels, samples)| {
@@ -268,6 +278,7 @@ impl PromQLEvaluator {
                 &post_filters,
                 fetch,
                 (range_start, eval_time),
+                params.deadline,
             )?;
             result.extend(
                 series_map

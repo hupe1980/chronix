@@ -259,6 +259,57 @@ pub struct QueryParams {
     /// for longer than the universe has existed, and the evaluator is a public
     /// embedded API where no HTTP-layer guard stands in front of it.
     pub max_points: usize,
+    /// When this evaluation must stop, and the budget it was given.
+    ///
+    /// **A deadline the evaluation carries.** `prom_query_timeout_secs` was a
+    /// `tokio::time::timeout` around the `spawn_blocking` handle that runs
+    /// this evaluator, and dropping a `JoinHandle` cancels nothing: the client
+    /// got its timeout while the scan ran on to completion, holding a blocking
+    /// thread and its accumulator. A repeated expensive query therefore cost
+    /// unbounded work on a server that had already answered. Checked between
+    /// steps and before each selector scan, which are the two units of work a
+    /// range query is made of.
+    ///
+    /// `None` means no deadline. The HTTP layer keeps its own `timeout` as a
+    /// backstop for the case where a single step outlives the budget.
+    pub deadline: Option<Deadline>,
+}
+
+/// A wall-clock budget for one evaluation.
+///
+/// `Instant` is not `Default` and a deadline has to survive being copied into
+/// every per-step [`QueryParams`], so it carries both the expiry and the
+/// budget it came from — the budget is what the error message names, and an
+/// expiry alone cannot say what it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadline {
+    expires_at: std::time::Instant,
+    budget: std::time::Duration,
+}
+
+impl Deadline {
+    /// A deadline `budget` from now. `None` for a zero budget.
+    #[must_use]
+    pub fn after(budget: std::time::Duration) -> Option<Self> {
+        (!budget.is_zero()).then(|| Self {
+            expires_at: std::time::Instant::now() + budget,
+            budget,
+        })
+    }
+
+    /// `Err` once the budget is spent.
+    ///
+    /// # Errors
+    /// [`EvalError`] naming the budget, so the caller learns what bound it.
+    pub fn check(self) -> Result<(), EvalError> {
+        if std::time::Instant::now() >= self.expires_at {
+            return Err(EvalError(format!(
+                "query exceeded its time budget of {:?}",
+                self.budget
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl Default for QueryParams {
@@ -274,6 +325,7 @@ impl Default for QueryParams {
             max_series: 0,
             max_memory_bytes: 0,
             max_points: 11_000,
+            deadline: None,
         }
     }
 }
@@ -374,6 +426,11 @@ impl PromQLEvaluator {
 
         let mut t = start;
         while t <= end {
+            // One step is one full evaluation of the expression, so this is
+            // the granularity at which a range query can be stopped.
+            if let Some(deadline) = params.deadline {
+                deadline.check()?;
+            }
             let step_params = QueryParams {
                 time: t,
                 // The query's own bounds travel with every step, because
@@ -389,6 +446,7 @@ impl PromQLEvaluator {
                 max_series,
                 max_memory_bytes: max_memory,
                 max_points: params.max_points,
+                deadline: params.deadline,
             };
             let result = self.eval(expr, &step_params)?;
             if let PromQLValue::Vector(series_list) = result {
@@ -629,6 +687,9 @@ impl PromQLEvaluator {
         }
 
         while t <= window_end {
+            if let Some(deadline) = params.deadline {
+                deadline.check()?;
+            }
             let step_params = QueryParams {
                 time: t,
                 step: Some(step_ns),
@@ -656,6 +717,7 @@ impl PromQLEvaluator {
                 max_series: params.max_series,
                 max_memory_bytes: params.max_memory_bytes,
                 max_points: params.max_points,
+                deadline: params.deadline,
             };
             let result = self.eval(inner, &step_params)?;
             if let PromQLValue::Vector(series_list) = result {
@@ -692,5 +754,86 @@ impl PromQLEvaluator {
             .collect();
 
         Ok(PromQLValue::Matrix(matrix))
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{Deadline, PromQLEvaluator, QueryParams};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A zero budget is no budget, so the embedded API keeps its old shape.
+    #[test]
+    fn a_zero_budget_is_no_deadline() {
+        assert!(Deadline::after(Duration::ZERO).is_none());
+        assert!(Deadline::after(Duration::from_secs(1)).is_some());
+    }
+
+    /// A spent budget names itself, so the caller learns what bound it.
+    #[test]
+    fn a_spent_budget_says_what_it_was() {
+        let deadline = Deadline::after(Duration::from_nanos(1)).expect("non-zero");
+        std::thread::sleep(Duration::from_millis(2));
+        let err = deadline.check().expect_err("the budget is spent");
+        assert!(err.0.contains("time budget"), "{err}");
+    }
+
+    /// An evaluation that starts past its deadline stops before it scans.
+    ///
+    /// `prom_query_timeout_secs` used to be a `tokio::time::timeout` around
+    /// the `spawn_blocking` handle running this evaluator, and dropping a
+    /// `JoinHandle` cancels nothing: the client got its timeout while the
+    /// scan ran on, holding a blocking thread and its accumulator. So the
+    /// deadline had to become something the evaluation itself carries.
+    #[test]
+    fn an_expired_deadline_stops_a_range_query_before_its_first_step() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = chronix_core::ChronixConfig::builder()
+            .data_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("config");
+        let db = Arc::new(crate::Chronix::open(config).expect("open"));
+        let now = 1_700_000_000_000_000_000i64;
+        let points: Vec<chronix_core::Point> = (0..100)
+            .map(|i| {
+                chronix_core::Point::new(
+                    chronix_core::SeriesKey::new("cpu", crate::tags! { "host" => "a" })
+                        .expect("key"),
+                    crate::fields! { "value" => f64::from(i) },
+                    now + i64::from(i) * 1_000_000_000,
+                )
+                .expect("point")
+            })
+            .collect();
+        let _ = db.insert_batch(&points).expect("insert");
+
+        let expr = crate::promql::parse("cpu").expect("parse");
+        let evaluator = PromQLEvaluator::new(db);
+        let deadline = Deadline::after(Duration::from_nanos(1));
+        std::thread::sleep(Duration::from_millis(2));
+        let params = QueryParams {
+            start: Some(now),
+            end: Some(now + 100_000_000_000),
+            step: Some(1_000_000_000),
+            deadline,
+            ..Default::default()
+        };
+        let err = evaluator
+            .range_query(&expr, &params)
+            .expect_err("an expired deadline must stop the evaluation");
+        assert!(err.0.contains("time budget"), "{err}");
+
+        // …and with no deadline the same query answers, so the guard above is
+        // the deadline biting and not the query being broken.
+        let ok = QueryParams {
+            deadline: None,
+            ..params
+        };
+        evaluator
+            .range_query(&expr, &ok)
+            .expect("the same query without a budget answers");
     }
 }

@@ -165,6 +165,54 @@ impl PcoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Bitwise-exact round trip on arbitrary input, for each of the three
+        /// types pco stores.
+        ///
+        /// The crate's rule is a property test per codec, and pco is the one
+        /// the compression table leads with — it had three worked examples
+        /// and no arbitrary input.
+        #[test]
+        fn roundtrip_arbitrary_f64(values in prop::collection::vec(any::<f64>(), 1..300)) {
+            let decoded = PcoDecoder::decode_f64(&PcoEncoder::encode_f64(&values).unwrap()).unwrap();
+            prop_assert_eq!(decoded.len(), values.len());
+            for (a, b) in values.iter().zip(&decoded) {
+                prop_assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+
+        #[test]
+        fn roundtrip_arbitrary_i64(values in prop::collection::vec(any::<i64>(), 1..300)) {
+            let decoded = PcoDecoder::decode_i64(&PcoEncoder::encode_i64(&values).unwrap()).unwrap();
+            prop_assert_eq!(decoded, values);
+        }
+
+        #[test]
+        fn roundtrip_arbitrary_u64(values in prop::collection::vec(any::<u64>(), 1..300)) {
+            let decoded = PcoDecoder::decode_u64(&PcoEncoder::encode_u64(&values).unwrap()).unwrap();
+            prop_assert_eq!(decoded, values);
+        }
+
+        /// Timestamps go through their own entry point, which picks a
+        /// different chunk configuration.
+        #[test]
+        fn roundtrip_arbitrary_timestamps(values in prop::collection::vec(any::<i64>(), 1..300)) {
+            let decoded =
+                PcoDecoder::decode_i64(&PcoEncoder::encode_timestamps(&values).unwrap()).unwrap();
+            prop_assert_eq!(decoded, values);
+        }
+
+        /// Arbitrary bytes must be refused, never decoded into values and
+        /// never used to size an allocation.
+        #[test]
+        fn arbitrary_bytes_do_not_decode(data in prop::collection::vec(any::<u8>(), 0..512)) {
+            let _ = PcoDecoder::decode_f64(&data);
+            let _ = PcoDecoder::decode_i64(&data);
+            let _ = PcoDecoder::decode_u64(&data);
+        }
+    }
 
     #[test]
     fn round_trips_all_three_types() {

@@ -1,6 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may unwrap
 //! `execute()` and `execute_stream()` must agree on
 //! last-write-wins ordering between the memtable and on-disk segments.
+//!
+//! The third pairing — **one frozen memtable against another** — is pinned in
+//! `chronix_engine::memtable::flush::tests::the_newest_frozen_memtable_wins_a_duplicate`,
+//! because two *unflushed* frozen memtables cannot be produced from this level
+//! on purpose: the router freezes and drains in one call. They coexist for
+//! real in two states — sustained ingest, where the queue sits at its depth of
+//! two, and after a **failed flush**, which is where a full disk leaves it —
+//! and in both the older value used to win.
 
 use arrow::array::{Array, Float64Array};
 use arrow::record_batch::RecordBatch;

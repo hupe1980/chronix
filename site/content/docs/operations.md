@@ -87,6 +87,9 @@ zstd_level = 3
 | `enable_last_value_cache` | `false` | Sub-µs last-value reads (~400 ns; otherwise a memtable scan) |
 | `compaction_concurrency` | — | Parallel compaction tasks |
 | `max_series_cardinality` | — | Cardinality budget |
+| `query_timeout_secs` | `60` | Deadline for one **native** read — `/api/v1/chronix/query`, exports, every engine scan. Checked before each time bucket's segment I/O, so it stops the reading. `0` disables |
+| `per_query_memory_limit` | `268435456` | Memory budget for one query's intermediate state (DataFusion's pool spills past it) |
+| `max_query_result_bytes` | `268435456` | Ceiling on the bytes one collected native result may hold |
 
 `wal_fsync_policy = "periodic_5000"` coalesces fsyncs onto a background thread
 at that interval instead of syncing per write. On flash-backed storage the
@@ -99,12 +102,20 @@ observable form of the setting.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `sql_query_timeout_secs` | `30` | SQL execution deadline, including result streaming |
-| `prom_query_timeout_secs` | `30` | PromQL execution deadline |
+| `sql_query_timeout_secs` | `30` | SQL execution deadline, including result streaming. `504 QUERY_TIMEOUT` |
+| `prom_query_timeout_secs` | `30` | PromQL execution deadline. The budget travels **into** the evaluator and is checked between range-query steps and before each selector scan, so it stops the work rather than only the waiting for it |
 | `sql_max_rows` | `100000` | Maximum rows a SQL query returns |
 | `max_range_query_points` | `11000` | Point budget for a PromQL range query |
 | `prom_series_limit` | `10000` | Maximum label-sets from `/api/v1/series` |
 | `prom_max_result_bytes` | `268435456` | Byte budget for an accumulated range-query result; `0` disables |
+
+**Three deadlines, three engines.** `sql_query_timeout_secs` bounds
+DataFusion, `prom_query_timeout_secs` bounds the PromQL evaluator, and
+`database.query_timeout_secs` bounds the engine's own scan — the one the
+native query endpoint and every export use. A deployment that raises only the
+first leaves the other two at their defaults. All three are enforced *inside*
+the work, so a query that runs out of time stops rather than being abandoned
+while it continues.
 
 ### Write limits
 
@@ -313,8 +324,8 @@ a tier fed by another rollup, as far as that rollup has been materialised.
 `compact()` — which the maintenance thread runs every `maintenance_interval`
 — materialises after each pass, `enforce_retention()` materialises before
 it drops, and `db.materialise_rollups()` is the explicit call. Definitions
-and watermarks live in the **catalog**, which is fsynced per append and
-carried forward by every snapshot, so a rollup cannot be lost by a
+and watermarks live in the **catalog**, fsynced before the call that changed it
+returns and carried forward by every snapshot, so a rollup cannot be lost to a
 half-written file beside the data directory.
 
 **Late writes are repaired, not ignored.** A `backfill` or a delete into a
@@ -405,6 +416,20 @@ Chronix exposes Prometheus metrics at `/metrics` (default port 8086).
 | Metric | Type | Description |
 |--------|------|-------------|
 | `chronix_wire_non_finite_samples_skipped_total` | Counter | NaN/Infinity values dropped from streaming aggregation |
+
+#### Self-maintenance
+
+Flushing, compaction, rollup materialisation and retention all run on one
+thread per open database. **Alert on `chronix_maintenance_running == 0`**: a
+process that has lost it looks healthy until the memtable fills, after which
+only a restart recovers. `/ready` answers `503` naming the condition, and a
+full memtable with no thread to flush it is `503 OVERLOADED` rather than
+retryable back-pressure.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `chronix_maintenance_running` | Gauge | `1` while the maintenance thread is alive, `0` once it has ended. Refreshed every tick, so an absence lasting longer than that means the same as a zero |
+| `chronix_maintenance_panics_total` | Counter | Passes that panicked. The thread survives one — the other passes keep running — but a non-zero rate is a defect to report |
 
 ### Grafana Dashboards
 
@@ -618,7 +643,16 @@ Alert on `chronix_write_errors_total{reason="storage_full"}`.
 
 A failed `fsync` is different and **does** stop writes: the kernel may drop the
 dirty pages and clear the error, so the file's contents are unknown. `/ready`
-answers `503` with the reason; recovery is to close and reopen the database.
+answers `503` with the reason, and so does every write — `503 OVERLOADED`,
+unredacted, naming the condition. Recovery is to close and reopen the database.
+
+### When ingestion outruns the storage
+
+A memtable at capacity is back-pressure, not a fault: the flush that clears it
+is already running. Writes answer `503 BACKPRESSURE` with `Retry-After: 1` and
+a message naming the limit, so an agent backs off for a second and carries on.
+It is the ordinary condition on a gateway whose flash is slower than its
+ingest. Alert on `chronix_write_admission_rejected_total`.
 
 ### OpenAPI Specification
 
@@ -660,7 +694,10 @@ container stack.
 | Quota exceeded (429) | Tenant over limit | Increase quota or add retention policies |
 | Slow cold storage reads | Cache cold | Pre-warm cache or increase `cache.max_size_bytes` |
 | TLS `failed to configure` | Invalid certs/keys | Check file paths and cert/key pairing; server starts without TLS on failure |
-| `ADMISSION_REJECTED` (503) | System overloaded | Check ingestion rate; increase `admission.max_pending_bytes` or scale out |
+| `BACKPRESSURE` (503) | The memtable is at capacity and a flush is running | Slow the ingestion rate, raise `database.max_memtable_memory`, or move to faster storage. Watch `chronix_write_admission_rejected_total{reason="memtable_full"}` |
+| `OVERLOADED` (503) | The WAL is poisoned by a failed `fsync` | Close and reopen the database; the file's contents are unknown after the kernel dropped its dirty pages |
+| `QUERY_TIMEOUT` (504) | A read exceeded its deadline | Narrow the time range, or raise `server.sql_query_timeout_secs` / `database.query_timeout_secs` |
+| `WRITE_TIMEOUT` (504) | The server stopped waiting for a write | The write may still have landed — retry it; a point is identified by its series and timestamp |
 | Circuit breaker open | Unhealthy DataNode | Check target node health; breaker auto-recovers after `recovery_timeout_secs` |
 | `retention: rollups not yet materialised` | A rollup fed by this data has not caught up, or has a repair pending | Expected and self-healing: the next maintenance pass materialises and the pass after it drops the data. Persisting means a rollup is failing — check for `rollup materialisation failed` |
 

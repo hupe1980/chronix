@@ -295,6 +295,9 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | `chronix_sql_results_truncated_total` | Counter | the HTTP, gRPC and Flight SQL query paths | Results the `sql_max_rows` ceiling cut short or refused. A non-zero rate means somebody is reading a prefix and calling it an answer |
 | `chronix_backfill_points_total` | Counter | every write path with `?backfill=true` | Points written **outside** the out-of-order window — importing history rather than ingesting live |
 | `chronix_compaction_backpressure_active` | Gauge | `apply_backpressure()` | 1.0 when write throttling is active, 0.0 otherwise |
+| `chronix_catalog_fsync_total` | Counter | the catalog manifest | Manifest fsyncs. Beside `chronix_wal_fsync_total`: on flash the fsync rate is the wear rate. A compaction is **one**, whatever it retires, and so is a delete however many tombstones it produces |
+| `chronix_maintenance_running` | Gauge | the maintenance thread, refreshed each tick | `1` while it is alive, `0` once it has ended. Everything a database does for itself happens there, so a `0` — or an absence lasting longer than a tick — means the process will stop accepting writes and only a restart recovers. **The one to alert on** |
+| `chronix_maintenance_panics_total` | Counter | the maintenance thread | Passes that panicked. The thread survives one and the other passes keep running, so this is a defect report rather than an outage |
 | `chronix_memtable_memory_bytes` | Gauge | `statistics()` | Memtable rows and index entries |
 | `chronix_interner_memory_bytes` | Gauge | `statistics()` | String interners — grows with cardinality, not row count |
 | `chronix_wal_buffer_bytes` | Gauge | `statistics()` | WAL writer's buffer; fixed size |

@@ -160,7 +160,7 @@ to partition **fails to plan** rather than answering wrongly.
 
 | Function | Description |
 |---|---|
-| `time_bucket(interval, timestamp)` | Floor a timestamp to an interval (overflow-safe `rem_euclid`) |
+| `time_bucket(width, timestamp [, timezone])` | Floor a timestamp to a bucket. `'30s'`…`'1h'` are a fixed span; `'1d'`, `'1w'`, `'1mo'`, `'1y'` follow `timezone`'s calendar |
 
 #### Window — require `OVER (PARTITION BY … ORDER BY …)`
 

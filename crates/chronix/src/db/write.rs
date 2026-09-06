@@ -18,6 +18,7 @@
 //! 4. **Memtable** insertion of what the WAL holds, unconditionally.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 
 use metrics::{counter, gauge, histogram};
 use tracing::{debug, warn};
@@ -315,6 +316,15 @@ impl super::Chronix {
     /// [`DbError::PersistentOverload`] when the WAL writer is poisoned by an
     /// fsync failure, which needs the database reopened. A WAL that is full
     /// (`max_unflushed_wals` files) surfaces as the append error itself.
+    ///
+    /// **Which of the two a full memtable is depends on the maintenance
+    /// thread.** `TransientOverload` is a promise — "back off, the flush that
+    /// clears this is already signalled" — and it is only true while
+    /// somebody is left to perform the flush. If that thread has ended, the
+    /// same condition never clears and the database has to be reopened, so
+    /// the honest answer is the persistent one. The server renders the two
+    /// differently on purpose: `Retry-After: 1` against `Retry-After: 60`
+    /// and a message naming the remedy.
     fn check_admission(&self) -> Result<()> {
         let mem = self.shards.total_memory();
         let max_mem = self.config.max_memtable_memory;
@@ -326,6 +336,13 @@ impl super::Chronix {
             );
             counter!("chronix_write_admission_rejected_total", "reason" => "memtable_full")
                 .increment(1);
+            if !self.maintenance_alive.load(Ordering::Acquire) {
+                return Err(DbError::PersistentOverload {
+                    reason: format!(
+                        "memtable memory at capacity ({mem} bytes >= {max_mem} bytes limit) and                          the maintenance thread is not running, so no flush will clear it;                          reopen the database"
+                    ),
+                });
+            }
             self.wake_maintenance();
             return Err(DbError::TransientOverload {
                 reason: format!(

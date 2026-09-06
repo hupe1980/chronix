@@ -2,7 +2,15 @@
 //! and PCA reconstruction error.
 
 use crate::compute::simd_dot_product;
-use rand::RngExt;
+use rand::{RngExt, SeedableRng};
+
+/// Seed for the randomized-SVD sketch in [`PcaAnomalyDetector`].
+///
+/// Fixed so that fitting the same data twice yields the same components. Any
+/// value works — the Halko–Martinsson–Tropp bound holds with high probability
+/// for any draw — but changing it moves every fitted model, so it does not
+/// change.
+const RANDOMIZED_EIGEN_SEED: u64 = 0x_C047_0817_5EED_0001;
 
 use crate::multivariate::context::MultiSeriesContext;
 use crate::multivariate::error::MultivariateError;
@@ -648,12 +656,18 @@ impl PcaAnomalyDetector {
     ) -> (Vec<f64>, Vec<Vec<f64>>) {
         let r = (n_components + n_oversampling).min(k);
 
-        // Step 1: Generate pseudo-random Gaussian matrix Ω (k × r)
-        // Use rand crate (ChaCha12 by default) instead of
-        // correlated LCG. Box-Muller on cryptographic-quality uniform draws
-        // produces independent standard-normal samples.
+        // Step 1: Generate a pseudo-random Gaussian matrix Ω (k × r) by
+        // Box-Muller, from a **fixed seed**.
+        //
+        // The Halko–Martinsson–Tropp guarantee holds with high probability
+        // for any draw, so nothing is lost by fixing one — and reproducibility
+        // is a requirement rather than a nicety: an anomaly detector whose
+        // `fit` returns different components for the same input gives a
+        // different score for the same point on a re-run, so an operator
+        // cannot re-derive an alert. The thread RNG also made the recovery
+        // test fail on a rare draw, which reads as flakiness.
         let mut omega = vec![0.0; k * r];
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(RANDOMIZED_EIGEN_SEED);
         for v in omega.iter_mut() {
             // Box-Muller: two uniform draws → one standard normal
             let u1: f64 = rng.random_range(1e-15_f64..1.0_f64); // avoid log(0)
@@ -1127,6 +1141,14 @@ mod tests {
 
         let (evals, evecs) = PcaAnomalyDetector::randomized_eigen(&a, k, k, 2);
         assert_eq!(evals.len(), k);
+
+        // Same input, same answer. The sketch is seeded, so this is exact —
+        // and it is the property an operator needs: a detector that scores
+        // the same point differently on a re-run cannot have its alerts
+        // re-derived. Unseeded, this test also failed on a rare draw, which
+        // reads as flakiness rather than as non-determinism.
+        let (again, _) = PcaAnomalyDetector::randomized_eigen(&a, k, k, 2);
+        assert_eq!(evals, again, "randomized_eigen is deterministic");
 
         // Eigenvalues should be close to the true ones (sorted descending)
         for (i, &expected) in eigenvalues.iter().enumerate() {

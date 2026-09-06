@@ -43,7 +43,9 @@ chronix/
 │   ├── chronix-meta/        # FROZEN: Raft cluster metadata (OpenRaft)
 │   ├── chronix-cluster/     # FROZEN: DataNode lifecycle, regions, coordination
 │   └── chronix-dsim/        # FROZEN: deterministic cluster simulation
-├── docs/                    # This directory
+├── site/                    # This documentation (Zola)
+├── sdks/python/             # Python client
+├── dashboards/              # Bundled Grafana dashboards
 ├── Cargo.toml               # Workspace manifest
 ├── rustfmt.toml             # Formatting rules
 ├── clippy.toml              # Lint configuration
@@ -138,38 +140,38 @@ errors:
 
 ```text
 DbError (chronix crate)
-├── Core(ChronixError)
-│   ├── Wal(WalError)
-│   │   ├── Io, Corruption, SequenceSkip
-│   │   ├── Full, InvalidHeader, LockPoisoned
-│   ├── Encoding(EncodingError)
-│   │   ├── InsufficientData, InvalidHeader, InvalidEncoding
-│   │   ├── Overflow, DecodeMismatch, Io
-│   ├── Segment(SegmentError)
-│   │   ├── Io, CorruptFile, InvalidMagic, UnsupportedVersion
-│   │   ├── InvalidColumnType, Encoding, Overflow
-│   ├── Memtable(MemtableError)
-│   │   ├── Frozen, NoFrozenMemtable, Capacity
-│   │   ├── ShardOutOfRange, Io
-│   ├── Schema(SchemaError)
-│   │   ├── EmptyName, NameTooLong, NullByte
-│   │   ├── TooManyTags, EmptyFields, TypeConflict
-│   │   ├── MeasurementNotFound, LockPoisoned
-│   ├── Config(ConfigError)
-│   │   ├── MissingField, Validation, Io, Parse
-│   ├── Capacity, Io
-├── Storage(StorageError)
-│   ├── Io, NotFound, InvalidPath
-├── Index(IndexError)
-│   ├── Io, Corruption, NotFound
-├── Query(QueryError)
-│   ├── InvalidPlan, InvalidColumn, EmptyBatch
-│   ├── UnsupportedType, Execution
-├── Closed          — operation on a closed database
-├── LockFailed      — exclusive file lock not acquired
-├── Internal        — unexpected internal error
-└── Io              — direct I/O error
+│
+│  Wrapped from the layer that produced them
+├── Core(ChronixError)          — point and series-key validation
+├── Schema(SchemaError)         — name, type and cardinality rules
+├── Config(ConfigError)         — configuration parse and validation
+├── Wal(WalError)               — append, replay, rotation, poisoning
+├── Encoding(EncodingError)     — column codecs
+├── Segment(SegmentError)       — `.csx` read and write
+├── Memtable(MemtableError)     — freeze, flush, capacity
+├── Storage(StorageError)       — object-store and file backends
+├── Index(IndexError)           — catalog, tag index, series sidecar
+├── Query(QueryError)           — plan validation and execution
+├── Sql(DataFusionError)        — SQL planning and execution
+├── Io(std::io::Error)          — direct I/O
+│
+│  Raised by the database itself
+├── PromQl(String)              — PromQL parse or evaluation
+├── Closed                      — operation on a closed database
+├── LockFailed { path }         — the data directory is held by another process
+├── Internal(String)            — unexpected internal error
+├── CardinalityExceeded         — over `max_series_cardinality`; permanent
+├── QueryTimeout(Duration)      — over `query_timeout`
+├── FutureTimestamp             — beyond `future_write_tolerance`
+├── TransientOverload           — memtable at capacity; a flush will clear it
+└── PersistentOverload          — poisoned WAL, or no maintenance thread;
+                                  needs the database reopened
 ```
+
+`chronixd` maps every variant to a status and a machine-readable `code` in one
+exhaustive match, shared by the HTTP and gRPC renderings — see the
+[API reference](@/docs/api-reference.md). Adding a variant here is a compile
+error there, so the mapping cannot silently fall through to a `500`.
 
 All error types use `thiserror` for ergonomic `Display` and `From`
 implementations. Library code never panics on lock poisoning — all paths

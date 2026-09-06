@@ -330,8 +330,9 @@ pub async fn sql_handler(
     let mut stream = if timeout_secs > 0 {
         tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), stream_future)
             .await
-            .map_err(|_| {
-                ServerError::Internal(format!("SQL query timed out after {timeout_secs}s"))
+            .map_err(|_| ServerError::QueryTimeout {
+                timeout: std::time::Duration::from_secs(timeout_secs),
+                setting: "server.sql_query_timeout_secs",
             })?
             .map_err(|e| sql_execution_error(&e))?
     } else {
@@ -369,9 +370,12 @@ pub async fn sql_handler(
             match tokio::time::timeout_at(dl, stream.next()).await {
                 Ok(v) => v,
                 Err(_) => {
-                    return Err(ServerError::Internal(format!(
-                        "SQL query timed out after {timeout_secs}s during result streaming"
-                    )));
+                    // Dropping the stream cancels the DataFusion execution
+                    // underneath, so this deadline really does stop the work.
+                    return Err(ServerError::QueryTimeout {
+                        timeout: std::time::Duration::from_secs(timeout_secs),
+                        setting: "server.sql_query_timeout_secs",
+                    });
                 }
             }
         } else {

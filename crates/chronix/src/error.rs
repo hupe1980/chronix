@@ -132,26 +132,17 @@ pub enum DbError {
     },
 }
 
-impl DbError {
-    /// Returns `true` when the error represents a transient condition that
-    /// is likely to resolve on its own (e.g. after a flush or timeout).
-    ///
-    /// Callers can use this to decide whether to retry with back-off or
-    /// fail immediately.
-    pub fn is_transient(&self) -> bool {
-        match self {
-            // Explicit transient overload.
-            Self::TransientOverload { .. } => true,
-            // Query timeout — the same query may succeed if the system is
-            // less loaded.
-            Self::QueryTimeout(_) => true,
-            // I/O errors are often transient (disk hiccup, fd limit).
-            Self::Io(_) => true,
-            // Everything else is considered permanent or unknown.
-            _ => false,
-        }
-    }
-}
+// `is_transient()` used to live here: a public predicate documented as
+// "callers can use this to decide whether to retry", with **no callers**
+// anywhere in the tree — including `chronixd`, the caller that most needed
+// one, which flattened every variant into `500 DATABASE_ERROR: an internal
+// error occurred` instead. A boolean could not have carried the answer
+// anyway: "retry in a second" (a memtable being flushed), "retry in a
+// minute, and page somebody" (a poisoned WAL) and "never retry, fix the
+// query" (a cardinality limit) are three different instructions, and it
+// lumped `Io` — which is where `ENOSPC` arrives — in with the first.
+// Classification now lives in one exhaustive match in `chronixd::error`,
+// where adding a variant here is a compile error rather than a silent 500.
 
 /// Outcome of a batch insert.
 ///

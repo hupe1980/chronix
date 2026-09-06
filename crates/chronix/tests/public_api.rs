@@ -30,6 +30,9 @@ const SURFACE: &[&str] = &[
     "mod retention",
     "mod rollup",
     "mod sql",
+    // The one answer to "what is a day?", shared by `time_bucket()` in SQL
+    // and by every rollup tier.
+    "mod timebucket",
     // ── Re-exported engine crates (tier 3) ─────────────────────────
     "mod chronix_analytics",
     "mod chronix_core",

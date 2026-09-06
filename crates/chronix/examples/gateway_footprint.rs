@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .name(name)
                 .source(source)
                 .target(target)
-                .interval_ns(interval)
+                .bucket(chronix::timebucket::TimeBucket::fixed_ns(interval))
                 .aggregation(RollupAggFn::Avg)
                 .aggregation(RollupAggFn::First)
                 .aggregation(RollupAggFn::Last)

@@ -82,6 +82,7 @@ pub mod promql;
 pub mod retention;
 pub mod rollup;
 pub mod sql;
+pub mod timebucket;
 
 // The engine crates, for advanced use. No aliases: a module alias is a
 // second name for the same thing, and every one of them was a name the

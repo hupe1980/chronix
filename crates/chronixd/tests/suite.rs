@@ -26,3 +26,6 @@ mod tenancy_test;
 mod tls_test;
 #[path = "suite/triggers_test.rs"]
 mod triggers_test;
+
+#[path = "suite/stopping.rs"]
+mod stopping;

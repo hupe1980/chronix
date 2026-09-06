@@ -103,16 +103,19 @@ together — a mixed set has never been tested. Within 0.x a breaking change
 bumps the minor (`0.1.0` → `0.2.0`) and a fix bumps the patch. The on-disk
 `.csx` and WAL formats are not stable before 1.0; a format change is a minor
 bump called out in the release notes, and there is no migration tooling before
-then. Sealing the facade API is a pre-1.0 job, not a pre-0.1 one.
+then. Sealing the facade API is a pre-1.0 job, not a pre-0.2 one.
 
 **Cutting a release** is a version bump and a tag:
 
 ```bash
-$EDITOR Cargo.toml        # workspace [package] version — one version, one commit
+# Two places in Cargo.toml, and both must match or `cargo publish` refuses:
+#   [workspace.package]      version = "…"
+#   [workspace.dependencies] the eight `chronix* = { path = …, version = "…" }`
+$EDITOR Cargo.toml
 cargo update --workspace  # refresh Cargo.lock to match
-git commit -am "Release 0.1.0"
-git tag -a v0.1.0 -m "chronix 0.1.0"
-git push origin v0.1.0
+git commit -am "Release 0.2.0"
+git tag -a v0.2.0 -m "chronix 0.2.0"
+git push origin v0.2.0
 ```
 
 `.github/workflows/release.yml` does the rest: it checks the tag against the

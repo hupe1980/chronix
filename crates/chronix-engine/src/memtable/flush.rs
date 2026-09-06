@@ -356,8 +356,12 @@ impl FlushController {
 
     /// Scan both active and frozen memtables for a specific series.
     ///
-    /// Results are merged and deduplicated by timestamp (active wins if
-    /// both contain the same timestamp, since active is newer).
+    /// Deduplicated by timestamp, **newest write wins** — the active memtable
+    /// first, then the frozen queue newest to oldest.
+    ///
+    /// The result is a *set*, in no particular order.
+    /// [`ShardRouter`](crate::memtable::ShardRouter) sorts by timestamp across
+    /// shards, and every caller reaches this through it.
     ///
     /// # Consistency
     ///
@@ -374,47 +378,51 @@ impl FlushController {
     ) -> Vec<Point> {
         let (active, frozen_list) = self.snapshot_memtables();
 
-        let mut points = active.scan(series_key, min_ts, max_ts);
-
-        // Merge from all frozen memtables (oldest first).
-        for frozen_mt in &frozen_list {
-            let frozen_points = frozen_mt.scan(series_key, min_ts, max_ts);
-            points = merge_points(points, frozen_points);
+        // Newest first: the active memtable, then the frozen queue from its
+        // back — `freeze_and_swap` pushes to the back, so the front is oldest.
+        let mut sources = Vec::with_capacity(frozen_list.len() + 1);
+        sources.push(active.scan(series_key, min_ts, max_ts));
+        for frozen_mt in frozen_list.iter().rev() {
+            sources.push(frozen_mt.scan(series_key, min_ts, max_ts));
         }
-
-        points
+        merge_newest_first(sources)
     }
 
     /// Scan all points across both active and frozen memtables.
+    ///
+    /// Deduplicated by `(series, timestamp)`, newest write wins. Unordered —
+    /// see [`scan_measurement`](Self::scan_measurement).
     #[must_use]
     pub fn scan_all(&self) -> Vec<Point> {
         let (active, frozen_list) = self.snapshot_memtables();
 
-        let mut all_points = active.scan_all();
-
-        for frozen_mt in &frozen_list {
-            let frozen_points = frozen_mt.scan_all();
-            all_points = merge_points(all_points, frozen_points);
+        let mut sources = Vec::with_capacity(frozen_list.len() + 1);
+        sources.push(active.scan_all());
+        for frozen_mt in frozen_list.iter().rev() {
+            sources.push(frozen_mt.scan_all());
         }
-
-        all_points
+        merge_newest_first(sources)
     }
 
-    /// Scan points for a specific measurement across active and frozen memtables.
+    /// Scan points for a specific measurement across active and frozen
+    /// memtables.
     ///
-    /// Results are merged and deduplicated (active wins for same timestamp).
+    /// Deduplicated by `(series, timestamp)`, **newest write wins** — the
+    /// active memtable first, then the frozen queue newest to oldest.
+    ///
+    /// The result is a *set*, in no particular order.
+    /// [`ShardRouter`](crate::memtable::ShardRouter) sorts by timestamp across
+    /// shards, and every caller reaches this through it.
     #[must_use]
     pub fn scan_measurement(&self, measurement: &str, min_ts: i64, max_ts: i64) -> Vec<Point> {
         let (active, frozen_list) = self.snapshot_memtables();
 
-        let mut points = active.scan_measurement(measurement, min_ts, max_ts);
-
-        for frozen_mt in &frozen_list {
-            let frozen_points = frozen_mt.scan_measurement(measurement, min_ts, max_ts);
-            points = merge_points(points, frozen_points);
+        let mut sources = Vec::with_capacity(frozen_list.len() + 1);
+        sources.push(active.scan_measurement(measurement, min_ts, max_ts));
+        for frozen_mt in frozen_list.iter().rev() {
+            sources.push(frozen_mt.scan_measurement(measurement, min_ts, max_ts));
         }
-
-        points
+        merge_newest_first(sources)
     }
 
     /// Returns the total estimated memory across active and all frozen memtables.
@@ -536,41 +544,44 @@ pub struct FlushResult {
     pub series_keys: Vec<chronix_core::SeriesKey>,
 }
 
-/// Merge two sorted point vectors, deduplicating by
-/// `(series_canonical, timestamp)`. When both contain the same key, the
-/// point from `primary` (active memtable) wins.
+/// Merge memtable scans into one deduplicated result, **newest source first**.
 ///
-/// Uses the canonical form (`measurement\0tag1=v1\0tag2=v2`) as part of
-/// the key instead of hash-only identity, preventing hash-collision data
-/// loss where two different series with the same FNV-1a hash and timestamp
-/// would otherwise silently overwrite each other.
-fn merge_points(primary: Vec<Point>, secondary: Vec<Point>) -> Vec<Point> {
-    use std::collections::BTreeMap as Map;
-
-    // Build a map keyed by (series_hash, timestamp, canonical_form).
-    // The hash is kept as the first component for fast BTree ordering;
-    // the canonical form is the collision-proof tiebreaker.
-    let mut map: Map<(u64, i64, String), Point> = Map::new();
-
-    for p in secondary {
-        let key = (
-            p.series_key().hash_fnv(),
-            p.timestamp(),
-            p.series_key().canonical_form().to_string(),
-        );
-        map.insert(key, p);
-    }
-    // Primary overwrites secondary
-    for p in primary {
-        let key = (
-            p.series_key().hash_fnv(),
-            p.timestamp(),
-            p.series_key().canonical_form().to_string(),
-        );
-        map.insert(key, p);
+/// `sources` must be ordered newest to oldest — the active memtable, then the
+/// frozen queue from its back (newest frozen) to its front (oldest). The first
+/// copy of a `(series, timestamp)` encountered wins, so the newest write does.
+///
+/// # One pass, not a fold
+///
+/// Folding a two-argument merge over the frozen queue needs the precedence
+/// spelled out at each step, and a fold that took the accumulated result as
+/// the winner let the *oldest* frozen memtable beat the newest — invisible,
+/// because the active memtable was still right. One pass has a single
+/// ordering rule in a single place. It is also linear rather than quadratic,
+/// and keys on the borrowed canonical form, so no `String` is allocated.
+///
+/// The output is in source order, not key order: callers reach this through
+/// `ShardRouter`, which sorts by timestamp across shards.
+fn merge_newest_first(sources: Vec<Vec<Point>>) -> Vec<Point> {
+    let total: usize = sources.iter().map(Vec::len).sum();
+    let mut all = Vec::with_capacity(total);
+    for src in sources {
+        all.extend(src);
     }
 
-    map.into_values().collect()
+    // The key is the canonical form itself, **borrowed**, not a hash of it:
+    // exact, and with no per-point `String`. The old form allocated one
+    // `String` per point *per merge round* and used a `BTreeMap`, so it also
+    // compared those strings O(log n) times each.
+    let mut seen = std::collections::HashSet::with_capacity(total);
+    let mut keep = Vec::with_capacity(total);
+    for p in &all {
+        keep.push(seen.insert((p.series_key().canonical_form(), p.timestamp())));
+    }
+    drop(seen);
+
+    let mut keep = keep.into_iter();
+    all.retain(|_| keep.next().unwrap_or(false));
+    all
 }
 
 /// Estimate the maximum number of rows that fit within a target segment size.
@@ -780,19 +791,77 @@ mod tests {
     }
 
     #[test]
-    fn merge_points_dedup() {
-        let primary = vec![make_point("a", 100, 10.0), make_point("a", 300, 30.0)];
-        let secondary = vec![
-            make_point("a", 100, 1.0), // dup — primary wins
-            make_point("a", 200, 2.0),
-        ];
-
-        let merged = merge_points(primary, secondary);
+    fn merging_keeps_the_first_source_that_has_a_key() {
+        // Sources are newest first, so the earlier source wins a duplicate —
+        // and a *third* source cannot beat the second, which is where the
+        // fold this replaced went wrong.
+        let merged = merge_newest_first(vec![
+            vec![make_point("a", 100, 10.0), make_point("a", 300, 30.0)],
+            vec![make_point("a", 100, 1.0), make_point("a", 200, 2.0)],
+            vec![make_point("a", 200, 99.0)],
+        ]);
         assert_eq!(merged.len(), 3);
 
-        // The ts=100 entry should have primary's value (10.0)
         let ts100 = merged.iter().find(|p| p.timestamp() == 100).unwrap();
         assert_eq!(ts100.field("value"), Some(&FieldValue::F64(10.0)));
+        let ts200 = merged.iter().find(|p| p.timestamp() == 200).unwrap();
+        assert_eq!(
+            ts200.field("value"),
+            Some(&FieldValue::F64(2.0)),
+            "the second source wins over the third"
+        );
+    }
+
+    /// The **newest** value of a `(series, timestamp)` wins, including when
+    /// both copies are in frozen memtables.
+    ///
+    /// The three read paths merge the frozen queue oldest-first with the
+    /// accumulated result as the *winner*, so the first frozen memtable beat
+    /// every one after it — older data beating newer, which is the one thing
+    /// last-write-wins may not do. `active` was always right, which is what
+    /// the doc comment said and what every test checked.
+    #[test]
+    fn the_newest_frozen_memtable_wins_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let fc = FlushController::new(test_config(dir.path()));
+
+        // Write, freeze, rewrite the same (series, timestamp), freeze again:
+        // now two *frozen* memtables hold the same point.
+        fc.insert(&make_point("a", 100, 1.0)).unwrap();
+        fc.freeze_and_swap().unwrap();
+        fc.insert(&make_point("a", 100, 2.0)).unwrap();
+        fc.freeze_and_swap().unwrap();
+
+        let key = make_point("a", 100, 0.0).series_key().clone();
+        for (path, points) in [
+            ("scan", fc.scan(&key, 0, i64::MAX)),
+            ("scan_all", fc.scan_all()),
+            (
+                "scan_measurement",
+                fc.scan_measurement(key.measurement(), 0, i64::MAX),
+            ),
+        ] {
+            assert_eq!(points.len(), 1, "{path}: one point survives dedup");
+            assert_eq!(
+                points[0].field("value"),
+                Some(&FieldValue::F64(2.0)),
+                "{path}: the newer write wins"
+            );
+        }
+    }
+
+    /// …and the active memtable still beats every frozen one.
+    #[test]
+    fn the_active_memtable_wins_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let fc = FlushController::new(test_config(dir.path()));
+        fc.insert(&make_point("a", 100, 1.0)).unwrap();
+        fc.freeze_and_swap().unwrap();
+        fc.insert(&make_point("a", 100, 9.0)).unwrap();
+
+        let points = fc.scan_all();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].field("value"), Some(&FieldValue::F64(9.0)));
     }
 
     #[test]
@@ -837,10 +906,15 @@ mod tests {
         fc.insert(&make_point_with_measurement("mem", "b", 250, 8.0))
             .unwrap();
 
-        let cpu = fc.scan_measurement("cpu", 0, i64::MAX);
-        assert_eq!(cpu.len(), 2);
-        assert_eq!(cpu[0].timestamp(), 100);
-        assert_eq!(cpu[1].timestamp(), 200);
+        // A `FlushController` scan is a *set*: it is `ShardRouter` that orders
+        // by timestamp, across shards, and every caller reaches it that way.
+        let mut cpu: Vec<i64> = fc
+            .scan_measurement("cpu", 0, i64::MAX)
+            .iter()
+            .map(Point::timestamp)
+            .collect();
+        cpu.sort_unstable();
+        assert_eq!(cpu, vec![100, 200]);
 
         let mem = fc.scan_measurement("mem", 0, i64::MAX);
         assert_eq!(mem.len(), 2);

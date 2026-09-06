@@ -1,6 +1,6 @@
 name: Release
 
-# Tag-driven. `git push origin v0.1.0` publishes the eight library crates to
+# Tag-driven. `git push origin v0.2.0` publishes the eight library crates to
 # crates.io, builds the `chronixd` binaries and attaches them to the GitHub
 # release.
 #
@@ -44,6 +44,28 @@ jobs:
           echo "tag=$tag manifest=$manifest"
           [ "$tag" = "v$manifest" ] || {
             echo "::error::tag $tag does not match workspace version $manifest" >&2
+            exit 1
+          }
+          # The Python SDK carries its own version and is published from this
+          # same tag. `skip-existing` on the PyPI upload turns a stale version
+          # into a *silent success* — the release completes having published
+          # nothing — so the mismatch has to fail here instead.
+          sdk=$(sed -n 's/^version = "\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)
+          echo "python sdk=$sdk"
+          [ "$sdk" = "$manifest" ] || {
+            echo "::error::sdks/python/pyproject.toml is $sdk, workspace is $manifest" >&2
+            exit 1
+          }
+          # `[workspace.dependencies]` repeats the version for each internal
+          # crate, because `cargo publish` refuses a dependency that carries
+          # only a `path`. A bump that misses them fails at the *publish*
+          # step — after the tag is pushed and CI has passed, which is the one
+          # point this workflow cannot take back.
+          bad=$(grep -oE 'path = "crates/chronix[a-z-]*", version = "[^"]+"' Cargo.toml \
+                | grep -v "version = \"$manifest\"" || true)
+          [ -z "$bad" ] || {
+            echo "::error::internal dependency versions disagree with $manifest:" >&2
+            echo "$bad" >&2
             exit 1
           }
 
@@ -203,45 +225,108 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-protoc
-      - name: Publish
+      # The order below is the contract: cargo resolves each crate's
+      # dependencies against crates.io, not against this tree, so a crate
+      # cannot go up before the ones it depends on. One step per crate rather
+      # than a loop, so the release page shows exactly how far it got.
+      - name: Publish order matches the manifests
+        run: |
+          set -euo pipefail
+          derived=$(./scripts/publish-order.sh)
+          declared=$(grep -oE 'publish-crate\.sh [a-z-]+' .github/workflows/release.yml \
+                     | awk '{print $2}')
+          if [ "$derived" != "$declared" ]; then
+            echo "::error::the publish steps are stale. Derived order:" >&2
+            printf '%s\n' "$derived" >&2
+            echo "declared in this file:" >&2
+            printf '%s\n' "$declared" >&2
+            exit 1
+          fi
+          echo "publish order is current"
+
+      - name: Publish chronix-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-core
+
+      - name: Publish chronix-analytics
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-analytics
+
+      - name: Publish chronix-encoding
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-encoding
+
+      - name: Publish chronix-security
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-security
+
+      - name: Publish chronix-engine
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-engine
+
+      - name: Publish chronix-query
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-query
+
+      - name: Publish chronix-streaming
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-streaming
+
+      - name: Publish chronix
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix
+
+  # ── Publish the Python SDK to PyPI ───────────────────────────────────
+  pypi:
+    name: Publish chronix-client to PyPI
+    # The same gate as the crates: CI's verdict on this exact commit. The SDK
+    # is pure Python, so there is no wheel matrix — one sdist and one
+    # universal wheel cover every platform.
+    needs: [ci-passed]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # PyPI Trusted Publishing mints a short-lived OIDC token in place of a
+      # long-lived API token. Nothing else in this job needs write access.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        working-directory: sdks/python
         run: |
           set -euo pipefail
-          [ -n "${CARGO_REGISTRY_TOKEN:-}" ] || {
-            echo "::error::CARGO_REGISTRY_TOKEN is not set" >&2
-            exit 1
-          }
-          args=(--locked)
-          # `--dry-run` on a crate whose dependencies are not yet on crates.io
-          # fails with "no matching package named …", so a dry run is only
-          # meaningful once a first release exists.
-          if [ "${DRY_RUN:-false}" = "true" ]; then
-            args+=(--dry-run)
-          fi
+          python -m pip install --upgrade pip build
+          python -m build --sdist --wheel --outdir dist
+          ls -l dist
 
-          # Dependency order, derived from the manifests rather than pinned
-          # here, so a dependency change cannot leave it stale.
-          for crate in $(./scripts/publish-order.sh); do
-            echo "── $crate"
-            # `cargo publish` blocks until the new version appears in the
-            # index, so the next crate in the order can resolve it.
-            set +e
-            out=$(cargo publish -p "$crate" "${args[@]}" 2>&1)
-            rc=$?
-            set -e
-            printf '%s\n' "$out"
-            if [ "$rc" -ne 0 ]; then
-              # Re-running a partly-completed release must not fail on the
-              # crates already uploaded at this version.
-              if printf '%s' "$out" | grep -qiE "already (exists|uploaded)"; then
-                echo "$crate is already published at this version — skipping"
-                continue
-              fi
-              exit "$rc"
-            fi
-          done
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdks/python/dist
+          # A re-run after a partial release must not fail on a version that
+          # is already up. The version itself is checked in `verify`, so this
+          # cannot quietly skip a stale build.
+          skip-existing: true
 
   github-release:
     name: Attach binaries to the release

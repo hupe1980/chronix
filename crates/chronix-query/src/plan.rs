@@ -75,10 +75,19 @@ pub enum QueryPlan {
         estimated_cardinality: Option<usize>,
     },
     /// Downsample results into time buckets.
+    ///
+    /// **Fixed-width buckets only.** A `Duration` is a span of nanoseconds,
+    /// so this cannot express a calendar bucket — a day in a time zone is 23
+    /// or 25 hours across a transition, and a month is not a span at all. The
+    /// type says so rather than pretending: the two surfaces that *do* offer
+    /// calendar buckets are `time_bucket()` in SQL and a rollup tier, and both
+    /// go through `chronix::timebucket::TimeBucket`. Threading that through
+    /// here would put the tz database inside the query engine for a surface
+    /// nobody has asked it of.
     Downsample {
         /// The underlying scan plan.
         source: Box<QueryPlan>,
-        /// Bucket interval.
+        /// Bucket interval — a fixed span, aligned to the Unix epoch in UTC.
         interval: Duration,
         /// Aggregation function per bucket.
         function: AggFn,
@@ -257,6 +266,13 @@ impl QueryBuilder {
 
     /// Set downsampling parameters.
     #[must_use]
+    /// Bucket results into fixed spans of `interval`, aligned to the Unix
+    /// epoch in UTC.
+    ///
+    /// For a bucket that follows a **calendar** — local midnight to local
+    /// midnight, or a calendar month — use `time_bucket()` in SQL or declare
+    /// a rollup tier; see `chronix::timebucket`. A `Duration` cannot be
+    /// either, and this API does not pretend it can.
     pub fn downsample(mut self, interval: Duration, function: AggFn) -> Self {
         self.downsample = Some((interval, function));
         self

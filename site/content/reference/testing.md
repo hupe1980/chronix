@@ -32,22 +32,25 @@ materialisation:
 
 ## Properties, not examples
 
-- **28 proptest suites**, including one per codec — every encoding round-trips
-  arbitrary input.
-- **3 fuzz targets** covering all 21 encodings, run by a nightly CI job.
+- **A property test for every codec** — each round-trips arbitrary input
+  bitwise-exactly, and refuses arbitrary bytes without decoding them.
+- **3 fuzz targets** covering every encoding, run by a nightly CI job. The
+  enum, its tag mapping and the list the fuzzer walks are generated from one
+  macro, so a new codec cannot be added without landing in the fuzz corpus.
 - **Numeric results are asserted against the same quantity computed a
   different way**, never for sign or finiteness alone.
 
 ## The documentation is tested too
 
-Five guards compare prose to the tree:
+Six guards compare prose to the tree:
 
 | Guard | Asks |
 |-------|------|
 | `documented_config` | Does every ```toml block in these pages load with the real parser? |
 | `documented_metrics` | Is every `chronix_*` name here emitted by non-test code? |
 | `documented_env_vars` | Is every documented override actually read? |
-| `documented_sql` / `documented_promql` | Does every documented query plan and return something? |
+| `documented_sql` | Does every documented SQL statement plan? |
+| `documented_promql` | Does every documented PromQL query return something? |
 | `route_inventory` | Is every route in the OpenAPI document, and every documented path a route? |
 
 `scripts/check-docs.sh` covers the rest: crate names, ports, example links,

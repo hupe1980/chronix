@@ -2,8 +2,10 @@
 
 from chronix_client.client import ChronixClient
 from chronix_client.exceptions import (
+    BackpressureError,
     ChronixError,
     ConnectionError,
+    DeadlineExceeded,
     QueryError,
     WriteError,
 )
@@ -19,10 +21,12 @@ from chronix_client.models import (
 )
 
 __all__ = [
+    "BackpressureError",
     "ChronixClient",
     "ChronixError",
     "ColumnSchema",
     "ConnectionError",
+    "DeadlineExceeded",
     "DeleteResult",
     "FieldValue",
     "MeasurementInfo",
@@ -34,4 +38,4 @@ __all__ = [
     "WriteError",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

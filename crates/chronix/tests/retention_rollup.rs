@@ -25,7 +25,7 @@ fn rollup(db: &Chronix, name: &str, source: &str, target: &str, interval: i64) {
             .name(name)
             .source(source)
             .target(target)
-            .interval_ns(interval)
+            .bucket(chronix::timebucket::TimeBucket::fixed_ns(interval))
             // The tiers outlive the raw data — that is what a rollup is for.
             // Without this the 1 ns global retention below expires the
             // materialised tiers too, once the maintenance thread has

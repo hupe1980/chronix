@@ -398,7 +398,9 @@ impl Chronix {
         let mut writer = ParquetArchiveWriter::new(schema.clone())
             .map_err(|e| DbError::Internal(format!("cold archive writer: {e}")))?;
 
-        for batch in self.execute_iter(&plan)? {
+        // Tiering to object storage is background work with no caller
+        // waiting on it, so `query_timeout` does not apply.
+        for batch in self.execute_iter(&plan)?.without_deadline() {
             let batch = batch?;
             if batch.num_rows() == 0 {
                 continue;

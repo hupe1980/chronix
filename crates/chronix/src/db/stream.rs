@@ -106,6 +106,16 @@ pub struct BatchStream<'a> {
     to_skip: usize,
     /// Set after an error so the iterator stops rather than retrying.
     done: bool,
+    /// When this scan must stop, and the budget it was given.
+    ///
+    /// **The deadline belongs to the iterator, not to the fold above it.**
+    /// `query_timeout` used to be checked only by `execute_stream_inner`,
+    /// once the whole scan had already been collected — so the work was done
+    /// and *then* the caller was told it had run out of time — and the
+    /// streaming handlers, `/api/v1/chronix/query` among them, did not check
+    /// it at all. Checking here, before each bucket's segment I/O, is what
+    /// makes a deadline stop the reading rather than describe it.
+    deadline: Option<(std::time::Instant, std::time::Duration)>,
     /// What segment pruning did for this scan.
     pruning_stats: chronix_query::pruning::PruningStats,
 }
@@ -121,6 +131,26 @@ impl BatchStream<'_> {
     #[must_use]
     pub fn with_max_total_bytes(mut self, max_bytes: usize) -> Self {
         self.max_total_bytes = max_bytes;
+        self
+    }
+
+    /// Drop the deadline `config.query_timeout` gave this scan.
+    ///
+    /// **For work nobody is waiting on.** A query deadline exists so that a
+    /// caller's request cannot cost the server more than the caller's
+    /// patience; a maintenance pass has no caller and no patience. Rollup
+    /// materialisation catching a gateway up after a week offline, the cold
+    /// tier writing a segment window to object storage, and `export_parquet`
+    /// over a window larger than RAM are all *supposed* to take longer than
+    /// a request would — and a `QueryTimeout` in a maintenance pass is worse
+    /// than slow, because the pass retries on the next interval and fails
+    /// again for ever.
+    ///
+    /// Naming the exception here keeps the default the safe way round: a scan
+    /// is bounded unless somebody said why it should not be.
+    #[must_use]
+    pub fn without_deadline(mut self) -> Self {
+        self.deadline = None;
         self
     }
 
@@ -298,6 +328,14 @@ impl Iterator for BatchStream<'_> {
                 return None;
             }
             let bucket = self.buckets.pop_front()?;
+            // Before the I/O, not after it: a bucket read is the unit of work
+            // this deadline exists to stop.
+            if let Some((expiry, budget)) = self.deadline {
+                if std::time::Instant::now() >= expiry {
+                    self.done = true;
+                    return Some(Err(DbError::QueryTimeout(budget)));
+                }
+            }
             match self.materialise(bucket) {
                 Ok(chunks) => self.pending.extend(chunks),
                 Err(e) => {
@@ -431,6 +469,10 @@ impl Chronix {
             remaining: None,
             to_skip: 0,
             done: false,
+            deadline: {
+                let budget = self.config.query_timeout;
+                (!budget.is_zero()).then(|| (std::time::Instant::now() + budget, budget))
+            },
             pruning_stats,
         })
     }

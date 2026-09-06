@@ -383,6 +383,32 @@ pub struct DatabaseConfig {
     /// Max series cardinality.
     #[serde(default = "default_max_cardinality")]
     pub max_series_cardinality: usize,
+
+    /// Deadline for one native read, in seconds (`0` disables it).
+    ///
+    /// Bounds the engine's own scan — `/api/v1/chronix/query`, `export`,
+    /// every `execute_iter` consumer — and is checked before each time
+    /// bucket's segment I/O, so it stops the reading rather than describing
+    /// it afterwards. Distinct from `server.sql_query_timeout_secs`, which
+    /// bounds DataFusion, and from `server.prom_query_timeout_secs`, which
+    /// bounds the PromQL evaluator.
+    ///
+    /// This and the two budgets below were fields of `ChronixConfig` that
+    /// `to_chronix_config` never set, so every `chronixd` ran the library
+    /// default whatever the operator wrote — while the performance guide
+    /// told them to tune `per_query_memory_limit` per box.
+    #[serde(default = "default_query_timeout_secs")]
+    pub query_timeout_secs: u64,
+
+    /// Memory budget for one query's intermediate state, in bytes
+    /// (`0` disables it).
+    #[serde(default = "default_per_query_memory_limit")]
+    pub per_query_memory_limit: usize,
+
+    /// Ceiling on the bytes one collected query result may hold
+    /// (`0` disables it).
+    #[serde(default = "default_max_query_result_bytes")]
+    pub max_query_result_bytes: usize,
 }
 
 /// TLS configuration.
@@ -825,6 +851,9 @@ impl Default for DatabaseConfig {
             enable_last_value_cache: false,
             compaction_concurrency: default_compaction_concurrency(),
             max_series_cardinality: default_max_cardinality(),
+            query_timeout_secs: default_query_timeout_secs(),
+            per_query_memory_limit: default_per_query_memory_limit(),
+            max_query_result_bytes: default_max_query_result_bytes(),
         }
     }
 }
@@ -1161,7 +1190,10 @@ impl ServerConfig {
             .segment_cache_size(self.database.segment_cache_size)
             .enable_last_value_cache(self.database.enable_last_value_cache)
             .compaction_concurrency(self.database.compaction_concurrency)
-            .max_series_cardinality(self.database.max_series_cardinality);
+            .max_series_cardinality(self.database.max_series_cardinality)
+            .query_timeout(Duration::from_secs(self.database.query_timeout_secs))
+            .per_query_memory_limit(self.database.per_query_memory_limit)
+            .max_query_result_bytes(self.database.max_query_result_bytes);
 
         if let Some(retention) = retention {
             builder = builder.retention(Some(retention));
@@ -1349,6 +1381,20 @@ fn default_compaction_concurrency() -> usize {
 
 fn default_max_cardinality() -> usize {
     1_000_000
+}
+
+// The three below mirror `ChronixConfig`'s own defaults, so a `chronixd.toml`
+// that says nothing gets exactly what the embedded library gets.
+fn default_query_timeout_secs() -> u64 {
+    60
+}
+
+fn default_per_query_memory_limit() -> usize {
+    256 * 1024 * 1024 // 256 MiB
+}
+
+fn default_max_query_result_bytes() -> usize {
+    256 * 1024 * 1024 // 256 MiB
 }
 
 #[cfg(test)]

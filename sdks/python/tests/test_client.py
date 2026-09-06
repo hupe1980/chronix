@@ -9,9 +9,11 @@ import httpx
 import respx
 
 from chronix_client import (
+    BackpressureError,
     ChronixClient,
     ChronixError,
     ConnectionError,
+    DeadlineExceeded,
     Point,
     QueryError,
     QueryResult,
@@ -499,3 +501,87 @@ async def test_list_connectors(mock_api):
     async with ChronixClient(BASE) as c:
         conns = await c.list_connectors()
     assert conns == []
+
+
+# ── What the caller is told when the server stops ────────────────
+#
+# The API reference tells clients to branch on the `code` beside every error
+# message, and this client discarded it: a full memtable, a query that ran out
+# of time and a genuine bug in the server all arrived as a bare `ChronixError`
+# whose only distinguishing feature was a status number inside a string. An
+# ingestion loop could not answer the one question it has — should I retry,
+# and when?
+
+
+@pytest.mark.asyncio
+async def test_backpressure_is_retryable_and_says_how_long(mock_api):
+    mock_api.post("/api/v1/write").respond(
+        status_code=503,
+        json={"error": "memtable memory at capacity", "code": "BACKPRESSURE"},
+        headers={"Retry-After": "1"},
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(BackpressureError) as exc:
+            await c.write([Point("cpu", {"host": "a"}, {"value": 1.0}, 1)])
+    assert exc.value.code == "BACKPRESSURE"
+    assert exc.value.retry_after == 1.0
+    assert exc.value.retryable
+
+
+@pytest.mark.asyncio
+async def test_a_full_disk_is_retryable(mock_api):
+    mock_api.post("/api/v1/write").respond(
+        status_code=507,
+        json={"error": "no space left on the data volume", "code": "STORAGE_FULL"},
+        headers={"Retry-After": "5"},
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(BackpressureError) as exc:
+            await c.write([Point("cpu", {"host": "a"}, {"value": 1.0}, 1)])
+    assert exc.value.code == "STORAGE_FULL"
+    assert exc.value.retry_after == 5.0
+
+
+@pytest.mark.asyncio
+async def test_a_write_timeout_is_its_own_error_and_retryable(mock_api):
+    # The server cannot cancel a blocking write, so a 504 on a write means the
+    # outcome is *unknown*, not that nothing happened. Retrying is safe
+    # because a point is identified by its series and timestamp.
+    mock_api.post("/api/v1/write").respond(
+        status_code=504,
+        json={"error": "it may still be applied", "code": "WRITE_TIMEOUT"},
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(DeadlineExceeded) as exc:
+            await c.write([Point("cpu", {"host": "a"}, {"value": 1.0}, 1)])
+    assert exc.value.code == "WRITE_TIMEOUT"
+    assert exc.value.retryable
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_rejection_is_not_retryable(mock_api):
+    # The cardinality budget does not move on its own, so re-sending the same
+    # batch is refused for ever. A client that retried this one would spend
+    # the rest of its life on a request that can never be accepted.
+    mock_api.post("/api/v1/write").respond(
+        status_code=400,
+        json={"error": "cardinality limit", "code": "CARDINALITY_EXCEEDED"},
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(QueryError) as exc:
+            await c.write([Point("cpu", {"host": "a"}, {"value": 1.0}, 1)])
+    assert exc.value.code == "CARDINALITY_EXCEEDED"
+    assert not exc.value.retryable
+
+
+@pytest.mark.asyncio
+async def test_an_internal_error_is_not_retryable(mock_api):
+    mock_api.get("/health").respond(
+        status_code=500,
+        json={"error": "DATABASE_ERROR: an internal error occurred", "code": "DATABASE_ERROR"},
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(ChronixError) as exc:
+            await c.health()
+    assert exc.value.code == "DATABASE_ERROR"
+    assert not exc.value.retryable

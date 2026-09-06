@@ -303,8 +303,16 @@ pub struct RollupInfo {
     pub source_measurement: String,
     /// Target measurement storing the roll-up data.
     pub target_measurement: String,
-    /// Aggregation window size in seconds.
-    pub window_seconds: u64,
+    /// The bucket width, spelled the way it is written: `"15m"`, `"1d"`,
+    /// `"1mo"`.
+    ///
+    /// It used to be `window_seconds`, which cannot say "a month" and reads
+    /// "86400" for a tier whose buckets are 23 or 25 hours long. The string
+    /// is the one `every` accepts, so what this endpoint reports can be typed
+    /// straight back into a create request.
+    pub every: String,
+    /// The IANA zone the buckets are read against, or `null` for UTC.
+    pub timezone: Option<String>,
     /// Aggregation functions applied.
     pub aggregations: Vec<String>,
     /// Exclusive end of the newest bucket materialised so far, in
@@ -347,7 +355,8 @@ pub async fn list_rollups_handler(
                 name: visible_name,
                 source_measurement: r.source_measurement.clone(),
                 target_measurement: r.target_measurement.clone(),
-                window_seconds: (r.interval_ns / 1_000_000_000) as u64,
+                every: r.bucket.width().to_string(),
+                timezone: r.bucket.timezone().map(str::to_string),
                 aggregations: r.aggregations.iter().map(|a| format!("{a:?}")).collect(),
                 materialised_until: state.materialised_until,
                 pending_repairs: state.pending_invalidations().to_vec(),
@@ -432,8 +441,20 @@ pub struct CreateRollupRequest {
     pub source_measurement: String,
     /// Target measurement where rollup points are stored.
     pub target_measurement: String,
-    /// Aggregation interval in seconds.
-    pub interval_seconds: u64,
+    /// Bucket width: `"30s"`, `"15m"`, `"1h"`, `"1d"`, `"1w"`, `"1mo"`,
+    /// `"1y"`.
+    ///
+    /// The **unit** decides what a bucket means: sub-day units are a fixed
+    /// span that never varies, super-day units follow the calendar of
+    /// `timezone`. The month is `mo`; `m` is always the minute.
+    pub every: String,
+    /// IANA time zone the buckets are read against, e.g. `"Europe/Berlin"`.
+    ///
+    /// Without it a `1d` tier buckets on **UTC** midnight, which is 02:00
+    /// local in Berlin in summer — so a "daily" total is a day's worth of
+    /// somebody else's day.
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// Aggregation functions to apply (avg, min, max, sum, count, last).
     pub aggregations: Vec<String>,
     /// Tags to group by.
@@ -481,11 +502,10 @@ pub async fn create_rollup_handler(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let interval_ns = body
-        .interval_seconds
-        .checked_mul(1_000_000_000)
-        .ok_or_else(|| ServerError::BadRequest("interval_seconds overflow".into()))?
-        as i64;
+    // Parsed here rather than inside the blocking task so a typo is a `400`
+    // naming what was wrong, not a `500`.
+    let bucket = chronix::timebucket::TimeBucket::parse(&body.every, body.timezone.as_deref())
+        .map_err(|e| ServerError::BadRequest(e.0))?;
 
     let name_for_builder = rollup_name.clone();
     tokio::task::spawn_blocking(move || {
@@ -493,7 +513,7 @@ pub async fn create_rollup_handler(
             .name(&name_for_builder)
             .source(&body.source_measurement)
             .target(&body.target_measurement)
-            .interval_ns(interval_ns);
+            .bucket(bucket);
 
         for agg in &agg_fns {
             builder = builder.aggregation(*agg);

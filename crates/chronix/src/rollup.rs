@@ -22,6 +22,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::timebucket::TimeBucket;
+
 /// Error type for rollup configuration and validation.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RollupError {
@@ -80,8 +82,16 @@ pub struct RollupConfig {
     pub source_measurement: String,
     /// Target measurement to write aggregated data to.
     pub target_measurement: String,
-    /// Aggregation interval in nanoseconds.
-    pub interval_ns: i64,
+    /// How the source's time line is divided into buckets.
+    ///
+    /// A [`TimeBucket`], not an `i64` of nanoseconds, because the two most
+    /// useful tiers a person asks for cannot be one. "A day" in Berlin is
+    /// local midnight to local midnight — 23 or 25 hours on a transition —
+    /// and a fixed 86 400 000 000 000 nanoseconds from the Unix epoch runs
+    /// 02:00 to 02:00 local instead. "A month" is not a fixed number of
+    /// nanoseconds at all, so a monthly tier — which is what a billing or a
+    /// § 14a evidence total is — could not be declared.
+    pub bucket: TimeBucket,
     /// Aggregation functions to compute.
     pub aggregations: Vec<RollupAggFn>,
     /// Tags to preserve in rolled-up data (group-by).
@@ -96,7 +106,8 @@ pub struct RollupBuilder {
     name: Option<String>,
     source_measurement: Option<String>,
     target_measurement: Option<String>,
-    interval_ns: Option<i64>,
+    width: Option<String>,
+    timezone: Option<String>,
     aggregations: Vec<RollupAggFn>,
     group_by_tags: Vec<String>,
     retention_ns: Option<i64>,
@@ -110,7 +121,8 @@ impl RollupBuilder {
             name: None,
             source_measurement: None,
             target_measurement: None,
-            interval_ns: None,
+            width: None,
+            timezone: None,
             aggregations: Vec::new(),
             group_by_tags: Vec::new(),
             retention_ns: None,
@@ -138,10 +150,42 @@ impl RollupBuilder {
         self
     }
 
-    /// Set the aggregation interval in nanoseconds.
+    /// How wide each bucket is: `"15m"`, `"1h"`, `"1d"`, `"1w"`, `"1mo"`,
+    /// `"1y"`.
+    ///
+    /// The **unit** decides what the bucket means — sub-day units are a fixed
+    /// span, super-day units follow the calendar — and the month is `mo`,
+    /// never `M`. See [`crate::timebucket`]. Refused at
+    /// [`build`](Self::build) if it does not parse, so a typo is an error at
+    /// the point the rollup is declared rather than a tier that quietly
+    /// aggregates the wrong thing for three years.
     #[must_use]
-    pub fn interval_ns(mut self, ns: i64) -> Self {
-        self.interval_ns = Some(ns);
+    pub fn every(mut self, width: impl Into<String>) -> Self {
+        self.width = Some(width.into());
+        self
+    }
+
+    /// Set the bucket directly, for a caller that already has one.
+    ///
+    /// [`every`](Self::every) and [`timezone`](Self::timezone) are the
+    /// spelling a person writes; this is the one a protocol handler uses once
+    /// it has validated the strings it was sent.
+    #[must_use]
+    pub fn bucket(mut self, bucket: TimeBucket) -> Self {
+        self.width = Some(bucket.width().to_string());
+        self.timezone = bucket.timezone().map(str::to_string);
+        self
+    }
+
+    /// Read the buckets against an IANA time zone, e.g. `"Europe/Berlin"`.
+    ///
+    /// Only meaningful with a calendar width — a `1d` tier then runs from
+    /// local midnight to local midnight — but it is accepted with a fixed
+    /// width too, where it shifts the alignment to the zone's standard offset
+    /// (visible in a zone whose offset is not a whole hour).
+    #[must_use]
+    pub fn timezone(mut self, tz: impl Into<String>) -> Self {
+        self.timezone = Some(tz.into());
         self
     }
 
@@ -181,15 +225,13 @@ impl RollupBuilder {
         let target = self.target_measurement.ok_or(RollupError::InvalidConfig(
             "target measurement is required".into(),
         ))?;
-        let interval = self
-            .interval_ns
-            .ok_or(RollupError::InvalidConfig("interval_ns is required".into()))?;
+        let width = self.width.ok_or(RollupError::InvalidConfig(
+            "a bucket width is required — say every(\"15m\"), every(\"1d\") or every(\"1mo\")"
+                .into(),
+        ))?;
+        let bucket = TimeBucket::parse(&width, self.timezone.as_deref())
+            .map_err(|e| RollupError::InvalidConfig(e.0))?;
 
-        if interval <= 0 {
-            return Err(RollupError::InvalidConfig(
-                "interval_ns must be positive".into(),
-            ));
-        }
         if self.aggregations.is_empty() {
             return Err(RollupError::InvalidConfig(
                 "at least one aggregation function is required".into(),
@@ -205,7 +247,7 @@ impl RollupBuilder {
             name,
             source_measurement: source,
             target_measurement: target,
-            interval_ns: interval,
+            bucket,
             aggregations: self.aggregations,
             group_by_tags: self.group_by_tags,
             retention_ns: self.retention_ns,
@@ -359,15 +401,19 @@ impl RollupRegistry {
         from: i64,
         to: i64,
     ) -> Vec<String> {
-        let affected: Vec<(String, i64)> = self
+        let affected: Vec<(String, TimeBucket)> = self
             .rollups_rooted_at(measurement)
             .into_iter()
-            .map(|c| (c.name.clone(), c.interval_ns))
+            .map(|c| (c.name.clone(), c.bucket))
             .collect();
         let mut changed = Vec::new();
-        for (name, interval) in affected {
-            let lo = align_to_bucket(from, interval);
-            let hi = align_to_bucket(to.saturating_sub(1), interval).saturating_add(interval);
+        for (name, bucket) in affected {
+            // The invalidated span is *whole buckets*: the change at `from`
+            // moved the bucket containing it, and the change at `to - 1` moved
+            // the bucket containing that. `next`, not `+ width`, because the
+            // last of those may be a month or a 25-hour day.
+            let lo = bucket.start_of(from);
+            let hi = bucket.next(bucket.start_of(to.saturating_sub(1)));
             let entry = self.state.entry(name.clone()).or_default();
             let before = entry.invalid.clone();
             entry.invalidate(lo, hi);
@@ -594,24 +640,6 @@ impl BucketAccumulator {
     }
 }
 
-/// Align a timestamp to a bucket boundary.
-///
-/// Uses Euclidean remainder so negative timestamps are correctly
-/// snapped to the lower boundary, e.g. `align_to_bucket(-5, 10) == -10`.
-/// This form (`ts - ts.rem_euclid(interval)`) avoids the overflow that
-/// `div_euclid * interval` causes for large timestamps near `i64::MAX`.
-///
-/// If `interval_ns` is zero or negative, it is clamped to 1 to prevent
-/// a `rem_euclid(0)` panic.
-#[must_use]
-pub fn align_to_bucket(ts: i64, interval_ns: i64) -> i64 {
-    let safe_interval = interval_ns.max(1);
-    // `rem_euclid` is non-negative, so this can only underflow, and only
-    // within one interval of the floor. Saturating is exactly right there:
-    // the bucket containing `i64::MIN` starts at `i64::MIN`.
-    ts.saturating_sub(ts.rem_euclid(safe_interval))
-}
-
 /// Streaming rollup accumulator: folds time-ordered batches into buckets
 /// and emits a bucket once a later one has started.
 ///
@@ -717,7 +745,7 @@ impl<'a> RollupAccumulator<'a> {
         let mut newest_bucket = i64::MIN;
         for row in 0..batch.num_rows() {
             let ts = ts_array.value(row);
-            let bucket = align_to_bucket(ts, self.config.interval_ns);
+            let bucket = self.config.bucket.start_of(ts);
             newest_bucket = newest_bucket.max(bucket);
             if self.closed_through.is_some_and(|c| bucket <= c) {
                 self.unordered = true;
@@ -1018,7 +1046,7 @@ mod tests {
             .name("cpu_5min")
             .source("cpu")
             .target("cpu_5min_agg")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(RollupAggFn::Avg)
             .aggregation(RollupAggFn::Max)
             .group_by("host")
@@ -1037,7 +1065,7 @@ mod tests {
         let result = RollupBuilder::new()
             .source("cpu")
             .target("cpu_5min")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(RollupAggFn::Avg)
             .build();
         assert!(result.is_err());
@@ -1049,22 +1077,59 @@ mod tests {
             .name("test")
             .source("cpu")
             .target("cpu")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(RollupAggFn::Avg)
             .build();
         assert!(result.is_err());
     }
 
+    /// A width that does not parse is refused where the rollup is declared,
+    /// naming what was wrong.
+    ///
+    /// The alternative is a tier that quietly aggregates the wrong thing for
+    /// three years, which is how long the coarse tiers this feature exists
+    /// for are kept.
     #[test]
-    fn rollup_builder_negative_interval() {
+    fn a_rollup_with_an_unparseable_width_is_refused() {
+        for bad in ["-1ns", "0s", "5", "1fortnight", "1M"] {
+            let result = RollupBuilder::new()
+                .name("test")
+                .source("cpu")
+                .target("cpu_5min")
+                .every(bad)
+                .aggregation(RollupAggFn::Avg)
+                .build();
+            assert!(result.is_err(), "'{bad}' must be refused");
+        }
+        // …and so is a zone that is not in the tz database.
         let result = RollupBuilder::new()
             .name("test")
             .source("cpu")
-            .target("cpu_5min")
-            .interval_ns(-1)
+            .target("cpu_daily")
+            .every("1d")
+            .timezone("Europe/Atlantis")
             .aggregation(RollupAggFn::Avg)
             .build();
-        assert!(result.is_err());
+        assert!(result.is_err(), "an unknown zone must be refused");
+    }
+
+    /// A calendar tier is declarable, which is the point of the whole type.
+    #[test]
+    fn a_rollup_can_be_a_calendar_month_in_a_zone() {
+        let config = RollupBuilder::new()
+            .name("monthly")
+            .source("meter")
+            .target("meter_monthly")
+            .every("1mo")
+            .timezone("Europe/Berlin")
+            .aggregation(RollupAggFn::Last)
+            .build()
+            .expect("a monthly tier in Berlin");
+        assert_eq!(config.bucket.width().to_string(), "1mo");
+        assert_eq!(config.bucket.timezone(), Some("Europe/Berlin"));
+        // February 2024 is 29 days, and it starts at Berlin's local midnight.
+        let feb = config.bucket.start_of(1_708_171_200_000_000_000); // 2024-02-17T12:00Z
+        assert_eq!(config.bucket.next(feb) - feb, 29 * 24 * 3_600_000_000_000);
     }
 
     #[test]
@@ -1073,7 +1138,7 @@ mod tests {
             .name("test")
             .source("cpu")
             .target("cpu_5min")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .build();
         assert!(result.is_err());
     }
@@ -1086,7 +1151,7 @@ mod tests {
             .name("cpu_5min")
             .source("cpu")
             .target("cpu_5min_agg")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(RollupAggFn::Avg)
             .build()
             .unwrap();
@@ -1100,7 +1165,7 @@ mod tests {
             .name("cpu_5min")
             .source("mem")
             .target("mem_5min")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(RollupAggFn::Sum)
             .build()
             .unwrap();
@@ -1119,7 +1184,7 @@ mod tests {
             .name("cpu_5min")
             .source("cpu")
             .target("cpu_5min_agg")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(RollupAggFn::Avg)
             .build()
             .unwrap();
@@ -1128,7 +1193,7 @@ mod tests {
             .name("mem_5min")
             .source("mem")
             .target("mem_5min_agg")
-            .interval_ns(300_000_000_000)
+            .every("5m")
             .aggregation(RollupAggFn::Max)
             .build()
             .unwrap();
@@ -1164,13 +1229,6 @@ mod tests {
         assert!((field_aggs[&RollupAggFn::Sum] - 60.0).abs() < f64::EPSILON);
         assert!((field_aggs[&RollupAggFn::Count] - 3.0).abs() < f64::EPSILON);
         assert!((field_aggs[&RollupAggFn::Last] - 30.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn align_to_bucket_snaps_down() {
-        assert_eq!(align_to_bucket(1_500, 1_000), 1_000);
-        assert_eq!(align_to_bucket(2_000, 1_000), 2_000);
-        assert_eq!(align_to_bucket(999, 1_000), 0);
     }
 
     #[test]
@@ -1213,7 +1271,7 @@ mod tests {
             .name("test")
             .source("cpu_raw")
             .target("cpu_10s")
-            .interval_ns(10)
+            .bucket(crate::timebucket::TimeBucket::fixed_ns(10))
             .aggregation(RollupAggFn::Avg)
             .aggregation(RollupAggFn::Min)
             .aggregation(RollupAggFn::Max)
@@ -1286,7 +1344,7 @@ mod tests {
                     .name("cpu_5min")
                     .source("cpu")
                     .target("cpu_5min_agg")
-                    .interval_ns(300_000_000_000)
+                    .every("5m")
                     .aggregation(RollupAggFn::Avg)
                     .group_by("host")
                     .retention_ns(86_400_000_000_000 * 30)
@@ -1312,7 +1370,7 @@ mod tests {
 
         let back = restored.get("cpu_5min").unwrap();
         assert_eq!(back.source_measurement, "cpu");
-        assert_eq!(back.interval_ns, 300_000_000_000);
+        assert_eq!(back.bucket.width().to_string(), "5m");
         assert_eq!(back.retention_ns, Some(86_400_000_000_000 * 30));
         let state = restored.state("cpu_5min");
         assert_eq!(state.materialised_until, Some(900_000_000_000));
@@ -1368,7 +1426,7 @@ mod tests {
                     .name("m_1m")
                     .source("m")
                     .target("m_1m")
-                    .interval_ns(60)
+                    .bucket(crate::timebucket::TimeBucket::fixed_ns(60))
                     .aggregation(RollupAggFn::Avg)
                     .build()
                     .unwrap(),
@@ -1393,7 +1451,7 @@ mod tests {
                 .name(name)
                 .source(from)
                 .target(to)
-                .interval_ns(60)
+                .bucket(crate::timebucket::TimeBucket::fixed_ns(60))
                 .aggregation(RollupAggFn::Avg)
                 .build()
                 .unwrap()
@@ -1409,25 +1467,10 @@ mod tests {
             .name("self")
             .source("a")
             .target("a")
-            .interval_ns(60)
+            .bucket(crate::timebucket::TimeBucket::fixed_ns(60))
             .aggregation(RollupAggFn::Avg)
             .build()
             .is_err());
         assert_eq!(registry.rollups_rooted_at("a").len(), 2);
-    }
-
-    /// `align_to_bucket` must not overflow at either end of the range.
-    #[test]
-    fn aligning_a_bucket_saturates_at_the_floor() {
-        assert_eq!(align_to_bucket(-5, 10), -10);
-        assert_eq!(align_to_bucket(0, 10), 0);
-        assert_eq!(
-            align_to_bucket(i64::MAX, 60),
-            i64::MAX - i64::MAX.rem_euclid(60)
-        );
-        // The bucket holding `i64::MIN` starts there; this used to panic in
-        // a debug build and wrap in a release one.
-        assert_eq!(align_to_bucket(i64::MIN, 60), i64::MIN);
-        assert_eq!(align_to_bucket(i64::MIN, 1), i64::MIN);
     }
 }

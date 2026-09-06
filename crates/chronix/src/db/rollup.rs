@@ -192,7 +192,7 @@ impl super::Chronix {
         let Some(final_before) = final_before else {
             return Ok((written, progressed));
         };
-        let to = crate::rollup::align_to_bucket(final_before, config.interval_ns);
+        let to = config.bucket.start_of(final_before);
         let from = state.materialised_until.unwrap_or(i64::MIN);
         if to <= from {
             return Ok((written, progressed));
@@ -293,9 +293,10 @@ impl super::Chronix {
                 .cloned()
                 .ok_or_else(|| DbError::Internal(format!("no rollup named {name}")))?
         };
-        let from = crate::rollup::align_to_bucket(start, config.interval_ns);
-        let to = crate::rollup::align_to_bucket(end, config.interval_ns)
-            .saturating_add(config.interval_ns);
+        // `next`, not `+ width`: the bucket holding `end` is a month long
+        // when the tier is monthly and 25 hours long on a fall-back day.
+        let from = config.bucket.start_of(start);
+        let to = config.bucket.next(config.bucket.start_of(end));
         self.delete_target_range(&config, from, to)?;
         let written = self.materialise_range(&config, from, to)?;
         self.wal.sync()?;
@@ -328,7 +329,11 @@ impl super::Chronix {
         let mut pending: Vec<Point> = Vec::new();
         let mut written = 0usize;
         let mut flushes = 0usize;
-        for batch in self.execute_iter(&plan)? {
+        // Not bounded by `query_timeout`: nobody is waiting on a
+        // materialisation, and a gateway catching up after a week
+        // offline is *supposed* to take longer than a request would.
+        // A deadline here would fail the pass, and the next pass, for ever.
+        for batch in self.execute_iter(&plan)?.without_deadline() {
             pending.extend(acc.push(&batch?));
             if pending.len() >= CHUNK {
                 written += self.backfill(&pending)?.into_complete()?;
@@ -417,8 +422,7 @@ impl super::Chronix {
 
         // Live half: the source above the watermark, aggregated now.
         if end >= watermark {
-            let live_from =
-                crate::rollup::align_to_bucket(start.max(watermark), config.interval_ns);
+            let live_from = config.bucket.start_of(start.max(watermark));
             let plan = self
                 .query()
                 .measurement(&config.source_measurement)
@@ -463,8 +467,7 @@ impl super::Chronix {
             // watermark is past its end: aligning `until` down and
             // comparing `>=` accepted a watermark that had not yet
             // aggregated the bucket the last rows fall in.
-            let boundary =
-                crate::rollup::align_to_bucket(until, c.interval_ns).saturating_add(c.interval_ns);
+            let boundary = c.bucket.next(c.bucket.start_of(until));
             let state = reg.state(&c.name);
             state.materialised_until.is_some_and(|m| m >= boundary)
                 // A range still waiting to be recomputed overlaps the data

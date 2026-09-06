@@ -578,16 +578,6 @@ impl Memtable {
         self.scan_all()
     }
 
-    /// Deprecated: use [`to_points`](Self::to_points) instead.
-    #[must_use]
-    #[deprecated(
-        since = "0.1.0",
-        note = "renamed to `to_points`; this method does not drain"
-    )]
-    pub fn drain_to_points(&self) -> Vec<Point> {
-        self.to_points()
-    }
-
     /// Convert a skip list entry back into a [`Point`].
     ///
     /// Returns `None` if reconstruction fails (e.g. invalid series key),
@@ -907,10 +897,6 @@ mod tests {
             assert_eq!(s.timestamp(), d.timestamp());
             assert_eq!(s.fields(), d.fields());
         }
-
-        // Verify deprecated alias still works
-        let drain = mt.drain_to_points();
-        assert_eq!(drain.len(), points.len());
     }
 
     #[test]

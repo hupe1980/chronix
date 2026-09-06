@@ -45,3 +45,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 sdks/python/.venv/
+# `python -m build` output, produced by the release workflow and by anyone
+# testing the package locally.
+sdks/python/dist/
+sdks/python/build/
+*.egg-info/
