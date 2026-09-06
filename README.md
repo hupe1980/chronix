@@ -286,6 +286,14 @@ waits for every protocol surface before closing the database, per-request
 timeouts and row limits, SSE annotations, and bundled Grafana dashboards in
 [`dashboards/`](dashboards/).
 
+**SQL is a default-on feature.** `chronix` with `default-features = false`
+drops DataFusion, which is 96 seconds of every clean build (131 s against
+227 s for a small consumer). Writes, the native query API, PromQL, rollups,
+retention, analytics, triggers and the cold archive are unaffected; only
+`db.sql()`, `EXPLAIN` and the cold tier's read half go. It is not a way to
+shrink the binary — the linker already discards DataFusion when nothing calls
+it, so that difference is 0.34 MiB.
+
 **No C toolchain for the connectors.** `krafka` and `rumqttc` are pure Rust.
 One dependency does compile C — `aws-lc-rs`, the single rustls crypto provider
 the whole workspace shares rather than inheriting each dependency's default —

@@ -117,14 +117,12 @@ merging to prevent nonsensical min/max values from mixed types.
 | `distinct_count` | Sum of per-column distinct counts (upper bound) | Inexact |
 | `sum_value` | Aggregated from `sum` / `sum_i128` | Inexact |
 
-**No per-segment sketches.** Earlier revisions stored a precision-14
-HyperLogLog (16 KiB) and a 64-bucket equi-depth histogram per column, and both
-were removed: nothing read them. The statistics provider works from the
-catalog's **exact** per-column `distinct_count`, which is strictly better than
-an estimate, and the sketches cost 51 KiB per segment for it — on an
-hourly-sharded gateway a 1,600-row segment measured 91 % sketch. Non-block
-metadata is now ~760 bytes and a regression test bounds it
-(`writer::tests::segment_metadata_overhead_stays_proportional_to_data`).
+**No per-segment sketches.** The statistics provider works from the catalog's
+**exact** per-column `distinct_count` rather than from a HyperLogLog or a
+histogram stored per segment: exact is better than an estimate, and sketches
+cost 51 KiB a segment — on an hourly-sharded gateway a 1,600-row segment would
+be 91 % sketch. Non-block metadata is ~760 bytes, bounded by
+`writer::tests::segment_metadata_overhead_stays_proportional_to_data`.
 
 The general rule this came from: fixed per-segment overhead is invisible in a
 cloud deployment and is device lifetime on eMMC, so segment metadata must be

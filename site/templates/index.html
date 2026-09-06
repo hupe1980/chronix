@@ -90,9 +90,10 @@
     <article class="card">
       <h3>Compression that fits the data</h3>
       <p>Most metric values started life as decimals — a meter reporting
-      <code>231.45</code>&nbsp;W. ALP recovers the integer instead of XOR-ing bit
-      patterns, which is worth <strong>4–9×</strong> where the XOR codecs manage
-      1.0–1.2×, and decodes 3.3× faster than Chimp.</p>
+      <code>231.45</code>&nbsp;W. Pcodec recovers the integer instead of XOR-ing
+      bit patterns, then entropy-codes the deltas: <strong>5–29×</strong> on
+      realistic meter and inverter data, where ALP manages 3–9× and the XOR
+      codecs 1.0–2.5×. The winner is chosen per block by trial encoding.</p>
       <a href="{{ get_url(path='@/internals/encoding.md') }}">How encoding works →</a>
     </article>
     <article class="card">

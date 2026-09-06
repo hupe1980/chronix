@@ -47,27 +47,30 @@ When a segment is written, each column passes through the encoding pipeline:
 Raw column data
      │
      ▼
-AdaptiveSelector (analyse sample → detect pattern)
-     │
-     ├─ Constant      → single-value encoding
-     ├─ NarrowRange   → Frame-of-Reference (FOR) encoding
-     ├─ Decimal-valued → ALP
-     ├─ SlowlyVarying → Patas, Chimp or Gorilla
-     ├─ Periodic      → delta + repeat
-     └─ Random        → plain fallback
+AdaptiveSelector — sample the column, detect its pattern
+     │   floats:   Constant │ Periodic │ SlowlyVarying │ Random
+     │   integers: Constant │ RegularInterval │ NarrowRange │ Irregular
+     │   strings:  LowCardinality │ HighCardinality
+     ▼
+The pattern orders a candidate list; it does not pick the codec.
+For every non-constant float list that is pco, then ALP, then the
+XOR codecs; narrow integers put Frame-of-Reference first, and
+low-cardinality strings the dictionary.
      │
      ▼
-TypeEncoder (delta, gorilla, chimp, integer, dict, bitmap)
+Trial-encode a stratified sample with each candidate; smallest wins
      │
      ▼
-Optional LZ4 post-compression
+Optional LZ4 or Zstd post-compression (skipped above ≈8× already)
      │
      ▼
 EncodedBlock (stored in segment file)
 ```
 
-The encoding choice is stored in the column metadata so the reader can
-select the correct decoder without trial decoding.
+**The winner is measured, not predicted.** A candidate that loses costs one
+sample encode, which is why a workload the leading codecs are bad at costs a
+trial rather than a bad ratio. The choice is recorded in the column metadata,
+so the reader decodes directly with no trial of its own.
 
 See the sub-pages for detailed theory on each encoding method:
 

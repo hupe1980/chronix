@@ -424,13 +424,22 @@ pub struct TlsConfig {
     /// to present a certificate signed by this CA.
     #[serde(default)]
     pub client_ca: Option<PathBuf>,
-    /// Interval in seconds to check for certificate/key file changes and
-    /// hot-reload TLS configuration (0 = disabled, default: 0).
+    /// Seconds between checks for a changed certificate or key. `0` disables
+    /// it; the default is 60.
     ///
-    /// When enabled, the server monitors cert and key file modification
-    /// times and atomically swaps the TLS configuration on change —
-    /// zero-downtime certificate rotation.
-    #[serde(default)]
+    /// **On by default, because every certificate expires.** Let's Encrypt is
+    /// 90 days and `cert-manager` rotates on its own schedule; a server that
+    /// configures TLS and does not reload serves the old certificate until
+    /// somebody restarts it, which is an outage with no warning beforehand.
+    /// Defaulting this off made a rotation mechanism that is implemented,
+    /// tested and reached by no deployment.
+    ///
+    /// It cannot cause the outage it prevents: a certificate that fails to
+    /// parse — a file caught half-written — leaves the running configuration
+    /// in place, counts `chronix_tls_reloads_total{status="error"}` and
+    /// retries on the next tick. The cost when nothing changes is two
+    /// `stat` calls a minute.
+    #[serde(default = "default_tls_reload_interval_secs")]
     pub reload_interval_secs: u64,
 }
 
@@ -1255,6 +1264,14 @@ fn default_prom_query_timeout_secs() -> u64 {
 
 fn default_sql_max_rows() -> usize {
     100_000 // 100k rows
+}
+
+/// Poll for a rotated certificate every minute.
+///
+/// Short enough that a rotation is picked up before a monitoring system
+/// would notice, long enough to be two `stat` calls a minute.
+fn default_tls_reload_interval_secs() -> u64 {
+    60
 }
 
 fn default_max_write_batch_size() -> usize {

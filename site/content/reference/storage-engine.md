@@ -164,21 +164,14 @@ the checksum rather than silently turning a value into a `NULL`. (The
 per-block `block_crc` deliberately covers only the value payload, matching
 what the block decode path reads.)
 
-**Why v2 exists.** In v1 an absent value was encoded as a type-specific
-sentinel (`0`, `""`, `false`) and only an aggregate `null_count` survived in
-the block statistics. A stored zero and an absent field were indistinguishable
-at read time, which meant:
+**Absent is not zero.** The bitmap is what makes `WHERE x IS NULL` and
+`WHERE x = 0` different questions, keeps a missing value out of `AVG`, `MIN`,
+`SUM` and `COUNT`, and makes the memtable and the segment answer a query the
+same way either side of a flush. Nulls survive compaction.
 
-- `WHERE x IS NULL` never matched;
-- `WHERE x = 0` matched rows that had no value at all;
-- `AVG`, `MIN`, `SUM` and `COUNT` silently folded sentinels into their results.
-
-Worse, the *memtable* path always built proper Arrow null buffers, so the same
-query returned different answers before and after a flush. Both paths now
-agree, and nulls survive compaction.
-
-Chronix is pre-release, so the v1 reader was removed rather than kept behind a
-compatibility shim: there is no v1 data in the wild to migrate.
+`.csx` **v2 is the only format**: a segment written by an older version is
+refused at `open()` rather than read as though its columns still meant what
+they used to (`segment::header::tests::header_older_version_rejected`).
 
 ### Column Order
 

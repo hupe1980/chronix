@@ -81,6 +81,7 @@ pub mod pipeline;
 pub mod promql;
 pub mod retention;
 pub mod rollup;
+#[cfg(feature = "sql")]
 pub mod sql;
 pub mod timebucket;
 

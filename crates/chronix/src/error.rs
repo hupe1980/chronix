@@ -57,6 +57,7 @@ pub enum DbError {
     Io(#[from] std::io::Error),
 
     /// SQL planning or execution error.
+    #[cfg(feature = "sql")]
     #[error("SQL error: {0}")]
     Sql(#[from] datafusion::error::DataFusionError),
 

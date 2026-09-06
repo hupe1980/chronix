@@ -12,5 +12,5 @@ call paths between them. This is the level of detail you need to modify the
 engine or to reason about a failure, and it assumes the concepts from
 [Internals](/internals/).
 
-It was one 3,400-line document. It is now one page per subsystem, because a
-single page that answers forty questions answers none of them well.
+One page per subsystem, because a single page that answers forty questions
+answers none of them well.

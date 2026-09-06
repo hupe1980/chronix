@@ -21,18 +21,21 @@ use crate::rollup::RollupRegistry;
 use super::{Chronix, DatabaseStatistics};
 
 impl Chronix {
+    #[cfg(feature = "sql")]
     /// Register a custom scalar UDF that will be available in SQL queries.
     pub fn register_udf(&self, udf: Arc<datafusion::logical_expr::ScalarUDF>) {
         *self.sql_ctx.write() = None;
         self.custom_udfs.write().push(udf);
     }
 
+    #[cfg(feature = "sql")]
     /// Register a custom aggregate UDF that will be available in SQL queries.
     pub fn register_udaf(&self, udaf: Arc<datafusion::logical_expr::AggregateUDF>) {
         *self.sql_ctx.write() = None;
         self.custom_udafs.write().push(udaf);
     }
 
+    #[cfg(feature = "sql")]
     /// Run a SQL query and collect the result.
     ///
     /// The whole SQL surface — DataFusion with Chronix's measurements as
@@ -85,6 +88,7 @@ impl Chronix {
         runtime.block_on(self.sql_async(query))
     }
 
+    #[cfg(feature = "sql")]
     /// [`sql`](Self::sql) for async callers.
     ///
     /// # Errors
@@ -96,6 +100,7 @@ impl Chronix {
         Ok(df.collect().await?)
     }
 
+    #[cfg(feature = "sql")]
     /// The DataFusion [`SessionContext`](datafusion::execution::context::SessionContext)
     /// behind [`sql`](Self::sql): every measurement as a table, all
     /// analytics functions registered. For callers that want DataFusion's
@@ -175,11 +180,13 @@ impl Chronix {
             .map_err(|e| DbError::PromQl(e.0))
     }
 
+    #[cfg(feature = "sql")]
     /// Return a snapshot of all runtime-registered scalar UDFs.
     pub fn custom_udfs(&self) -> Vec<Arc<datafusion::logical_expr::ScalarUDF>> {
         self.custom_udfs.read().clone()
     }
 
+    #[cfg(feature = "sql")]
     /// Return a snapshot of all runtime-registered aggregate UDFs.
     pub fn custom_udafs(&self) -> Vec<Arc<datafusion::logical_expr::AggregateUDF>> {
         self.custom_udafs.read().clone()

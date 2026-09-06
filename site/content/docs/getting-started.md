@@ -17,6 +17,13 @@ Add the crate:
 cargo add chronix
 ```
 
+SQL is on by default. If you do not need it, `default-features = false` drops
+DataFusion and takes **96 seconds off a clean build** (131 s against 227 s for
+a small consumer); everything else — writes, the native query API, PromQL,
+rollups, retention, analytics, triggers, the cold archive — is unaffected. It
+is not a way to shrink the binary: the linker already discards DataFusion when
+nothing calls it, so the difference there is 0.34 MiB.
+
 Open a database, write a point, read it back — this is
 [`examples/quickstart.rs`](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/quickstart.rs),
 which CI compiles and runs on every change:

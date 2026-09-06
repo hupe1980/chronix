@@ -12,6 +12,7 @@ chronix/
 │   ├── chronixd/            # Server daemon (REST, gRPC, Flight SQL, PromQL, OTLP)
 │   │   └── src/otel/        #   OTLP trace export & W3C propagation (feature: otlp)
 │   ├── chronix/             # Public embedded API (Chronix struct, SQL, PromQL)
+│   │   └── sql/             #   DataFusion surface (feature: sql, on by default)
 │   ├── chronix-core/        # Core data model, schema, config, errors
 │   ├── chronix-encoding/    # Column codecs (ALP, Chimp, Gorilla, Patas, DoD, PFOR, …)
 │   ├── chronix-engine/      # Storage engine
@@ -152,7 +153,7 @@ DbError (chronix crate)
 ├── Storage(StorageError)       — object-store and file backends
 ├── Index(IndexError)           — catalog, tag index, series sidecar
 ├── Query(QueryError)           — plan validation and execution
-├── Sql(DataFusionError)        — SQL planning and execution
+├── Sql(DataFusionError)        — SQL planning and execution (feature: sql)
 ├── Io(std::io::Error)          — direct I/O
 │
 │  Raised by the database itself

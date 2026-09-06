@@ -29,7 +29,6 @@ const SURFACE: &[&str] = &[
     "mod promql",
     "mod retention",
     "mod rollup",
-    "mod sql",
     // The one answer to "what is a day?", shared by `time_bucket()` in SQL
     // and by every rollup tier.
     "mod timebucket",
@@ -66,7 +65,14 @@ const SURFACE: &[&str] = &[
 ];
 
 /// Feature-gated additions, keyed by the feature that provides them.
-const FEATURE_SURFACE: &[(&str, &[&str])] = &[("object-store", &["mod cold_archive"])];
+const FEATURE_SURFACE: &[(&str, &[&str])] = &[
+    ("object-store", &["mod cold_archive"]),
+    // On by default; `default-features = false` drops DataFusion and with it
+    // `db.sql()`, `session_context()` and the analytics SQL functions. The
+    // rest of the surface — writes, the native query API, PromQL, rollups,
+    // retention, triggers — is unchanged.
+    ("sql", &["mod sql"]),
+];
 
 /// Parse `lib.rs` for what it declares public.
 fn declared_surface() -> (Vec<String>, Vec<(String, String)>) {

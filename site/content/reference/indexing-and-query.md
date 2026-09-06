@@ -283,7 +283,7 @@ deduplication using a **K-way merge** architecture:
    by `(group_id, timestamp, write_order)`. Later batches (higher write
    order) win on duplicate keys.
 7. **K-way merge** — a `BinaryHeap` (min-heap) merges K pre-sorted streams
-   in O(N log K) time (vs the previous O(N log N) global sort). Inline
+   in O(N log K) time, not the O(N log N) a global sort would cost. Inline
    dedup keeps only the **last** entry per `(group_id, timestamp)` pair,
    implementing last-write-wins semantics.
 8. **Interleave** — `arrow::compute::interleave()` materializes the output by

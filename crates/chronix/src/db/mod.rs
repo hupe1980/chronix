@@ -310,8 +310,10 @@ pub struct DbInner {
     /// Closed flag.
     pub(super) closed: AtomicBool,
     /// Runtime-registered scalar UDFs (available after `register_udf`).
+    #[cfg(feature = "sql")]
     pub(super) custom_udfs: Arc<parking_lot::RwLock<Vec<Arc<datafusion::logical_expr::ScalarUDF>>>>,
     /// Runtime-registered aggregate UDFs (available after `register_udaf`).
+    #[cfg(feature = "sql")]
     pub(super) custom_udafs:
         Arc<parking_lot::RwLock<Vec<Arc<datafusion::logical_expr::AggregateUDF>>>>,
     /// Guard preventing concurrent compaction runs. Only one
@@ -322,8 +324,10 @@ pub struct DbInner {
     pub(super) replayed_records: usize,
     /// The DataFusion session behind [`Chronix::sql`], built on first use
     /// and rebuilt when a UDF is registered.
+    #[cfg(feature = "sql")]
     pub(super) sql_ctx: parking_lot::RwLock<Option<datafusion::execution::context::SessionContext>>,
     /// A private runtime for the blocking [`Chronix::sql`].
+    #[cfg(feature = "sql")]
     pub(super) sql_runtime: std::sync::OnceLock<tokio::runtime::Runtime>,
 }
 
@@ -639,11 +643,15 @@ impl Chronix {
                 pending_measurement_drops: Arc::new(RwLock::new(HashMap::new())),
                 _lock_file: lock_file,
                 closed: AtomicBool::new(false),
+                #[cfg(feature = "sql")]
                 custom_udfs: Arc::new(parking_lot::RwLock::new(Vec::new())),
+                #[cfg(feature = "sql")]
                 custom_udafs: Arc::new(parking_lot::RwLock::new(Vec::new())),
                 compaction_running: AtomicBool::new(false),
                 replayed_records: replayed_count,
+                #[cfg(feature = "sql")]
                 sql_ctx: parking_lot::RwLock::new(None),
+                #[cfg(feature = "sql")]
                 sql_runtime: std::sync::OnceLock::new(),
             }),
         };

@@ -195,7 +195,11 @@ memmap2 = "0.9"
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 
 # Arrow
-arrow = { version = "59" }
+# `prettyprint` is used by the examples' table output. Declared here rather
+# than inherited: DataFusion enables it transitively, so without this a build
+# with `--no-default-features` (no SQL, no DataFusion) stopped compiling them —
+# a dependency's default features are this workspace's configuration (D41).
+arrow = { version = "59", features = ["prettyprint"] }
 parquet = { version = "59", features = ["arrow"] }
 
 # SQL engine

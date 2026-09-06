@@ -24,9 +24,35 @@ rustdoc-args = ["--cfg", "docsrs"]
 doctest = false
 
 [features]
-default = []
+default = ["sql"]
+
+## SQL through DataFusion: `db.sql()`, `session_context()`, the analytics
+## functions, `EXPLAIN`, and the cold tier's read half.
+##
+## **On by default. Turn it off to halve your build, not to shrink your
+## binary** — the measurements say those are different questions:
+##
+## | | `default-features = false` | with `sql` |
+## |---|---|---|
+## | clean debug build of a small consumer | 131 s | 227 s |
+## | stripped release binary, SQL unused | 11.74 MiB | 12.08 MiB |
+## | stripped release binary, SQL used | — | 73.19 MiB |
+## | peak heap, same aggregate | baseline | +0.86 MiB |
+##
+## DataFusion is ~52 MiB of object code, but the linker discards all of it
+## when nothing calls it, so the *gate* is worth 0.34 MiB and cutting the
+## dependency is worth 96 seconds a build. Memory is not a reason either way.
+##
+## Without it, writes, the native query API, PromQL, rollups, retention,
+## analytics, triggers and the cold *archive* all still work — the PromQL
+## evaluator never touches DataFusion.
+sql = ["dep:datafusion"]
+
 ## Parquet cold tier on S3/GCS/Azure, queryable through SQL (D6).
-object-store = ["chronix-engine/object-store", "dep:object_store", "dep:url"]
+##
+## Implies `sql`: the read half registers a DataFusion listing table, so a
+## cold tier without SQL could be written and never read.
+object-store = ["sql", "chronix-engine/object-store", "dep:object_store", "dep:url"]
 
 [dependencies]
 chronix-core.workspace = true
@@ -38,7 +64,7 @@ chronix-analytics.workspace = true
 chronix-security.workspace = true
 arrow.workspace = true
 dashmap.workspace = true
-datafusion.workspace = true
+datafusion = { workspace = true, optional = true }
 fs2.workspace = true
 futures.workspace = true
 async-stream.workspace = true
@@ -70,15 +96,80 @@ criterion = { workspace = true }
 [[bench]]
 name = "chronix_bench"
 harness = false
+required-features = ["sql"]
 
-# Examples are auto-discovered from `examples/`; only the feature-gated one
-# needs a declaration. They used to live at the workspace root and be wired up
+# Examples are auto-discovered from `examples/`; only the feature-gated ones
+# need a declaration. They used to live at the workspace root and be wired up
 # with 27 `path = "../../examples/..."` entries — which `cargo package` cannot
 # include, so the published crate declared 27 example targets whose sources
 # were absent and the verification build failed.
 [[example]]
 name = "cold_tier"
 required-features = ["object-store"]
+
+# Targets that exercise the SQL surface. `required-features` rather than a
+# `#![cfg]` inside each file: cargo then *skips* them for a build without the
+# feature, instead of compiling an empty test binary that reports success.
+[[example]]
+name = "quickstart"
+required-features = ["sql"]
+
+[[example]]
+name = "schema_exploration"
+required-features = ["sql"]
+
+[[example]]
+name = "storage_lifecycle"
+required-features = ["sql"]
+
+[[example]]
+name = "sql_footprint"
+required-features = ["sql"]
+
+[[example]]
+name = "sql_queries"
+required-features = ["sql"]
+
+[[test]]
+name = "lww_consistency"
+required-features = ["sql"]
+
+[[test]]
+name = "null_semantics"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_analytics_functions"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_scan_streaming"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_time_predicates"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_catalog_scope"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_forecast_types"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_projection"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_rate_partitioning"
+required-features = ["sql"]
+
+[[test]]
+name = "documented_sql"
+required-features = ["sql"]
+
 
 
 
@@ -108,3 +199,11 @@ required-features = ["object-store"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "gateway_footprint"
+required-features = ["sql"]
+
+[[test]]
+name = "analytics_limits"
+required-features = ["sql"]

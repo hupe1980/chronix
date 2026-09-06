@@ -539,12 +539,18 @@ ca_cert = "/etc/chronix/certs/ca-cert.pem"
 ### Certificate rotation
 
 Chronix watches certificate files for changes and hot-reloads **all endpoints**
-(HTTP, gRPC, and Flight SQL) without restart:
+(HTTP, gRPC, and Flight SQL) without restart. It is **on by default** — a
+`[tls]` section you did not tune polls once a minute:
 
 ```toml
 [tls]
-reload_interval_secs = 300  # 0 disables polling
+reload_interval_secs = 60  # the default; 0 disables polling
 ```
+
+A certificate that fails to parse — one caught half-written — leaves the
+running configuration in place, counts
+`chronix_tls_reloads_total{status="error"}` and retries on the next tick, so
+reloading cannot cause the outage it prevents.
 
 **Implementation:**
 - **HTTP** — `axum-server` reload handle for seamless certificate swap

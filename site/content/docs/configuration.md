@@ -163,7 +163,7 @@ reload_interval_secs = 3600
 | `cert` | `PathBuf` | — | Path to PEM-encoded server certificate |
 | `key` | `PathBuf` | — | Path to PEM-encoded private key |
 | `client_ca` | `PathBuf?` | None | CA cert for mutual TLS client verification |
-| `reload_interval_secs` | `u64` | 0 | Cert/key file change check interval (0=off) |
+| `reload_interval_secs` | `u64` | 60 | Seconds between checks for a rotated cert/key; `0` disables. **On by default** — a certificate that expires without a reload is an outage with no warning |
 
 **CLI equivalents:**
 

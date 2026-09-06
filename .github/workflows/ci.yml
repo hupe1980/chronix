@@ -183,6 +183,11 @@ jobs:
       - run: cargo check -p chronix-streaming --features flight --all-targets
       - run: cargo check -p chronix-security --no-default-features --all-targets
       - run: cargo check -p chronix-engine --no-default-features --all-targets
+      # The embedded build without DataFusion. A `#[cfg(feature = "sql")]`
+      # that stops compiling is invisible to every other job, because `sql`
+      # is on by default everywhere else.
+      - run: cargo clippy -p chronix --no-default-features --all-targets -- -D warnings
+      - run: cargo test -p chronix --no-default-features
 
   examples:
     # Nothing ran the examples, so `storage_lifecycle` silently rotted: it

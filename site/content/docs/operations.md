@@ -181,7 +181,7 @@ tenant's measurement exists, and reads no rows from it.
 cert = "/etc/chronix/server.crt"
 key = "/etc/chronix/server.key"
 client_ca = "/etc/chronix/ca.crt"   # optional; enables mTLS
-reload_interval_secs = 0            # >0 polls the files and hot-reloads
+reload_interval_secs = 60           # default; polls the files and hot-reloads, 0 disables
 ```
 
 ### Authentication and authorization

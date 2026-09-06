@@ -375,24 +375,49 @@ async fn the_sql_endpoint_reports_its_deadline_like_its_siblings() {
 /// *wait*, never the task: the write lands. The API reference said *"the
 /// write did not complete within `write_timeout`"*, which is the one thing
 /// the server does not know.
+/// How a write is made to outrun its deadline, deterministically.
+///
+/// **Not by shrinking the deadline.** `tokio::time::timeout` polls the inner
+/// future *first*, so a `spawn_blocking` write that finishes before that first
+/// poll returns `Ok` and never times out, however small the budget. A
+/// one-nanosecond deadline therefore raced — and raced differently on two CI
+/// runners than on the development machine: one job saw `204 No Content` (no
+/// body to parse), another saw the idempotency key committed, and both passed
+/// locally.
+///
+/// So the *write* is made slow rather than the deadline small, and slow in
+/// **CPU** rather than in I/O: an fsync is milliseconds on one filesystem and
+/// microseconds on another, while parsing and inserting ten thousand points
+/// costs the same order everywhere. Measured at ~200 ms in a debug build
+/// against a 1 ms budget. For this to race, a machine would have to ingest ten
+/// million points a second through JSON — sixteen times the *release* build's
+/// measured single-writer rate.
+const SLOW_WRITE_POINTS: usize = 10_000;
+
+/// A budget no write of [`SLOW_WRITE_POINTS`] can meet.
+const TIGHT_WRITE_TIMEOUT: Duration = Duration::from_millis(1);
+
 #[tokio::test]
 async fn a_write_that_outruns_its_deadline_says_the_outcome_is_unknown() {
     chronixd::tls::ensure_crypto_provider();
-    // One nanosecond: the deadline is past before the blocking task is
-    // scheduled, so the response is a timeout every time.
-    let h = harness(|_| {}, |_| {}, Duration::from_nanos(1)).await;
+    let h = harness(|_| {}, |_| {}, TIGHT_WRITE_TIMEOUT).await;
 
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{}/api/v1/write", h.base))
-        .json(&write_body("late", 0, 1))
+        .json(&write_body("late", 0, SLOW_WRITE_POINTS))
         .send()
         .await
         .expect("request");
     let status = resp.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "the premise: a {SLOW_WRITE_POINTS}-point write must not fit in \
+         {TIGHT_WRITE_TIMEOUT:?}"
+    );
     let body: Value = resp.json().await.expect("json");
 
-    assert_eq!(status, reqwest::StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert_eq!(body["code"], "WRITE_TIMEOUT", "{body}");
     let message = body["error"].as_str().unwrap_or_default();
     assert!(
@@ -423,13 +448,17 @@ async fn a_write_that_outruns_its_deadline_says_the_outcome_is_unknown() {
 /// first attempt landed. A point is identified by its series and timestamp,
 /// so re-sending it is a no-op — which is what makes releasing the claim the
 /// safe choice, and worth pinning.
+///
+/// The premise is asserted, not assumed: a write that *succeeds* commits its
+/// key, and a `409` on the retry would then be correct. See
+/// [`SLOW_WRITE_POINTS`] for why the timeout is deterministic.
 #[tokio::test]
 async fn a_timed_out_write_leaves_its_idempotency_key_reusable() {
     chronixd::tls::ensure_crypto_provider();
-    let h = harness(|_| {}, |_| {}, Duration::from_nanos(1)).await;
+    let h = harness(|_| {}, |_| {}, TIGHT_WRITE_TIMEOUT).await;
 
     let client = reqwest::Client::new();
-    let body = write_body("dedup", 0, 1);
+    let body = write_body("dedup", 0, SLOW_WRITE_POINTS);
     for attempt in 0..2 {
         let resp = client
             .post(format!("{}/api/v1/write", h.base))
@@ -438,11 +467,12 @@ async fn a_timed_out_write_leaves_its_idempotency_key_reusable() {
             .send()
             .await
             .expect("request");
-        assert_ne!(
+        assert_eq!(
             resp.status(),
-            reqwest::StatusCode::CONFLICT,
-            "attempt {attempt}: a retry after an unknown outcome must not be \
-             refused as a duplicate"
+            reqwest::StatusCode::GATEWAY_TIMEOUT,
+            "attempt {attempt}: the outcome must be unknown for this test to \
+             say anything — a write that succeeded would commit its key, and a \
+             409 on the retry would then be right"
         );
     }
 }
