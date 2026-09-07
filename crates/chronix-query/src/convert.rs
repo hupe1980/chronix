@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{
+    ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -31,6 +33,8 @@ enum FieldType {
     F64,
     Bool,
     String,
+    /// An exact decimal, carrying the column's scale.
+    Decimal(u8),
 }
 
 /// A discovered column from point data.
@@ -160,6 +164,34 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                         Field::new(&col.name, DataType::Boolean, true).with_metadata(meta.clone()),
                     );
                 }
+                FieldType::Decimal(scale) => {
+                    // Mantissas at the column's scale. A value that arrived
+                    // at a narrower scale is widened losslessly; one that
+                    // cannot be expressed at this scale would have to be
+                    // rounded, so it reads as NULL rather than as a
+                    // quietly wrong number.
+                    let values: Vec<Option<i128>> = points
+                        .iter()
+                        .map(|p| match p.field(&col.name) {
+                            Some(FieldValue::Decimal(d)) => {
+                                d.rescale(scale).ok().map(|v| v.mantissa())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let dt = DataType::Decimal128(
+                        chronix_core::DECIMAL_PRECISION,
+                        i8::try_from(scale).unwrap_or(0),
+                    );
+                    let array = Decimal128Array::from(values)
+                        .with_precision_and_scale(
+                            chronix_core::DECIMAL_PRECISION,
+                            i8::try_from(scale).unwrap_or(0),
+                        )
+                        .map_err(QueryError::from)?;
+                    arrow_arrays.push(Arc::new(array));
+                    fields.push(Field::new(&col.name, dt, true).with_metadata(meta.clone()));
+                }
                 FieldType::String => {
                     let values: Vec<Option<String>> = points
                         .iter()
@@ -201,6 +233,7 @@ fn discover_columns(points: &[Point]) -> Vec<Column> {
                 FieldValue::F64(_) => FieldType::F64,
                 FieldValue::Bool(_) => FieldType::Bool,
                 FieldValue::String(_) => FieldType::String,
+                FieldValue::Decimal(d) => FieldType::Decimal(d.scale()),
             };
             // Detect type conflicts across points and widen
             // numeric types automatically (I64/U64 → F64) rather than
@@ -219,6 +252,13 @@ fn discover_columns(points: &[Point]) -> Vec<Column> {
                             | (FieldType::F64, FieldType::U64)
                             | (FieldType::I64, FieldType::U64)
                             | (FieldType::U64, FieldType::I64) => FieldType::F64,
+                            // Two scales of the same decimal column are not
+                            // a conflict: the wider one holds both, exactly.
+                            // (The write path normalises, so this only
+                            // arises for points that never went through it.)
+                            (FieldType::Decimal(a), FieldType::Decimal(b)) => {
+                                FieldType::Decimal(a.max(b))
+                            }
                             _ => FieldType::String,
                         };
                     }

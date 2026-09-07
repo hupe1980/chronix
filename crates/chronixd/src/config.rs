@@ -351,6 +351,55 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub retention_secs: u64,
 
+    // ── Engine settings the server could not reach ──────────────────
+    //
+    // Each of these governs how a *server* deployment behaves, and each was
+    // settable only through the embedded builder — so an operator reading
+    // "live ingestion is held to ±`ooo_shard_tolerance` shards" or "every
+    // `maintenance_interval` (30 s)" in the server documentation was being
+    // told the name of a knob they had no way to turn.
+    //
+    // They are `Option`, and unset means *leave the engine's default alone*.
+    // Repeating the numbers here would give every one of them two
+    // definitions that can disagree, which is the mistake
+    // `ChronixConfigBuilder` was itself restructured to avoid.
+    /// How often the maintenance thread compacts, materialises rollups,
+    /// collects garbage and enforces retention. Unset uses the engine
+    /// default; `0` disables the periodic passes.
+    #[serde(default)]
+    pub maintenance_interval_secs: Option<u64>,
+
+    /// Past shards that still accept live, out-of-order writes. Anything
+    /// older needs `?backfill=true`.
+    #[serde(default)]
+    pub ooo_shard_tolerance: Option<u32>,
+
+    /// How far ahead of the wall clock a timestamp may be, on every write
+    /// path including backfill.
+    #[serde(default)]
+    pub future_write_tolerance_secs: Option<u64>,
+
+    /// CDC events buffered for a slow subscriber. The ring is allocated on
+    /// the first subscription, so a deployment that never reads the change
+    /// stream pays nothing for it.
+    #[serde(default)]
+    pub cdc_capacity: Option<usize>,
+
+    /// Unflushed WAL files tolerated before writes are held back.
+    #[serde(default)]
+    pub wal_max_unflushed: Option<usize>,
+
+    /// Grace period before a dropped measurement is hard-deleted. Unset
+    /// means a drop is immediate and irreversible; with it set, the
+    /// measurement is recoverable until the deadline passes.
+    #[serde(default)]
+    pub soft_delete_ttl_secs: Option<u64>,
+
+    /// Measurements the last-value cache covers. Empty means all of them,
+    /// which is also what omitting the key means.
+    #[serde(default)]
+    pub lvc_measurements: Vec<String>,
+
     /// Zstd compression level (1–22). Only used when `compression = "zstd"`.
     #[serde(default = "default_zstd_level")]
     pub zstd_level: i32,
@@ -854,6 +903,15 @@ impl Default for DatabaseConfig {
             max_memtable_memory: default_max_memtable_memory(),
             shard_duration_secs: default_shard_duration_secs(),
             retention_secs: 0,
+            // `None` is "leave the engine's default", so the default lives
+            // in exactly one place.
+            maintenance_interval_secs: None,
+            ooo_shard_tolerance: None,
+            future_write_tolerance_secs: None,
+            cdc_capacity: None,
+            wal_max_unflushed: None,
+            soft_delete_ttl_secs: None,
+            lvc_measurements: Vec::new(),
             compression: default_compression(),
             float_encoding: default_float_encoding(),
             segment_cache_size: default_segment_cache_size(),
@@ -1206,6 +1264,28 @@ impl ServerConfig {
 
         if let Some(retention) = retention {
             builder = builder.retention(Some(retention));
+        }
+        if let Some(secs) = self.database.maintenance_interval_secs {
+            builder = builder.maintenance_interval(Duration::from_secs(secs));
+        }
+        if let Some(tolerance) = self.database.ooo_shard_tolerance {
+            builder = builder.ooo_shard_tolerance(tolerance);
+        }
+        if let Some(secs) = self.database.future_write_tolerance_secs {
+            builder = builder.future_write_tolerance(Duration::from_secs(secs));
+        }
+        if let Some(capacity) = self.database.cdc_capacity {
+            builder = builder.cdc_capacity(capacity);
+        }
+        if let Some(max) = self.database.wal_max_unflushed {
+            builder = builder.wal_max_unflushed(max);
+        }
+        if let Some(secs) = self.database.soft_delete_ttl_secs {
+            builder = builder.soft_delete_ttl(Some(Duration::from_secs(secs)));
+        }
+        if !self.database.lvc_measurements.is_empty() {
+            builder =
+                builder.lvc_measurements(self.database.lvc_measurements.iter().cloned().collect());
         }
 
         builder

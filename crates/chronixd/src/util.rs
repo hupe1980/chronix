@@ -251,27 +251,47 @@ pub fn now_nanos() -> Result<i64, ServerError> {
 }
 
 /// Convert a [`ColumnType`] to a human-readable wire format string.
-pub fn column_type_to_str(ct: ColumnType) -> &'static str {
+pub fn column_type_to_str(ct: ColumnType) -> String {
     match ct {
-        ColumnType::F64 => "float64",
-        ColumnType::I64 => "int64",
-        ColumnType::U64 => "uint64",
-        ColumnType::Bool => "bool",
-        ColumnType::String => "string",
-        ColumnType::Timestamp => "timestamp",
+        ColumnType::F64 => "float64".to_string(),
+        ColumnType::I64 => "int64".to_string(),
+        ColumnType::U64 => "uint64".to_string(),
+        ColumnType::Bool => "bool".to_string(),
+        ColumnType::String => "string".to_string(),
+        ColumnType::Timestamp => "timestamp".to_string(),
+        // The scale is part of the type, so it is part of the name: a
+        // client that reads `decimal` alone cannot tell a schema endpoint
+        // what the column actually stores.
+        ColumnType::Decimal { scale } => {
+            format!("decimal({}, {scale})", chronix_core::DECIMAL_PRECISION)
+        }
     }
+}
+
+/// Render one cell of a `Decimal128` column as its exact digits.
+///
+/// Returns `None` for a null cell, or for a column whose scale is outside
+/// what a Chronix decimal can carry.
+///
+/// Every wire encoder — HTTP JSON, gRPC, the schema endpoint — goes through
+/// this one function, so a decimal reads the same on all of them and reads
+/// the same as `FieldValue`'s own `Display`. The alternative was three
+/// formatters that agree until one of them is changed.
+#[must_use]
+pub fn decimal_cell_to_string(arr: &arrow::array::Decimal128Array, row: usize) -> Option<String> {
+    use arrow::array::Array;
+    if arr.is_null(row) {
+        return None;
+    }
+    let scale = u8::try_from(arr.scale()).ok()?;
+    chronix_core::Decimal::new(arr.value(row), scale)
+        .ok()
+        .map(|d| d.to_string())
 }
 
 /// Convert a [`ColumnType`] to an Arrow [`DataType`](arrow::datatypes::DataType).
 pub fn column_type_to_arrow(ct: ColumnType) -> arrow::datatypes::DataType {
-    match ct {
-        ColumnType::F64 => arrow::datatypes::DataType::Float64,
-        ColumnType::I64 => arrow::datatypes::DataType::Int64,
-        ColumnType::U64 => arrow::datatypes::DataType::UInt64,
-        ColumnType::Bool => arrow::datatypes::DataType::Boolean,
-        ColumnType::String => arrow::datatypes::DataType::Utf8,
-        ColumnType::Timestamp => arrow::datatypes::DataType::Int64,
-    }
+    chronix_query::column_type_to_arrow(ct)
 }
 
 /// Parse a JSON object with `tags`, `fields`, and optional `timestamp`
@@ -338,10 +358,21 @@ pub fn parse_json_point(
     Ok(vec![point])
 }
 
+/// The JSON key that marks a field value as an exact decimal.
+///
+/// `{"z1nb": {"decimal": "1234.5678"}}` rather than `{"z1nb": 1234.5678}`,
+/// and the difference is not decoration. A bare JSON number is parsed by
+/// `serde_json` into an `f64`, so by the time the write handler sees it the
+/// digits are already gone — `1234.5678` has become the nearest double, and
+/// no amount of care downstream can recover what it was. The digits have to
+/// arrive as digits, which in JSON means as a string.
+pub const DECIMAL_JSON_KEY: &str = "decimal";
+
 /// Convert a single JSON value to a [`FieldValue`].
 ///
 /// Integer types are preferred over floats when the JSON number has no
-/// fractional part.
+/// fractional part. An exact decimal is written as
+/// `{"decimal": "1234.5678"}` — see [`DECIMAL_JSON_KEY`].
 pub fn json_value_to_field(key: &str, val: serde_json::Value) -> Result<FieldValue, ServerError> {
     match val {
         serde_json::Value::Number(n) => {
@@ -359,6 +390,39 @@ pub fn json_value_to_field(key: &str, val: serde_json::Value) -> Result<FieldVal
         }
         serde_json::Value::Bool(b) => Ok(FieldValue::Bool(b)),
         serde_json::Value::String(s) => Ok(FieldValue::String(s)),
+        // `{"decimal": "…"}`, and also the `{"Decimal": "…"}` that
+        // `FieldValue`'s own serialisation produces, so a value read back
+        // out of a CDC event can be written straight back in.
+        serde_json::Value::Object(map) if map.len() == 1 => {
+            let (tag, inner) = map
+                .into_iter()
+                .next()
+                .expect("len() == 1 guarantees one entry");
+            if !tag.eq_ignore_ascii_case(DECIMAL_JSON_KEY) {
+                return Err(ServerError::BadRequest(format!(
+                    "unsupported value type for field '{key}': expected \
+                     {{\"{DECIMAL_JSON_KEY}\": \"…\"}}, got {{\"{tag}\": …}}"
+                )));
+            }
+            let digits = match inner {
+                serde_json::Value::String(s) => s,
+                // A JSON number here has already been through an `f64`, so
+                // accepting it would defeat the point of asking for a
+                // decimal in the first place.
+                other => {
+                    return Err(ServerError::BadRequest(format!(
+                        "decimal field '{key}' must be a string of digits, not {other} — \
+                         a JSON number is parsed as a double and loses the value"
+                    )))
+                }
+            };
+            digits
+                .parse::<chronix_core::Decimal>()
+                .map(FieldValue::Decimal)
+                .map_err(|e| {
+                    ServerError::BadRequest(format!("invalid decimal for field '{key}': {e}"))
+                })
+        }
         _ => Err(ServerError::BadRequest(format!(
             "unsupported value type for field '{key}'"
         ))),
@@ -385,6 +449,10 @@ mod tests {
         assert_eq!(column_type_to_str(ColumnType::Bool), "bool");
         assert_eq!(column_type_to_str(ColumnType::String), "string");
         assert_eq!(column_type_to_str(ColumnType::Timestamp), "timestamp");
+        assert_eq!(
+            column_type_to_str(ColumnType::Decimal { scale: 4 }),
+            "decimal(38, 4)"
+        );
     }
 
     #[test]
@@ -396,12 +464,46 @@ mod tests {
         assert_eq!(column_type_to_arrow(ColumnType::Bool), DataType::Boolean);
         assert_eq!(column_type_to_arrow(ColumnType::String), DataType::Utf8);
         assert_eq!(column_type_to_arrow(ColumnType::Timestamp), DataType::Int64);
+        assert_eq!(
+            column_type_to_arrow(ColumnType::Decimal { scale: 4 }),
+            DataType::Decimal128(38, 4)
+        );
     }
 
     #[test]
     fn json_value_to_field_integer() {
         let fv = json_value_to_field("x", serde_json::json!(42)).unwrap();
         assert!(matches!(fv, FieldValue::I64(42)));
+    }
+
+    #[test]
+    fn json_value_to_field_decimal() {
+        let fv = json_value_to_field("z1nb", serde_json::json!({"decimal": "1234.5678"})).unwrap();
+        match fv {
+            FieldValue::Decimal(d) => {
+                assert_eq!(d.mantissa(), 12_345_678);
+                assert_eq!(d.scale(), 4);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        // The capitalised form is what `FieldValue` itself serialises to.
+        assert!(matches!(
+            json_value_to_field("z", serde_json::json!({"Decimal": "0.3"})).unwrap(),
+            FieldValue::Decimal(_)
+        ));
+    }
+
+    #[test]
+    fn a_decimal_written_as_a_json_number_is_refused() {
+        // Accepting it would mean accepting whatever `f64` the parser made
+        // of the digits, which is the loss the type exists to prevent.
+        let err = json_value_to_field("z", serde_json::json!({"decimal": 1234.5678})).unwrap_err();
+        assert!(err.to_string().contains("string of digits"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_single_key_object_is_refused() {
+        assert!(json_value_to_field("z", serde_json::json!({"nope": "1"})).is_err());
     }
 
     #[test]

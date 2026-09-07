@@ -100,8 +100,11 @@ fn unreadable_segment_is_not_dropped_by_rollup_aware_retention() {
     std::fs::write(&segs[0], b"NOT A SEGMENT").unwrap();
 
     let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
-    // The clock segment goes; the raw segment must stay.
-    assert_eq!(result.segments_deleted, 1, "only the clock segment may go");
+    // Nothing may go. The raw segment is unreadable, so its rollup cannot be
+    // materialised; and the clock segment holds the newest timestamp in the
+    // database, which is what retention measures age *from* — the newest data
+    // can never be expired, whatever the rule says.
+    assert_eq!(result.segments_deleted, 0, "nothing is eligible");
     assert!(
         segs[0].exists(),
         "the unreadable segment must be preserved, not dropped"
@@ -134,7 +137,13 @@ fn readable_segment_is_dropped_after_rollup() {
     advance_clock(&db, 10 * HOUR);
 
     let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
-    assert_eq!(result.segments_deleted, 2, "raw and clock");
+    // The raw segment only: the clock marker holds the newest timestamp, and
+    // retention measures age from `min(wall clock, newest held)`, so the
+    // newest data is never itself expired.
+    assert_eq!(
+        result.segments_deleted, 1,
+        "the raw segment; the clock anchors the reference"
+    );
     assert!(db
         .catalog()
         .read()
@@ -169,7 +178,13 @@ fn retention_materialises_the_whole_cascade_before_dropping_raw() {
     advance_clock(&db, 10 * HOUR);
 
     let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
-    assert_eq!(result.segments_deleted, 2, "raw and clock");
+    // The raw segment only: the clock marker holds the newest timestamp, and
+    // retention measures age from `min(wall clock, newest held)`, so the
+    // newest data is never itself expired.
+    assert_eq!(
+        result.segments_deleted, 1,
+        "the raw segment; the clock anchors the reference"
+    );
 
     let m1 = scan(&db, "raw_1m");
     assert_eq!(m1.num_rows(), 30, "thirty 1-minute buckets");
@@ -228,8 +243,8 @@ fn retention_rolls_a_bucket_up_over_every_segment_that_feeds_it() {
 
     let result = db.enforce_retention(Duration::from_nanos(1)).unwrap();
     assert_eq!(
-        result.segments_deleted, 4,
-        "three raw segments and the clock"
+        result.segments_deleted, 3,
+        "three raw segments; the clock anchors the reference and stays"
     );
 
     let batch = scan(&db, "raw_1m");

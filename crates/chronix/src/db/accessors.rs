@@ -252,6 +252,7 @@ impl Chronix {
             ts.len()
         };
         let metadata_cache_entries = self.metadata_cache.len();
+        let metadata_cache_bytes = self.metadata_cache.memory_bytes();
 
         // Emit gauge metrics so Prometheus/OTLP scrapers pick them up.
         gauge!("chronix_series_count").set(series_count as f64);
@@ -265,6 +266,7 @@ impl Chronix {
         gauge!("chronix_wal_sequence").set(wal_sequence as f64);
         gauge!("chronix_tombstone_count").set(tombstone_count as f64);
         gauge!("chronix_metadata_cache_entries").set(metadata_cache_entries as f64);
+        gauge!("chronix_metadata_cache_bytes").set(metadata_cache_bytes as f64);
         gauge!("chronix_storage_disk_usage_bytes").set(self.disk_usage_bytes() as f64);
 
         DatabaseStatistics {
@@ -279,6 +281,7 @@ impl Chronix {
             wal_sequence,
             tombstone_count,
             metadata_cache_entries,
+            metadata_cache_bytes,
         }
     }
 
@@ -508,7 +511,7 @@ pub(super) fn record_series(
 /// [`TAG_SEPARATOR`]: chronix_core::TAG_SEPARATOR
 /// [`KV_SEPARATOR`]: chronix_core::KV_SEPARATOR
 /// [`SeriesKey::validate_name`]: chronix_core::SeriesKey::validate_name
-fn split_canonical(canonical: &str) -> Option<(&str, &str)> {
+pub(super) fn split_canonical(canonical: &str) -> Option<(&str, &str)> {
     let mut parts = canonical.split(chronix_core::TAG_SEPARATOR);
     let measurement = parts.next()?;
     let namespace = parts

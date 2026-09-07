@@ -198,3 +198,92 @@ fn every_documented_metric_is_one_the_tree_emits() {
         problems.into_iter().collect::<Vec<_>>().join("\n  ")
     );
 }
+
+/// Every metric this tree records is a name Prometheus will keep, inside the
+/// `chronix_` namespace.
+///
+/// The exposition format allows `[a-zA-Z_:][a-zA-Z0-9_:]*`, and
+/// `metrics-exporter-prometheus` rewrites anything else at render time —
+/// silently, and only on the scrape. Three metrics were declared with **dots**
+/// while 236 used underscores, so they reached an operator under a name that
+/// was not the one in the source, and one of them
+/// (`chronix.auth.env_key.grace_hit`) was written that way in the doc comment
+/// telling operators to watch it. `documented_metrics` above could not see
+/// this: it looks for `"chronix_…"` literals, which a dotted name is not.
+///
+/// The rewrite is proved rather than assumed, in
+/// `chronixd --test metrics_exported::a_dotted_metric_name_is_rewritten_before_it_reaches_a_scrape`.
+#[test]
+fn every_metric_name_is_prometheus_safe() {
+    let root = repo_root();
+    let mut problems: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    walk(&root.join("crates"), "rs", &mut |path, text| {
+        for (lineno, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            for name in metric_macro_literals(line) {
+                checked += 1;
+                // Two rules, and the second is why the first was not enough
+                // on its own: `signal.condition.type_mismatch` was both
+                // invalid *and* outside the namespace, so it rendered as
+                // `signal_condition_type_mismatch` — a metric no operator
+                // filtering on `chronix_` would ever see.
+                let valid_identifier = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    && !name.starts_with(|c: char| c.is_ascii_digit());
+                if !valid_identifier || !name.starts_with("chronix_") {
+                    problems.push(format!(
+                        "{}:{}  {name}",
+                        path.strip_prefix(&root).unwrap_or(path).display(),
+                        lineno + 1,
+                    ));
+                }
+            }
+        }
+    });
+
+    assert!(
+        checked > 100,
+        "the macro scan found only {checked} metric names, so it is broken",
+    );
+    assert!(
+        problems.is_empty(),
+        "{} metric name(s) are not a valid Prometheus identifier under the \
+         `chronix_` namespace. The exporter rewrites an invalid one silently, so \
+         an operator greps the scrape for a name that is not in it; a valid one \
+         outside the namespace is invisible to anyone filtering by prefix:\n  {}",
+        problems.len(),
+        problems.join("\n  "),
+    );
+}
+
+/// The first string-literal argument of a `counter!`/`gauge!`/`histogram!`
+/// call on this line, if it is a literal rather than a `const`.
+///
+/// A `const` fed to the macro is covered by the same rule at its definition,
+/// which is itself a `"chronix_…"` literal the other scan sees.
+fn metric_macro_literals(line: &str) -> Vec<String> {
+    const MACROS: [&str; 3] = ["counter!(", "gauge!(", "histogram!("];
+    let mut out = Vec::new();
+    for m in MACROS {
+        let mut from = 0usize;
+        while let Some(pos) = line[from..].find(m) {
+            let after = from + pos + m.len();
+            from = after;
+            let rest = line[after..].trim_start();
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue; // a `const`, or a multi-line call
+            };
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+            }
+        }
+    }
+    out
+}

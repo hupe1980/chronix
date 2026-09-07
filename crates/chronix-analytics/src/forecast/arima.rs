@@ -1247,6 +1247,106 @@ pub fn select_differencing_order(values: &[f64], max_d: usize) -> usize {
     d
 }
 
+/// Seasonal strength above which a series is treated as having a seasonal
+/// unit root, from Wang, Smith & Hyndman (2006).
+///
+/// R's `forecast::nsdiffs` uses this exact threshold as its **default** test,
+/// with the comment "Threshold chosen based on seasonal M3 auto.arima
+/// accuracy" — it was fitted by minimising MASE over the M3 and M4
+/// collections rather than derived, which is why it is a bare number and why
+/// copying it is better than inventing one.
+pub const SEASONAL_STRENGTH_THRESHOLD: f64 = 0.64;
+
+/// How many seasonal differences a series needs, from its seasonal strength.
+///
+/// The measure is `max(0, min(1, 1 − Var(remainder) / Var(remainder +
+/// seasonal)))` over an STL decomposition: the share of the seasonal-plus-noise
+/// variance that the seasonal component explains. One seasonal difference is
+/// taken when it exceeds [`SEASONAL_STRENGTH_THRESHOLD`].
+///
+/// This is the default test in R's `forecast::nsdiffs`, in preference to OCSB
+/// — which that package keeps as an option rather than a default. Reading the
+/// two guards out of its source mattered as much as the formula: a **constant**
+/// series needs no differencing however the variance ratio comes out (both
+/// variances are zero), and a series shorter than two periods cannot be
+/// decomposed at all, let alone differenced.
+///
+/// # Why this is not cosmetic
+///
+/// The alternative is what stood here: a fixed `D = 1`. Every seasonal
+/// candidate was seasonally differenced, so a series with strong but
+/// *stationary* seasonality — a daily load curve that repeats rather than
+/// drifting — was always over-differenced, and the model that fits it,
+/// `SARIMA(p,d,q)(P,0,Q)[m]`, could not be proposed at all. Over-differencing
+/// does not fail; it inflates the forecast variance and widens every interval
+/// built on it.
+#[must_use]
+pub fn select_seasonal_differencing_order(values: &[f64], period: usize, max_d: usize) -> usize {
+    if period < 2 || max_d == 0 {
+        return 0;
+    }
+    // Fewer than two full periods cannot be decomposed, and `nsdiffs`
+    // refuses for the same reason.
+    if values.len() < 2 * period {
+        return 0;
+    }
+    // A constant series has zero variance in both terms, so the ratio is
+    // meaningless; R checks this before the heuristic and so does this.
+    let first = values.first().copied().unwrap_or(0.0);
+    if values.iter().all(|v| (v - first).abs() < f64::EPSILON) {
+        return 0;
+    }
+
+    let mut current = values.to_vec();
+    let mut d = 0usize;
+    while d < max_d {
+        let Some(strength) = seasonal_strength(&current, period) else {
+            break;
+        };
+        if strength <= SEASONAL_STRENGTH_THRESHOLD {
+            break;
+        }
+        current = seasonal_difference(&current, period, 1);
+        d += 1;
+        if current.len() < 2 * period {
+            break;
+        }
+    }
+    d
+}
+
+/// `max(0, min(1, 1 − Var(remainder) / Var(remainder + seasonal)))`, or
+/// `None` if the series cannot be decomposed.
+fn seasonal_strength(values: &[f64], period: usize) -> Option<f64> {
+    let decomposition = crate::preprocess::decomposition::stl_decompose(
+        values,
+        &crate::preprocess::decomposition::StlConfig::new(period),
+    )
+    .ok()?;
+    let remainder_var = variance(&decomposition.residual)?;
+    let combined: Vec<f64> = decomposition
+        .residual
+        .iter()
+        .zip(&decomposition.seasonal)
+        .map(|(r, s)| r + s)
+        .collect();
+    let combined_var = variance(&combined)?;
+    if combined_var <= 0.0 {
+        return Some(0.0);
+    }
+    Some((1.0 - remainder_var / combined_var).clamp(0.0, 1.0))
+}
+
+/// Sample variance, or `None` for fewer than two observations.
+fn variance(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    Some(values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0))
+}
+
 // ── auto_arima ──────────────────────────────────────────────────────────
 
 /// Result of automatic ARIMA model selection.
@@ -1965,6 +2065,118 @@ mod tests {
         assert_eq!(kpss_statistic(&[1.0, 1.0]), 0.0);
         assert_eq!(kpss_statistic(&[7.0; 50]), 0.0);
         assert_eq!(select_differencing_order(&[7.0; 50], 2), 0);
+    }
+
+    /// Strong seasonality takes a seasonal difference.
+    ///
+    /// This is the M3/M4-tuned behaviour of the measure, and it is worth
+    /// being explicit that it is a **strength** test, not a unit-root test:
+    /// a perfectly repeating pattern around a stable level scores near 1 and
+    /// is differenced. R's `nsdiffs` does the same, deliberately — the
+    /// threshold was fitted by minimising forecast error, not derived from
+    /// stationarity theory.
+    #[test]
+    fn strong_seasonality_takes_a_seasonal_difference() {
+        let m = 24usize;
+        let values: Vec<f64> = (0..(m * 14))
+            .map(|i| {
+                let phase = (i % m) as f64 / m as f64 * std::f64::consts::TAU;
+                100.0 + 20.0 * phase.sin() + ((i * 37) % 11) as f64 * 0.05
+            })
+            .collect();
+        assert_eq!(select_seasonal_differencing_order(&values, m, 1), 1);
+    }
+
+    /// Faint seasonality buried in noise takes none — and this is the case
+    /// the fixed `D = 1` got wrong.
+    ///
+    /// `detect_period` will happily return a period for a series whose
+    /// seasonal term explains almost none of its variance. Differencing it
+    /// anyway spends `m` observations, adds a moving-average term the data
+    /// does not support, and widens every interval built on the result.
+    #[test]
+    fn weak_seasonality_takes_no_seasonal_difference() {
+        let m = 24usize;
+        let values: Vec<f64> = (0..(m * 14))
+            .map(|i| {
+                let phase = (i % m) as f64 / m as f64 * std::f64::consts::TAU;
+                let noise = (((i * 2_654_435_761usize) % 1000) as f64 / 1000.0 - 0.5) * 40.0;
+                100.0 + 0.5 * phase.sin() + noise
+            })
+            .collect();
+        assert_eq!(select_seasonal_differencing_order(&values, m, 1), 0);
+    }
+
+    #[test]
+    fn pure_noise_takes_no_seasonal_difference() {
+        let m = 24usize;
+        let values: Vec<f64> = (0..(m * 14))
+            .map(|i| 100.0 + (((i * 2_654_435_761usize) % 1000) as f64 / 1000.0 - 0.5) * 40.0)
+            .collect();
+        assert_eq!(select_seasonal_differencing_order(&values, m, 0), 0);
+        assert_eq!(select_seasonal_differencing_order(&values, m, 1), 0);
+    }
+
+    /// The measure's blind spot, pinned rather than left to be rediscovered.
+    ///
+    /// A **seasonal random walk** — each season's level drifts from cycle to
+    /// cycle — is the textbook case for a seasonal difference, and the
+    /// strength heuristic scores it *low*: STL's cycle-subseries smoother
+    /// cannot fit a seasonal shape that keeps moving, so the variation lands
+    /// in the remainder and the ratio collapses. This is exactly what a real
+    /// seasonal unit-root test (OCSB, Canova–Hansen) is for, and why R keeps
+    /// them as options beside this default. Recorded as a test so the limit
+    /// is a known quantity rather than a surprise.
+    #[test]
+    fn the_strength_measure_is_blind_to_a_stochastic_seasonal_level() {
+        let m = 24usize;
+        let mut values = vec![0.0f64; 12 * m];
+        let mut season_level = vec![0.0f64; m];
+        let mut rng_state = 42u64;
+        let mut next = || {
+            rng_state = rng_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((rng_state >> 33) as f64 / f64::from(u32::MAX >> 1)) - 1.0
+        };
+        for cycle in 0..12 {
+            for season in 0..m {
+                season_level[season] += next() * 3.0;
+                values[cycle * m + season] = season_level[season] + next() * 0.1;
+            }
+        }
+        assert_eq!(
+            select_seasonal_differencing_order(&values, m, 1),
+            0,
+            "if this starts returning 1 the measure has changed — check which \
+             test is being used before assuming it is an improvement",
+        );
+    }
+
+    #[test]
+    fn a_constant_series_is_never_seasonally_differenced() {
+        // Both variances are zero, so the ratio says nothing; the guard has
+        // to come first. R's `nsdiffs` checks `is.constant` before the
+        // heuristic for exactly this reason.
+        let values = vec![7.0f64; 200];
+        assert_eq!(select_seasonal_differencing_order(&values, 24, 1), 0);
+    }
+
+    #[test]
+    fn a_series_shorter_than_two_periods_is_never_seasonally_differenced() {
+        let values: Vec<f64> = (0..30).map(|i| f64::from(i % 24)).collect();
+        assert_eq!(
+            select_seasonal_differencing_order(&values, 24, 1),
+            0,
+            "STL needs two full periods; there is nothing to measure",
+        );
+    }
+
+    #[test]
+    fn a_period_below_two_is_not_seasonal() {
+        let values: Vec<f64> = (0..100).map(f64::from).collect();
+        assert_eq!(select_seasonal_differencing_order(&values, 1, 1), 0);
+        assert_eq!(select_seasonal_differencing_order(&values, 0, 1), 0);
     }
 
     #[test]

@@ -444,6 +444,33 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
     paths = paths.path(
+        "/api/v1/measurements/{name}/restore",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Measurements")
+                .summary(Some("Undo a pending measurement drop"))
+                .description(Some(
+                    "Restores a measurement whose drop is still within the grace \
+                     period set by `[database] soft_delete_ttl_secs`. Without that \
+                     setting a drop is immediate and irreversible, and this returns \
+                     404. Under multi-tenancy a drop removes the namespace's series \
+                     rather than the measurement, so there is nothing to undo and the \
+                     answer is also 404.",
+                ))
+                .parameter(
+                    ParameterBuilder::new()
+                        .name("name")
+                        .parameter_in(ParameterIn::Path)
+                        .required(utoipa::openapi::Required::True)
+                        .build(),
+                )
+                .response("204", ok_json("Restored", obj_schema()))
+                .response("404", ok_json("Not pending deletion", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
         "/api/v1/measurements/{name}/schema",
         PathItem::new(
             HttpMethod::Get,
@@ -459,6 +486,36 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 )
                 .response("200", ok_json("Measurement schema", obj_schema()))
                 .response("404", ok_json("Not found", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/measurements/{name}/schema/fields",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Measurements")
+                .summary(Some("Declare a field column"))
+                .description(Some(
+                    "Create a field column before anything is written to it. \
+                     Schema-on-write covers every other case; a decimal column is the \
+                     exception, because its scale is part of its type and is fixed by \
+                     whatever creates the column. Body: \
+                     {\"name\": \"z1nb_q\", \"type\": \"decimal\", \"scale\": 4}.",
+                ))
+                .parameter(
+                    ParameterBuilder::new()
+                        .name("name")
+                        .parameter_in(ParameterIn::Path)
+                        .required(utoipa::openapi::Required::True)
+                        .build(),
+                )
+                .request_body(Some(json_body("Field declaration", obj_schema())))
+                .response("200", ok_json("Measurement schema", obj_schema()))
+                .response(
+                    "400",
+                    ok_json("Invalid type or conflicting column", obj_schema()),
+                )
                 .build(),
         ),
     );

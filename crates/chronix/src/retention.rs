@@ -10,10 +10,22 @@ use chronix_core::ShardId;
 /// Result of a retention enforcement pass.
 #[derive(Debug, Clone)]
 pub struct RetentionResult {
-    /// Number of shards dropped.
+    /// Number of shards the pass removed entirely.
+    ///
+    /// Not the number it *considered*: a shard past the cutoff whose
+    /// segments are all still needed by a rollup is not counted here, which
+    /// is the difference between "the disk is not shrinking because there is
+    /// nothing to drop" and "…because something is holding it back".
     pub shards_dropped: usize,
     /// Number of segments deleted.
     pub segments_deleted: usize,
+    /// Segments past the cutoff that the pass declined to delete, because a
+    /// rollup fed by them has not been materialised that far yet.
+    ///
+    /// Self-healing — the next pass tries again — but it is the reason a
+    /// retention rule can appear not to work, so it is reported rather than
+    /// left to a log line.
+    pub segments_preserved: usize,
     /// Total bytes freed.
     pub bytes_freed: u64,
 }
@@ -42,14 +54,43 @@ pub fn shards_to_drop(
         .collect()
 }
 
+/// The instant retention measures age from: the wall clock, **capped by the
+/// newest timestamp the database holds**.
+///
+/// Retention is the only irreversible thing a background thread does, and a
+/// cutoff derived from `SystemTime::now()` alone makes one reading of the
+/// clock enough to delete everything — a gateway with no battery-backed RTC,
+/// an NTP server handing out a date in the next century, a restored VM
+/// snapshot. It also empties a database that has simply *stopped writing*:
+/// three days of readings that ended a month ago are three days old to each
+/// other, and a seven-day rule has nothing to say about them.
+///
+/// Capping answers both, and is the rule the rollup materialiser already
+/// used: finality is anchored on the newest write, not on the clock.
+///
+/// The cap **delays** retention rather than disabling it — one fresh write
+/// moves the reference to the present. Two consequences, stated rather than
+/// implied: the newest data can never be expired, and a database that stops
+/// receiving data stops freeing disk. `delete` is the way to reclaim it.
+///
+/// `newest_data_ns` is `None` for an empty database, where nothing can expire
+/// anyway.
+#[must_use]
+pub fn retention_reference(now_ns: i64, newest_data_ns: Option<i64>) -> i64 {
+    match newest_data_ns {
+        Some(newest) => now_ns.min(newest),
+        None => now_ns,
+    }
+}
+
 /// Compute the retention cutoff timestamp.
 ///
-/// `now_ms` is the current time in the same unit as timestamps (typically
-/// epoch nanoseconds). `retention_ns` is the retention duration in the
-/// same unit.
+/// `reference_ns` comes from [`retention_reference`] — never from the wall
+/// clock directly. `retention_ns` is the retention duration in the same unit
+/// (epoch nanoseconds).
 #[must_use]
-pub fn retention_cutoff(now_ns: i64, retention_ns: i64) -> i64 {
-    now_ns.saturating_sub(retention_ns).max(0)
+pub fn retention_cutoff(reference_ns: i64, retention_ns: i64) -> i64 {
+    reference_ns.saturating_sub(retention_ns).max(0)
 }
 
 #[cfg(test)]
@@ -97,5 +138,44 @@ mod tests {
     #[test]
     fn retention_cutoff_no_underflow() {
         assert_eq!(retention_cutoff(100, 1_000_000), 0);
+    }
+
+    #[test]
+    fn the_reference_is_the_clock_while_the_data_keeps_up() {
+        // Live ingest: the newest point is a moment old, so the clock wins
+        // and retention behaves exactly as a wall-clock rule.
+        assert_eq!(retention_reference(1_000, Some(999)), 999);
+        assert_eq!(retention_reference(1_000, Some(1_000)), 1_000);
+    }
+
+    #[test]
+    fn a_clock_that_jumps_forward_cannot_expire_more_than_the_data_allows() {
+        // The clock reads a century ahead for one pass. Without the cap the
+        // cutoff is 100 years past every shard and the database is emptied.
+        let newest = 1_000_i64;
+        let clock_in_the_next_century = 3_000_000_000_000_i64;
+        assert_eq!(
+            retention_reference(clock_in_the_next_century, Some(newest)),
+            newest,
+        );
+    }
+
+    #[test]
+    fn a_database_that_stopped_writing_stops_expiring() {
+        // Writes ended a month ago; a seven-day rule must not empty it.
+        let month = 30 * 86_400_000_000_000_i64;
+        let week = 7 * 86_400_000_000_000_i64;
+        let now = 100 * month;
+        let newest = now - month;
+        let cutoff = retention_cutoff(retention_reference(now, Some(newest)), week);
+        assert!(
+            cutoff < newest,
+            "the newest data must survive its own retention window",
+        );
+    }
+
+    #[test]
+    fn an_empty_database_falls_back_to_the_clock() {
+        assert_eq!(retention_reference(1_000, None), 1_000);
     }
 }

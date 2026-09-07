@@ -38,6 +38,31 @@ inflated by an order of magnitude.
 | Integers (narrow) | Frame-of-Reference | 15–40× | Values in small range → min-offset bit-packing |
 | Strings | Dictionary | 20–50× | Low-cardinality tags → integer indices |
 | Booleans | Bitmap | 8× | 1 bit per value vs 1 byte |
+| Decimals | The integer stack, on the mantissa | 475× noisy power, 1040× monotone register, 2731× constant tariff | The value *is* a scaled integer — nothing to recover, so RLE, FOR and pco apply directly |
+
+### What a decimal column costs against the float it replaces
+
+The row above is the "Floats (decimal)" row from the other end. A `231.45`
+stored as an `f64` has had its integer destroyed by IEEE-754, and ALP and pco
+spend their first stage recovering it; a `Decimal` column never destroyed it.
+The scale is stored once in the column's metadata, so what reaches the codec
+is a column of plain `i128` mantissas.
+
+Two physical forms, chosen per block:
+
+- **Narrow** — every mantissa fits an `i64`, which is every realistic one.
+  The block goes straight to the integer encoder, so a decimal column
+  inherits RLE, frame-of-reference and pco from the same
+  trial-and-keep-the-smallest selection an `i64` field gets.
+- **Wide** — 38-digit financial quantities, or a scale large enough that
+  ordinary values overflow 63 bits. Delta + ZigZag + LEB128, at most 19 bytes
+  per value against the 16 a raw `i128` would take.
+
+The same values as `f64` reach 85× on the noisy power column and 1074× on the
+monotone register: the exact type is worth 5.6× where the float codec's
+mantissa recovery struggles, and costs two bytes a block — the form byte and
+the delegated tag — where it does not
+(`chronix-encoding/tests/decimal_codec_ratios.rs`).
 
 ## Encoding Pipeline
 

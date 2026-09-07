@@ -92,8 +92,11 @@
       <p>Most metric values started life as decimals — a meter reporting
       <code>231.45</code>&nbsp;W. Pcodec recovers the integer instead of XOR-ing
       bit patterns, then entropy-codes the deltas: <strong>5–29×</strong> on
-      realistic meter and inverter data, where ALP manages 3–9× and the XOR
-      codecs 1.0–2.5×. The winner is chosen per block by trial encoding.</p>
+      realistic meter and inverter data, where ALP manages 3–8× and the XOR
+      codecs 1.0–2.5×. The winner is chosen per block by trial encoding.
+      A column declared <code>Decimal</code> skips the recovery step — the
+      mantissa is already the integer — and reaches <strong>475×</strong> on
+      noisy connection-point power.</p>
       <a href="{{ get_url(path='@/internals/encoding.md') }}">How encoding works →</a>
     </article>
     <article class="card">

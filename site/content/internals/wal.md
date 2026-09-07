@@ -48,7 +48,7 @@ Sequence numbers provide:
 
 Each WAL record is self-describing with integrity protection.
 
-**v2 format** (current, `WAL_VERSION = 2`):
+`WAL_VERSION = 1`:
 
 ```text
 ┌──────────┬──────────┬──────────────┬────────────┬─────────────────┬───────────┐
@@ -72,17 +72,8 @@ Each WAL record is self-describing with integrity protection.
 - **PayloadVersion** enables per-type schema evolution (currently `1`).
 - The CRC covers `length + sequence_no + record_type + payload_version + payload`.
 
-**v1 format** (legacy, `WAL_VERSION = 1`):
-
-```text
-┌──────────┬──────────┬──────────────┬───────────────────┐
-│ CRC32c   │ Length   │ Sequence No  │ Payload           │
-│ (4 bytes)│ (4 bytes)│ (8 bytes)    │ (variable)        │
-└──────────┴──────────┴──────────────┴───────────────────┘
-```
-
-The reader accepts both v1 and v2 files. When reading v1 records, the type
-defaults to `Data` and the payload version to `1`.
+The reader checks the file version for **equality**. There is one format, so
+a file that is not it is refused rather than guessed at.
 
 ### Payload Encoding
 
@@ -112,9 +103,8 @@ traditional CRC32 (IEEE) for two reasons:
    single-instruction CRC32c computation, achieving throughput of ~1 byte per
    clock cycle.
 
-In v2 format, the checksum covers `length + sequence_no + record_type +
-payload_version + payload`. In v1 format it covers `length + sequence_no +
-payload`. The CRC itself is not covered (a corrupted CRC will simply fail
+The checksum covers `length + sequence_no + record_type + payload_version +
+payload`. The CRC itself is not covered (a corrupted CRC simply fails
 verification).
 
 ## File Format

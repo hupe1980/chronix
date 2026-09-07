@@ -438,7 +438,14 @@ impl ExecutionPlan for ChronixExec {
                         Precision::Inexact(ScalarValue::Boolean(Some(merged.max_i64 != 0))),
                         Precision::Absent,
                     ),
-                    // String/tag columns: no numeric min/max in zone maps.
+                    // String, tag and decimal columns: no usable numeric
+                    // min/max here. A decimal's zone map holds *mantissas*,
+                    // saturated into an `i64`, and a `ScalarValue` for the
+                    // column would have to carry its scale to mean anything;
+                    // reporting nothing costs a planner hint, reporting the
+                    // raw mantissa would cost correctness. Row-group pruning
+                    // still uses those bounds, in the mantissa domain where
+                    // they are meaningful — see `FieldPredicate`.
                     _ => (Precision::Absent, Precision::Absent, Precision::Absent),
                 };
 

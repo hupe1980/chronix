@@ -141,6 +141,95 @@ async fn grpc_write_and_query() {
     assert_eq!(total_rows, 2, "expected 2 query rows");
 }
 
+#[tokio::test]
+async fn grpc_carries_an_exact_decimal_both_ways() {
+    // Both directions matter and neither is the other's test: `decimal` on
+    // the way in has to parse the digits rather than a double, and on the
+    // way out the row encoder has to *have* an arm for the type — its
+    // catch-all logged at debug and left the column out of the response.
+    let (mut client, _endpoint, _tmp) = start_grpc_server().await;
+
+    let point = proto::Point {
+        measurement: "meter".to_string(),
+        tags: vec![proto::Tag {
+            key: "device".to_string(),
+            value: "main".to_string(),
+        }],
+        fields: vec![proto::Field {
+            key: "z1nb_q".to_string(),
+            value: Some(proto::FieldValue {
+                // Seventeen significant digits: past what a double holds.
+                value: Some(proto::field_value::Value::Decimal(
+                    "0.30000000000000004".to_string(),
+                )),
+            }),
+        }],
+        timestamp: 1_000_000,
+    };
+
+    let resp = client
+        .write(proto::WriteRequest {
+            points: vec![point],
+            backfill: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.written, 1);
+
+    let mut stream = client
+        .query(proto::QueryRequest {
+            measurement: "meter".to_string(),
+            range: Some(proto::TimeRange {
+                start: 0,
+                end: 10_000_000,
+            }),
+            tag_filters: vec![],
+            field_columns: vec![],
+            limit: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut seen = Vec::new();
+    while let Some(resp) = stream.message().await.unwrap() {
+        for row in resp.rows {
+            for field in row.fields {
+                match field.value.and_then(|v| v.value) {
+                    Some(proto::field_value::Value::Decimal(d)) => seen.push(d),
+                    other => panic!("expected a decimal field, got {other:?}"),
+                }
+            }
+        }
+    }
+    assert_eq!(seen, ["0.30000000000000004"]);
+}
+
+#[tokio::test]
+async fn grpc_refuses_a_decimal_it_cannot_parse() {
+    let (mut client, _endpoint, _tmp) = start_grpc_server().await;
+    let point = proto::Point {
+        measurement: "meter".to_string(),
+        tags: vec![],
+        fields: vec![proto::Field {
+            key: "v".to_string(),
+            value: Some(proto::FieldValue {
+                value: Some(proto::field_value::Value::Decimal("1.2.3".to_string())),
+            }),
+        }],
+        timestamp: 1,
+    };
+    let status = client
+        .write(proto::WriteRequest {
+            points: vec![point],
+            backfill: false,
+        })
+        .await
+        .expect_err("a malformed decimal must be refused, not stored as something else");
+    assert!(status.message().contains("decimal"), "{status:?}");
+}
+
 // ── Write with tag filter query ────────────────────────────────────────
 
 #[tokio::test]

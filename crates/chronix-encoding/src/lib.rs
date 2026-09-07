@@ -13,6 +13,7 @@
 //! | Floats | [`ChimpEncoder`] / [`GorillaEncoder`] — XOR-based | 1.3–4× |
 //! | Integers | [`IntegerEncoder`] — delta + ZigZag + bit-packing | 4–16× |
 //! | Integers | [`ForEncoder`] — Frame-of-Reference (narrow range) | 4–32× |
+//! | Decimals | [`DecimalEncoder`] — `i128` mantissa over the integer stack | 4–1000× |
 //! | Strings | [`DictionaryEncoder`] — string table + index | 4–64× |
 //! | Booleans | [`BitmapEncoder`] — 1 bit per value | 8× |
 //! | Any | [`PlainEncoder`] — uncompressed fallback | 1× |
@@ -49,6 +50,7 @@ pub mod alp;
 pub mod bitmap;
 pub mod chimp;
 pub(crate) mod coding;
+pub mod decimal;
 pub mod delta;
 pub mod dictionary;
 pub mod error;
@@ -66,6 +68,7 @@ pub use adaptive::{AdaptiveSelector, FloatPattern, IntegerPattern, StringPattern
 pub use alp::{AlpDecoder, AlpEncoder};
 pub use bitmap::{BitmapDecoder, BitmapEncoder};
 pub use chimp::{Chimp128Decoder, Chimp128Encoder, ChimpDecoder, ChimpEncoder};
+pub use decimal::{DecimalDecoder, DecimalEncoder};
 pub use delta::{DeltaOfDeltaDecoder, DeltaOfDeltaEncoder};
 pub use dictionary::{DictionaryDecoder, DictionaryEncoder};
 pub use error::EncodingError;

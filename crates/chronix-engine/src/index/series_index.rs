@@ -43,7 +43,8 @@ use crate::index::error::IndexError;
 /// File extension of the sidecar.
 pub const EXTENSION: &str = "series";
 const MAGIC: &[u8; 4] = b"CXSI";
-const VERSION: u8 = 2;
+/// Sidecar format version — 1, the first that ships.
+const VERSION: u8 = 1;
 /// False-positive rate of the bloom filter rebuilt from the index.
 const BLOOM_FPR: f64 = 0.01;
 

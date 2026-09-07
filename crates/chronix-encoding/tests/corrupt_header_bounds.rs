@@ -103,6 +103,43 @@ fn bitmap_rejects_an_absurd_value_count() {
     assert!(BitmapDecoder::decode(&block).is_err());
 }
 
+/// The exact-decimal codec, in both physical forms.
+///
+/// The wide form declares its own value count and then allocates a
+/// `Vec<i128>` of it, which is 16 bytes an element — the widest allocation
+/// any decoder here makes, and the reason `MAX_ELEMENT_BYTES` had to grow
+/// when this codec landed. The narrow form has no count of its own: it
+/// delegates to the `i64` stack, so its ceiling is whatever that block's is,
+/// and the interesting failure there is a tag that names *this* codec again.
+#[test]
+fn decimal_rejects_an_absurd_value_count() {
+    use chronix_encoding::DecimalDecoder;
+
+    // [form=1 wide][count u32][first i128]
+    let mut wide = vec![1u8];
+    wide.extend_from_slice(&ABSURD.to_le_bytes());
+    wide.extend_from_slice(&0i128.to_le_bytes());
+    assert!(
+        DecimalDecoder::decode(&wide).is_err(),
+        "an absurd value count must be refused before the allocation"
+    );
+
+    // A narrow block whose inner tag names the decimal codec again would
+    // recurse until the stack ran out.
+    let nested = [0u8, EncodingType::DecimalI128.tag(), 0, 0];
+    assert!(
+        DecimalDecoder::decode(&nested).is_err(),
+        "a nested decimal block must be refused, not decoded"
+    );
+
+    // And through the unified entry point, which is what a segment uses.
+    let block = EncodedBlock {
+        encoding: EncodingType::DecimalI128,
+        payload: wide,
+    };
+    assert!(ColumnDecoder::decode(&block).is_err());
+}
+
 /// Dictionary blocks carry *two* attacker-controlled counts: the value count
 /// and the dictionary entry count. Both drive an allocation.
 #[test]

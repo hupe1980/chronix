@@ -134,7 +134,20 @@ impl super::Chronix {
                 .retain(|canonical| !canonical.starts_with(&prefix));
         }
 
-        // 8. Evict measurement from caches and inverted index
+        // 8. Forget the measurement in the namespace index.
+        //
+        // That index answers "may this namespace see this measurement", and a
+        // dropped measurement exists for nobody. It follows the *measurement*
+        // rather than its rows on purpose: retention emptying a measurement
+        // must leave the table resolvable, or a tenant whose sensor went quiet
+        // for longer than the retention window gets a planning error where an
+        // empty result belongs.
+        self.namespace_measurements.retain(|_, set| {
+            set.remove(measurement);
+            !set.is_empty()
+        });
+
+        // 9. Evict measurement from caches and inverted index
         self.lvc.evict_measurement(measurement);
         for entry in &entries {
             self.tag_index.remove_segment(entry.segment_id);

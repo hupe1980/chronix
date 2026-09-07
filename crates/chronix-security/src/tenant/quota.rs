@@ -76,7 +76,7 @@ impl<'a> QuotaEnforcer<'a> {
     /// Hidden from public API — use `check_and_increment_write` instead.
     #[doc(hidden)]
     #[deprecated(
-        since = "0.2.0",
+        since = "0.3.0",
         note = "Non-atomic (TOCTOU). Use `check_and_increment_write` instead."
     )]
     pub fn check_write(&self, namespace: &str, new_series: u64, new_points: u64) -> Result<()> {

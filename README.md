@@ -19,6 +19,18 @@ crate.
   maintains itself: one built-in thread flushes, compacts, materialises
   rollups and enforces retention, so there is nothing to start and no
   daemon to run. Runs where a database *server* cannot.
+- **Exact where exactness is the point** — a `Decimal` field type (`i128`
+  mantissa × 10⁻ˢᶜᵃˡᵉ), because one class of time series is not a measurement
+  but a legal quantity: a quarter-hour meter register a settlement is computed
+  from, a price, an invoice line. `f64` cannot represent `0.1`, and a
+  settlement that went through a `double` is one nobody can reproduce. The
+  scale belongs to the **column**, fixed when it is created; a value with more
+  digits is refused rather than rounded; `SUM`, `MIN`, `MAX`, `FIRST` and
+  `LAST` — a rollup's included — stay exact in `i128`; SQL sees
+  `DECIMAL(38, s)`, and a decimal literal is a decimal, so arithmetic on a
+  register is exact too. It costs no compression: the mantissa *is* the
+  integer ALP and pco spend their first stage recovering from a double, worth
+  **475×** against 85× on noisy connection-point power.
 - **Analytics inside the engine** — statistical forecasting (SES, Holt,
   Holt-Winters, ARIMA/SARIMA), anomaly detection (Z-score, MAD, IQR,
   forecast-residual, CUSUM, seasonal thresholds), drift detection, and
@@ -173,7 +185,9 @@ Each claim below is pinned by a test; the depth is in the
   straight into Arrow columns. `examples/gateway_footprint.rs` prints **under
   25 MiB peak heap** for an hour of the design partner's workload — rollups
   and dashboards included — settling at 1.6 MiB, and
-  `DatabaseStatistics::resident_memory_bytes` breaks that down term by term.
+  `DatabaseStatistics::resident_memory_bytes` breaks that down term by term:
+  memtables, interners, the WAL buffer, the catalog and the segment metadata
+  index.
 - **Immutable `.csx` segments**: row groups, per-column stats, validity
   bitmaps, LZ4/Zstd with dictionary training, mmap reads, atomic
   temp→fsync→rename. Footer size is proportional to the data, not a fixed
@@ -195,6 +209,12 @@ Each claim below is pinned by a test; the depth is in the
   delete or an import into an already-aggregated range records an
   **invalidation** that the next pass recomputes, and retention drops raw data
   only once every tier it feeds has caught up.
+- **Retention measures age from `min(wall clock, newest timestamp held)`**, so
+  a wrong clock cannot empty the database and a gateway whose sensors go quiet
+  keeps its history; one fresh write resumes normal expiry. What it deletes it
+  also **releases** — the cardinality budget and the last-value cache are
+  re-derived from what is left, so device churn does not end in permanent
+  write refusal.
 - **A tier can be a calendar tier.** `every("1d").timezone("Europe/Berlin")`
   runs local midnight to local midnight — 23 or 25 hours on a daylight-saving
   day — and `every("1mo")` is a calendar month. The **unit decides**: sub-day
@@ -386,7 +406,7 @@ each against an in-process embedded database:
 `promql_queries`, `forecast`, `quantile_forecast`, `anomaly_detection`,
 `alerting`, `multivariate_analysis`, `preprocessing`, `model_lifecycle`,
 `continuous_forecast`, `encoding`, `schema_exploration`,
-`storage_lifecycle`, `delete_operations`, `gateway_footprint`,
+`storage_lifecycle`, `delete_operations`, `exact_decimals`, `gateway_footprint`,
 `signal_triggers`, `data_pipeline`, `cold_tier`, `authz`, `encryption`,
 `audit_logging`, `tenant_isolation`, `compute_engine`.
 

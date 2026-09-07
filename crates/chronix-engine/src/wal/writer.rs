@@ -5,7 +5,6 @@ use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
@@ -712,67 +711,6 @@ impl WalWriter {
         Ok(deleted)
     }
 
-    /// Delete WAL files older than `max_age` based on file modification time.
-    ///
-    /// This provides a time-based compaction strategy complementing the
-    /// sequence-based [`truncate_before`](Self::truncate_before). Useful when
-    /// callers want to bound WAL retention by wall-clock time rather than (or
-    /// in addition to) sequence numbers.
-    ///
-    /// Never deletes the active WAL file. Idempotent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WalError`] on I/O failure.
-    pub fn truncate_before_age(&self, max_age: Duration) -> Result<usize, WalError> {
-        let inner = self.inner.lock();
-        let current_path = inner.current_path.clone();
-        drop(inner);
-
-        let entries = list_wal_files(&self.dir)?;
-        let now = std::time::SystemTime::now();
-
-        let mut deleted = 0;
-        for (_file_start, path) in &entries {
-            // Never delete the current active file.
-            if *path == current_path {
-                continue;
-            }
-
-            let metadata = fs::metadata(path)?;
-            let modified = metadata.modified().map_err(|e| {
-                WalError::Io(io::Error::other(format!(
-                    "cannot read mtime of {}: {e}",
-                    path.display()
-                )))
-            })?;
-
-            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
-            if age >= max_age {
-                tracing::info!(
-                    path = %path.display(),
-                    age_secs = age.as_secs(),
-                    max_age_secs = max_age.as_secs(),
-                    "truncating WAL file (age-based)"
-                );
-                fs::remove_file(path)?;
-                deleted += 1;
-            }
-        }
-
-        // Fsync the WAL directory so that file removals are durable.
-        if deleted > 0 {
-            let dir_file = fs::File::open(&self.dir)?;
-            dir_file.sync_all()?;
-
-            // Update cached file count
-            let mut inner = self.inner.lock();
-            inner.cached_file_count = inner.cached_file_count.saturating_sub(deleted);
-        }
-
-        Ok(deleted)
-    }
-
     /// Archive WAL files whose maximum sequence ≤ `sequence_no` to `archive_dir`,
     /// then delete the originals.
     ///
@@ -1309,6 +1247,7 @@ pub(crate) fn list_wal_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicI64;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     thread_local! {
@@ -1692,55 +1631,6 @@ mod tests {
         let count2 = writer.truncate_before(2).unwrap();
         assert_eq!(count2, 0, "Second truncation should be a no-op");
         assert!(count1 > 0 || count2 == 0);
-    }
-
-    #[test]
-    fn truncation_by_age_removes_old_files() {
-        let dir = TempDir::new().unwrap();
-        let writer = WalWriter::open(dir.path(), small_config()).unwrap();
-
-        let payload = vec![0u8; 100];
-        for _ in 0..5 {
-            writer.append(&payload).unwrap();
-        }
-
-        let initial_count = writer.file_count().unwrap();
-        assert!(
-            initial_count >= 2,
-            "Expected multiple files, got {initial_count}"
-        );
-
-        // All files are brand-new, so max_age of 0 seconds should delete
-        // all non-active files.
-        let deleted = writer.truncate_before_age(Duration::from_secs(0)).unwrap();
-        assert!(deleted > 0, "Expected some files deleted by age");
-
-        let final_count = writer.file_count().unwrap();
-        assert!(final_count < initial_count);
-        // Active file must remain
-        assert!(final_count >= 1);
-    }
-
-    #[test]
-    fn truncation_by_age_preserves_recent_files() {
-        let dir = TempDir::new().unwrap();
-        let writer = WalWriter::open(dir.path(), small_config()).unwrap();
-
-        let payload = vec![0u8; 100];
-        for _ in 0..5 {
-            writer.append(&payload).unwrap();
-        }
-
-        let initial_count = writer.file_count().unwrap();
-        assert!(initial_count >= 2);
-
-        // max_age of 1 hour — no files should be old enough to delete.
-        let deleted = writer
-            .truncate_before_age(Duration::from_secs(3600))
-            .unwrap();
-        assert_eq!(deleted, 0, "No files should be old enough");
-
-        assert_eq!(writer.file_count().unwrap(), initial_count);
     }
 
     #[test]

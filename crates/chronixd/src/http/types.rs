@@ -335,6 +335,29 @@ pub struct MeasurementInfo {
     pub columns: Vec<ColumnInfo>,
 }
 
+/// Request body for declaring a field column before it is written.
+///
+/// `POST /api/v1/measurements/{name}/schema/fields`.
+///
+/// The reason this endpoint exists is decimals: a decimal column's scale is
+/// part of its type and is fixed by whatever creates the column, so letting
+/// the first meter reading decide how many fractional digits a settlement
+/// register keeps is a coin toss. Declaring it makes that a decision.
+#[derive(Debug, Deserialize)]
+pub struct DeclareFieldRequest {
+    /// Field (column) name.
+    pub name: String,
+    /// Column type, in the vocabulary the schema endpoint reports:
+    /// `float64`, `int64`, `uint64`, `bool`, `string`, or
+    /// `decimal(38, <scale>)`.
+    #[serde(rename = "type")]
+    pub column_type: String,
+    /// Fractional digits for a decimal column — a shorthand for writing
+    /// `decimal(38, 4)` in `type`. Ignored for every other type.
+    #[serde(default)]
+    pub scale: Option<u8>,
+}
+
 /// Column info in a measurement schema.
 #[derive(Debug, Serialize)]
 pub struct ColumnInfo {
@@ -476,6 +499,19 @@ pub(super) fn arrow_value_to_json(col: &dyn arrow::array::Array, idx: usize) -> 
                         .collect(),
                 )
             }),
+        // An exact decimal reaches JSON as its digits, in a string.
+        //
+        // A JSON number would be parsed back through an `f64` by every
+        // client on the planet, which is precisely the loss the column type
+        // exists to prevent — the value would survive storage, the query
+        // and the wire, and be destroyed by `JSON.parse`. The column's own
+        // type travels beside it in the result metadata
+        // (`decimal(38, s)`), so a string here is unambiguous.
+        DataType::Decimal128(_, _) => col
+            .as_any()
+            .downcast_ref::<arrow::array::Decimal128Array>()
+            .and_then(|a| crate::util::decimal_cell_to_string(a, idx))
+            .map_or(serde_json::Value::Null, serde_json::Value::String),
         _ => serde_json::Value::String(format!("<unsupported: {}>", col.data_type())),
     }
 }
@@ -518,7 +554,7 @@ pub(super) fn measurement_schema_to_info(
             columns.push(ColumnInfo {
                 name: col.name.clone(),
                 role: "field".to_string(),
-                data_type: Some(crate::util::column_type_to_str(col.column_type).to_string()),
+                data_type: Some(crate::util::column_type_to_str(col.column_type)),
             });
         }
     }

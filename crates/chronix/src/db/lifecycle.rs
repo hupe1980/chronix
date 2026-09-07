@@ -352,40 +352,6 @@ impl super::Chronix {
     ) -> Result<retention::RetentionResult> {
         self.check_open()?;
 
-        let now_ns = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        )
-        .unwrap_or(i64::MAX);
-        // Without a global rule nothing expires by age alone; the
-        // per-measurement pass below still runs.
-        let global_cutoff =
-            global_retention_ns.map_or(i64::MIN, |ns| retention::retention_cutoff(now_ns, ns));
-
-        // Build per-measurement cutoffs from config overrides, plus the
-        // retention each rollup declares for its own target measurement.
-        let mut per_measurement_cutoffs: std::collections::HashMap<String, i64> = self
-            .config
-            .measurement_retention
-            .iter()
-            .map(|(m, dur)| {
-                let retention_ns_m = i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX);
-                (
-                    m.clone(),
-                    retention::retention_cutoff(now_ns, retention_ns_m),
-                )
-            })
-            .collect();
-        for rollup in self.rollup_registry.read().list() {
-            if let Some(r) = rollup.retention_ns {
-                per_measurement_cutoffs
-                    .entry(rollup.target_measurement.clone())
-                    .or_insert_with(|| retention::retention_cutoff(now_ns, r));
-            }
-        }
-
         // Rollups first: a shard may only be dropped once every rollup its
         // measurements feed has been materialised past it.
         if let Err(e) = self.materialise_rollups() {
@@ -421,11 +387,73 @@ impl super::Chronix {
             (bounds, by_shard)
         };
 
+        // Every cutoff is measured from here, and it is deliberately *not*
+        // the wall clock: it is the clock capped by the newest timestamp the
+        // database holds, so one bad reading of the clock cannot delete
+        // everything and a gateway whose sensors went quiet keeps its
+        // history. See `retention::retention_reference`.
+        //
+        // Computed from the same snapshot the bounds came from, plus the
+        // shard live writes are landing in — a database whose newest data is
+        // still unflushed must not read as one that stopped writing. The
+        // shard's *start* is used rather than its end, which is the
+        // conservative direction: it can only hold data back.
+        let now_ns = Self::now_ns();
+        let newest_data_ns = {
+            let on_disk = shard_bounds.values().map(|b| b.1).max();
+            let shard_ns = i64::try_from(self.config.shard_duration.as_nanos()).unwrap_or(i64::MAX);
+            let in_memory = self
+                .shards
+                .active_shard()
+                .map(|s| s.0.saturating_mul(shard_ns));
+            match (on_disk, in_memory) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            }
+        };
+        let reference_ns = retention::retention_reference(now_ns, newest_data_ns);
+
+        // Without a global rule nothing expires by age alone; the
+        // per-measurement pass below still runs.
+        let global_cutoff = global_retention_ns
+            .map_or(i64::MIN, |ns| retention::retention_cutoff(reference_ns, ns));
+
+        // Build per-measurement cutoffs from config overrides, plus the
+        // retention each rollup declares for its own target measurement.
+        let mut per_measurement_cutoffs: std::collections::HashMap<String, i64> = self
+            .config
+            .measurement_retention
+            .iter()
+            .map(|(m, dur)| {
+                let retention_ns_m = i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX);
+                (
+                    m.clone(),
+                    retention::retention_cutoff(reference_ns, retention_ns_m),
+                )
+            })
+            .collect();
+        for rollup in self.rollup_registry.read().list() {
+            if let Some(r) = rollup.retention_ns {
+                per_measurement_cutoffs
+                    .entry(rollup.target_measurement.clone())
+                    .or_insert_with(|| retention::retention_cutoff(reference_ns, r));
+            }
+        }
+
         // Use the global cutoff for whole-shard drops.
         let expired = retention::shards_to_drop(&shard_bounds, global_cutoff);
 
         let mut total_segments: usize = 0;
         let mut total_bytes: u64 = 0;
+        // Shards this pass actually removed, and segments it declined to
+        // remove because a rollup still needs them. `shards_dropped` used to
+        // be `expired.len()` — the shards the pass *looked at* — so an
+        // operator watching a disk that would not shrink read
+        // "Retention enforced, shards=13" on every pass, for ever, while the
+        // pass deleted nothing. The tell for this class is a number that is
+        // always the same.
+        let mut shards_dropped: usize = 0;
+        let mut segments_preserved: usize = 0;
 
         for &shard_id in &expired {
             // From the same snapshot the bounds came from.
@@ -453,6 +481,7 @@ impl super::Chronix {
                 }
                 if !self.rollups_materialised_past(&entry.measurement, shard_end.saturating_add(1))
                 {
+                    segments_preserved += 1;
                     warn!(
                         segment_id = ?entry.segment_id,
                         measurement = %entry.measurement,
@@ -497,6 +526,7 @@ impl super::Chronix {
 
             // The shard's time index goes only when nothing in it survived.
             if protected.is_empty() {
+                shards_dropped += 1;
                 time_idx.remove(&shard_id);
             } else if let Some(ti) = time_idx.get_mut(&shard_id) {
                 for entry in &entries {
@@ -586,24 +616,122 @@ impl super::Chronix {
             }
         }
 
+        // A pass that removed segments changed what the database holds, so
+        // every value derived from that has to be repaired — the cardinality
+        // budget above all, because it is an admission limit.
+        if total_segments > 0 {
+            self.repair_live_series();
+        }
+
         let result = retention::RetentionResult {
-            shards_dropped: expired.len(),
+            shards_dropped,
             segments_deleted: total_segments,
+            segments_preserved,
             bytes_freed: total_bytes,
         };
 
-        if result.shards_dropped > 0 {
+        if result.shards_dropped > 0 || result.segments_deleted > 0 {
             counter!("chronix_retention_shards_dropped_total")
                 .increment(result.shards_dropped as u64);
             info!(
                 shards = result.shards_dropped,
                 segments = result.segments_deleted,
+                preserved = result.segments_preserved,
                 bytes = result.bytes_freed,
                 "Retention enforced"
+            );
+        } else if result.segments_preserved > 0 {
+            // Nothing was deleted *and* something was held back: the one
+            // case an operator investigating disk usage needs to see.
+            info!(
+                preserved = result.segments_preserved,
+                "Retention preserved every expired segment — rollups have not caught up"
             );
         }
 
         Ok(result)
+    }
+
+    /// Re-derive the cardinality budget from what the database still holds.
+    ///
+    /// `known_series` is the counter `max_series_cardinality` is checked
+    /// against on every write. It was maintained by writes and by whole-series
+    /// deletes, and **not by retention** — so a deployment with any tag churn
+    /// climbed towards the limit for ever and eventually refused every write,
+    /// with the data it was counting long since deleted. A restart healed it,
+    /// which is the tell: the admission decision depended on process uptime.
+    ///
+    /// A repair rather than a second counter, because this is a derived value
+    /// whose input keeps moving. It runs only on a pass that actually deleted
+    /// something, so the cost — one sidecar read per surviving segment, no
+    /// segment decoded — is paid once per shard rotation rather than per tick.
+    ///
+    /// The live set is the segments on disk **plus the memtables**: a series
+    /// written a second ago is in no segment yet.
+    pub(crate) fn repair_live_series(&self) {
+        let started = std::time::Instant::now();
+        // Memtables first, then the catalog — the order is load-bearing.
+        // Data only ever moves one way, memtable → segment, so a flush
+        // landing between the two reads is seen by the *second* one. Reading
+        // the catalog first would leave a window in which a series had been
+        // flushed out of the memtable and its segment had not yet been read,
+        // and the repair would release a series whose data is on disk.
+        let in_memory = self.shards.live_series();
+        let on_disk = Self::series_on_disk(&self.catalog.read());
+        let before = self.known_series.len();
+        self.known_series
+            .retain(|k| on_disk.contains(k.as_str()) || in_memory.contains(k.as_str()));
+        let released = before.saturating_sub(self.known_series.len());
+        if released == 0 {
+            return;
+        }
+
+        // The last-value cache is a copy of each series' newest row, so it
+        // has to forget the series the data no longer holds — otherwise a
+        // device offline for longer than the retention window went on
+        // answering `last_value()` with a reading nothing else can return.
+        // Asked as a predicate rather than handed a set, so a million-series
+        // budget is not copied to prune a cache.
+        self.lvc
+            .retain_series(|canonical| self.known_series.contains(canonical));
+
+        // The namespace index is deliberately *not* pruned here. It answers
+        // "may this namespace see this measurement", and a tenant whose
+        // sensor went quiet for longer than the retention window must still
+        // be able to query the table — a scoped `table_exist` that says no
+        // turns an empty graph into a planning error. The index follows the
+        // measurement, so it is pruned where a measurement is *dropped*.
+
+        metrics::counter!("chronix_series_released_total").increment(released as u64);
+        // The duration is reported because the pass is linear in the total
+        // number of series entries across every surviving segment's sidecar,
+        // and it runs on the maintenance thread — the same thread a full
+        // memtable is waiting on. Measured at 25 ms for 500 segments × 50
+        // series and 2.0 s for 8 000 × 500, so an operator seeing the latter
+        // is seeing a real stall rather than guessing about one.
+        info!(
+            released,
+            remaining = self.known_series.len(),
+            duration_ms = started.elapsed().as_millis(),
+            "Cardinality budget released for series whose data is gone"
+        );
+    }
+
+    /// The canonical form of every series the active segments hold, read from
+    /// the per-segment series sidecars — no segment is decoded.
+    fn series_on_disk(
+        catalog: &chronix_engine::index::SegmentCatalog,
+    ) -> std::collections::HashSet<String> {
+        let mut known = std::collections::HashSet::new();
+        for entry in catalog.all_segments() {
+            if entry.state != SegmentState::Active {
+                continue;
+            }
+            for key in Self::series_keys_of(&entry.path, &entry.measurement) {
+                known.insert(key.canonical_form().to_string());
+            }
+        }
+        known
     }
 
     // ── Compaction ──────────────────────────────────────────────────
@@ -779,6 +907,7 @@ impl super::Chronix {
                                             name: cm.name.clone(),
                                             data_type: cm.data_type,
                                             role: cm.role,
+                                            decimal_scale: cm.decimal_scale,
                                             stats: cm.stats.clone(),
                                         })
                                         .collect();
@@ -1028,6 +1157,13 @@ impl super::Chronix {
             counter!("chronix_gc_segments_deleted_total").increment(removed as u64);
             info!(segments = removed, "GC: hard-deleted expired segments");
 
+            // Same repair retention runs, for the same reason: hard-deleting
+            // a segment can be the moment a series stops existing.
+            drop(blooms);
+            drop(time_idx);
+            drop(catalog);
+            self.repair_live_series();
+
             // After GC removes segments, garbage-collect tombstones
             // whose target segments no longer exist in any active segment.
             let tombstones_removed = self.gc_tombstones();
@@ -1188,6 +1324,7 @@ impl super::Chronix {
                     name: cm.name.clone(),
                     data_type: cm.data_type,
                     role: cm.role,
+                    decimal_scale: cm.decimal_scale,
                     stats: cm.stats.clone(),
                 })
                 .collect();

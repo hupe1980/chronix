@@ -21,7 +21,7 @@ use chronixd::server::build_router;
 
 /// Spin up a test HTTP server backed by a fresh temp database.
 /// Returns the base URL and temp dir handle (must be kept alive).
-async fn start_test_server() -> (String, TempDir) {
+pub(crate) async fn start_test_server() -> (String, TempDir) {
     let tmp = TempDir::new().expect("tempdir");
     let config = ChronixConfigBuilder::default()
         .data_dir(tmp.path().to_path_buf())
@@ -79,7 +79,7 @@ async fn start_test_server() -> (String, TempDir) {
 /// These suites never call `server::run`, so nothing else installs it — and
 /// `reqwest` panics inside `Client::builder().build()` rather than returning
 /// an error when it is missing.
-fn client() -> reqwest::Client {
+pub(crate) fn client() -> reqwest::Client {
     chronixd::tls::ensure_crypto_provider();
     reqwest::Client::new()
 }

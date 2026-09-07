@@ -433,6 +433,23 @@ impl Memtable {
         results
     }
 
+    /// The canonical form of every series this memtable holds.
+    ///
+    /// The cardinality budget is derived from what the database holds, and a
+    /// memtable holds series no segment does yet — so a repair that consulted
+    /// only the segments on disk would release a series written a second ago
+    /// and then count it again on the next write.
+    ///
+    /// `series_tags` is already keyed by canonical form, so this walks the
+    /// map rather than scanning the points.
+    #[must_use]
+    pub fn series_canonical_forms(&self) -> Vec<Arc<str>> {
+        self.series_tags
+            .iter()
+            .map(|e| Arc::clone(e.key()))
+            .collect()
+    }
+
     /// Returns the number of entries in the memtable.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1192,6 +1209,12 @@ enum FieldBuilder {
     U64(arrow::array::UInt64Builder),
     Bool(arrow::array::BooleanBuilder),
     Str(arrow::array::StringBuilder),
+    /// An exact decimal column, with the scale the first value carried.
+    ///
+    /// The scale is fixed for the column by the write path, which rescales
+    /// every value to the schema's declared scale before it reaches the
+    /// memtable — so the first value's scale is the column's scale.
+    Decimal(arrow::array::Decimal128Builder, u8),
 }
 
 impl FieldBuilder {
@@ -1203,6 +1226,20 @@ impl FieldBuilder {
             V::U64(_) => Self::U64(arrow::array::UInt64Builder::new()),
             V::Bool(_) => Self::Bool(arrow::array::BooleanBuilder::new()),
             V::String(_) => Self::Str(arrow::array::StringBuilder::new()),
+            // The Arrow type is set on the builder rather than on the
+            // finished array: `with_precision_and_scale` re-validates every
+            // value and can fail, and there is no honest thing to return
+            // from a failure here. The scale comes from a validated
+            // `Decimal`, so it is inside Arrow's range by construction.
+            V::Decimal(d) => Self::Decimal(
+                arrow::array::Decimal128Builder::new().with_data_type(
+                    arrow::datatypes::DataType::Decimal128(
+                        chronix_core::DECIMAL_PRECISION,
+                        d.scale() as i8,
+                    ),
+                ),
+                d.scale(),
+            ),
         };
         for _ in 0..rows_before {
             b.append_null();
@@ -1217,6 +1254,7 @@ impl FieldBuilder {
             Self::U64(b) => b.append_null(),
             Self::Bool(b) => b.append_null(),
             Self::Str(b) => b.append_null(),
+            Self::Decimal(b, _) => b.append_null(),
         }
     }
 
@@ -1231,6 +1269,14 @@ impl FieldBuilder {
             (Self::U64(b), V::U64(x)) => b.append_value(*x),
             (Self::Bool(b), V::Bool(x)) => b.append_value(*x),
             (Self::Str(b), V::String(x)) => b.append_value(x),
+            // A value at another scale is rescaled rather than dropped: the
+            // write path has already normalised the batch, so reaching this
+            // means the value came from somewhere that had not — and a
+            // lossless widening is still the right answer.
+            (Self::Decimal(b, scale), V::Decimal(x)) => match x.rescale(*scale) {
+                Ok(v) => b.append_value(v.mantissa()),
+                Err(_) => b.append_null(),
+            },
             (this, _) => this.append_null(),
         }
     }
@@ -1243,6 +1289,10 @@ impl FieldBuilder {
             Self::U64(mut b) => (DataType::UInt64, Arc::new(b.finish())),
             Self::Bool(mut b) => (DataType::Boolean, Arc::new(b.finish())),
             Self::Str(mut b) => (DataType::Utf8, Arc::new(b.finish())),
+            Self::Decimal(mut b, scale) => {
+                let dt = DataType::Decimal128(chronix_core::DECIMAL_PRECISION, scale as i8);
+                (dt, Arc::new(b.finish()))
+            }
         }
     }
 }

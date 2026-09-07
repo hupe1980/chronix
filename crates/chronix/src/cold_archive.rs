@@ -145,6 +145,18 @@ impl Chronix {
             ));
         }
 
+        // The wall clock, deliberately uncapped — unlike retention, which
+        // measures age from `min(clock, newest timestamp held)` so that one
+        // bad reading of the clock cannot empty the database.
+        //
+        // The rule is: **cap what cannot be undone.** A retention pass
+        // deletes; a clock a century ahead therefore destroys everything
+        // irreversibly, and the cap is worth what it costs. Archiving
+        // *moves* — the rows stay queryable through the archive table — so
+        // the worst a wrong clock does here is tier the hot window early,
+        // which is slow rather than lost. Capping it would cost more than it
+        // buys: a database that stops receiving writes would stop tiering,
+        // which is exactly when a gateway wants old data off its SD card.
         let now_ns = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -487,6 +499,17 @@ impl Chronix {
                 outcome.segments += 1;
                 outcome.bytes += entry.byte_size;
             }
+        }
+        drop(blooms);
+        drop(time_idx);
+        drop(catalog);
+
+        // Archiving is a delete from the hot database, so the values derived
+        // from what it holds — the cardinality budget, the namespace index,
+        // the last-value cache — are repaired here as they are after
+        // retention.
+        if outcome.segments > 0 {
+            self.repair_live_series();
         }
     }
 }

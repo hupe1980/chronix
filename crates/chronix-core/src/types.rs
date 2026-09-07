@@ -350,8 +350,29 @@ impl fmt::Display for ShardId {
 
 /// A typed field value in a time-series data point.
 ///
-/// Chronix supports five field types matching the `InfluxDB` Line Protocol model
-/// extended with unsigned integers and bytes.
+/// The `InfluxDB` Line Protocol model — float, integer, boolean, string —
+/// extended with unsigned integers and with [`Decimal`](crate::Decimal), which is the one
+/// variant that is not a measurement but a quantity: an exact
+/// `mantissa × 10⁻ˢᶜᵃˡᵉ`, for meter registers, prices and anything else a
+/// settlement is computed from.
+///
+/// # Choosing between `F64` and `Decimal`
+///
+/// The question is not "how precise does this need to be" but "what kind of
+/// number is this":
+///
+/// | | `F64` | `Decimal` |
+/// |---|---|---|
+/// | A sensor reading, a rate, a ratio | ✓ | |
+/// | A quantity someone is billed for, or that a regulator audits | | ✓ |
+/// | Arithmetic | fast, approximate | exact, checked |
+/// | Aggregation | `SUM`/`AVG` in `f64` | `SUM`/`MIN`/`MAX` exact |
+/// | Statistics (`stddev`, forecasting, anomaly detection) | native | needs an explicit cast |
+///
+/// `F64` cannot represent `0.1`, and a settlement computed from values that
+/// went through a `double` is one nobody can reproduce. `Decimal` never
+/// touches binary floating point: not on the way in, not in the WAL, not in
+/// a segment, not in a query result. See [`crate::decimal`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FieldValue {
     /// 64-bit IEEE 754 floating-point number.
@@ -364,6 +385,14 @@ pub enum FieldValue {
     Bool(bool),
     /// UTF-8 string value.
     String(String),
+    /// Exact fixed-point decimal — `mantissa × 10⁻ˢᶜᵃˡᵉ`.
+    ///
+    /// The scale is a property of the *column*, not of the point: the first
+    /// write to a decimal field fixes it, and every later value is rescaled
+    /// to it losslessly or rejected. Declare it up front with
+    /// [`declare_field`](../../chronix/struct.Chronix.html#method.declare_field)
+    /// when the first value might not carry the intended number of digits.
+    Decimal(crate::decimal::Decimal),
 }
 
 impl FieldValue {
@@ -377,14 +406,47 @@ impl FieldValue {
             Self::U64(_) => "u64",
             Self::Bool(_) => "bool",
             Self::String(_) => "string",
+            Self::Decimal(_) => "decimal",
         }
     }
 
     /// Returns `true` if this value is the same type as `other`.
+    ///
+    /// Two decimals are "the same type" here whatever their scales: the
+    /// scale belongs to the column, and [`ColumnType::accepts_value`] is
+    /// what decides whether a particular value fits a particular column.
+    ///
+    /// [`ColumnType::accepts_value`]: crate::ColumnType::accepts_value
     #[inline]
     #[must_use]
     pub fn same_type_as(&self, other: &Self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+
+    /// Returns `true` if this is an exact [`Decimal`](crate::Decimal).
+    #[inline]
+    #[must_use]
+    pub const fn is_decimal(&self) -> bool {
+        matches!(self, Self::Decimal(_))
+    }
+
+    /// The value as an `f64` — **lossy for decimals**, and `None` for
+    /// booleans and strings.
+    ///
+    /// Every caller that reduces a field to a float goes through here so
+    /// that the one type for which that is a loss is visible at the call
+    /// site rather than buried in a `match` arm.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn as_f64_lossy(&self) -> Option<f64> {
+        match self {
+            Self::F64(v) => Some(*v),
+            Self::I64(v) => Some(*v as f64),
+            Self::U64(v) => Some(*v as f64),
+            Self::Decimal(d) => Some(d.to_f64_lossy()),
+            Self::Bool(_) | Self::String(_) => None,
+        }
     }
 }
 
@@ -400,6 +462,9 @@ impl fmt::Display for FieldValue {
                 let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
                 write!(f, "\"{escaped}\"")
             }
+            // `d` beside line protocol's `i` and `u`: a Chronix extension,
+            // because Influx has no exact type to borrow a suffix from.
+            Self::Decimal(v) => write!(f, "{v}d"),
         }
     }
 }
@@ -437,6 +502,12 @@ impl From<String> for FieldValue {
 impl From<&str> for FieldValue {
     fn from(v: &str) -> Self {
         Self::String(v.to_owned())
+    }
+}
+
+impl From<crate::decimal::Decimal> for FieldValue {
+    fn from(v: crate::decimal::Decimal) -> Self {
+        Self::Decimal(v)
     }
 }
 
@@ -1313,6 +1384,23 @@ impl Point {
     #[inline]
     pub fn field_keys(&self) -> impl Iterator<Item = &str> {
         self.fields.iter().map(|(k, _)| k.as_ref())
+    }
+
+    /// Replace an existing field's value in place, returning `false` when
+    /// the field is not present.
+    ///
+    /// The field set is fixed at construction, so this cannot change the
+    /// sort order or the point's validity — it exists for the one caller
+    /// that rewrites a value without rewriting the point: rescaling a
+    /// decimal to its column's declared scale on the write path.
+    pub fn set_field(&mut self, key: &str, value: FieldValue) -> bool {
+        match self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(key)) {
+            Ok(idx) => {
+                self.fields[idx].1 = value;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Returns the timestamp.

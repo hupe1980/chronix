@@ -27,52 +27,39 @@
 use chronix_encoding::{ColumnDecoder, EncodedBlock, EncodingType};
 use proptest::prelude::*;
 
-/// Every encoding, mirroring the fuzz target.
+/// Every encoding, from the list the enum itself is generated from.
 ///
-/// This list must stay exhaustive and the compiler cannot check that: an
-/// omission is invisible, because the decoder simply never gets exercised.
-/// `every_encoding_is_covered` below is the guard.
-const ENCODINGS: &[EncodingType] = &[
-    EncodingType::DeltaOfDelta,
-    EncodingType::Chimp,
-    EncodingType::Chimp128,
-    EncodingType::Gorilla,
-    EncodingType::Patas,
-    EncodingType::Alp,
-    EncodingType::Pco,
-    EncodingType::PcoI64,
-    EncodingType::PcoU64,
-    EncodingType::IntegerI64,
-    EncodingType::IntegerU64,
-    EncodingType::VarintI64,
-    EncodingType::VarintU64,
-    EncodingType::ForI64,
-    EncodingType::ForU64,
-    EncodingType::Dictionary,
-    EncodingType::Bitmap,
-    EncodingType::Rle,
-    EncodingType::Nullable,
-    EncodingType::PlainF64,
-    EncodingType::PlainI64,
-    EncodingType::PlainU64,
-    EncodingType::PlainBool,
-    EncodingType::PlainString,
-];
+/// This was a hand-written array guarded by `len() == 24`, which compares
+/// the list against a *literal*: it catches someone shrinking the list and
+/// is silent when a codec is added to the enum and not to it. `DecimalI128`
+/// went in that way — an unfuzzed decoder with `every_encoding_is_covered`
+/// passing beside it. `EncodingType::ALL` comes from the macro that declares
+/// the enum, so the list is complete by construction, as the fuzz target's
+/// already was.
+const ENCODINGS: &[EncodingType] = EncodingType::ALL;
 
-/// The count is asserted so that adding a codec without adding it here fails
-/// loudly instead of silently reducing coverage.
+/// The two lists that must agree are the same list, and this says so — a
+/// codec added to the enum reaches every proptest below without an edit.
 #[test]
 fn every_encoding_is_covered() {
-    assert_eq!(
-        ENCODINGS.len(),
-        24,
-        "the encoding list must stay exhaustive — a missing entry is invisible \
-         coverage loss, not a compile error"
+    assert!(
+        ENCODINGS.len() >= 25,
+        "the codec list shrank to {} — a decoder removed from `EncodingType` is a \
+         format change, not a refactor",
+        ENCODINGS.len()
     );
-    let mut seen = ENCODINGS.to_vec();
-    seen.sort_by_key(|e| format!("{e:?}"));
-    seen.dedup_by_key(|e| format!("{e:?}"));
-    assert_eq!(seen.len(), ENCODINGS.len(), "duplicate entry in the list");
+    assert!(
+        ENCODINGS.contains(&EncodingType::DecimalI128),
+        "the exact-decimal codec must be fuzzed like every other"
+    );
+    let mut seen: Vec<String> = ENCODINGS.iter().map(|e| format!("{e:?}")).collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        ENCODINGS.len(),
+        "duplicate entry in `EncodingType::ALL`"
+    );
 }
 
 proptest! {

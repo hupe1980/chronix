@@ -9,6 +9,12 @@ message FieldValue {
         uint64 u64_value = 3;
         bool bool_value = 4;
         string string_value = 5;
+        /// An exact fixed-point decimal, as its digits: "1234.5678".
+        ///
+        /// A string, for the same reason `chronixd`'s own proto sends one:
+        /// every numeric proto scalar is binary, so `double` would lose the
+        /// value and there is no 128-bit integer to carry a mantissa in.
+        string decimal_value = 6;
     }
 }
 

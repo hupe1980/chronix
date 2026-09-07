@@ -164,6 +164,12 @@ encoding_types! {
     PcoI64 = 22, "pco_i64";
     /// Pcodec for unsigned integers.
     PcoU64 = 23, "pco_u64";
+    /// Exact decimal mantissas (`i128`) — see [`crate::decimal`].
+    ///
+    /// Not a codec of its own so much as a shape: the narrow form, which is
+    /// nearly every real decimal column, delegates straight to the `i64`
+    /// stack above and therefore inherits RLE, FOR, varint and pco.
+    DecimalI128 = 24, "decimal-i128";
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +572,25 @@ impl ColumnEncoder {
         })
     }
 
+    /// Encode a column of decimal mantissas.
+    ///
+    /// The scale is *not* encoded here: it belongs to the column, is stored
+    /// once in the segment's column metadata, and is the same for every
+    /// value in the column by construction — the write path rescales each
+    /// value to its column's declared scale before it reaches the memtable.
+    /// What is left is a column of integers, which is exactly what the
+    /// integer codecs are best at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is empty.
+    pub fn encode_decimal(values: &[i128]) -> Result<EncodedBlock> {
+        Ok(EncodedBlock {
+            encoding: EncodingType::DecimalI128,
+            payload: crate::decimal::DecimalEncoder::encode(values)?,
+        })
+    }
+
     // ── Nullable encoding methods ────────────────────────────────────
 
     /// Encode a nullable float column.
@@ -704,6 +729,36 @@ impl ColumnEncoder {
         ))
     }
 
+    /// Encode a nullable decimal column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is empty.
+    pub fn encode_decimal_nullable(values: &[Option<i128>]) -> Result<EncodedBlock> {
+        if values.is_empty() {
+            return Err(EncodingError::EmptyInput {
+                context: "nullable decimal encoder",
+            });
+        }
+        let validity: Vec<bool> = values.iter().map(std::option::Option::is_some).collect();
+        let non_null: Vec<i128> = values.iter().filter_map(|v| *v).collect();
+        if non_null.is_empty() {
+            return Ok(wrap_nullable(
+                EncodingType::DecimalI128,
+                values.len(),
+                &validity,
+                &[],
+            ));
+        }
+        let inner = Self::encode_decimal(&non_null)?;
+        Ok(wrap_nullable(
+            inner.encoding,
+            values.len(),
+            &validity,
+            &inner.payload,
+        ))
+    }
+
     /// Encode a nullable boolean column.
     ///
     /// # Errors
@@ -758,6 +813,9 @@ pub enum DecodedColumn {
     Bool(Vec<bool>),
     /// UTF-8 string values.
     String(Vec<String>),
+    /// Exact decimal mantissas — `mantissa × 10⁻ˢᶜᵃˡᵉ`, with the scale held
+    /// by the column rather than by each value.
+    Decimal(Vec<i128>),
     /// Nullable signed 64-bit integers.
     NullableI64(Vec<Option<i64>>),
     /// Nullable unsigned 64-bit integers.
@@ -768,6 +826,8 @@ pub enum DecodedColumn {
     NullableBool(Vec<Option<bool>>),
     /// Nullable UTF-8 string values.
     NullableString(Vec<Option<String>>),
+    /// Nullable decimal mantissas.
+    NullableDecimal(Vec<Option<i128>>),
 }
 
 /// Bitwise f64 comparison helper (NaN-safe: NaN == NaN).
@@ -798,6 +858,8 @@ impl PartialEq for DecodedColumn {
             (Self::NullableF64(a), Self::NullableF64(b)) => opt_f64_slice_eq(a, b),
             (Self::NullableBool(a), Self::NullableBool(b)) => a == b,
             (Self::NullableString(a), Self::NullableString(b)) => a == b,
+            (Self::Decimal(a), Self::Decimal(b)) => a == b,
+            (Self::NullableDecimal(a), Self::NullableDecimal(b)) => a == b,
             _ => false,
         }
     }
@@ -818,6 +880,8 @@ impl DecodedColumn {
             Self::NullableF64(v) => v.len(),
             Self::NullableBool(v) => v.len(),
             Self::NullableString(v) => v.len(),
+            Self::Decimal(v) => v.len(),
+            Self::NullableDecimal(v) => v.len(),
         }
     }
 
@@ -937,6 +1001,10 @@ impl ColumnDecoder {
                 let values = ForDecoder::decode_u64(&block.payload)?;
                 Ok(DecodedColumn::U64(values))
             }
+            EncodingType::DecimalI128 => {
+                let values = crate::decimal::DecimalDecoder::decode(&block.payload)?;
+                Ok(DecodedColumn::Decimal(values))
+            }
         }
     }
 
@@ -1010,6 +1078,9 @@ impl ColumnDecoder {
                 EncodingType::Bitmap | EncodingType::PlainBool => {
                     Ok(DecodedColumn::NullableBool(vec![None; total_count]))
                 }
+                EncodingType::DecimalI128 => {
+                    Ok(DecodedColumn::NullableDecimal(vec![None; total_count]))
+                }
                 _ => Err(EncodingError::CorruptData {
                     detail: format!("unexpected inner encoding in nullable: {inner_enc}"),
                 }),
@@ -1031,6 +1102,9 @@ impl ColumnDecoder {
             DecodedColumn::Bool(vals) => Ok(DecodedColumn::NullableBool(scatter(vals, &validity))),
             DecodedColumn::String(vals) => {
                 Ok(DecodedColumn::NullableString(scatter(vals, &validity)))
+            }
+            DecodedColumn::Decimal(vals) => {
+                Ok(DecodedColumn::NullableDecimal(scatter(vals, &validity)))
             }
             _ => Err(EncodingError::CorruptData {
                 detail: "unexpected decoded type in nullable wrapper".to_string(),

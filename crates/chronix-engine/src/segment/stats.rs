@@ -133,6 +133,26 @@ impl ColumnStats {
         self.value_count += 1;
     }
 
+    /// Update statistics with a new decimal mantissa.
+    ///
+    /// The mantissa is an `i128` and `min_value`/`max_value` are `i64`, so
+    /// the zone map records a *saturated* range. That is deliberate and
+    /// safe in the only direction that matters: a saturated bound is wider
+    /// than the true one, so a row group is never pruned that might have
+    /// matched — the predicate simply stops being selective above 19
+    /// digits. `sum_i128` stays exact, because a sum is an answer rather
+    /// than a hint.
+    pub fn update_decimal(&mut self, mantissa: i128) {
+        let clamped =
+            i64::try_from(mantissa).unwrap_or(if mantissa > 0 { i64::MAX } else { i64::MIN });
+        self.min_value = self.min_value.min(clamped);
+        self.max_value = self.max_value.max(clamped);
+        // Saturating rather than wrapping: an overflowed sum is a wrong
+        // answer, and this field is only ever a hint for the planner.
+        self.sum_i128 = self.sum_i128.saturating_add(mantissa);
+        self.value_count += 1;
+    }
+
     /// Update statistics with a new `f64` value.
     ///
     /// Uses [`f64_to_ordered_i64`] for correct ordering of negative values.

@@ -40,8 +40,11 @@ pub use writer::WalWriter;
 /// WAL file magic bytes.
 pub const WAL_MAGIC: &[u8; 4] = b"CXWL";
 
-/// Current WAL format version.
-pub const WAL_VERSION: u16 = 2;
+/// Current WAL format version — 1, the first that ships.
+///
+/// Checked for equality by the reader. The number counts released formats,
+/// not the times the layout changed before anyone could see one.
+pub const WAL_VERSION: u16 = 1;
 
 /// WAL file header size: 4 (magic) + 2 (version) = 6 bytes.
 pub const WAL_HEADER_SIZE: usize = 6;

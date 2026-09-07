@@ -532,6 +532,12 @@ pub struct BucketAccumulator {
 }
 
 /// Per-field running statistics for aggregation.
+///
+/// Two tracks: an `f64` one for every ordinary column, and an exact `i128`
+/// one that exists only once a decimal value has been seen. A rollup of a
+/// quarter-hour settlement register into a daily total has to be the same
+/// number the fifteen-minute rows add up to, and a `double` cannot promise
+/// that — see [`chronix_query::DecimalTrack`].
 #[derive(Debug, Clone)]
 struct FieldStats {
     sum: f64,
@@ -542,6 +548,8 @@ struct FieldStats {
     first_value: f64,
     last_ts: i64,
     last_value: f64,
+    /// The exact track, allocated only for a decimal column.
+    decimal: Option<Box<chronix_query::DecimalTrack>>,
 }
 
 impl FieldStats {
@@ -555,7 +563,38 @@ impl FieldStats {
             first_value: 0.0,
             last_ts: i64::MIN,
             last_value: 0.0,
+            decimal: None,
         }
+    }
+
+    /// Fold one exact decimal mantissa into the running statistics.
+    fn update_decimal(&mut self, mantissa: i128, scale: u8, timestamp: i64) {
+        let track = self
+            .decimal
+            .get_or_insert_with(|| Box::new(chronix_query::DecimalTrack::new(scale)));
+        let Some(m) = track.align(mantissa, scale) else {
+            track.overflow = true;
+            return;
+        };
+        match track.sum.checked_add(m) {
+            Some(sum) => track.sum = sum,
+            None => track.overflow = true,
+        }
+        if m < track.min {
+            track.min = m;
+        }
+        if m > track.max {
+            track.max = m;
+        }
+        if timestamp < self.first_ts {
+            self.first_ts = timestamp;
+            track.first = m;
+        }
+        if timestamp >= self.last_ts {
+            self.last_ts = timestamp;
+            track.last = m;
+        }
+        self.count += 1;
     }
 
     fn update(&mut self, value: f64, timestamp: i64) {
@@ -598,13 +637,30 @@ impl BucketAccumulator {
             .update(value, timestamp);
     }
 
+    /// Accumulate an exact decimal for a field, keeping it exact.
+    pub fn accumulate_decimal(
+        &mut self,
+        field: &str,
+        value: chronix_core::Decimal,
+        timestamp: i64,
+    ) {
+        self.stats
+            .entry(field.to_string())
+            .or_insert_with(FieldStats::new)
+            .update_decimal(value.mantissa(), value.scale(), timestamp);
+    }
+
     /// Emit aggregated values for the requested functions.
     ///
     /// Fields where every value was NaN (count == 0) are silently omitted
     /// to avoid emitting sentinel values (`f64::MAX`, `f64::MIN`, `0.0`)
     /// that would corrupt downstream dashboards and alerts.
     #[must_use]
-    pub fn emit(&self, agg_fns: &[RollupAggFn]) -> BTreeMap<String, BTreeMap<RollupAggFn, f64>> {
+    pub fn emit(
+        &self,
+        agg_fns: &[RollupAggFn],
+    ) -> BTreeMap<String, BTreeMap<RollupAggFn, chronix_query::AggResult>> {
+        use chronix_query::AggResult;
         let mut result = BTreeMap::new();
         for (field, stats) in &self.stats {
             // Skip fields with no valid observations — all values were NaN.
@@ -613,24 +669,32 @@ impl BucketAccumulator {
             }
             let mut aggs = BTreeMap::new();
             for &agg_fn in agg_fns {
-                let value = match agg_fn {
-                    RollupAggFn::Avg => {
-                        if stats.count > 0 {
-                            #[allow(clippy::cast_precision_loss)]
-                            {
-                                stats.sum / stats.count as f64
-                            }
-                        } else {
-                            0.0
-                        }
+                // A count is a count whatever the column holds; every other
+                // aggregate of an exact column stays exact.
+                #[allow(clippy::cast_precision_loss)]
+                let value = if agg_fn == RollupAggFn::Count {
+                    AggResult::F64(stats.count as f64)
+                } else if let Some(track) = stats.decimal.as_deref() {
+                    match agg_fn {
+                        RollupAggFn::Avg => track.avg_result(stats.count),
+                        RollupAggFn::Min => track.at(track.min),
+                        RollupAggFn::Max => track.at(track.max),
+                        RollupAggFn::Sum => track.sum_result(),
+                        RollupAggFn::First => track.at(track.first),
+                        RollupAggFn::Last => track.at(track.last),
+                        RollupAggFn::Count => unreachable!("handled above"),
                     }
-                    RollupAggFn::Min => stats.min,
-                    RollupAggFn::Max => stats.max,
-                    RollupAggFn::Sum => stats.sum,
+                } else {
                     #[allow(clippy::cast_precision_loss)]
-                    RollupAggFn::Count => stats.count as f64,
-                    RollupAggFn::First => stats.first_value,
-                    RollupAggFn::Last => stats.last_value,
+                    AggResult::F64(match agg_fn {
+                        RollupAggFn::Avg => stats.sum / stats.count as f64,
+                        RollupAggFn::Min => stats.min,
+                        RollupAggFn::Max => stats.max,
+                        RollupAggFn::Sum => stats.sum,
+                        RollupAggFn::First => stats.first_value,
+                        RollupAggFn::Last => stats.last_value,
+                        RollupAggFn::Count => unreachable!("handled above"),
+                    })
                 };
                 aggs.insert(agg_fn, value);
             }
@@ -704,7 +768,9 @@ impl<'a> RollupAccumulator<'a> {
     /// Fold one batch in. Returns the rollup points of every bucket that is
     /// now provably complete.
     pub fn push(&mut self, batch: &arrow::record_batch::RecordBatch) -> Vec<chronix_core::Point> {
-        use arrow::array::{Array, Float64Array, Int64Array, StringArray, UInt64Array};
+        use arrow::array::{
+            Array, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+        };
 
         let Ok(ts_idx) = batch.schema().index_of(chronix_core::TIME_COLUMN) else {
             return Vec::new();
@@ -731,6 +797,12 @@ impl<'a> RollupAccumulator<'a> {
                         arrow::datatypes::DataType::Float64
                             | arrow::datatypes::DataType::Int64
                             | arrow::datatypes::DataType::UInt64
+                            // A decimal column is the one a rollup matters
+                            // most for — a daily total of quarter-hour
+                            // settlement registers — and leaving it off this
+                            // list produced no rollup, no error, and then a
+                            // retention pass that dropped the raw rows.
+                            | arrow::datatypes::DataType::Decimal128(_, _)
                     )
             })
             .map(|(i, f)| (i, f.name().clone()))
@@ -766,6 +838,18 @@ impl<'a> RollupAccumulator<'a> {
             for (idx, name) in &field_indices {
                 let col = batch.column(*idx);
                 #[allow(clippy::cast_precision_loss)]
+                // A decimal column takes the exact path; nothing else can,
+                // and nothing else needs to.
+                if let Some(a) = col.as_any().downcast_ref::<Decimal128Array>() {
+                    if a.is_valid(row) {
+                        if let Ok(scale) = u8::try_from(a.scale()) {
+                            if let Ok(d) = chronix_core::Decimal::new(a.value(row), scale) {
+                                acc.accumulate_decimal(name, d, ts);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let value = if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
                     a.is_valid(row).then(|| a.value(row))
                 } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
@@ -828,10 +912,15 @@ impl<'a> RollupAccumulator<'a> {
         let mut fields = BTreeMap::new();
         for (field_name, agg_values) in &aggregated {
             for (agg_fn, value) in agg_values {
-                fields.insert(
-                    format!("{field_name}_{agg_fn}"),
-                    chronix_core::FieldValue::F64(*value),
-                );
+                // A rollup of a decimal column is written back as a decimal:
+                // the tier a query actually reads is the tier that has to be
+                // exact, and a total that went through an `f64` on the way
+                // into the rollup is one nobody can reconcile against the
+                // raw rows it came from.
+                let Some(field_value) = agg_result_to_field(*value) else {
+                    continue;
+                };
+                fields.insert(format!("{field_name}_{agg_fn}"), field_value);
             }
         }
         if fields.is_empty() {
@@ -841,6 +930,19 @@ impl<'a> RollupAccumulator<'a> {
             chronix_core::SeriesKey::new(self.config.target_measurement.clone(), tags.clone())
                 .ok()?;
         chronix_core::Point::new(series_key, fields, bucket).ok()
+    }
+}
+
+/// One aggregate result as a field value, or `None` when it is NULL.
+fn agg_result_to_field(value: chronix_query::AggResult) -> Option<chronix_core::FieldValue> {
+    match value {
+        chronix_query::AggResult::Null => None,
+        chronix_query::AggResult::F64(v) => Some(chronix_core::FieldValue::F64(v)),
+        chronix_query::AggResult::Decimal { mantissa, scale } => {
+            chronix_core::Decimal::new(mantissa, scale)
+                .ok()
+                .map(chronix_core::FieldValue::Decimal)
+        }
     }
 }
 
@@ -892,7 +994,7 @@ pub fn record_batch_to_points(
     batch: &arrow::record_batch::RecordBatch,
     measurement: &str,
 ) -> Vec<chronix_core::Point> {
-    use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+    use arrow::array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray};
     let schema = batch.schema();
     let Some(ts) = batch
         .column_by_name(chronix_core::TIME_COLUMN)
@@ -912,16 +1014,25 @@ pub fn record_batch_to_points(
                 .map(|a| (f.name().as_str(), a))
         })
         .collect();
-    let fields: Vec<(&str, &Float64Array)> = schema
+    // A field column is whatever Arrow type it is: reading only `Float64`
+    // here silently dropped every decimal column from a rollup's input, so
+    // a rollup of a settlement register produced no rows at all.
+    enum FieldCol<'a> {
+        F64(&'a Float64Array),
+        Decimal(&'a Decimal128Array, u8),
+    }
+    let fields: Vec<(&str, FieldCol<'_>)> = schema
         .fields()
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
-            batch
-                .column(i)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .map(|a| (f.name().as_str(), a))
+            let col = batch.column(i);
+            if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+                return Some((f.name().as_str(), FieldCol::F64(a)));
+            }
+            let a = col.as_any().downcast_ref::<Decimal128Array>()?;
+            let scale = u8::try_from(a.scale()).ok()?;
+            Some((f.name().as_str(), FieldCol::Decimal(a, scale)))
         })
         .collect();
     let mut out = Vec::with_capacity(batch.num_rows());
@@ -936,12 +1047,18 @@ pub fn record_batch_to_points(
             .collect();
         let field_map: BTreeMap<String, chronix_core::FieldValue> = fields
             .iter()
-            .filter(|(_, a)| a.is_valid(row))
-            .map(|(k, a)| {
-                (
-                    (*k).to_string(),
-                    chronix_core::FieldValue::F64(a.value(row)),
-                )
+            .filter_map(|(k, col)| {
+                let value = match col {
+                    FieldCol::F64(a) => a
+                        .is_valid(row)
+                        .then(|| chronix_core::FieldValue::F64(a.value(row))),
+                    FieldCol::Decimal(a, scale) => a.is_valid(row).then(|| {
+                        chronix_core::Decimal::new(a.value(row), *scale)
+                            .ok()
+                            .map(chronix_core::FieldValue::Decimal)
+                    })?,
+                }?;
+                Some(((*k).to_string(), value))
             })
             .collect();
         if field_map.is_empty() {
@@ -958,82 +1075,22 @@ pub fn record_batch_to_points(
 
 /// Convert a slice of [`chronix_core::Point`] into an Arrow `RecordBatch`.
 ///
-/// This function assembles a flat table with a `_time` column, one
-/// `Utf8` column per distinct tag key, and one `Float64` column per
-/// distinct field key.  Returns `None` if `points` is empty.
+/// A thin wrapper over [`chronix_query::points_to_record_batch`] that keeps
+/// the `Option` shape the rollup materialiser expects: `None` for no points.
+///
+/// It used to be a second implementation, and the two had drifted: this one
+/// built every field column as `Float64` and stamped no role metadata, so a
+/// rollup whose target held anything else — a string field, a count, an
+/// exact decimal — wrote a column of nulls where the values should have
+/// been. One conversion, one set of types.
 #[must_use]
 pub fn points_to_record_batch(
     points: &[chronix_core::Point],
 ) -> Option<arrow::record_batch::RecordBatch> {
-    use arrow::array::{Float64Builder, Int64Builder, StringBuilder};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-
     if points.is_empty() {
         return None;
     }
-
-    // Discover all tag keys and field keys
-    let mut tag_keys: BTreeSet<String> = BTreeSet::new();
-    let mut field_keys: BTreeSet<String> = BTreeSet::new();
-    for p in points {
-        for k in p.series_key().tag_keys() {
-            tag_keys.insert(k.to_string());
-        }
-        for k in p.field_keys() {
-            field_keys.insert(k.to_string());
-        }
-    }
-
-    // Build schema: timestamp + tags (Utf8) + fields (Float64)
-    let mut fields = vec![Field::new(
-        chronix_core::TIME_COLUMN,
-        DataType::Int64,
-        false,
-    )];
-    for tag in &tag_keys {
-        fields.push(Field::new(tag, DataType::Utf8, true));
-    }
-    for field in &field_keys {
-        fields.push(Field::new(field, DataType::Float64, true));
-    }
-    let schema = Arc::new(Schema::new(fields));
-
-    // Build arrays
-    let mut ts_builder = Int64Builder::with_capacity(points.len());
-    let mut tag_builders: Vec<StringBuilder> =
-        tag_keys.iter().map(|_| StringBuilder::new()).collect();
-    let mut field_builders: Vec<Float64Builder> = field_keys
-        .iter()
-        .map(|_| Float64Builder::with_capacity(points.len()))
-        .collect();
-
-    for p in points {
-        ts_builder.append_value(p.timestamp());
-        for (i, key) in tag_keys.iter().enumerate() {
-            match p.series_key().tag(key) {
-                Some(v) => tag_builders[i].append_value(v),
-                None => tag_builders[i].append_null(),
-            }
-        }
-        for (i, key) in field_keys.iter().enumerate() {
-            match p.field(key) {
-                Some(chronix_core::FieldValue::F64(v)) => field_builders[i].append_value(*v),
-                _ => field_builders[i].append_null(),
-            }
-        }
-    }
-
-    let mut columns: Vec<Arc<dyn arrow::array::Array>> = vec![Arc::new(ts_builder.finish())];
-    for b in &mut tag_builders {
-        columns.push(Arc::new(b.finish()));
-    }
-    for b in &mut field_builders {
-        columns.push(Arc::new(b.finish()));
-    }
-
-    arrow::record_batch::RecordBatch::try_new(schema, columns).ok()
+    chronix_query::points_to_record_batch(points).ok()
 }
 
 #[cfg(test)]
@@ -1223,12 +1280,12 @@ mod tests {
         ]);
 
         let field_aggs = aggs.get("value").unwrap();
-        assert!((field_aggs[&RollupAggFn::Avg] - 20.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Min] - 10.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Max] - 30.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Sum] - 60.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Count] - 3.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Last] - 30.0).abs() < f64::EPSILON);
+        assert!((field_aggs[&RollupAggFn::Avg].as_f64().unwrap() - 20.0).abs() < f64::EPSILON);
+        assert!((field_aggs[&RollupAggFn::Min].as_f64().unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((field_aggs[&RollupAggFn::Max].as_f64().unwrap() - 30.0).abs() < f64::EPSILON);
+        assert!((field_aggs[&RollupAggFn::Sum].as_f64().unwrap() - 60.0).abs() < f64::EPSILON);
+        assert!((field_aggs[&RollupAggFn::Count].as_f64().unwrap() - 3.0).abs() < f64::EPSILON);
+        assert!((field_aggs[&RollupAggFn::Last].as_f64().unwrap() - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1240,7 +1297,7 @@ mod tests {
 
         let aggs = acc.emit(&[RollupAggFn::Last]);
         let field_aggs = aggs.get("value").unwrap();
-        assert!((field_aggs[&RollupAggFn::Last] - 300.0).abs() < f64::EPSILON);
+        assert!((field_aggs[&RollupAggFn::Last].as_f64().unwrap() - 300.0).abs() < f64::EPSILON);
     }
 
     #[test]

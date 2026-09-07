@@ -21,6 +21,15 @@ message FieldValue {
     uint64 uint64  = 3;
     bool   boolean = 4;
     string string  = 5;
+    /// An exact fixed-point decimal, as its digits: "1234.5678".
+    ///
+    /// A string rather than a number, and for the same reason PostgreSQL's
+    /// wire protocol sends NUMERIC as digits: every numeric proto scalar is
+    /// binary — `double` loses the value outright, and there is no 128-bit
+    /// integer type to carry a mantissa in. The text form is exact, is what
+    /// every client library can already produce, and carries the scale
+    /// along with the value ("1.50" is scale 2, "1.5" is scale 1).
+    string decimal = 6;
   }
 }
 
@@ -180,6 +189,8 @@ message SqlValue {
     uint64 uint64  = 3;
     bool   boolean = 4;
     string string  = 5;
+    /// An exact decimal cell, as its digits. See `FieldValue.decimal`.
+    string decimal = 7;
   }
   bool is_null = 6;
 }

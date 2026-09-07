@@ -4,7 +4,7 @@ description = "Runnable examples covering the embedded API, SQL and PromQL queri
 weight = 100
 +++
 
-Chronix ships with **26 runnable examples** covering every major feature. CI
+Chronix ships a **runnable example for every major feature**. CI
 compiles and runs every one of them on each change, so they cannot drift away
 from the API they demonstrate.
 
@@ -27,6 +27,7 @@ cargo run -p chronix --features object-store --example cold_tier
 | [query_and_aggregation](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/query_and_aggregation.rs) | Fluent `QueryBuilder` with aggregation, downsampling, and pruning statistics |
 | [sql_queries](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/sql_queries.rs) | SQL via DataFusion: `GROUP BY`, window functions, `ORDER BY`, `LIMIT`, UDFs |
 | [promql_queries](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/promql_queries.rs) | PromQL instant/range queries: `rate()`, `avg_over_time()`, label matching |
+| [exact_decimals](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/exact_decimals.rs) | Meter registers a settlement is computed from, beside a 1 s float series: declaring a decimal column's scale, exact sums, and the write that is refused rather than rounded |
 | [schema_exploration](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/schema_exploration.rs) | Introspect measurements, tag keys, field keys, columns, and schema registry |
 
 ## Analytics & Forecasting

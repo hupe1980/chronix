@@ -112,8 +112,8 @@ pub use rollup::{RollupAggFn, RollupBuilder, RollupConfig, RollupRegistry, Rollu
 pub mod prelude {
     pub use chronix_core::{
         ChronixConfig, ChronixConfigBuilder, ChronixError, ColumnDef, ColumnRole, ColumnType,
-        CompressionCodec, FieldValue, FloatEncoding, FsyncPolicy, MeasurementSchema, Point,
-        SeriesKey, Timestamp,
+        CompressionCodec, Decimal, FieldValue, FloatEncoding, FsyncPolicy, MeasurementSchema,
+        Point, SeriesKey, Timestamp,
     };
     pub use chronix_query::{AggFn, QueryBuilder, QueryPlan};
 

@@ -111,7 +111,28 @@ compression = "lz4"
 float_encoding = "chimp"
 retention_secs = 2592000
 segment_cache_size = 536870912
+maintenance_interval_secs = 30
+ooo_shard_tolerance = 2
+future_write_tolerance_secs = 3600
+soft_delete_ttl_secs = 86400
 ```
+
+### Database Settings
+
+`[database]` maps to the embedded `ChronixConfig`, so everything in the
+**Embedded Library** tables above applies to a server deployment too. Each key
+below is **optional; omitting it keeps the engine's default**, which is why no
+second default is written here.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `maintenance_interval_secs` | `u64` | engine default (30 s) | How often the maintenance thread compacts, materialises rollups, collects garbage and enforces retention. `0` disables the periodic passes; flush-on-demand stays. On flash-backed storage a longer interval is fewer writes |
+| `ooo_shard_tolerance` | `u32` | engine default (2) | Past shards that still accept live out-of-order writes. Anything older needs `?backfill=true` |
+| `future_write_tolerance_secs` | `u64` | engine default (1 h) | How far ahead of the wall clock a timestamp may be, on every write path including backfill |
+| `cdc_capacity` | `usize` | engine default (65 536) | Change events buffered for a slow subscriber. The ring is allocated on the first subscription, so a deployment that never reads the change stream pays nothing |
+| `wal_max_unflushed` | `usize` | engine default | Unflushed WAL files tolerated before writes are held back |
+| `soft_delete_ttl_secs` | `u64` | unset — drops are immediate | Grace period before a dropped measurement is hard-deleted. With it set, `DELETE /api/v1/measurements/{name}` is recoverable until the deadline passes; without it the drop is irreversible |
+| `lvc_measurements` | `[String]` | empty — all measurements | Measurements the last-value cache covers, when `enable_last_value_cache` is on |
 
 ### Server Settings
 

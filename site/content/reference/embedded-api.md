@@ -313,7 +313,9 @@ No data is ever dropped — only write throughput is throttled.
 `measurement_retention` config map. After applying the global shard-level
 retention, a second pass checks each measurement's individual cutoff and drops
 segments from non-expired shards when a measurement has a shorter retention
-period than the global default.
+period than the global default. Every cutoff is measured from the same
+reference — `min(wall clock, newest timestamp held)` — so a rule can never
+delete data that is younger than its window *relative to the data itself*.
 
 ### Concurrency Model
 

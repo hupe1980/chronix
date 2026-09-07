@@ -303,6 +303,101 @@ async fn flight_sql_do_get_statement() {
     assert_eq!(total_rows, 2, "expected 2 rows");
 }
 
+/// Flight `DoPut` is the bulk-load path, and it must carry exact decimals.
+///
+/// It is the surface a `pyarrow` table of meter registers arrives on —
+/// which is to say, the one write path built for loading a lot of exact
+/// values at once. Before this it refused a `Decimal128` column outright
+/// with "unsupported Arrow data type", so the only way to bulk-load
+/// settlement data was one JSON point at a time.
+#[tokio::test]
+async fn flight_do_put_carries_an_exact_decimal() {
+    use arrow::array::{Decimal128Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_flight::sql::CommandStatementUpdate;
+
+    let (mut client, db, _tmp) = start_flight_server().await;
+    db.declare_field("meter", "z1nb_q", ColumnType::Decimal { scale: 4 })
+        .unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(chronix::chronix_core::TIME_COLUMN, DataType::Int64, false),
+        Field::new("device", DataType::Utf8, true),
+        Field::new("z1nb_q", DataType::Decimal128(38, 4), true),
+    ]));
+    let registers = Decimal128Array::from(vec![12_345_678_i128, 12_345_679])
+        .with_precision_and_scale(38, 4)
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1_000_i64, 2_000])),
+            Arc::new(StringArray::from(vec!["main", "main"])),
+            Arc::new(registers),
+        ],
+    )
+    .unwrap();
+
+    let cmd = CommandStatementUpdate {
+        query: "meter".to_string(),
+        transaction_id: None,
+    };
+    let descriptor = FlightDescriptor::new_cmd(pack_any(&cmd));
+    let flight_data: Vec<arrow_flight::FlightData> =
+        arrow_flight::utils::batches_to_flight_data(schema.as_ref(), vec![batch])
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                // The descriptor rides on the first message of the stream,
+                // which is where the server reads the target measurement.
+                if i == 0 {
+                    d.flight_descriptor = Some(descriptor.clone());
+                }
+                d
+            })
+            .collect();
+
+    let response = client
+        .do_put(futures::stream::iter(flight_data))
+        .await
+        .expect("DoPut must accept a decimal column")
+        .into_inner();
+    // Drain the result stream so the write is complete before we read.
+    let _ = collect_put_result(response).await;
+
+    // And the digits survived: 1234.5678, not a double that prints like it.
+    let plan = db
+        .query()
+        .measurement("meter")
+        .range(i64::MIN, i64::MAX)
+        .build()
+        .unwrap();
+    let batch = db.execute(&plan).unwrap();
+    let col = batch
+        .column_by_name("z1nb_q")
+        .expect("the column the client sent")
+        .as_any()
+        .downcast_ref::<arrow::array::Decimal128Array>()
+        .expect("a decimal written over Flight is still a decimal");
+    let scale = u8::try_from(col.scale()).unwrap();
+    assert_eq!(
+        Decimal::new(col.value(0), scale).unwrap().to_string(),
+        "1234.5678"
+    );
+}
+
+/// Drain a `DoPut` response stream, ignoring the per-batch results.
+async fn collect_put_result(
+    mut stream: tonic::Streaming<arrow_flight::PutResult>,
+) -> Vec<arrow_flight::PutResult> {
+    let mut out = Vec::new();
+    while let Ok(Some(item)) = stream.message().await {
+        out.push(item);
+    }
+    out
+}
+
 /// `GetFlightInfo` must refuse a statement the read-only check refuses.
 ///
 /// It used to plan through `SessionContext::sql`, which **executes** DDL,

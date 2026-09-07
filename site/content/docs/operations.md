@@ -316,6 +316,27 @@ enforced by the database's own maintenance thread every
 `maintenance_interval` (30 s by default). It is opt-in: with no retention
 configured, nothing is ever deleted.
 
+**Age is measured from `min(wall clock, newest timestamp the database
+holds)`.** Two consequences:
+
+- A clock that reads far ahead — a dead RTC, a bad NTP server, a restored VM
+  snapshot — cannot expire data the data itself does not justify expiring.
+- A database that stops receiving writes keeps its history. One fresh write
+  moves the reference to the present and the backlog expires on the next pass.
+
+The newest data is therefore never expired, whatever the rule says, and a
+measurement that stops being written stops freeing disk. Use `DELETE` to
+reclaim that space.
+
+**Retention releases what it deletes.** On any pass that deleted something,
+the cardinality budget (`max_series_cardinality`, reported as
+`chronix_series_count`) and the last-value cache are re-derived from what the
+database still holds, so device churn does not climb towards the cardinality
+limit and `last_value()` stops answering for a series whose data has aged out.
+`chronix_series_released_total` counts the released series. An emptied
+measurement is still a queryable table returning no rows; it leaves the
+measurement list only when it is dropped.
+
 Rollups are materialised, never computed as a by-product of compaction or
 retention. A bucket is aggregated once, over a deduplicated scan of its
 source, as soon as its input is final: for a raw measurement, once the
@@ -342,8 +363,11 @@ Rollup-aware retention trades raw data for its aggregates, so a segment is
 only dropped once **every** tier of its rollup chain has been materialised
 past it and has no repair pending — for the per-measurement rules as well as
 the global one. A segment that is still needed is preserved and counted in
-`chronix_retention_segments_awaiting_rollup_total`; a segment that cannot be
-read fails the materialisation that needs it, so it is preserved too.
+`chronix_retention_segments_awaiting_rollup_total` and in the pass's
+`segments_preserved`; a segment that cannot be read fails the
+materialisation that needs it, so it is preserved too. `shards_dropped`
+counts the shards the pass **removed**, so a pass that dropped nothing logs
+`Retention preserved every expired segment` rather than a count.
 `chronix_rollup_points_written_total` counts what materialisation wrote.
 Cold archiving removes a segment from the hot database, so it waits on the
 same gate (`chronix_cold_archive_groups_awaiting_rollup_total`).

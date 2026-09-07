@@ -139,6 +139,9 @@ varies, while `'1d'`, `'1w'`, `'1mo'` and `'1y'` follow that zone's calendar —
 so a transition day is 23 or 25 hours and February is February. The month is
 `'mo'`; `'m'` is always the minute.
 
+The long spellings work too, with or without the space: `'1 hour'`,
+`'15 minutes'`, `'3 months'`. A bare `'M'` is refused rather than guessed at.
+
 The time column is `_time` — the same name the schema endpoint, an Arrow
 batch and a `.csx` segment use, so what you read back is what you type. It
 compares against an epoch-nanosecond integer, an RFC 3339 string and `now()`

@@ -27,23 +27,20 @@ pub const MAGIC: [u8; 4] = *b"CXSG";
 
 /// Current segment format version.
 ///
-/// - **v1** — original layout.
-/// - **v2** — adds per-block validity bitmaps (D-NULL). Absent values are no
-///   longer encoded as `0`/`""`/`false` sentinels, so `IS NULL` and
-///   aggregates are correct on sparse data. See
-///   [`ColumnBlockMeta::validity_length`].
-/// - **v3** — the time column is stored as `_time`, the one name every layer
-///   uses. It was `timestamp` here, `time` in the schema registry and `_time`
-///   in SQL, so a reader who printed a schema and then wrote a query had to
-///   translate.
+/// **v1 is the first format that exists.** The layout changed several times
+/// before release; those generations were superseded before anyone could
+/// hold one, and their readers were deleted with them, so the count starts
+/// at the version that ships rather than at the number of edits it took to
+/// get there.
 ///
-/// Chronix is pre-release, so readers for older versions were removed rather
-/// than kept: there is no data in the wild to migrate, and a reader that
-/// *accepted* v2 would hand back a column called `timestamp` that nothing
-/// looks for any more — zero rows and no error.
+/// The version is checked for **equality**, not `<=`. Two layouts can differ
+/// in a way no tolerant reader bridges — one that named the time column
+/// `timestamp` against one that names it `_time` yields a batch whose time
+/// column nothing looks for, which is zero rows and no error — so a file
+/// this reader did not write is refused rather than guessed at.
 ///
 /// [`ColumnBlockMeta::validity_length`]: crate::segment::metadata::ColumnBlockMeta::validity_length
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 1;
 
 /// Size of the serialized header in bytes.
 pub const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 2 + 4 + 1 + 1;
@@ -261,29 +258,6 @@ mod tests {
     }
 
     #[test]
-    fn header_unsupported_version() {
-        let mut bytes = SegmentHeader {
-            version: VERSION,
-            flags: 0,
-            created_at: 0,
-            min_timestamp: 0,
-            max_timestamp: 0,
-            row_count: 0,
-            column_count: 0,
-            series_count: 0,
-            compression: 0,
-            sort_order: 0,
-        }
-        .to_bytes();
-        // Set version to 999
-        bytes[4..6].copy_from_slice(&999u16.to_le_bytes());
-        assert!(matches!(
-            SegmentHeader::from_bytes(&bytes),
-            Err(SegmentError::UnsupportedVersion { version: 999 })
-        ));
-    }
-
-    #[test]
     fn footer_roundtrip() {
         let footer = SegmentFooter {
             metadata_offset: 1024,
@@ -324,37 +298,19 @@ mod tests {
         assert!(SegmentFooter::from_bytes(&[0; 5]).is_err());
     }
 
-    #[test]
-    fn header_version_zero_rejected() {
-        let header = SegmentHeader {
-            version: VERSION,
-            flags: 0,
-            created_at: 0,
-            min_timestamp: 0,
-            max_timestamp: 0,
-            row_count: 0,
-            column_count: 0,
-            series_count: 0,
-            compression: 0,
-            sort_order: 0,
-        };
-        let mut bytes = header.to_bytes();
-        // Set version to 0
-        bytes[4] = 0;
-        bytes[5] = 0;
-        assert!(matches!(
-            SegmentHeader::from_bytes(&bytes),
-            Err(SegmentError::UnsupportedVersion { version: 0 })
-        ));
-    }
-
-    /// An *older* segment is refused too, not read.
+    /// The version check is equality, so it refuses in **both** directions.
     ///
-    /// v2 called the time column `timestamp`; v3 calls it `_time`. A reader
-    /// that accepted v2 would return a batch whose time column nothing looks
-    /// for — no rows, no error — so the version check is equality.
+    /// Two layouts can differ in a way no tolerant reader bridges — one that
+    /// names the time column `timestamp` against one that names it `_time`
+    /// returns a batch whose time column nothing looks for, which is no rows
+    /// and no error. Below `VERSION` that is 0, which is also what a zeroed
+    /// or truncated header reads as; far above it stands for a file from a
+    /// future Chronix.
+    ///
+    /// This replaced four tests that asked the same question with four
+    /// different wrong values.
     #[test]
-    fn header_older_version_rejected() {
+    fn header_version_is_refused_in_both_directions() {
         let header = SegmentHeader {
             version: VERSION,
             flags: 0,
@@ -367,38 +323,16 @@ mod tests {
             compression: 0,
             sort_order: 0,
         };
-        let mut bytes = header.to_bytes();
-        let older = super::VERSION - 1;
-        bytes[4] = older as u8;
-        bytes[5] = (older >> 8) as u8;
-        assert!(matches!(
-            SegmentHeader::from_bytes(&bytes),
-            Err(SegmentError::UnsupportedVersion { .. })
-        ));
-    }
-
-    #[test]
-    fn header_future_version_rejected() {
-        let header = SegmentHeader {
-            version: VERSION,
-            flags: 0,
-            created_at: 0,
-            min_timestamp: 0,
-            max_timestamp: 0,
-            row_count: 0,
-            column_count: 0,
-            series_count: 0,
-            compression: 0,
-            sort_order: 0,
-        };
-        let mut bytes = header.to_bytes();
-        // Set version to VERSION + 1
-        let future = super::VERSION + 1;
-        bytes[4] = future as u8;
-        bytes[5] = (future >> 8) as u8;
-        assert!(matches!(
-            SegmentHeader::from_bytes(&bytes),
-            Err(SegmentError::UnsupportedVersion { .. })
-        ));
+        for wrong in [VERSION - 1, VERSION + 1, 999] {
+            let mut bytes = header.to_bytes();
+            bytes[4..6].copy_from_slice(&wrong.to_le_bytes());
+            assert!(
+                matches!(
+                    SegmentHeader::from_bytes(&bytes),
+                    Err(SegmentError::UnsupportedVersion { .. })
+                ),
+                "version {wrong} must be refused, not read as {VERSION}"
+            );
+        }
     }
 }

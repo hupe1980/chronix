@@ -1883,25 +1883,53 @@ fn retention_enforcement_removes_old_data() {
         .unwrap();
     let db = Chronix::open(config).unwrap();
 
-    // Write points at timestamp 0 range (considered "old")
+    // Two hourly shards: one three hours old, one current. Retention
+    // measures age from the newest timestamp the database holds capped by
+    // the clock (`retention::retention_reference`), so the fixture has to
+    // *contain* the span it is asserting about — a database whose newest
+    // point is three hours old is three hours old to itself, and a rule
+    // measured against the wall clock alone would delete all of it the first
+    // time anybody's clock was wrong.
+    let now_ns = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
+    let hour_ns = 3_600_000_000_000i64;
+
     for i in 0..25 {
-        db.insert(&cpu_point("a", (i + 1) * 1000, i as f64))
+        db.insert(&cpu_point("a", now_ns - 3 * hour_ns + i * 1000, i as f64))
+            .unwrap();
+    }
+    db.flush().unwrap();
+    for i in 0..25 {
+        db.insert(&cpu_point("a", now_ns - i * 1000, i as f64))
             .unwrap();
     }
     db.flush().unwrap();
 
-    // A very small retention means "keep almost nothing" — any data older
-    // than (now - retention) is eligible for removal.
     let result = db
-        .enforce_retention(std::time::Duration::from_nanos(1))
+        .enforce_retention(std::time::Duration::from_secs(3600))
         .unwrap();
-    // All data should be eligible for removal since timestamps are near 0
-    // and the retention window is only 1ns from current wall-clock time.
     assert!(
         result.shards_dropped > 0 || result.segments_deleted > 0,
-        "retention should remove old data (shards_dropped={}, segments_deleted={})",
+        "retention should remove the three-hour-old shard (shards_dropped={}, segments_deleted={})",
         result.shards_dropped,
         result.segments_deleted,
+    );
+
+    // …and must not have taken the current one with it.
+    let plan = db
+        .query()
+        .measurement("cpu")
+        .range(now_ns - hour_ns, i64::MAX)
+        .build()
+        .unwrap();
+    assert!(
+        db.execute(&plan).unwrap().num_rows() > 0,
+        "the data inside the retention window must survive"
     );
 
     db.close().unwrap();

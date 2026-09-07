@@ -42,11 +42,29 @@ pub(crate) fn checked_count(len: usize) -> Result<u32> {
 
 /// Largest element a decoder can produce, in bytes.
 ///
-/// `Option<String>` and `String` are 24 bytes on every target this builds
-/// for, and they are what [`MAX_BLOCK_VALUES`] has to be sized against. The
-/// previous ceiling was reasoned about as `count × 8` because the codec that
-/// motivated it decoded `f64`, which under-states the worst case by 3×.
-pub(crate) const MAX_ELEMENT_BYTES: usize = 24;
+/// `Option<i128>` is 32 bytes — an `i128` is 16-byte aligned, so the
+/// discriminant costs a whole second word — and it is the widest thing any
+/// decoder here produces, which makes it what [`MAX_BLOCK_VALUES`] has to be
+/// sized against.
+///
+/// The number has been wrong twice the same way — first as `count × 8` for
+/// the `f64` codec that motivated the guard, then left at 24 when the
+/// decimal codec made `Option<i128>` the widest element. Hence the assertion
+/// below: a decoder that produces something wider fails the build rather
+/// than quietly raising the ceiling.
+pub(crate) const MAX_ELEMENT_BYTES: usize = 32;
+
+/// The constant above must cover every type a decoder can allocate.
+///
+/// Checked at compile time against the actual sizes, because the point of
+/// the guard is a byte ceiling and a stale constant silently raises it.
+const _: () = {
+    assert!(MAX_ELEMENT_BYTES >= std::mem::size_of::<Option<i128>>());
+    assert!(MAX_ELEMENT_BYTES >= std::mem::size_of::<Option<String>>());
+    assert!(MAX_ELEMENT_BYTES >= std::mem::size_of::<String>());
+    assert!(MAX_ELEMENT_BYTES >= std::mem::size_of::<Option<f64>>());
+    assert!(MAX_ELEMENT_BYTES >= std::mem::size_of::<i128>());
+};
 
 /// Largest allocation a single corrupt block header may cause.
 ///
@@ -69,7 +87,7 @@ pub(crate) const MAX_DECODED_BYTES: usize = 32 << 20;
 /// 128 MiB bound was really 384 MiB, and the workspace's own decoder
 /// robustness proptest was being OOM-killed by it.
 ///
-/// The result is ~1.4M values, still ~21× the default row-group size
+/// The result is ~1.05M values, still 16× the default row-group size
 /// (`chronix_engine::segment::DEFAULT_ROW_GROUP_SIZE`, 65 536), which is the
 /// most values any block this crate writes can hold.
 pub(crate) const MAX_BLOCK_VALUES: usize = MAX_DECODED_BYTES / MAX_ELEMENT_BYTES;

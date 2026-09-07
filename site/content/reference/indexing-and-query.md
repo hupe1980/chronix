@@ -99,10 +99,14 @@ Zone maps enable **late materialization** — evaluating numeric field predicate
 3. Segment reader evaluates each predicate against per-row-group `ColumnStats`:
    - **F64 columns:** Convert stats via `ordered_i64_to_f64()`, evaluate `may_match_f64()`
    - **I64/Timestamp columns:** Evaluate `may_match_i64()` directly on raw stats
+   - **Decimal columns:** Evaluate `may_match_decimal()`. The stats hold
+     *mantissas* and the predicate holds an `f64`, so the bounds are widened
+     by a whole mantissa unit first — a predicate value binary floating point
+     cannot represent exactly must never prune a row group that contains it
 4. Row groups where *any* predicate rules out a match are **skipped entirely**
 5. Metric: `chronix_segment_rg_pruned_by_zone_map_total` tracks pruned row groups
 
-**Supported operators:** `=`, `>`, `>=`, `<`, `<=` on numeric columns (F64, I64, U64).
+**Supported operators:** `=`, `>`, `>=`, `<`, `<=` on numeric columns (F64, I64, U64, Decimal).
 
 **Impact:** For selective queries (e.g., `WHERE temperature > 100`), zone-map pruning can eliminate 90%+ of row groups, delivering 10-100x speedup on large segments.
 

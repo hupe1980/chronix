@@ -330,3 +330,96 @@ fn sampling_parses_in_the_documented_form() {
         chronixd::otel::SamplingStrategy::Ratio(r) if (r - 0.05).abs() < 1e-9
     ));
 }
+
+/// Every engine setting the server documentation names is one a server
+/// operator can actually set.
+///
+/// The `[database]` table maps to `ChronixConfig`, and eight of its settings
+/// had no key at all: `maintenance_interval`, `ooo_shard_tolerance`,
+/// `future_write_tolerance`, `cdc_capacity`, `wal_max_unflushed`,
+/// `soft_delete_ttl`, `lvc_measurements` and the analytics bounds. Three of
+/// them are named in *server* pages — "live ingestion is held to
+/// ±`ooo_shard_tolerance` shards" in the API reference, "every
+/// `maintenance_interval` (30 s)" in operations and getting-started — so an
+/// operator was told the name of a knob and had no way to turn it.
+///
+/// The values are checked through the **real loader**, and each is
+/// deliberately different from the engine default, so a key that parses and
+/// is then dropped on the floor fails here rather than looking configured.
+#[test]
+fn the_engine_settings_a_server_operator_needs_are_settable() {
+    let toml = r#"
+        [database]
+        data_dir = "/tmp/chronix-test"
+        maintenance_interval_secs = 300
+        ooo_shard_tolerance = 5
+        future_write_tolerance_secs = 60
+        cdc_capacity = 1024
+        wal_max_unflushed = 3
+        soft_delete_ttl_secs = 86400
+        lvc_measurements = ["power", "energy"]
+    "#;
+    let server: ServerConfig = toml::from_str(toml).expect("the documented form must load");
+    let engine = server
+        .to_chronix_config()
+        .expect("the loaded settings must build an engine config");
+
+    assert_eq!(
+        engine.maintenance_interval,
+        std::time::Duration::from_secs(300)
+    );
+    assert_eq!(engine.ooo_shard_tolerance, 5);
+    assert_eq!(
+        engine.future_write_tolerance,
+        std::time::Duration::from_secs(60)
+    );
+    assert_eq!(engine.cdc_capacity, 1024);
+    assert_eq!(engine.wal.max_unflushed_wals, 3);
+    assert_eq!(
+        engine.soft_delete_ttl,
+        Some(std::time::Duration::from_secs(86_400))
+    );
+    let lvc = engine
+        .lvc_measurements
+        .as_ref()
+        .expect("an explicit list must reach the engine");
+    assert!(
+        lvc.contains("power") && lvc.contains("energy"),
+        "got {lvc:?}"
+    );
+}
+
+/// Omitting them leaves the engine's own defaults in place.
+///
+/// They are `Option` for this reason: repeating each default in the server
+/// config would give it two definitions that can drift apart, and the value
+/// an operator gets would depend on which one they read.
+#[test]
+fn an_unset_engine_setting_keeps_the_engine_default() {
+    let server: ServerConfig = toml::from_str(
+        r#"
+        [database]
+        data_dir = "/tmp/chronix-test"
+        "#,
+    )
+    .expect("a minimal database section must load");
+    let engine = server.to_chronix_config().expect("builds");
+    let default = chronix::prelude::ChronixConfigBuilder::default()
+        .data_dir("/tmp/chronix-test")
+        .build()
+        .expect("engine defaults are valid");
+
+    assert_eq!(engine.maintenance_interval, default.maintenance_interval);
+    assert_eq!(engine.ooo_shard_tolerance, default.ooo_shard_tolerance);
+    assert_eq!(
+        engine.future_write_tolerance,
+        default.future_write_tolerance
+    );
+    assert_eq!(engine.cdc_capacity, default.cdc_capacity);
+    assert_eq!(
+        engine.wal.max_unflushed_wals,
+        default.wal.max_unflushed_wals
+    );
+    assert_eq!(engine.soft_delete_ttl, default.soft_delete_ttl);
+    assert_eq!(engine.lvc_measurements, default.lvc_measurements);
+}

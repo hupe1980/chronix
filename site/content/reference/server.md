@@ -76,7 +76,9 @@ implementation follows this pipeline:
    access via `TypedField` and `TagCol` enums, performing O(columns) type
    downcasts instead of O(rows × columns). Tags support both plain `StringArray`
    and `DictionaryArray<Int32, Utf8>`. Fields are extracted with full type
-   support (F64, I64, U64, Bool, String). Null values are skipped gracefully
+   support (F64, I64, U64, Bool, String, Decimal128). Null values are skipped
+   gracefully; a `Decimal128` value outside what Chronix stores is an error
+   rather than a skipped field
 5. **Database write** — Converted points are written via `db.insert_batch()`
    inside `spawn_blocking` for non-blocking async execution
 
@@ -302,7 +304,9 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | `chronix_interner_memory_bytes` | Gauge | `statistics()` | String interners — grows with cardinality, not row count |
 | `chronix_wal_buffer_bytes` | Gauge | `statistics()` | WAL writer's buffer; fixed size |
 | `chronix_catalog_memory_bytes` | Gauge | `statistics()` | Segment catalog, schema registry and tombstones |
-| `chronix_retention_shards_dropped_total` | Counter | `enforce_retention()` | Number of shards dropped by retention enforcement |
+| `chronix_metadata_cache_bytes` | Gauge | `statistics()` | Segment metadata index — one entry per live segment: header, column statistics, per-tag bloom filters. Grows with segment count |
+| `chronix_retention_shards_dropped_total` | Counter | `enforce_retention()` | Shards retention **removed** — not the ones it considered. A pass that declines an expired shard because a rollup still needs it counts zero here |
+| `chronix_series_released_total` | Counter | `enforce_retention()`, `gc()`, `archive_cold_segments()` | Series returned to the cardinality budget because the last of their data was deleted |
 | `chronix_gc_segments_deleted_total` | Counter | `gc_with_grace()` | Number of segments hard-deleted by garbage collection |
 | `chronix_rollup_invalidations_total` | Counter | `backfill()`, `execute_delete()` | Rollups whose buckets were marked for recomputation by a late write or a delete |
 | `chronix_rollup_ranges_recomputed_total` | Counter | `materialise_rollups()` | Invalidated ranges recomputed |

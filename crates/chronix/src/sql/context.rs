@@ -142,10 +142,28 @@ fn build_session_context(db: &Arc<Chronix>, namespace: Option<String>) -> Sessio
     // registry: it would have listed every tenant's measurements. The
     // catalog is now scoped to the session's namespace, so what these views
     // enumerate is the caller's own data.
-    let session_config = SessionConfig::new()
+    let mut session_config = SessionConfig::new()
         .with_default_catalog_and_schema("chronix", "public")
         .with_information_schema(true)
         .with_target_partitions(target_partitions);
+
+    // **A decimal literal in SQL is a decimal**, as in PostgreSQL.
+    //
+    // DataFusion parses `0.05` as an `f64` by default, which is fine while
+    // every numeric column is one. It is not fine beside `Decimal128`:
+    // comparison coercion promotes the literal to the decimal, so `WHERE
+    // z1nb_q > 0.1` is exact either way, but *arithmetic* coercion demotes
+    // the decimal to the float — and a settlement is arithmetic on
+    // registers, so the query that computes one is the query that loses it.
+    //
+    // A `Float64` column is unaffected, because `Float64 op Decimal128`
+    // still coerces to `Float64`. The exponent form is not an escape hatch
+    // (`1.5e0` is a decimal here too); `CAST(1.5 AS DOUBLE)` is.
+    // `sql_decimal_semantics.rs` pins both halves.
+    session_config
+        .options_mut()
+        .sql_parser
+        .parse_float_as_decimal = true;
 
     // Configure RuntimeEnv with spill-to-disk and a bounded
     // memory pool so that large GROUP BY / ORDER BY queries spill instead

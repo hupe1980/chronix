@@ -1,17 +1,21 @@
-//! Metadata Cache — in-memory cache for segment metadata.
+//! Segment metadata index — one entry per live segment.
 //!
-//! Caches segment headers, bloom filters, and column statistics permanently
-//! in memory. Updated on segment creation, compaction, and deletion.
-//! Memory cost is approximately 1 KB per segment — no eviction needed.
+//! Holds each segment's header, column statistics and per-tag bloom filters
+//! so the query planner can prune without opening a file. Populated at open
+//! from the catalog and maintained by flush, compaction, retention, delete
+//! and GC.
 //!
-//! # Eviction policy
+//! # This is an index, not a cache
 //!
-//! This cache intentionally has **no LRU eviction**.  Each entry is ~1 KB
-//! (header + column stats), so even 100 000 segments consume only ~100 MB.
-//! Segments are explicitly removed from the cache when they are deleted or
-//! compacted away (see `MetadataCache::remove`).  If segment counts ever
-//! grow to the point where this becomes a concern, an LRU bound or
-//! generation-based eviction can be layered on top.
+//! There is no eviction and no hit rate: the entry set *is* the live segment
+//! set, bounded by the segments on disk exactly as the catalog is. It used to
+//! advertise a `max_entries` cap that only logged — inserts succeeded
+//! regardless — beside a comment putting an entry at "~1 KB", which no
+//! per-tag bloom filter was going to honour.
+//!
+//! [`MetadataCache::memory_bytes`] replaces both: maintained as entries come
+//! and go, summed into the resident-memory total, exported as
+//! `chronix_metadata_cache_bytes`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,63 +45,55 @@ pub struct CachedSegmentMeta {
 ///
 /// Uses `RwLock<HashMap>` for concurrent read access.
 ///
-/// # Capacity bound
+/// # Size
 ///
-/// An optional `max_entries` limit caps the number of cached segments.
-/// When the limit is reached, new inserts are still accepted (to keep
-/// hot metadata available) but a warning is emitted so operators can
-/// investigate.  Each entry is ~1 KB, so even the default cap of
-/// 500 000 entries consumes at most ~500 MB — a safe upper bound for
-/// most deployments.  Set `max_entries = 0` to disable the cap.
+/// One entry per live segment, and [`memory_bytes`](Self::memory_bytes)
+/// reports what they cost. The figure is maintained as entries are inserted
+/// and removed rather than recomputed, because `statistics()` runs on every
+/// metrics scrape and walking the map there would make the exporter the most
+/// expensive thing in the process.
 pub struct MetadataCache {
     /// Map from segment ID → cached metadata, `Arc`-wrapped to avoid a deep clone on read.
     entries: Arc<RwLock<HashMap<SegmentId, Arc<CachedSegmentMeta>>>>,
-    /// Maximum number of entries before warnings are emitted (0 = unlimited).
-    max_entries: usize,
+    /// Running total of [`entry_bytes`] over `entries`, maintained under the
+    /// same lock so it cannot drift from the map it describes.
+    bytes: Arc<RwLock<usize>>,
 }
 
-/// Default maximum number of cached segment metadata entries.
+/// What one entry costs: the struct, its header, and every column's name,
+/// statistics and bloom filter.
 ///
-/// At ~1 KB per entry this allows up to ~500 MB of metadata, which
-/// is a safe upper bound for the vast majority of deployments.
-const DEFAULT_MAX_ENTRIES: usize = 500_000;
+/// The bloom filter is the term that matters and the one the old "~1 KB per
+/// entry" estimate omitted — it is a `Vec<u8>` sized by the segment's tag
+/// cardinality, so a wide segment's entry is orders of magnitude larger than
+/// a narrow one's.
+fn entry_bytes(meta: &CachedSegmentMeta) -> usize {
+    std::mem::size_of::<CachedSegmentMeta>()
+        + meta.columns.capacity() * std::mem::size_of::<ColumnMeta>()
+        + meta
+            .columns
+            .iter()
+            .map(|c| c.name.capacity() + c.bloom_filter.as_ref().map_or(0, Vec::capacity))
+            .sum::<usize>()
+}
 
 impl MetadataCache {
-    /// Create an empty metadata cache with the default capacity bound.
+    /// Create an empty metadata index.
     #[must_use]
     pub fn new() -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
-            max_entries: DEFAULT_MAX_ENTRIES,
-        }
-    }
-
-    /// Create an empty metadata cache with a custom capacity bound.
-    ///
-    /// Pass `0` to disable the capacity warning.
-    #[must_use]
-    pub fn with_max_entries(max_entries: usize) -> Self {
-        Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
-            max_entries,
+            bytes: Arc::new(RwLock::new(0)),
         }
     }
 
     /// Insert or update metadata for a segment.
-    ///
-    /// If the cache exceeds [`max_entries`](Self::with_max_entries) a
-    /// warning is logged but the insert still succeeds so that hot
-    /// metadata is never silently dropped.
     pub fn insert(&self, meta: CachedSegmentMeta) {
+        let added = entry_bytes(&meta);
         let mut map = self.entries.write();
-        map.insert(meta.segment_id, Arc::new(meta));
-        if self.max_entries > 0 && map.len() > self.max_entries {
-            tracing::warn!(
-                cache_len = map.len(),
-                max_entries = self.max_entries,
-                "MetadataCache exceeded max_entries — consider raising the limit or investigating segment count",
-            );
-        }
+        let mut bytes = self.bytes.write();
+        let replaced = map.insert(meta.segment_id, Arc::new(meta));
+        *bytes = bytes.saturating_sub(replaced.as_deref().map_or(0, entry_bytes)) + added;
     }
 
     /// Look up metadata for a segment.
@@ -110,7 +106,20 @@ impl MetadataCache {
 
     /// Remove metadata for a segment.
     pub fn remove(&self, segment_id: SegmentId) {
-        self.entries.write().remove(&segment_id);
+        let mut map = self.entries.write();
+        let mut bytes = self.bytes.write();
+        if let Some(removed) = map.remove(&segment_id) {
+            *bytes = bytes.saturating_sub(entry_bytes(&removed));
+        }
+    }
+
+    /// Bytes the index holds, counted as entries come and go.
+    ///
+    /// Summed into the database's resident-memory total and exported as
+    /// `chronix_metadata_cache_bytes`.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        *self.bytes.read()
     }
 
     /// Returns the number of cached segments.
@@ -127,7 +136,10 @@ impl MetadataCache {
 
     /// Clear all cached metadata.
     pub fn clear(&self) {
-        self.entries.write().clear();
+        let mut map = self.entries.write();
+        let mut bytes = self.bytes.write();
+        map.clear();
+        *bytes = 0;
     }
 
     /// Returns column metadata for a segment, if cached.
@@ -150,6 +162,7 @@ impl std::fmt::Debug for MetadataCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetadataCache")
             .field("entries", &self.entries.read().len())
+            .field("bytes", &*self.bytes.read())
             .finish()
     }
 }
@@ -185,6 +198,7 @@ mod tests {
             row_group_blooms: None,
             encrypted: false,
             key_id: None,
+            decimal_scale: None,
         }
     }
 

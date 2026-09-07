@@ -430,8 +430,6 @@ impl super::Chronix {
         TagInvertedIndex,
         std::collections::HashSet<String>,
     ) {
-        use chronix_engine::index::series_index;
-
         let mut time_indices: BTreeMap<ShardId, TimeIndex> = BTreeMap::new();
         let mut blooms: BTreeMap<u64, SeriesBloomFilter> = BTreeMap::new();
         let tag_index = TagInvertedIndex::new();
@@ -450,22 +448,7 @@ impl super::Chronix {
                 max_ts: entry.max_timestamp,
             });
 
-            let keys = match series_index::SegmentStamp::read(&entry.path)
-                .and_then(|stamp| series_index::read(&entry.path, stamp))
-            {
-                Ok(keys) => keys,
-                Err(e) => {
-                    warn!(
-                        segment = %entry.path.display(),
-                        error = %e,
-                        "series index unreadable — rebuilding it from the segment"
-                    );
-                    match Self::rebuild_series_index(&entry.path, &entry.measurement) {
-                        Some(keys) => keys,
-                        None => continue,
-                    }
-                }
-            };
+            let keys = Self::series_keys_of(&entry.path, &entry.measurement);
             Self::index_series_keys(&mut blooms, &tag_index, entry.segment_id, &keys);
             for key in &keys {
                 known.insert(key.canonical_form().to_string());
@@ -473,6 +456,30 @@ impl super::Chronix {
         }
 
         (time_indices, blooms, tag_index, known)
+    }
+
+    /// One segment's series, read from its sidecar.
+    ///
+    /// The single place a segment's series list is read, so the set the
+    /// cardinality repair compares against and the set `open()` builds the
+    /// budget from cannot drift. A sidecar that is missing or corrupt is
+    /// rebuilt from the segment's tag columns once and rewritten; a segment
+    /// that cannot be opened at all yields nothing.
+    pub(super) fn series_keys_of(path: &std::path::Path, measurement: &str) -> Vec<SeriesKey> {
+        use chronix_engine::index::series_index;
+        match series_index::SegmentStamp::read(path)
+            .and_then(|stamp| series_index::read(path, stamp))
+        {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(
+                    segment = %path.display(),
+                    error = %e,
+                    "series index unreadable — rebuilding it from the segment"
+                );
+                Self::rebuild_series_index(path, measurement).unwrap_or_default()
+            }
+        }
     }
 
     /// Register a segment's series in the bloom map and the tag index.
@@ -908,8 +915,7 @@ impl super::Chronix {
         ms: &MeasurementSchema,
         projection: &[String],
     ) -> Arc<arrow::datatypes::Schema> {
-        use arrow::datatypes::{DataType, Field};
-        use chronix_core::schema::ColumnType;
+        use arrow::datatypes::Field;
 
         let fields: Vec<Field> = ms
             .columns()
@@ -923,13 +929,7 @@ impl super::Chronix {
                     || projection.iter().any(|p| p == &col.name)
             })
             .map(|col| {
-                let dt = match col.column_type {
-                    ColumnType::Timestamp | ColumnType::I64 => DataType::Int64,
-                    ColumnType::U64 => DataType::UInt64,
-                    ColumnType::F64 => DataType::Float64,
-                    ColumnType::Bool => DataType::Boolean,
-                    ColumnType::String => DataType::Utf8,
-                };
+                let dt = chronix_query::column_type_to_arrow(col.column_type);
                 Field::new(col.name.clone(), dt, true).with_metadata(role_metadata(col.role))
             })
             .collect();

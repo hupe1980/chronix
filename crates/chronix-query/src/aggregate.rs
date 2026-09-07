@@ -24,7 +24,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+};
 use arrow::compute::kernels::aggregate as arrow_agg;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -76,6 +78,262 @@ pub enum AggFn {
     /// - **Null timestamp**: the row is skipped; only non-null
     ///   timestamps participate in the min/max search.
     Last,
+}
+
+/// Extra fractional digits an average of a decimal column is computed to.
+///
+/// A mean is a division, and a division of exact decimals does not
+/// generally terminate — `1/3` has no finite decimal form at any scale. So
+/// `avg` is the one aggregate here that rounds, and the rule is stated
+/// rather than left to a `double`: the result is carried to the column's
+/// scale plus six digits and rounded half away from zero, the way
+/// PostgreSQL's `NUMERIC` division extends its scale. Six digits is a
+/// millionth of the column's last digit; `sum` and `count` are both exact,
+/// so a caller who needs a different rounding can divide them itself.
+pub const AVG_EXTRA_SCALE: u8 = 6;
+
+/// One aggregate's result, in the type that keeps it exact.
+///
+/// Every column type but decimal reduces to an `f64`, which is what it
+/// already was. A decimal column stays a decimal all the way to the output
+/// array: `sum`, `min`, `max`, `first` and `last` over exact values are
+/// themselves exact, and turning them into a `double` on the way out would
+/// undo the whole point of the column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AggResult {
+    /// SQL `NULL` — an empty bucket, or a result that overflowed.
+    Null,
+    /// A floating-point result.
+    F64(f64),
+    /// An exact decimal result: `mantissa × 10⁻ˢᶜᵃˡᵉ`.
+    Decimal {
+        /// The unscaled result.
+        mantissa: i128,
+        /// Digits after the decimal point.
+        scale: u8,
+    },
+}
+
+impl AggResult {
+    /// The result as an `f64`, for the callers that only deal in floats.
+    ///
+    /// Lossy for a decimal, by definition — see
+    /// [`extract_f64`](crate::extract_f64) for where that is and is not the
+    /// right thing to do.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn as_f64(self) -> Option<f64> {
+        match self {
+            Self::Null => None,
+            Self::F64(v) => Some(v),
+            Self::Decimal { mantissa, scale } => {
+                Some(mantissa as f64 / chronix_core::pow10(u32::from(scale)).unwrap_or(1) as f64)
+            }
+        }
+    }
+}
+
+/// Build one output column from a column of results.
+///
+/// Public because the rollup engine builds the same columns from the same
+/// accumulator, and two functions that must agree on an output type are one
+/// function.
+///
+/// The Arrow type follows the results: a decimal aggregate produces a
+/// `Decimal128` column, everything else a `Float64` one. A run of results
+/// is homogeneous by construction — they come from one accumulator over one
+/// input column — so the first non-null one decides.
+pub fn agg_result_column(name: &str, results: &[AggResult]) -> Result<(Field, ArrayRef)> {
+    let scale = results.iter().find_map(|r| match r {
+        AggResult::Decimal { scale, .. } => Some(*scale),
+        _ => None,
+    });
+    match scale {
+        Some(scale) => {
+            let scale_i8 = i8::try_from(scale).map_err(|_| {
+                QueryError::Validation(format!("decimal scale {scale} is out of range"))
+            })?;
+            let mantissas: Vec<Option<i128>> = results
+                .iter()
+                .map(|r| match r {
+                    AggResult::Decimal { mantissa, .. } => Some(*mantissa),
+                    _ => None,
+                })
+                .collect();
+            let array = Decimal128Array::from(mantissas)
+                .with_precision_and_scale(chronix_core::DECIMAL_PRECISION, scale_i8)?;
+            let field = Field::new(
+                name,
+                DataType::Decimal128(chronix_core::DECIMAL_PRECISION, scale_i8),
+                true,
+            );
+            Ok((field, Arc::new(array)))
+        }
+        None => {
+            let values: Vec<Option<f64>> = results.iter().map(|r| r.as_f64()).collect();
+            Ok((
+                Field::new(name, DataType::Float64, true),
+                Arc::new(Float64Array::from(values)),
+            ))
+        }
+    }
+}
+
+/// A value pulled out of a column, in the type that keeps it exact.
+#[derive(Clone, Copy, Debug)]
+pub enum Num {
+    /// Anything that was already a float, or was widened to one.
+    F64(f64),
+    /// A decimal mantissa together with its scale.
+    Dec(i128, u8),
+}
+
+/// The exact half of an accumulator, allocated only for decimal columns.
+///
+/// Boxed behind an `Option` so a float column pays eight bytes for it and
+/// nothing else — a group-by over a high-cardinality tag holds one
+/// accumulator per (group, field), and making every one of them 128 bytes
+/// wider to support a column type it does not have is a cost the gateway
+/// would feel.
+#[derive(Debug, Clone)]
+pub struct DecimalTrack {
+    /// The scale everything tracked here is expressed at.
+    pub scale: u8,
+    /// Running total.
+    pub sum: i128,
+    /// Smallest mantissa seen.
+    pub min: i128,
+    /// Largest mantissa seen.
+    pub max: i128,
+    /// Mantissa at the earliest timestamp.
+    pub first: i128,
+    /// Mantissa at the latest timestamp.
+    pub last: i128,
+    /// A sum or a rescale needed more than 38 significant digits. The
+    /// affected results are `NULL`: a number that is not the answer is
+    /// worse than no number.
+    pub overflow: bool,
+}
+
+impl DecimalTrack {
+    /// An empty track at `scale`.
+    #[must_use]
+    pub fn new(scale: u8) -> Self {
+        Self {
+            scale,
+            sum: 0,
+            min: i128::MAX,
+            max: i128::MIN,
+            first: 0,
+            last: 0,
+            overflow: false,
+        }
+    }
+
+    /// Re-express everything tracked so far at a wider scale.
+    pub fn widen_to(&mut self, scale: u8) {
+        let Some(factor) = scale
+            .checked_sub(self.scale)
+            .and_then(|d| chronix_core::pow10(u32::from(d)))
+        else {
+            self.overflow = true;
+            return;
+        };
+        let mut scaled = |v: i128| match v.checked_mul(factor) {
+            Some(x) => x,
+            None => {
+                self.overflow = true;
+                v
+            }
+        };
+        self.sum = scaled(self.sum);
+        // The sentinels stay sentinels: scaling `i128::MAX` overflows, and
+        // it does not stand for a value anyway.
+        if self.min != i128::MAX {
+            self.min = scaled(self.min);
+        }
+        if self.max != i128::MIN {
+            self.max = scaled(self.max);
+        }
+        self.first = scaled(self.first);
+        self.last = scaled(self.last);
+        self.scale = scale;
+    }
+
+    /// Bring an incoming mantissa to the track's scale, widening the track
+    /// if the incoming value is finer. Both directions are exact.
+    ///
+    /// Returns `None` when the alignment would overflow 38 digits; the
+    /// caller sets [`overflow`](Self::overflow).
+    pub fn align(&mut self, mantissa: i128, scale: u8) -> Option<i128> {
+        match scale.cmp(&self.scale) {
+            std::cmp::Ordering::Equal => Some(mantissa),
+            std::cmp::Ordering::Greater => {
+                self.widen_to(scale);
+                Some(mantissa)
+            }
+            std::cmp::Ordering::Less => chronix_core::pow10(u32::from(self.scale - scale))
+                .and_then(|f| mantissa.checked_mul(f)),
+        }
+    }
+
+    /// The sum, or `Null` if it overflowed 38 digits.
+    #[must_use]
+    pub fn sum_result(&self) -> AggResult {
+        if self.overflow || chronix_core::Decimal::new(self.sum, self.scale).is_err() {
+            return AggResult::Null;
+        }
+        AggResult::Decimal {
+            mantissa: self.sum,
+            scale: self.scale,
+        }
+    }
+
+    /// The mean, carried to [`AVG_EXTRA_SCALE`] extra digits and rounded
+    /// half away from zero. See that constant for why this is the one
+    /// aggregate that rounds.
+    #[must_use]
+    pub fn avg_result(&self, count: u64) -> AggResult {
+        if self.overflow || count == 0 {
+            return AggResult::Null;
+        }
+        let target = self
+            .scale
+            .saturating_add(AVG_EXTRA_SCALE)
+            .min(chronix_core::MAX_DECIMAL_SCALE);
+        let extra = target - self.scale;
+        let Some(numerator) =
+            chronix_core::pow10(u32::from(extra)).and_then(|factor| self.sum.checked_mul(factor))
+        else {
+            return AggResult::Null;
+        };
+        let divisor = i128::from(count);
+        let quotient = numerator / divisor;
+        let remainder = numerator % divisor;
+        // Half away from zero: `|r| * 2 >= divisor` rounds up in magnitude.
+        let rounded = match remainder.unsigned_abs().checked_mul(2) {
+            Some(twice) if twice >= divisor.unsigned_abs() => {
+                quotient + if numerator < 0 { -1 } else { 1 }
+            }
+            _ => quotient,
+        };
+        if chronix_core::Decimal::new(rounded, target).is_err() {
+            return AggResult::Null;
+        }
+        AggResult::Decimal {
+            mantissa: rounded,
+            scale: target,
+        }
+    }
+
+    /// One tracked mantissa as a result.
+    #[must_use]
+    pub fn at(&self, mantissa: i128) -> AggResult {
+        AggResult::Decimal {
+            mantissa,
+            scale: self.scale,
+        }
+    }
 }
 
 /// Generate a typed aggregation function that applies `AggFn` to an Arrow
@@ -151,9 +409,9 @@ pub fn aggregate_batch(
         for func in functions {
             let func_name = format!("{field_name}_{}", agg_fn_name(*func));
             let value = aggregate_column_ts(col, *func, ts_col);
-
-            result_fields.push(Field::new(&func_name, DataType::Float64, true));
-            result_columns.push(Arc::new(Float64Array::from(vec![value])));
+            let (field, array) = agg_result_column(&func_name, &[value])?;
+            result_fields.push(field);
+            result_columns.push(array);
         }
     }
 
@@ -324,7 +582,7 @@ pub fn aggregate_grouped(
         // intermediate array allocations. TypedColumn pre-downcast eliminates
         // per-row dynamic dispatch.
         for (fi, typed) in typed_cols.iter().enumerate() {
-            if let Some(v) = typed.value_f64(row) {
+            if let Some(v) = typed.value_num(row) {
                 groups[gidx].1[fi].update(v, ts);
             }
         }
@@ -335,13 +593,6 @@ pub fn aggregate_grouped(
         .iter()
         .map(|name| Field::new(*name, DataType::Utf8, true))
         .collect();
-
-    for &field_name in field_columns {
-        for func in functions {
-            let func_name = format!("{field_name}_{}", agg_fn_name(*func));
-            result_fields.push(Field::new(&func_name, DataType::Float64, true));
-        }
-    }
 
     // Build result arrays
     let num_groups = groups.len();
@@ -355,15 +606,21 @@ pub fn aggregate_grouped(
     }
 
     // Finalize accumulators — each IncrementalAccumulator
-    // produces results for any requested AggFn in O(1).
-    for fi in 0..num_fields {
+    // produces results for any requested AggFn in O(1). The output column's
+    // type follows the results, so an aggregate over a decimal column stays
+    // a decimal.
+    for (fi, &field_name) in field_columns.iter().enumerate() {
         for func in functions {
-            let vals: Vec<Option<f64>> = (0..num_groups)
+            let func_name = format!("{field_name}_{}", agg_fn_name(*func));
+            let vals: Vec<AggResult> = (0..num_groups)
                 .map(|gi| groups[gi].1[fi].finalize(*func))
                 .collect();
-            result_columns.push(Arc::new(Float64Array::from(vals)));
+            let (field, array) = agg_result_column(&func_name, &vals)?;
+            result_fields.push(field);
+            result_columns.push(array);
         }
     }
+    debug_assert_eq!(num_fields, field_columns.len());
 
     let schema = Arc::new(Schema::new(result_fields));
     let batch = RecordBatch::try_new(schema, result_columns)?;
@@ -377,11 +634,7 @@ pub fn aggregate_grouped(
 ///
 /// Timestamp-aware column aggregation.
 #[allow(clippy::cast_precision_loss)]
-fn aggregate_column_ts(
-    col: &dyn Array,
-    func: AggFn,
-    timestamps: Option<&Int64Array>,
-) -> Option<f64> {
+fn aggregate_column_ts(col: &dyn Array, func: AggFn, timestamps: Option<&Int64Array>) -> AggResult {
     // For First/Last with a timestamp column, find the index of the
     // min/max timestamp and return the value at that index.
     if let Some(ts) = timestamps {
@@ -390,7 +643,35 @@ fn aggregate_column_ts(
         }
     }
 
-    if let Some(f64_col) = col.as_any().downcast_ref::<Float64Array>() {
+    // A decimal column is folded exactly, through the same accumulator the
+    // streaming path uses, rather than through the `f64` kernels.
+    if let TypedColumn::Decimal(a, scale) = TypedColumn::from_array(col) {
+        // With no timestamp column, First and Last mean array position —
+        // the same fallback the `f64` path takes. The accumulator cannot
+        // answer them here because it is fed no timestamps, and asking it
+        // anyway returned its zero-initialised slot rather than a value.
+        if matches!(func, AggFn::First | AggFn::Last) {
+            let mut present = (0..a.len()).filter(|&i| !a.is_null(i));
+            let idx = if func == AggFn::First {
+                present.next()
+            } else {
+                present.next_back()
+            };
+            return idx.map_or(AggResult::Null, |i| AggResult::Decimal {
+                mantissa: a.value(i),
+                scale,
+            });
+        }
+        let mut acc = IncrementalAccumulator::new();
+        for i in 0..a.len() {
+            if !a.is_null(i) {
+                acc.update(Num::Dec(a.value(i), scale), None);
+            }
+        }
+        return acc.finalize(func);
+    }
+
+    let value = if let Some(f64_col) = col.as_any().downcast_ref::<Float64Array>() {
         aggregate_f64(f64_col, func)
     } else if let Some(i64_col) = col.as_any().downcast_ref::<Int64Array>() {
         aggregate_i64(i64_col, func)
@@ -401,13 +682,14 @@ fn aggregate_column_ts(
             AggFn::Count => Some((col.len() - col.null_count()) as f64),
             _ => None,
         }
-    }
+    };
+    value.map_or(AggResult::Null, AggResult::F64)
 }
 
 /// Return the value at the row with the minimum (First) or maximum (Last)
 /// timestamp.  Works for any numeric column type.
 #[allow(clippy::cast_precision_loss)]
-fn first_last_by_ts(col: &dyn Array, ts: &Int64Array, func: AggFn) -> Option<f64> {
+fn first_last_by_ts(col: &dyn Array, ts: &Int64Array, func: AggFn) -> AggResult {
     let find_idx = |cmp: fn(i64, i64) -> bool| -> Option<usize> {
         let mut best_idx: Option<usize> = None;
         let mut best_ts: i64 = 0;
@@ -430,18 +712,17 @@ fn first_last_by_ts(col: &dyn Array, ts: &Int64Array, func: AggFn) -> Option<f64
         // This makes Last deterministic: for a given input order, the
         // latest-inserted row at the max timestamp is always selected.
         AggFn::Last => find_idx(|t, best| t >= best),
-        _ => return None,
-    }?;
+        _ => return AggResult::Null,
+    };
+    let Some(idx) = idx else {
+        return AggResult::Null;
+    };
 
     // Extract the value at the selected index.
-    if let Some(f64_col) = col.as_any().downcast_ref::<Float64Array>() {
-        Some(f64_col.value(idx))
-    } else if let Some(i64_col) = col.as_any().downcast_ref::<Int64Array>() {
-        Some(i64_col.value(idx) as f64)
-    } else {
-        col.as_any()
-            .downcast_ref::<UInt64Array>()
-            .map(|u64_col| u64_col.value(idx) as f64)
+    match TypedColumn::from_array(col).value_num(idx) {
+        Some(Num::F64(v)) => AggResult::F64(v),
+        Some(Num::Dec(mantissa, scale)) => AggResult::Decimal { mantissa, scale },
+        None => AggResult::Null,
     }
 }
 
@@ -472,6 +753,8 @@ enum TypedColumn<'a> {
     Float64(&'a Float64Array),
     Int64(&'a Int64Array),
     UInt64(&'a UInt64Array),
+    /// An exact decimal column, with the scale off its Arrow type.
+    Decimal(&'a Decimal128Array, u8),
     Other,
 }
 
@@ -483,8 +766,27 @@ impl<'a> TypedColumn<'a> {
             Self::Int64(a)
         } else if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
             Self::UInt64(a)
+        } else if let Some(a) = arr.as_any().downcast_ref::<Decimal128Array>() {
+            // A negative scale is legal Arrow and meaningless here; it reads
+            // as 0 rather than aborting the whole aggregate.
+            Self::Decimal(a, u8::try_from(a.scale()).unwrap_or(0))
         } else {
             Self::Other
+        }
+    }
+
+    /// The value at `row`, in the type that keeps it exact.
+    #[allow(clippy::cast_precision_loss)]
+    fn value_num(&self, row: usize) -> Option<Num> {
+        match self {
+            Self::Decimal(a, scale) => {
+                if a.is_null(row) {
+                    None
+                } else {
+                    Some(Num::Dec(a.value(row), *scale))
+                }
+            }
+            _ => self.value_f64(row).map(Num::F64),
         }
     }
 
@@ -512,6 +814,19 @@ impl<'a> TypedColumn<'a> {
                     Some(a.value(row) as f64)
                 }
             }
+            // A decimal reaches an `f64` only through `value_num`, which
+            // does not lose anything; this is the fallback for the callers
+            // that genuinely want a float.
+            Self::Decimal(a, scale) => {
+                if a.is_null(row) {
+                    None
+                } else {
+                    Some(
+                        a.value(row) as f64
+                            / chronix_core::pow10(u32::from(*scale)).unwrap_or(1) as f64,
+                    )
+                }
+            }
             Self::Other => None,
         }
     }
@@ -533,6 +848,8 @@ struct IncrementalAccumulator {
     last_ts: i64,
     last_val: f64,
     last_set: bool,
+    /// The exact track, present only once a decimal value has been seen.
+    decimal: Option<Box<DecimalTrack>>,
 }
 
 impl IncrementalAccumulator {
@@ -548,54 +865,119 @@ impl IncrementalAccumulator {
             last_ts: i64::MIN,
             last_val: 0.0,
             last_set: false,
+            decimal: None,
         }
     }
 
-    fn update(&mut self, value: f64, timestamp: Option<i64>) {
+    #[allow(clippy::cast_precision_loss)]
+    fn update(&mut self, value: Num, timestamp: Option<i64>) {
         self.count += 1;
-        self.sum += value;
-        if value < self.min {
-            self.min = value;
-        }
-        if value > self.max {
-            self.max = value;
+        match value {
+            Num::F64(v) => {
+                self.sum += v;
+                if v < self.min {
+                    self.min = v;
+                }
+                if v > self.max {
+                    self.max = v;
+                }
+            }
+            Num::Dec(mantissa, scale) => {
+                let track = self
+                    .decimal
+                    .get_or_insert_with(|| Box::new(DecimalTrack::new(scale)));
+                match track.align(mantissa, scale) {
+                    Some(m) => {
+                        match track.sum.checked_add(m) {
+                            Some(sum) => track.sum = sum,
+                            None => track.overflow = true,
+                        }
+                        if m < track.min {
+                            track.min = m;
+                        }
+                        if m > track.max {
+                            track.max = m;
+                        }
+                    }
+                    None => track.overflow = true,
+                }
+            }
         }
         // Skip First/Last tracking when timestamp is null (consistent
         // with the non-grouped `first_last_by_ts` path which also skips
         // null-timestamp rows).
         if let Some(ts) = timestamp {
-            if ts < self.first_ts || !self.first_set {
-                self.first_ts = ts;
-                self.first_val = value;
-                self.first_set = true;
-            }
+            let first = ts < self.first_ts || !self.first_set;
             // Use `>=` so that on ties, the last row encountered wins
             // (consistent with the non-grouped `first_last_by_ts` path).
-            if ts >= self.last_ts || !self.last_set {
+            let last = ts >= self.last_ts || !self.last_set;
+            if first {
+                self.first_ts = ts;
+                self.first_set = true;
+            }
+            if last {
                 self.last_ts = ts;
-                self.last_val = value;
                 self.last_set = true;
+            }
+            match value {
+                Num::F64(v) => {
+                    if first {
+                        self.first_val = v;
+                    }
+                    if last {
+                        self.last_val = v;
+                    }
+                }
+                Num::Dec(mantissa, scale) => {
+                    if let Some(track) = self.decimal.as_deref_mut() {
+                        if let Some(m) = track.align(mantissa, scale) {
+                            if first {
+                                track.first = m;
+                            }
+                            if last {
+                                track.last = m;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn finalize(&self, func: AggFn) -> Option<f64> {
+    fn finalize(&self, func: AggFn) -> AggResult {
         if self.count == 0 {
             return if func == AggFn::Count {
-                Some(0.0)
+                AggResult::F64(0.0)
             } else {
-                None
+                AggResult::Null
+            };
+        }
+        // A count is a count whatever the column holds, so it stays an
+        // `f64` for every type — it is the one aggregate whose result is
+        // not of the column's own kind.
+        if func == AggFn::Count {
+            return AggResult::F64(self.count as f64);
+        }
+        if let Some(track) = self.decimal.as_deref() {
+            return match func {
+                AggFn::Sum => track.sum_result(),
+                AggFn::Avg => track.avg_result(self.count),
+                AggFn::Min => track.at(track.min),
+                AggFn::Max => track.at(track.max),
+                AggFn::First => track.at(track.first),
+                AggFn::Last => track.at(track.last),
+                AggFn::Count => unreachable!("handled above"),
             };
         }
         match func {
-            AggFn::Count => Some(self.count as f64),
-            AggFn::Sum => Some(self.sum),
-            AggFn::Min => Some(self.min),
-            AggFn::Max => Some(self.max),
-            AggFn::Avg => Some(self.sum / self.count as f64),
-            AggFn::First => Some(self.first_val),
-            AggFn::Last => Some(self.last_val),
+            AggFn::Sum => AggResult::F64(self.sum),
+            AggFn::Min => AggResult::F64(self.min),
+            AggFn::Max => AggResult::F64(self.max),
+            AggFn::Avg => AggResult::F64(self.sum / self.count as f64),
+            AggFn::First => AggResult::F64(self.first_val),
+            AggFn::Last => AggResult::F64(self.last_val),
+            AggFn::Count => unreachable!("handled above"),
         }
     }
 }
@@ -765,7 +1147,7 @@ pub fn aggregate_sorted(
                 }
             });
             for (fi, typed) in typed_cols.iter().enumerate() {
-                if let Some(v) = typed.value_f64(row) {
+                if let Some(v) = typed.value_num(row) {
                     accs[fi].update(v, ts);
                 }
             }
@@ -780,13 +1162,6 @@ pub fn aggregate_sorted(
         .iter()
         .map(|name| Field::new(*name, DataType::Utf8, true))
         .collect();
-    for &field_name in field_columns {
-        for func in functions {
-            let func_name = format!("{field_name}_{}", agg_fn_name(*func));
-            result_fields.push(Field::new(&func_name, DataType::Float64, true));
-        }
-    }
-
     let num_groups = groups.len();
     let mut result_columns: Vec<ArrayRef> = Vec::new();
 
@@ -799,14 +1174,18 @@ pub fn aggregate_sorted(
         result_columns.push(Arc::new(arr));
     }
 
-    for fi in 0..num_fields {
+    for (fi, &field_name) in field_columns.iter().enumerate() {
         for func in functions {
-            let vals: Vec<Option<f64>> = (0..num_groups)
+            let func_name = format!("{field_name}_{}", agg_fn_name(*func));
+            let vals: Vec<AggResult> = (0..num_groups)
                 .map(|gi| groups[gi].1[fi].finalize(*func))
                 .collect();
-            result_columns.push(Arc::new(Float64Array::from(vals)));
+            let (field, array) = agg_result_column(&func_name, &vals)?;
+            result_fields.push(field);
+            result_columns.push(array);
         }
     }
+    debug_assert_eq!(num_fields, field_columns.len());
 
     let schema = Arc::new(Schema::new(result_fields));
     let batch = RecordBatch::try_new(schema, result_columns)?;
@@ -885,6 +1264,8 @@ struct UngroupedState {
     last_val: Vec<f64>,
     last_set: Vec<bool>,
     needs_first_last: bool,
+    /// The exact track per field, allocated only for decimal columns.
+    decimals: Vec<Option<Box<DecimalTrack>>>,
 }
 
 impl StreamingAggregator {
@@ -908,6 +1289,7 @@ impl StreamingAggregator {
                 needs_first_last: functions
                     .iter()
                     .any(|f| matches!(f, AggFn::First | AggFn::Last)),
+                decimals: (0..num_fields).map(|_| None).collect(),
             })
         } else {
             AggState::Grouped {
@@ -1082,7 +1464,7 @@ fn push_grouped(
         // Update one accumulator per field — single pass, no
         // redundant accumulator updates across function variants.
         for (fi, typed) in typed_cols.iter().enumerate() {
-            if let Some(v) = typed.and_then(|tc| tc.value_f64(row)) {
+            if let Some(v) = typed.and_then(|tc| tc.value_num(row)) {
                 groups[gidx].1[fi].update(v, ts);
             }
         }
@@ -1103,13 +1485,6 @@ fn finish_grouped(
         .iter()
         .map(|name| Field::new(*name, DataType::Utf8, true))
         .collect();
-    for &field_name in field_columns {
-        for func in functions {
-            let name = format!("{field_name}_{}", agg_fn_name(*func));
-            result_fields.push(Field::new(&name, DataType::Float64, true));
-        }
-    }
-
     let mut result_columns: Vec<ArrayRef> = Vec::new();
 
     // Group-by value columns.
@@ -1123,12 +1498,15 @@ fn finish_grouped(
     }
 
     // Aggregation result columns — one accumulator per field.
-    for fi in 0..field_columns.len() {
+    for (fi, &field_name) in field_columns.iter().enumerate() {
         for func in functions {
-            let vals: Vec<Option<f64>> = (0..num_groups)
+            let name = format!("{field_name}_{}", agg_fn_name(*func));
+            let vals: Vec<AggResult> = (0..num_groups)
                 .map(|gi| groups[gi].1[fi].finalize(*func))
                 .collect();
-            result_columns.push(Arc::new(Float64Array::from(vals)));
+            let (field, array) = agg_result_column(&name, &vals)?;
+            result_fields.push(field);
+            result_columns.push(array);
         }
     }
 
@@ -1202,6 +1580,33 @@ impl UngroupedState {
                         }
                     }
                 }
+                TypedColumn::Decimal(a, scale) => {
+                    // No Arrow kernel here: `sum` over `Decimal128` wraps on
+                    // overflow, and a wrapped total is a wrong answer rather
+                    // than a slow one. One checked pass instead.
+                    let track =
+                        self.decimals[fi].get_or_insert_with(|| Box::new(DecimalTrack::new(scale)));
+                    for i in 0..a.len() {
+                        if a.is_null(i) {
+                            continue;
+                        }
+                        match track.align(a.value(i), scale) {
+                            Some(m) => {
+                                match track.sum.checked_add(m) {
+                                    Some(sum) => track.sum = sum,
+                                    None => track.overflow = true,
+                                }
+                                if m < track.min {
+                                    track.min = m;
+                                }
+                                if m > track.max {
+                                    track.max = m;
+                                }
+                            }
+                            None => track.overflow = true,
+                        }
+                    }
+                }
                 TypedColumn::Other => {}
             }
 
@@ -1216,22 +1621,104 @@ impl UngroupedState {
                             continue;
                         }
                         let t = ts.value(i);
-                        if let Some(v) = typed.value_f64(i) {
-                            if t < self.first_ts[fi] || !self.first_set[fi] {
+                        if let Some(v) = typed.value_num(i) {
+                            let first = t < self.first_ts[fi] || !self.first_set[fi];
+                            // `>=` so last-encountered wins on ties.
+                            let last = t >= self.last_ts[fi] || !self.last_set[fi];
+                            if first {
                                 self.first_ts[fi] = t;
-                                self.first_val[fi] = v;
                                 self.first_set[fi] = true;
                             }
-                            // `>=` so last-encountered wins on ties.
-                            if t >= self.last_ts[fi] || !self.last_set[fi] {
+                            if last {
                                 self.last_ts[fi] = t;
-                                self.last_val[fi] = v;
                                 self.last_set[fi] = true;
+                            }
+                            match v {
+                                Num::F64(x) => {
+                                    if first {
+                                        self.first_val[fi] = x;
+                                    }
+                                    if last {
+                                        self.last_val[fi] = x;
+                                    }
+                                }
+                                Num::Dec(mantissa, scale) => {
+                                    let track = self.decimals[fi]
+                                        .get_or_insert_with(|| Box::new(DecimalTrack::new(scale)));
+                                    if let Some(m) = track.align(mantissa, scale) {
+                                        if first {
+                                            track.first = m;
+                                        }
+                                        if last {
+                                            track.last = m;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// One field's result for one function, exact where the column is.
+    #[allow(clippy::cast_precision_loss)]
+    fn finalize(&self, fi: usize, func: AggFn) -> AggResult {
+        if self.counts[fi] == 0 {
+            return if func == AggFn::Count {
+                AggResult::F64(0.0)
+            } else {
+                AggResult::Null
+            };
+        }
+        // A count is a count whatever the column holds.
+        if func == AggFn::Count {
+            return AggResult::F64(self.counts[fi] as f64);
+        }
+        if let Some(track) = self.decimals[fi].as_deref() {
+            return match func {
+                AggFn::Sum => track.sum_result(),
+                AggFn::Avg => track.avg_result(self.counts[fi]),
+                AggFn::Min => track.at(track.min),
+                AggFn::Max => track.at(track.max),
+                AggFn::First => {
+                    if self.first_set[fi] {
+                        track.at(track.first)
+                    } else {
+                        AggResult::Null
+                    }
+                }
+                AggFn::Last => {
+                    if self.last_set[fi] {
+                        track.at(track.last)
+                    } else {
+                        AggResult::Null
+                    }
+                }
+                AggFn::Count => unreachable!("handled above"),
+            };
+        }
+        match func {
+            AggFn::Sum => AggResult::F64(self.sums[fi]),
+            AggFn::Min => AggResult::F64(self.mins[fi]),
+            AggFn::Max => AggResult::F64(self.maxs[fi]),
+            AggFn::Avg => AggResult::F64(self.sums[fi] / self.counts[fi] as f64),
+            AggFn::First => {
+                if self.first_set[fi] {
+                    AggResult::F64(self.first_val[fi])
+                } else {
+                    AggResult::Null
+                }
+            }
+            AggFn::Last => {
+                if self.last_set[fi] {
+                    AggResult::F64(self.last_val[fi])
+                } else {
+                    AggResult::Null
+                }
+            }
+            AggFn::Count => unreachable!("handled above"),
         }
     }
 
@@ -1242,25 +1729,10 @@ impl UngroupedState {
         for (fi, &field_name) in field_columns.iter().enumerate() {
             for func in functions {
                 let name = format!("{field_name}_{}", agg_fn_name(*func));
-                result_fields.push(Field::new(&name, DataType::Float64, true));
-                let value = if self.counts[fi] == 0 {
-                    if *func == AggFn::Count {
-                        Some(0.0)
-                    } else {
-                        None
-                    }
-                } else {
-                    match func {
-                        AggFn::Count => Some(self.counts[fi] as f64),
-                        AggFn::Sum => Some(self.sums[fi]),
-                        AggFn::Min => Some(self.mins[fi]),
-                        AggFn::Max => Some(self.maxs[fi]),
-                        AggFn::Avg => Some(self.sums[fi] / self.counts[fi] as f64),
-                        AggFn::First => self.first_set[fi].then_some(self.first_val[fi]),
-                        AggFn::Last => self.last_set[fi].then_some(self.last_val[fi]),
-                    }
-                };
-                result_columns.push(Arc::new(Float64Array::from(vec![value])));
+                let value = self.finalize(fi, *func);
+                let (field, array) = agg_result_column(&name, &[value])?;
+                result_fields.push(field);
+                result_columns.push(array);
             }
         }
 
@@ -1272,6 +1744,139 @@ impl UngroupedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Exact decimals ─────────────────────────────────────────────
+
+    #[test]
+    fn first_and_last_over_a_decimal_column_without_timestamps() {
+        // No timestamp column, so First and Last mean array position. The
+        // accumulator is fed no timestamps on this path, and asking it for
+        // First returned its zero-initialised slot — a `0.00` where the
+        // first value was `1.11`.
+        let col: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(111_i128), None, Some(333)])
+                .with_precision_and_scale(38, 2)
+                .unwrap(),
+        );
+        assert_eq!(
+            aggregate_column_ts(col.as_ref(), AggFn::First, None),
+            AggResult::Decimal {
+                mantissa: 111,
+                scale: 2
+            }
+        );
+        assert_eq!(
+            aggregate_column_ts(col.as_ref(), AggFn::Last, None),
+            AggResult::Decimal {
+                mantissa: 333,
+                scale: 2
+            }
+        );
+        // And an all-null column has no first value at all.
+        let empty: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![None::<i128>, None])
+                .with_precision_and_scale(38, 2)
+                .unwrap(),
+        );
+        assert_eq!(
+            aggregate_column_ts(empty.as_ref(), AggFn::First, None),
+            AggResult::Null
+        );
+    }
+
+    #[test]
+    fn a_decimal_sum_that_overflows_38_digits_is_null_not_wrapped() {
+        // A wrapped total is a wrong answer that looks like an answer.
+        let widest = 99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
+        let col: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![Some(widest), Some(widest)])
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        );
+        assert_eq!(
+            aggregate_column_ts(col.as_ref(), AggFn::Sum, None),
+            AggResult::Null
+        );
+        // Min and max are untouched by the sum's overflow.
+        assert_eq!(
+            aggregate_column_ts(col.as_ref(), AggFn::Max, None),
+            AggResult::Decimal {
+                mantissa: widest,
+                scale: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_decimal_column_at_two_scales_folds_at_the_wider_one() {
+        // The write path normalises, so this only arises for batches that
+        // never went through it — but folding them at different scales would
+        // add a hundredth to a ten-thousandth.
+        let mut acc = IncrementalAccumulator::new();
+        acc.update(Num::Dec(150, 2), Some(1)); // 1.50
+        acc.update(Num::Dec(15_000, 4), Some(2)); // 1.5000
+        assert_eq!(
+            acc.finalize(AggFn::Sum),
+            AggResult::Decimal {
+                mantissa: 30_000,
+                scale: 4
+            }
+        );
+        // …and in the other order, which widens the track after the fact.
+        let mut acc = IncrementalAccumulator::new();
+        acc.update(Num::Dec(15_000, 4), Some(1));
+        acc.update(Num::Dec(150, 2), Some(2));
+        assert_eq!(
+            acc.finalize(AggFn::Sum),
+            AggResult::Decimal {
+                mantissa: 30_000,
+                scale: 4
+            }
+        );
+    }
+
+    #[test]
+    fn the_average_of_decimals_rounds_half_away_from_zero() {
+        let mut acc = IncrementalAccumulator::new();
+        for m in [100_i128, 100, 200] {
+            acc.update(Num::Dec(m, 2), Some(1));
+        }
+        // (1 + 1 + 2) / 3 = 1.333333…, at scale 2 + AVG_EXTRA_SCALE.
+        assert_eq!(
+            acc.finalize(AggFn::Avg),
+            AggResult::Decimal {
+                mantissa: 133_333_333,
+                scale: 8
+            }
+        );
+        // A negative mean rounds away from zero too, not toward it.
+        let mut acc = IncrementalAccumulator::new();
+        for m in [-100_i128, -100, -200] {
+            acc.update(Num::Dec(m, 2), Some(1));
+        }
+        assert_eq!(
+            acc.finalize(AggFn::Avg),
+            AggResult::Decimal {
+                mantissa: -133_333_333,
+                scale: 8
+            }
+        );
+    }
+
+    #[test]
+    fn a_count_of_decimals_is_a_float_column_not_a_decimal_one() {
+        let results = [AggResult::F64(3.0)];
+        let (field, _) = agg_result_column("v_count", &results).unwrap();
+        assert_eq!(field.data_type(), &DataType::Float64);
+        // And a decimal result produces a decimal column at its own scale.
+        let results = [AggResult::Decimal {
+            mantissa: 30,
+            scale: 2,
+        }];
+        let (field, array) = agg_result_column("v_sum", &results).unwrap();
+        assert_eq!(field.data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(array.len(), 1);
+    }
 
     fn test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

@@ -332,6 +332,26 @@ impl LastValueCache {
         }
     }
 
+    /// Keep only the series `keep` accepts, by canonical form.
+    ///
+    /// The LVC is a copy of the newest row of every series, and a copy is not
+    /// an answer: once retention has dropped a series' data the raw
+    /// query returns nothing while the cache kept returning its last reading
+    /// — a device offline for longer than the retention window went on
+    /// reporting a "current" value for ever. It is also how the cache stays
+    /// bounded on a long-lived deployment: the live series set is bounded by
+    /// retention, and without this the cache was not.
+    ///
+    /// Called by the cardinality repair, against the budget it just rebuilt —
+    /// as a predicate rather than a materialised set, so pruning the cache
+    /// does not cost a copy of every live series.
+    pub fn retain_series(&self, keep: impl Fn(&str) -> bool) {
+        self.cache.retain(|key, _point| keep(key.canonical_form()));
+        if self.max_entries > 0 {
+            self.order.lock().retain_present(&self.cache);
+        }
+    }
+
     /// Remove all entries for a measurement.
     pub fn evict_measurement(&self, measurement: &str) {
         self.cache

@@ -335,6 +335,7 @@ mod tests {
             name: "host".to_string(),
             data_type: 1, // STRING
             role: 1,      // TAG
+            decimal_scale: None,
             stats: ColumnStats {
                 min_value: 0,
                 max_value: 0,
@@ -354,6 +355,7 @@ mod tests {
             name: "host".to_string(),
             data_type: 1,
             role: 1,
+            decimal_scale: None,
             stats: ColumnStats {
                 min_value: 0,
                 max_value: 0,

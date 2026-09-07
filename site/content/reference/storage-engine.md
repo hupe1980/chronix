@@ -21,7 +21,7 @@ WAL files begin with a 6-byte header:
 
 ### Record Format
 
-Each record uses the **v2 format** (WAL version 2):
+Each record uses WAL format version 1:
 
 ```text
 [crc32c: u32][length: u32][sequence_no: u64][record_type: u8][payload_version: u8][payload: [u8; length]]
@@ -32,8 +32,8 @@ Each record uses the **v2 format** (WAL version 2):
 - **Record type** discriminant from `WalRecordType`: `Data`(0), `Batch`(1),
   `Schema`(2), `Tombstone`(3) — enables future record kinds without format changes
 - **Payload version** (currently 1) — enables future payload format evolution
-- Only WAL v2 format (18-byte record header) is supported; legacy v1 files
-  are rejected at open time
+- The version is checked for **equality**: there is one format, and a file
+  that is not it is refused at open rather than guessed at
 
 ### Payload Codec
 
@@ -143,7 +143,7 @@ it is flushed from the memtable.
 └─────────────────────────────────────────────┘
 ```
 
-### Null Semantics (`.csx` v2)
+### Null Semantics
 
 An absent field is a real SQL `NULL`, not a placeholder value.
 
@@ -169,9 +169,10 @@ what the block decode path reads.)
 `SUM` and `COUNT`, and makes the memtable and the segment answer a query the
 same way either side of a flush. Nulls survive compaction.
 
-`.csx` **v2 is the only format**: a segment written by an older version is
-refused at `open()` rather than read as though its columns still meant what
-they used to (`segment::header::tests::header_older_version_rejected`).
+There is **one `.csx` format**, and the header version is checked for
+equality: a segment Chronix did not write is refused at `open()` rather than
+read as though its columns meant what this reader assumes
+(`segment::header::tests::header_version_is_refused_in_both_directions`).
 
 ### Column Order
 
@@ -270,7 +271,7 @@ The segment reader performs several integrity checks when opening files:
 - **Per-block CRC32c** — each column block's `block_crc` field is verified on
   read; a value of `0` skips the check for backward compatibility with
   pre-checksum segments
-- **Version check** — only version 2 is accepted (0 and future versions rejected)
+- **Version check** — the header version must equal `segment::header::VERSION`
 - **Metadata offset** — validated against footer start to prevent out-of-bounds
 - **Row group count** — validated against remaining data size to prevent OOM
 
@@ -550,7 +551,31 @@ catalog.
 `enforce_retention(retention)` takes a `Duration`, as `ChronixConfig::retention`
 does, and identifies shards whose `max_timestamp` falls
 before the cutoff and drops all segments, catalog entries, bloom filters, tag
-index entries, and metadata cache entries for those shards.
+index entries, and metadata index entries for those shards.
+
+The cutoff is `reference − retention`, where the reference is
+`retention::retention_reference(now, newest_timestamp_held)` —
+`min(wall clock, newest timestamp the database holds)`. The newest timestamp
+comes from the same catalog snapshot the shard bounds do, plus the shard live
+writes are landing in; that shard's *start* is used, which can only hold data
+back.
+
+Cold archiving uses the bare wall clock: it moves rows that stay queryable
+through the archive table, so the cap that protects an irreversible delete
+would only stop a quiet database from tiering.
+
+The pass returns `RetentionResult { shards_dropped, segments_deleted,
+segments_preserved, bytes_freed }`. `shards_dropped` counts shards actually
+removed; `segments_preserved` counts segments past the cutoff that a rollup
+still needs.
+
+A pass that deleted anything then calls `repair_live_series`, which re-derives
+the live series set from the segment sidecars plus the memtables — memtables
+first, since data only moves memtable → segment — and retains `known_series`
+(the cardinality budget) and the last-value cache against it. The namespace →
+measurement index is outside this: it follows the measurement rather than its
+rows, so an emptied measurement stays resolvable for its tenant and a dropped
+one is removed by the drop path.
 
 **Crash-safety ordering:** Catalog and index entries are removed *before* segment
 files are deleted. This ensures that a crash between the two operations leaves

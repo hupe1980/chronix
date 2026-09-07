@@ -48,6 +48,10 @@ default = ["sql"]
 ## evaluator never touches DataFusion.
 sql = ["dep:datafusion"]
 
+## `TryFrom` conversions between `chronix::Decimal` and
+## `rust_decimal::Decimal` — see `chronix-core`'s feature of the same name.
+rust_decimal = ["chronix-core/rust_decimal"]
+
 ## Parquet cold tier on S3/GCS/Azure, queryable through SQL (D6).
 ##
 ## Implies `sql`: the read half registers a DataFusion listing table, so a
@@ -168,6 +172,10 @@ required-features = ["sql"]
 
 [[test]]
 name = "documented_sql"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_decimal_semantics"
 required-features = ["sql"]
 
 

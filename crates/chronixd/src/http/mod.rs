@@ -30,10 +30,11 @@ pub use types::{
 
 // Re-export all handler functions so server.rs can reference them as `http::handler_name`.
 pub use management::{
-    create_rollup_handler, delete_batch_handler, delete_handler, delete_rollup_handler,
-    drop_measurement_handler, export_dashboards_handler, export_parquet_handler,
-    get_schema_handler, health_handler, list_connectors_handler, list_measurements_handler,
-    list_rollups_handler, ready_handler, refresh_rollup_handler, update_log_level_handler,
+    create_rollup_handler, declare_field_handler, delete_batch_handler, delete_handler,
+    delete_rollup_handler, drop_measurement_handler, export_dashboards_handler,
+    export_parquet_handler, get_schema_handler, health_handler, list_connectors_handler,
+    list_measurements_handler, list_rollups_handler, ready_handler, refresh_rollup_handler,
+    restore_measurement_handler, update_log_level_handler,
 };
 pub use prom::{
     prom_buildinfo_handler, prom_empty_alerts_handler, prom_empty_exemplars_handler,

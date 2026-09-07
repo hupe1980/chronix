@@ -8,6 +8,9 @@
 //!
 //! - **Data model:** [`FieldValue`], [`SeriesKey`], [`Point`] — the fundamental
 //!   units of time-series data.
+//! - **Exact decimals:** [`Decimal`] — `mantissa × 10⁻ˢᶜᵃˡᵉ` for the one class
+//!   of series whose value is a legal quantity: metering, billing and
+//!   settlement. See [`decimal`] for why a `f64` cannot carry those.
 //! - **Schema:** [`MeasurementSchema`], [`SchemaRegistry`] — schema-on-write with
 //!   additive evolution.
 //! - **Errors:** [`ChronixError`] — crate-level and top-level error hierarchy.
@@ -19,6 +22,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod config;
+pub mod decimal;
 pub mod error;
 pub mod schema;
 pub mod types;
@@ -27,6 +31,9 @@ pub mod wal_codec;
 pub use config::{
     AnalyticsConfig, ChronixConfig, ChronixConfigBuilder, CompressionCodec, FloatEncoding,
     FsyncPolicy, WalConfig,
+};
+pub use decimal::{
+    pow10, Decimal, DecimalError, DECIMAL_PRECISION, MAX_DECIMAL_MANTISSA, MAX_DECIMAL_SCALE,
 };
 pub use error::{ChronixError, ConfigError, SchemaError, WalError};
 pub use schema::{

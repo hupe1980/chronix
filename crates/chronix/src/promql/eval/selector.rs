@@ -456,21 +456,26 @@ fn collect_series(
     Ok(series_map)
 }
 
+/// One sample's value, as the `f64` PromQL is defined over.
+///
+/// PromQL has one numeric type, so a `Decimal` column selected here is
+/// converted — and converted through the workspace's single conversion
+/// function, so the boundary is the one named in
+/// [`chronix_query::extract_f64`] rather than another copy of it. A register
+/// on a dashboard is exactly the case where that is the right answer; a
+/// register in a settlement is not, and SQL is where that query belongs.
+///
+/// The caller has already skipped null rows, so a `None` from the shared
+/// function here means an unsupported column type.
 pub(crate) fn extract_f64(col: &arrow::array::ArrayRef, row: usize) -> Result<f64, EvalError> {
-    if let Some(a) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
-        Ok(a.value(row))
-    } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
-        Ok(a.value(row) as f64)
-    } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::UInt64Array>() {
-        Ok(a.value(row) as f64)
-    } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::Float32Array>() {
-        Ok(f64::from(a.value(row)))
-    } else if let Some(a) = col.as_any().downcast_ref::<arrow::array::BooleanArray>() {
-        Ok(if a.value(row) { 1.0 } else { 0.0 })
-    } else {
-        Err(EvalError(format!(
-            "cannot extract f64 from {:?}",
-            col.data_type()
-        )))
+    // Two types PromQL accepts that the storage layer never produces, so
+    // they are not in the shared extractor: a 32-bit float and a boolean.
+    if let Some(a) = col.as_any().downcast_ref::<arrow::array::Float32Array>() {
+        return Ok(f64::from(a.value(row)));
     }
+    if let Some(a) = col.as_any().downcast_ref::<arrow::array::BooleanArray>() {
+        return Ok(if a.value(row) { 1.0 } else { 0.0 });
+    }
+    chronix_query::extract_f64(col.as_ref(), row)
+        .ok_or_else(|| EvalError(format!("cannot extract f64 from {:?}", col.data_type())))
 }

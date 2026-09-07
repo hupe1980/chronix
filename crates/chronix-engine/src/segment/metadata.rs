@@ -66,6 +66,16 @@ pub struct ColumnMeta {
     /// the decryption key from a `FieldKeyProvider`.
     #[serde(default)]
     pub key_id: Option<String>,
+    /// Digits after the decimal point, for a decimal column.
+    ///
+    /// `None` for every other type. The scale lives here, once per column,
+    /// rather than beside each value: it is a property of the column, fixed
+    /// when the column was created, and the write path rescales every value
+    /// to it before the memtable ever sees it. Storing it per value would
+    /// cost a byte a row to say the same thing 65 536 times, and would make
+    /// a segment whose rows disagreed representable.
+    #[serde(default)]
+    pub decimal_scale: Option<u8>,
     /// Per-row-group bloom filters for string columns .
     ///
     /// `row_group_blooms[rg_idx]` is a serialized bloom filter containing
@@ -76,6 +86,70 @@ pub struct ColumnMeta {
     /// written before .
     #[serde(default)]
     pub row_group_blooms: Option<Vec<Vec<u8>>>,
+}
+
+impl ColumnMeta {
+    /// The Arrow type this column decodes to.
+    ///
+    /// The single answer to a question four places in the reader used to
+    /// answer separately, each ending in `_ => DataType::Utf8`. That
+    /// fallback was fine while every non-numeric column was a string; it
+    /// silently turned a decimal column into `Utf8` the moment one existed.
+    #[must_use]
+    pub fn arrow_data_type(&self) -> arrow::datatypes::DataType {
+        use arrow::datatypes::DataType;
+        match self.data_type {
+            data_types::TIMESTAMP | data_types::I64 => DataType::Int64,
+            data_types::U64 => DataType::UInt64,
+            data_types::F64 => DataType::Float64,
+            data_types::BOOL => DataType::Boolean,
+            data_types::DECIMAL => DataType::Decimal128(
+                chronix_core::DECIMAL_PRECISION,
+                // A decimal column always carries its scale; a segment whose
+                // metadata lost it reads as scale 0, which is wrong by a
+                // power of ten but not a panic.
+                self.decimal_scale.unwrap_or(0) as i8,
+            ),
+            _ => DataType::Utf8,
+        }
+    }
+
+    /// An empty array of this column's Arrow type, for a pruned row group.
+    #[must_use]
+    pub fn empty_array(&self) -> arrow::array::ArrayRef {
+        use arrow::array::{
+            ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+            UInt64Array,
+        };
+        match self.data_type {
+            data_types::TIMESTAMP | data_types::I64 => {
+                std::sync::Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef
+            }
+            data_types::U64 => std::sync::Arc::new(UInt64Array::from(Vec::<u64>::new())),
+            data_types::F64 => std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())),
+            data_types::BOOL => std::sync::Arc::new(BooleanArray::from(Vec::<bool>::new())),
+            data_types::DECIMAL => {
+                let array = Decimal128Array::from(Vec::<i128>::new());
+                // Empty, so there is no value to fail validation; the scale
+                // still has to match the field the schema declares.
+                match array.with_precision_and_scale(
+                    chronix_core::DECIMAL_PRECISION,
+                    self.decimal_scale.unwrap_or(0) as i8,
+                ) {
+                    Ok(a) => std::sync::Arc::new(a),
+                    Err(_) => std::sync::Arc::new(Decimal128Array::from(Vec::<i128>::new())),
+                }
+            }
+            _ => std::sync::Arc::new(StringArray::from(Vec::<&str>::new())),
+        }
+    }
+
+    /// The Arrow field for this column, carrying its role as metadata.
+    #[must_use]
+    pub fn arrow_field(&self) -> arrow::datatypes::Field {
+        arrow::datatypes::Field::new(&self.name, self.arrow_data_type(), true)
+            .with_metadata(roles::arrow_metadata(self.role))
+    }
 }
 
 /// Column data type tags.
@@ -92,6 +166,9 @@ pub mod data_types {
     pub const U64: u8 = 4;
     /// Boolean column.
     pub const BOOL: u8 = 5;
+    /// Exact decimal column: an `i128` mantissa with the scale held in
+    /// [`ColumnMeta::decimal_scale`](super::ColumnMeta::decimal_scale).
+    pub const DECIMAL: u8 = 6;
 }
 
 /// Column role tags.
@@ -433,6 +510,7 @@ mod tests {
                     bloom_filter: None,
                     encrypted: false,
                     key_id: None,
+                    decimal_scale: None,
                     row_group_blooms: None,
                 },
                 ColumnMeta {
@@ -444,6 +522,7 @@ mod tests {
                     bloom_filter: None,
                     encrypted: false,
                     key_id: None,
+                    decimal_scale: None,
                     row_group_blooms: None,
                 },
                 ColumnMeta {
@@ -455,6 +534,7 @@ mod tests {
                     bloom_filter: None,
                     encrypted: false,
                     key_id: None,
+                    decimal_scale: None,
                     row_group_blooms: None,
                 },
             ],

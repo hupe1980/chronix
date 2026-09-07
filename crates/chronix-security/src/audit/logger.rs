@@ -151,7 +151,7 @@ impl AuditSink for MemorySink {
         if q.len() >= self.max_capacity {
             q.pop_front();
             let dropped = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
-            counter!("chronix.audit.memory_sink.dropped").increment(1);
+            counter!("chronix_audit_memory_sink_dropped_total").increment(1);
             // Warn at 1, 10, 100, 1000, then every 1000 drops to avoid
             // large silent gaps (the old `is_power_of_two()` pattern had a
             // 64K-event gap between the 65 536 and 131 072 warnings).
@@ -165,7 +165,7 @@ impl AuditSink for MemorySink {
         }
         q.push_back(event.clone());
         let fill = q.len() as f64 / self.max_capacity.max(1) as f64;
-        gauge!("chronix.audit.memory_sink.fill_ratio").set(fill);
+        gauge!("chronix_audit_memory_sink_fill_ratio").set(fill);
         Ok(())
     }
 }

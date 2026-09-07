@@ -191,6 +191,31 @@ pub enum SchemaError {
         got: String,
     },
 
+    /// A decimal value carries more fractional digits than its column
+    /// declares, so storing it would have to round.
+    ///
+    /// Separate from [`TypeConflict`](Self::TypeConflict) because the fix is
+    /// different: the types agree, the *scale* does not, and the writer
+    /// either rounds the value itself or declares the column with the scale
+    /// it needs before the first write.
+    #[error(
+        "Decimal scale conflict for field '{field}' in measurement '{measurement}': \
+         the column stores {declared} fractional digit(s) and the value {value} needs {got}. \
+         Declare the field with the scale it needs before the first write, or round the value."
+    )]
+    DecimalScaleConflict {
+        /// Measurement name where the conflict occurred.
+        measurement: String,
+        /// Field name with the scale conflict.
+        field: String,
+        /// The column's declared scale.
+        declared: u8,
+        /// The value's scale.
+        got: u8,
+        /// The offending value, rendered exactly.
+        value: String,
+    },
+
     /// Measurement not found.
     #[error("Measurement '{0}' not found")]
     MeasurementNotFound(String),

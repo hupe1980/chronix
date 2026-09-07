@@ -161,22 +161,30 @@ impl FromStr for BucketWidth {
             u32::try_from(n.saturating_mul(per))
                 .map_err(|_| BucketParseError(format!("bucket width '{s}' is too large")))
         };
+        // The long spellings are accepted beside the short ones, because
+        // `time_bucket('1 hour', _time)` is what somebody coming from
+        // TimescaleDB or PostgreSQL writes, and the parser already tolerates
+        // the space. What is deliberately *not* accepted is a bare `M` for
+        // the month: `m` is the minute here, and a unit that means one thing
+        // in one case and 43 200 times that in the other is a trap. The
+        // month is `mo` or `month`, always.
         match suffix {
-            "ns" => mul(NS),
-            "us" | "µs" => mul(US),
-            "ms" => mul(MS),
-            "s" => mul(SEC),
-            "m" | "min" => mul(MIN),
-            "h" => mul(HOUR),
-            "d" => count(1).map(Self::Days),
-            "w" => count(7).map(Self::Days),
-            "mo" => count(1).map(Self::Months),
-            "y" => count(12).map(Self::Months),
+            "ns" | "nanosecond" | "nanoseconds" => mul(NS),
+            "us" | "µs" | "microsecond" | "microseconds" => mul(US),
+            "ms" | "millisecond" | "milliseconds" => mul(MS),
+            "s" | "sec" | "secs" | "second" | "seconds" => mul(SEC),
+            "m" | "min" | "mins" | "minute" | "minutes" => mul(MIN),
+            "h" | "hr" | "hrs" | "hour" | "hours" => mul(HOUR),
+            "d" | "day" | "days" => count(1).map(Self::Days),
+            "w" | "week" | "weeks" => count(7).map(Self::Days),
+            "mo" | "month" | "months" => count(1).map(Self::Months),
+            "y" | "yr" | "yrs" | "year" | "years" => count(12).map(Self::Months),
             "" => Err(BucketParseError(format!(
                 "'{s}' has no unit — write a width like 15m, 1h, 1d, 1mo"
             ))),
             other => Err(BucketParseError(format!(
-                "unknown bucket unit '{other}'. Use ns, us, ms, s, m/min, h, d, w, mo, y \
+                "unknown bucket unit '{other}'. Use ns, us, ms, s, m/min, h, d, w, mo, y — \
+                 or their long forms (second, minute, hour, day, week, month, year) \
                  (the month is 'mo'; 'm' is always the minute)"
             ))),
         }
@@ -540,6 +548,60 @@ mod tests {
         // three years of stored data.
         let err = "1M".parse::<BucketWidth>().unwrap_err();
         assert!(err.0.contains("'mo'"), "{err}");
+    }
+
+    #[test]
+    fn the_long_unit_names_mean_the_same_as_the_short_ones() {
+        // `time_bucket('1 hour', _time)` is what somebody coming from
+        // TimescaleDB writes, and the parser already tolerated the space —
+        // so the only thing standing between that query and an answer was
+        // the vocabulary.
+        for (long, short) in [
+            ("1 second", "1s"),
+            ("30 seconds", "30s"),
+            ("15 minutes", "15m"),
+            ("1 minute", "1m"),
+            ("1 hour", "1h"),
+            ("24 hours", "24h"),
+            ("1 day", "1d"),
+            ("2 weeks", "2w"),
+            ("1 month", "1mo"),
+            ("3 months", "3mo"),
+            ("1 year", "1y"),
+        ] {
+            assert_eq!(
+                long.parse::<BucketWidth>().unwrap(),
+                short.parse::<BucketWidth>().unwrap(),
+                "'{long}' must mean '{short}'"
+            );
+        }
+        // And the long forms work without the space too.
+        assert_eq!(
+            "1hour".parse::<BucketWidth>().unwrap(),
+            BucketWidth::Fixed(HOUR)
+        );
+    }
+
+    #[test]
+    fn no_long_form_reopens_the_minute_month_trap() {
+        // `month` is unambiguous; `M`, `Min` and `MO` are not spellings this
+        // parser accepts, because a case-sensitive difference between a
+        // minute and a month is wrong once and then wrong for three years of
+        // stored data.
+        assert_eq!(
+            "1month".parse::<BucketWidth>().unwrap(),
+            BucketWidth::Months(1)
+        );
+        assert_eq!(
+            "1minute".parse::<BucketWidth>().unwrap(),
+            BucketWidth::Fixed(MIN)
+        );
+        for ambiguous in ["1M", "1MO", "1Month", "1Min"] {
+            assert!(
+                ambiguous.parse::<BucketWidth>().is_err(),
+                "'{ambiguous}' must be refused rather than guessed at"
+            );
+        }
     }
 
     #[test]

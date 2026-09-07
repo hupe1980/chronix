@@ -212,13 +212,17 @@ fn collect_annotations(
 
 /// `GET /api/v1/annotations/stream` — SSE stream of signal events for Grafana live annotations.
 ///
-/// # Polling interval
+/// # How it wakes up
 ///
-/// The inner polling loop sleeps for **2 seconds** between database
-/// scans. This is currently hardcoded. For high-frequency annotation
-/// workloads, a shorter interval may be desirable; for quiet systems,
-/// a longer interval saves CPU. Consider making this configurable via
-/// `ServerConfig::annotation_poll_interval_secs`.
+/// The loop is **pushed, not polled**: it subscribes to the CDC event bus and
+/// re-scans when a write arrives, so an annotation reaches Grafana as fast as
+/// the write does. The 30-second timer beside it is a *fallback*, there to
+/// catch anything that reaches the database without publishing an event —
+/// not an interval anybody waits for. It used to be a bare 2-second poll, and
+/// this comment went on describing that for some time after it stopped being
+/// true, which is why the number is now stated next to the code that produces
+/// it. A subscription is required: if the bus is at its subscriber limit the
+/// stream reports an error rather than silently degrading to polling.
 ///
 /// # Dedup key strategy
 ///

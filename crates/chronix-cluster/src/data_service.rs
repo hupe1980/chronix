@@ -152,6 +152,11 @@ pub fn proto_to_core_point(dp: &proto::DataPoint) -> Result<Point> {
             proto::field_value::Kind::U64Value(v) => FieldValue::U64(*v),
             proto::field_value::Kind::BoolValue(v) => FieldValue::Bool(*v),
             proto::field_value::Kind::StringValue(v) => FieldValue::String(v.clone()),
+            proto::field_value::Kind::DecimalValue(v) => {
+                FieldValue::Decimal(v.parse().map_err(|e| {
+                    ClusterError::Validation(format!("invalid decimal \"{v}\": {e}"))
+                })?)
+            }
         };
         fields.insert(entry.name.clone(), fv);
     }
@@ -173,6 +178,7 @@ pub fn core_to_proto_point(p: &Point) -> proto::DataPoint {
                 FieldValue::U64(v) => proto::field_value::Kind::U64Value(*v),
                 FieldValue::Bool(v) => proto::field_value::Kind::BoolValue(*v),
                 FieldValue::String(v) => proto::field_value::Kind::StringValue(v.clone()),
+                FieldValue::Decimal(d) => proto::field_value::Kind::DecimalValue(d.to_string()),
             };
             proto::FieldEntry {
                 name: name.to_string(),

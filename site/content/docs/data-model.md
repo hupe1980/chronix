@@ -26,7 +26,8 @@ timestamp:    1700000000000000000                  ← i64, nanoseconds
   of distinct tag combinations is what determines how much memory the database
   needs.
 - **Fields** are what you are recording. They are not indexed, and each may be
-  `f64`, `i64`, `u64`, `bool` or `String`.
+  `f64`, `i64`, `u64`, `bool`, `String` or an exact
+  [`Decimal`](#exact-decimals-for-money-and-meters).
 - A **series** is one measurement plus one exact tag set. `power{meter=main,
   phase=L1}` and `power{meter=main, phase=L2}` are two series.
 
@@ -65,6 +66,93 @@ The question is whether you will ever *filter or group by* it.
 Putting a high-cardinality value in a tag — a request id, a timestamp, a user
 id — creates one series per distinct value. That is the single most common way
 to make a time-series database unusable, and it is not specific to Chronix.
+
+### Exact decimals, for money and meters
+
+`f64` cannot represent `0.1`. For a temperature or a load average that does
+not matter; for a meter register a bill is computed from, it is the whole
+problem. Chronix has a sixth field type for those:
+
+```rust
+// A quarter-hour register in kWh to four decimal places.
+db.declare_field("meter", "z1nb_q", ColumnType::Decimal { scale: 4 })?;
+
+let reading: Decimal = "1234.5678".parse()?;
+let key = SeriesKey::new("meter", tags! { "device" => "main" })?;
+db.insert(&Point::new(key, fields! { "z1nb_q" => reading }, now)?)?;
+```
+
+The question is not "how precise does this need to be" but **what kind of
+number is this**:
+
+| | `f64` | `Decimal` |
+|---|---|---|
+| A sensor reading, a rate, a ratio | ✅ | |
+| A quantity someone is billed for, or a regulator audits | | ✅ |
+| `SUM` / `MIN` / `MAX` / `FIRST` / `LAST` | approximate | **exact** |
+| `AVG` | approximate | exact to scale + 6, rounded half away from zero |
+| Forecasting, anomaly detection, percentiles | native | converted, and says so |
+| In SQL | `DOUBLE` | `DECIMAL(38, s)` — DataFusion aggregates it exactly |
+
+A decimal never passes through binary floating point: not on the way in, not
+in the write-ahead log, not in a segment, not in a query result, and not on
+any wire format. Where an answer genuinely cannot be exact — a moving
+average, a Holt-Winters term, a PromQL sample — the conversion happens in one
+named place and the result is a `DOUBLE`, so you can see it happen.
+
+**In SQL a decimal literal is a decimal**, as in PostgreSQL, so `WHERE
+z1nb_q > 0.1` and `SELECT z1nb_q + 0.05` are both exact. A `DOUBLE` column is
+unaffected; write `CAST(1.5 AS DOUBLE)` for a literal that must be a float
+whatever it meets.
+
+#### The scale belongs to the column
+
+A decimal column stores a fixed number of fractional digits, and that number
+is fixed when the column is created. Every later write is rescaled to it:
+
+- Fewer digits than the column? Widened exactly — `1.5` into a scale-4
+  column is stored as `1.5000`.
+- More digits than the column? **Rejected**, naming both. Storing it would
+  mean rounding it.
+
+So declare the column before the first write — `db.declare_field(…)` above,
+or `POST /api/v1/measurements/{name}/schema/fields`. Otherwise the first
+point decides, and a device that reports `231.4` before `231.45` pins the
+column at one digit.
+
+The limits are 38 significant digits and a scale of 0–38, which is what
+Arrow's `Decimal128` carries. A value outside them is refused at ingest
+rather than truncated.
+
+#### Writing one over the wire
+
+A JSON number is parsed as a `double` by every client library there is, so a
+decimal travels as **digits in a string**:
+
+```json
+{ "measurement": "meter",
+  "tags":   { "device": "main" },
+  "fields": { "z1nb_q": { "decimal": "1234.5678" } },
+  "timestamp": 1700000000000000000 }
+```
+
+Line protocol uses a `d` suffix, beside the `i` and `u` you already know:
+
+```text
+meter,device=main z1nb_q=1234.5678d 1700000000000000000
+```
+
+Reading a point back gives you the same `{"decimal": "…"}` shape, so a point
+you read is a point you can write. A SQL result cell is a plain string of
+digits, with `decimal(38, 4)` in the column metadata beside it.
+
+Arrow Flight `DoPut` carries a `Decimal128` column directly, which is how a
+`pyarrow` table of registers bulk-loads.
+
+If your own values are already `rust_decimal::Decimal`, the `rust_decimal`
+feature gives `TryFrom` in both directions. Chronix does not depend on it
+otherwise: the representation is the same `i128` mantissa plus scale that
+`rust_decimal` and PostgreSQL `NUMERIC` use.
 
 ### How a field is named in PromQL
 
@@ -132,7 +220,9 @@ knowing before you tune anything:
 
 ## Retention and rollups
 
-Retention drops data older than its window. Rollups pre-aggregate raw data
+Retention drops data older than its window, where age is measured from
+`min(wall clock, newest timestamp the database holds)`
+(see [Operations](@/docs/operations.md)). Rollups pre-aggregate raw data
 into coarser tiers — 1&nbsp;s → 1&nbsp;min → 15&nbsp;min — and are
 **materialised**: every bucket is aggregated over every row that reaches it,
 once the out-of-order window has closed over it.

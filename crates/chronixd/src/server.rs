@@ -821,6 +821,7 @@ pub fn build_router(
     auth_state: Option<crate::auth::AuthState>,
 ) -> Router {
     let metrics_path_owned = metrics_path.to_string();
+    let state_for_metrics = state.clone();
 
     let mut router = Router::new()
         // Health / Readiness — un-versioned so probes work without
@@ -838,9 +839,28 @@ pub fn build_router(
         // reverse proxy.
         .route(
             &metrics_path_owned,
-            get(move || {
-                let handle = metrics_handle.clone();
-                async move { handle.render() }
+            get({
+                // `render()` returns whatever has been *recorded*, so the
+                // engine's gauges are refreshed here. `statistics()` is what
+                // sets them and it had no caller outside tests, so eleven of
+                // the thirteen — series count, every memory term, disk usage —
+                // were never exported by a running server, and Prometheus
+                // answers "no data" for a metric nobody writes exactly as it
+                // does for a quiet one.
+                //
+                // The cost is one pass over the catalog's segments and column
+                // statistics. The two expensive terms are paid for elsewhere:
+                // `disk_usage_bytes()` caches its directory walk for a minute,
+                // and the metadata index keeps a running byte total.
+                let stats_state = state_for_metrics.clone();
+                move || {
+                    let handle = metrics_handle.clone();
+                    let state = stats_state.clone();
+                    async move {
+                        let _ = state.db.statistics();
+                        handle.render()
+                    }
+                }
             }),
         )
         // Write — chronix's JSON body, and InfluxDB Line Protocol at the
@@ -947,8 +967,16 @@ pub fn build_router(
             get(http::get_schema_handler),
         )
         .route(
+            "/api/v1/measurements/{name}/schema/fields",
+            post(http::declare_field_handler),
+        )
+        .route(
             "/api/v1/measurements/{name}",
             delete(http::drop_measurement_handler),
+        )
+        .route(
+            "/api/v1/measurements/{name}/restore",
+            post(http::restore_measurement_handler),
         )
         .route("/api/v1/delete", post(http::delete_handler))
         // Bulk delete

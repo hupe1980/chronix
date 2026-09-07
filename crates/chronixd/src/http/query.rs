@@ -481,6 +481,7 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
         FieldI64(&'a Int64Array, String),
         FieldU64(&'a UInt64Array, String),
         FieldBool(&'a BooleanArray, String),
+        FieldDecimal(&'a arrow::array::Decimal128Array, String),
         Skip,
     }
 
@@ -540,6 +541,12 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .map_or(TypedCol::Skip, |arr| TypedCol::FieldBool(arr, name.clone())),
+                DataType::Decimal128(_, _) => col
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .map_or(TypedCol::Skip, |arr| {
+                        TypedCol::FieldDecimal(arr, name.clone())
+                    }),
                 _ => {
                     tracing::debug!(
                         column = name,
@@ -591,6 +598,17 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
                 TypedCol::FieldBool(arr, name) => {
                     if !arr.is_null(row_idx) {
                         fields.insert(name.clone(), serde_json::json!(arr.value(row_idx)));
+                    }
+                }
+                TypedCol::FieldDecimal(arr, name) => {
+                    // The same `{"decimal": "…"}` shape the write endpoint
+                    // accepts, so a point that is read can be written back
+                    // unchanged — which a bare JSON number could not be.
+                    if let Some(digits) = crate::util::decimal_cell_to_string(arr, row_idx) {
+                        fields.insert(
+                            name.clone(),
+                            serde_json::json!({ crate::util::DECIMAL_JSON_KEY: digits }),
+                        );
                     }
                 }
                 TypedCol::Skip => {}

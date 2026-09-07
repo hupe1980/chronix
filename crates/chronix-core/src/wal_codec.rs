@@ -163,6 +163,50 @@ mod tests {
     }
 
     #[test]
+    fn a_decimal_field_round_trips_through_the_wal() {
+        // postcard carries an `i128` as a varint and the scale as a byte, so
+        // the WAL record holds the digits themselves. If this went through
+        // an `f64` — as it would if the field were serialised as a number —
+        // 0.30000000000000004 would come back as 0.3 and nobody would see it.
+        let key = SeriesKey::new("meter", BTreeMap::new()).unwrap();
+        let fields = BTreeMap::from([
+            (
+                "z1nb".to_string(),
+                FieldValue::Decimal("1234.5678".parse().unwrap()),
+            ),
+            (
+                "tiny".to_string(),
+                FieldValue::Decimal("0.30000000000000004".parse().unwrap()),
+            ),
+            (
+                "widest".to_string(),
+                FieldValue::Decimal("99999999999999999999999999999999999999".parse().unwrap()),
+            ),
+        ]);
+        let entry = WalEntry::Write {
+            point: Point::new(key, fields, 1).unwrap(),
+        };
+        let decoded = decode(&encode(&entry).unwrap()).unwrap();
+        assert_eq!(entry, decoded);
+
+        let WalEntry::Write { point } = decoded else {
+            panic!("a write record");
+        };
+        // Equality alone would pass if both sides had lost the same digits.
+        match point.field("z1nb") {
+            Some(FieldValue::Decimal(d)) => {
+                assert_eq!(d.to_string(), "1234.5678");
+                assert_eq!(d.scale(), 4, "the scale travels with the value");
+            }
+            other => panic!("expected a decimal, got {other:?}"),
+        }
+        match point.field("tiny") {
+            Some(FieldValue::Decimal(d)) => assert_eq!(d.to_string(), "0.30000000000000004"),
+            other => panic!("expected a decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn write_roundtrip() {
         let entry = WalEntry::Write {
             point: sample_point(),

@@ -201,7 +201,14 @@ for page in site/content/docs/*.md; do
          | sed -E 's/[[:space:]]*=$//' | sort -u)
   for key in $keys; do
     leaf=${key##*.}
-    # Where is it named, other than in a `config.rs` that declares it?
+    # Where is it named, other than in the `src/config.rs` that declares it?
+    #
+    # The exclusion is anchored on `src/` deliberately. It used to be a bare
+    # `config\.rs$`, which also threw away `tests/documented_config.rs` — the
+    # one file whose whole purpose is to prove that a documented key reaches
+    # the engine. So a key that is *only* translated into an engine setting
+    # inside the config module, and proved by that test, was reported as read
+    # by nothing. A guard's question is as narrow as its wording.
     #
     # No `head` on this pipeline: it closes the pipe while `grep -r` is still
     # writing, and the SIGPIPE that follows fails the script under
@@ -209,7 +216,7 @@ for page in site/content/docs/*.md; do
     # The second `grep` consumes the whole stream, so nothing is left writing
     # into a closed pipe.
     users=$(grep -rl "\b${leaf}\b" crates/ --include='*.rs' 2>/dev/null \
-            | { grep -vE 'config\.rs$' || true; })
+            | { grep -vE 'src/config\.rs$' || true; })
     if [ -z "$users" ]; then
       note "$page documents setting '$key', which no code outside a config module reads"
     fi

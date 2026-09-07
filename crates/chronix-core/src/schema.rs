@@ -39,7 +39,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::SchemaError;
-use crate::types::FieldValue;
+use crate::types::{FieldValue, SeriesKey};
 
 /// The role of a column within a measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -77,10 +77,33 @@ pub enum ColumnType {
     U64,
     /// Boolean.
     Bool,
+    /// Exact fixed-point decimal with a fixed number of fractional digits.
+    ///
+    /// The scale is part of the column's type, not of each value, and it is
+    /// fixed the first time the column is written (or declared). Every later
+    /// write is rescaled to it losslessly — `1.5` into a scale-4 column is
+    /// stored as `1.5000` — and refused if that would drop a digit.
+    ///
+    /// # Why the scale cannot drift
+    ///
+    /// A decimal column is read back as Arrow `Decimal128(38, scale)`. Two
+    /// segments of the same column whose scales differ would produce two
+    /// incompatible Arrow schemas, and the batches from a scan that touched
+    /// both could not be concatenated. Fixing the scale at the column makes
+    /// that unrepresentable rather than a read-time failure.
+    Decimal {
+        /// Digits after the decimal point, `0..=38`.
+        scale: u8,
+    },
 }
 
 impl ColumnType {
     /// Derive the column type from a [`FieldValue`].
+    ///
+    /// For a decimal this reports the *value's* scale, which is what a
+    /// column created by this value would carry. Use
+    /// [`accepts_value`](Self::accepts_value) to ask whether an existing
+    /// column can store it.
     #[inline]
     #[must_use]
     pub fn from_field_value(value: &FieldValue) -> Self {
@@ -90,6 +113,32 @@ impl ColumnType {
             FieldValue::U64(_) => Self::U64,
             FieldValue::Bool(_) => Self::Bool,
             FieldValue::String(_) => Self::String,
+            FieldValue::Decimal(d) => Self::Decimal { scale: d.scale() },
+        }
+    }
+
+    /// Can a column of this type store `value` without losing anything?
+    ///
+    /// Every type but [`Decimal`](Self::Decimal) is a plain type-identity
+    /// check. A decimal column accepts any value that
+    /// [`rescale`](crate::Decimal::rescale)s to the column's scale exactly —
+    /// so `1.5` and `1.50000` both fit a scale-4 column, and `1.50001` does
+    /// not.
+    #[must_use]
+    pub fn accepts_value(&self, value: &FieldValue) -> bool {
+        match (self, value) {
+            (Self::Decimal { scale }, FieldValue::Decimal(d)) => d.rescale(*scale).is_ok(),
+            _ => *self == Self::from_field_value(value),
+        }
+    }
+
+    /// The scale of a decimal column, or `None` for every other type.
+    #[inline]
+    #[must_use]
+    pub const fn decimal_scale(&self) -> Option<u8> {
+        match self {
+            Self::Decimal { scale } => Some(*scale),
+            _ => None,
         }
     }
 }
@@ -103,7 +152,75 @@ impl fmt::Display for ColumnType {
             Self::I64 => write!(f, "i64"),
             Self::U64 => write!(f, "u64"),
             Self::Bool => write!(f, "bool"),
+            // The precision is fixed at 38 for every decimal column, so the
+            // scale is the only part worth printing — but printing it in
+            // SQL's own `decimal(p,s)` shape keeps the error message and the
+            // `SHOW COLUMNS` output readable as a type.
+            Self::Decimal { scale } => {
+                write!(f, "decimal({}, {scale})", crate::decimal::DECIMAL_PRECISION)
+            }
         }
+    }
+}
+
+impl std::str::FromStr for ColumnType {
+    type Err = SchemaError;
+
+    /// Parse the form [`Display`](fmt::Display) produces, plus the longer
+    /// aliases the HTTP schema endpoint reports (`float64`, `int64`,
+    /// `uint64`, `boolean`).
+    ///
+    /// A parser exists so that a column type can travel as text — a schema
+    /// response a client reads and a declaration it posts back are then the
+    /// same vocabulary, rather than one shape to read and another to write.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "timestamp" => return Ok(Self::Timestamp),
+            "string" | "utf8" => return Ok(Self::String),
+            "f64" | "float64" | "double" => return Ok(Self::F64),
+            "i64" | "int64" => return Ok(Self::I64),
+            "u64" | "uint64" => return Ok(Self::U64),
+            "bool" | "boolean" => return Ok(Self::Bool),
+            "decimal" => return Ok(Self::Decimal { scale: 0 }),
+            _ => {}
+        }
+
+        // `decimal(38, 4)` — the precision is fixed, so it is checked
+        // rather than honoured: a caller who writes another one is asking
+        // for something this format cannot store, and should be told so.
+        let invalid = || SchemaError::InvalidName {
+            name: s.to_string(),
+            reason: "not a column type: expected timestamp, string, f64, i64, u64, bool, \
+                     or decimal(38, <scale>)"
+                .to_string(),
+        };
+        let args = lower
+            .strip_prefix("decimal(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .ok_or_else(invalid)?;
+        let (precision, scale) = args.split_once(',').ok_or_else(invalid)?;
+        let precision: u8 = precision.trim().parse().map_err(|_| invalid())?;
+        if precision != crate::decimal::DECIMAL_PRECISION {
+            return Err(SchemaError::InvalidName {
+                name: s.to_string(),
+                reason: format!(
+                    "decimal precision must be {}, the only one this format stores",
+                    crate::decimal::DECIMAL_PRECISION
+                ),
+            });
+        }
+        let scale: u8 = scale.trim().parse().map_err(|_| invalid())?;
+        if scale > crate::decimal::MAX_DECIMAL_SCALE {
+            return Err(SchemaError::InvalidName {
+                name: s.to_string(),
+                reason: format!(
+                    "decimal scale {scale} exceeds the maximum of {}",
+                    crate::decimal::MAX_DECIMAL_SCALE
+                ),
+            });
+        }
+        Ok(Self::Decimal { scale })
     }
 }
 
@@ -247,13 +364,13 @@ impl MeasurementSchema {
                     got: "Field".to_string(),
                 });
             }
-            if existing.column_type != new_type {
-                return Err(SchemaError::TypeConflict {
-                    measurement: self.measurement.clone(),
-                    field: name.to_string(),
-                    expected: existing.column_type.to_string(),
-                    got: new_type.to_string(),
-                });
+            if !existing.column_type.accepts_value(field_value) {
+                return Err(Self::mismatch(
+                    &self.measurement,
+                    name,
+                    existing.column_type,
+                    field_value,
+                ));
             }
             return Ok(false);
         }
@@ -262,6 +379,117 @@ impl MeasurementSchema {
         self.columns.push(ColumnDef {
             name: name.to_string(),
             column_type: new_type,
+            role: ColumnRole::Field,
+        });
+        self.column_index.insert(name.to_string(), idx);
+        Ok(true)
+    }
+
+    /// The error a value that does not fit `existing` should be rejected
+    /// with.
+    ///
+    /// Two shapes, because they have two different fixes: a decimal whose
+    /// only problem is carrying more fractional digits than the column
+    /// declares is a [`SchemaError::DecimalScaleConflict`], and everything
+    /// else is a [`SchemaError::TypeConflict`].
+    fn mismatch(
+        measurement: &str,
+        field: &str,
+        existing: ColumnType,
+        value: &FieldValue,
+    ) -> SchemaError {
+        match (existing, value) {
+            // A decimal that fits the column's *scale* and still cannot be
+            // stored has run out of digits, not places: widening `10³⁷` from
+            // scale 0 to scale 4 needs 42 of them. Reporting that as a scale
+            // conflict prints "the column stores 4 places and the value
+            // needs 0", which is true and useless.
+            (ColumnType::Decimal { scale }, FieldValue::Decimal(d)) if d.scale() <= scale => {
+                SchemaError::InvalidFieldValue {
+                    field: field.to_string(),
+                    reason: format!(
+                        "{d} does not fit decimal({precision}, {scale}): it needs {needed} \
+                         significant digits at that scale, and the maximum is {precision}",
+                        precision = crate::decimal::DECIMAL_PRECISION,
+                        needed = d.mantissa().unsigned_abs().to_string().len()
+                            + usize::from(scale - d.scale()),
+                    ),
+                }
+            }
+            (ColumnType::Decimal { scale }, FieldValue::Decimal(d)) => {
+                SchemaError::DecimalScaleConflict {
+                    measurement: measurement.to_string(),
+                    field: field.to_string(),
+                    declared: scale,
+                    got: d.scale(),
+                    value: d.to_string(),
+                }
+            }
+            _ => SchemaError::TypeConflict {
+                measurement: measurement.to_string(),
+                field: field.to_string(),
+                expected: existing.to_string(),
+                got: ColumnType::from_field_value(value).to_string(),
+            },
+        }
+    }
+
+    /// Add a field column with an explicit type.
+    ///
+    /// The type-first form of [`add_field`](Self::add_field): it is how a
+    /// decimal column gets the scale it needs *before* the first value
+    /// arrives, and how a batch that introduces a decimal field creates the
+    /// column at the widest scale the batch carries rather than at whatever
+    /// scale the first point happened to have.
+    ///
+    /// Returns `true` if the column was newly added, `false` if it already
+    /// existed with exactly this type.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::TypeConflict`] if the name already exists as a tag or
+    /// with a different type — including a decimal with a different scale,
+    /// which is a different type.
+    pub fn declare_field(
+        &mut self,
+        name: &str,
+        column_type: ColumnType,
+    ) -> Result<bool, SchemaError> {
+        if let Some(existing) = self.columns.iter().find(|c| c.name == name) {
+            if existing.role != ColumnRole::Field {
+                return Err(SchemaError::TypeConflict {
+                    measurement: self.measurement.clone(),
+                    field: name.to_string(),
+                    expected: format!("{:?}", existing.role),
+                    got: "Field".to_string(),
+                });
+            }
+            if existing.column_type != column_type {
+                return Err(SchemaError::TypeConflict {
+                    measurement: self.measurement.clone(),
+                    field: name.to_string(),
+                    expected: existing.column_type.to_string(),
+                    got: column_type.to_string(),
+                });
+            }
+            return Ok(false);
+        }
+        SeriesKey::validate_name(name, "field name")?;
+        if let ColumnType::Decimal { scale } = column_type {
+            if scale > crate::decimal::MAX_DECIMAL_SCALE {
+                return Err(SchemaError::InvalidFieldValue {
+                    field: name.to_string(),
+                    reason: format!(
+                        "decimal scale {scale} exceeds the maximum of {}",
+                        crate::decimal::MAX_DECIMAL_SCALE
+                    ),
+                });
+            }
+        }
+        let idx = self.columns.len();
+        self.columns.push(ColumnDef {
+            name: name.to_string(),
+            column_type,
             role: ColumnRole::Field,
         });
         self.column_index.insert(name.to_string(), idx);
@@ -437,6 +665,13 @@ impl SchemaRegistry {
             std::collections::BTreeMap::new();
         let mut actions = Vec::new();
 
+        // A decimal column's scale is fixed when the column is created, so
+        // *which* point of the batch creates it must not decide it. One
+        // pre-pass takes the widest scale the batch carries for each new
+        // field, and the column is created at that scale — a batch of
+        // `1.5` then `1.4999` behaves the same as the reverse.
+        let widest = Self::widest_decimal_scales(points);
+
         for point in points {
             let name = point.series_key().measurement();
             let schema = match pending.get_mut(name) {
@@ -466,15 +701,38 @@ impl SchemaRegistry {
                 }
             }
             for (field_name, field_value) in point.fields() {
-                if schema.add_field(field_name.as_ref(), field_value)? {
-                    actions.push(SchemaAction::AddColumn {
-                        measurement: name.to_string(),
-                        column: ColumnDef {
-                            name: field_name.to_string(),
-                            column_type: ColumnType::from_field_value(field_value),
-                            role: ColumnRole::Field,
-                        },
-                    });
+                let column_type = match ColumnType::from_field_value(field_value) {
+                    ColumnType::Decimal { scale } => ColumnType::Decimal {
+                        scale: widest
+                            .get(&(name, field_name.as_ref()))
+                            .copied()
+                            .unwrap_or(scale),
+                    },
+                    other => other,
+                };
+                match schema.column(field_name.as_ref()) {
+                    Some(existing) => {
+                        if !existing.column_type.accepts_value(field_value) {
+                            return Err(MeasurementSchema::mismatch(
+                                name,
+                                field_name.as_ref(),
+                                existing.column_type,
+                                field_value,
+                            ));
+                        }
+                    }
+                    None => {
+                        if schema.declare_field(field_name.as_ref(), column_type)? {
+                            actions.push(SchemaAction::AddColumn {
+                                measurement: name.to_string(),
+                                column: ColumnDef {
+                                    name: field_name.to_string(),
+                                    column_type,
+                                    role: ColumnRole::Field,
+                                },
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -482,6 +740,150 @@ impl SchemaRegistry {
         for (name, schema) in pending {
             self.schemas.insert(name, Arc::new(schema));
         }
+        Ok(actions)
+    }
+
+    /// The widest decimal scale each `(measurement, field)` in the batch
+    /// carries. Empty — and free — for a batch with no decimal fields.
+    fn widest_decimal_scales<'a>(
+        points: &[&'a crate::types::Point],
+    ) -> HashMap<(&'a str, &'a str), u8> {
+        let mut widest: HashMap<(&str, &str), u8> = HashMap::new();
+        for point in points {
+            for (field_name, field_value) in point.fields() {
+                if let FieldValue::Decimal(d) = field_value {
+                    let key = (point.series_key().measurement(), field_name.as_ref());
+                    let entry = widest.entry(key).or_insert(0);
+                    *entry = (*entry).max(d.scale());
+                }
+            }
+        }
+        widest
+    }
+
+    /// Rescale every decimal field of `points` to its column's scale.
+    ///
+    /// A decimal column stores one number of fractional digits, and this is
+    /// where a value that arrived with fewer is widened to it — `1.5` into a
+    /// scale-4 column becomes `1.5000`. Without it the memtable, the WAL and
+    /// two segments of the same column could each hold a different scale,
+    /// and a scan across them could not produce one Arrow schema.
+    ///
+    /// Returns `None` when nothing needed changing, which is the common case
+    /// and copies nothing: a batch with no decimal fields never allocates.
+    /// Otherwise returns the whole batch, with the affected points rewritten.
+    ///
+    /// Call *after* [`register_batch`](Self::register_batch), so the columns
+    /// the batch introduces already exist.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::DecimalScaleConflict`] if a value carries more
+    /// fractional digits than its column stores. `register_batch` refuses
+    /// the same batch for the same reason, so reaching this is a sign the
+    /// two were called out of order.
+    pub fn normalize_decimals(
+        &self,
+        points: &[&crate::types::Point],
+    ) -> Result<Option<Vec<crate::types::Point>>, SchemaError> {
+        // Nothing to do for the overwhelming majority of batches: one pass
+        // that touches no schema and allocates nothing.
+        if !points
+            .iter()
+            .any(|p| p.fields().iter().any(|(_, v)| v.is_decimal()))
+        {
+            return Ok(None);
+        }
+
+        let mut out: Vec<crate::types::Point> = Vec::with_capacity(points.len());
+        for point in points {
+            let mut rewritten: Option<crate::types::Point> = None;
+            let schema = self.schemas.get(point.series_key().measurement());
+            for (field_name, field_value) in point.fields() {
+                let FieldValue::Decimal(value) = field_value else {
+                    continue;
+                };
+                let Some(scale) = schema
+                    .as_ref()
+                    .and_then(|s| s.column(field_name.as_ref()))
+                    .and_then(|c| c.column_type.decimal_scale())
+                else {
+                    continue;
+                };
+                if scale == value.scale() {
+                    continue;
+                }
+                let rescaled = value.rescale(scale).map_err(|_| {
+                    // The same two failures, told apart the same way as in
+                    // `MeasurementSchema::mismatch`: too many decimal places
+                    // for the column, or too many significant digits once
+                    // the places are added.
+                    MeasurementSchema::mismatch(
+                        point.series_key().measurement(),
+                        field_name.as_ref(),
+                        ColumnType::Decimal { scale },
+                        field_value,
+                    )
+                })?;
+                rewritten
+                    .get_or_insert_with(|| (*point).clone())
+                    .set_field(field_name.as_ref(), FieldValue::Decimal(rescaled));
+            }
+            out.push(rewritten.unwrap_or_else(|| (*point).clone()));
+        }
+        Ok(Some(out))
+    }
+
+    /// Declare a field column before anything is written to it.
+    ///
+    /// The reason this exists is decimals: a decimal column's scale is fixed
+    /// by whatever creates the column, and letting the first meter reading
+    /// decide how many fractional digits a settlement register keeps is a
+    /// coin toss. Declaring `Decimal { scale: 4 }` up front makes it a
+    /// decision.
+    ///
+    /// Returns the actions to persist — empty when the column already
+    /// existed with exactly this type.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::TypeConflict`] if the column exists with a different
+    /// type, a different decimal scale, or as a tag.
+    pub fn declare_field(
+        &self,
+        measurement: &str,
+        field: &str,
+        column_type: ColumnType,
+    ) -> Result<Vec<SchemaAction>, SchemaError> {
+        let _guard = self
+            .changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut actions = Vec::new();
+        let mut schema = match self.schemas.get(measurement) {
+            Some(existing) => (**existing).clone(),
+            None => {
+                let fresh = MeasurementSchema::new(measurement);
+                actions.push(SchemaAction::CreateMeasurement(fresh.clone()));
+                fresh
+            }
+        };
+        if schema.declare_field(field, column_type)? {
+            actions.push(SchemaAction::AddColumn {
+                measurement: measurement.to_string(),
+                column: ColumnDef {
+                    name: field.to_string(),
+                    column_type,
+                    role: ColumnRole::Field,
+                },
+            });
+        } else if actions.is_empty() {
+            // Nothing changed and nothing was created: no action to persist.
+            return Ok(Vec::new());
+        }
+        self.schemas
+            .insert(measurement.to_string(), Arc::new(schema));
         Ok(actions)
     }
 
@@ -499,14 +901,13 @@ impl SchemaRegistry {
         for (field_name, field_value) in point.fields() {
             match schema.column(field_name.as_ref()) {
                 Some(existing) => {
-                    let new_type = ColumnType::from_field_value(field_value);
-                    if existing.column_type != new_type {
-                        return Err(SchemaError::TypeConflict {
-                            measurement: schema.measurement().to_string(),
-                            field: field_name.to_string(),
-                            expected: existing.column_type.to_string(),
-                            got: new_type.to_string(),
-                        });
+                    if !existing.column_type.accepts_value(field_value) {
+                        return Err(MeasurementSchema::mismatch(
+                            schema.measurement(),
+                            field_name.as_ref(),
+                            existing.column_type,
+                            field_value,
+                        ));
                     }
                 }
                 None => return Ok(false),
@@ -798,6 +1199,133 @@ mod tests {
         let json = serde_json::to_string(&schema).unwrap();
         let back: MeasurementSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(schema, back);
+    }
+
+    #[test]
+    fn a_decimal_column_accepts_a_narrower_value_and_refuses_a_finer_one() {
+        let mut schema = MeasurementSchema::new("meter");
+        schema
+            .declare_field("z1nb", ColumnType::Decimal { scale: 4 })
+            .unwrap();
+        // Fewer places: widened losslessly at write time, no schema change.
+        assert!(!schema
+            .add_field("z1nb", &FieldValue::Decimal("1.5".parse().unwrap()))
+            .unwrap());
+        // Trailing zeros past the column's scale are still exact.
+        assert!(!schema
+            .add_field("z1nb", &FieldValue::Decimal("1.50000".parse().unwrap()))
+            .unwrap());
+        // A real fifth digit would have to be rounded.
+        let err = schema
+            .add_field("z1nb", &FieldValue::Decimal("1.00005".parse().unwrap()))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SchemaError::DecimalScaleConflict {
+                    declared: 4,
+                    got: 5,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn running_out_of_digits_is_not_reported_as_a_scale_conflict() {
+        // `10^37` at scale 0 fits; the same value at scale 4 does not, and
+        // saying "the column stores 4 places and the value needs 0" would be
+        // true and useless.
+        let mut schema = MeasurementSchema::new("m");
+        schema
+            .declare_field("v", ColumnType::Decimal { scale: 4 })
+            .unwrap();
+        let huge = crate::decimal::Decimal::new(10_i128.pow(37), 0).unwrap();
+        let err = schema
+            .add_field("v", &FieldValue::Decimal(huge))
+            .unwrap_err();
+        match err {
+            SchemaError::InvalidFieldValue { ref reason, .. } => {
+                assert!(reason.contains("significant digits"), "{reason}");
+            }
+            other => panic!("expected a precision error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_decimal_and_another_type_are_still_a_type_conflict() {
+        let mut schema = MeasurementSchema::new("m");
+        schema
+            .declare_field("v", ColumnType::Decimal { scale: 2 })
+            .unwrap();
+        let err = schema.add_field("v", &FieldValue::F64(1.5)).unwrap_err();
+        assert!(matches!(err, SchemaError::TypeConflict { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_batch_creating_a_decimal_column_takes_its_widest_scale() {
+        let registry = SchemaRegistry::new();
+        // Coarse first, fine second — and the reverse — must agree.
+        for order in [["1.5", "1.4999"], ["1.4999", "1.5"]] {
+            let registry = registry.clone();
+            let points: Vec<Point> = order
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    make_point(
+                        "meter",
+                        &[],
+                        &[("v", FieldValue::Decimal(text.parse().unwrap()))],
+                        i as i64,
+                    )
+                })
+                .collect();
+            let refs: Vec<&Point> = points.iter().collect();
+            registry.register_batch(&refs).unwrap();
+            assert_eq!(
+                registry
+                    .lookup("meter")
+                    .unwrap()
+                    .column("v")
+                    .unwrap()
+                    .column_type,
+                ColumnType::Decimal { scale: 4 },
+                "order {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_decimals_widens_to_the_column_and_copies_nothing_otherwise() {
+        let registry = SchemaRegistry::new();
+        let point = make_point(
+            "meter",
+            &[],
+            &[("v", FieldValue::Decimal("1.5000".parse().unwrap()))],
+            1,
+        );
+        registry.register_batch(&[&point]).unwrap();
+
+        // A batch with no decimal fields never allocates.
+        let plain = make_point("cpu", &[], &[("v", FieldValue::F64(1.0))], 1);
+        assert!(registry.normalize_decimals(&[&plain]).unwrap().is_none());
+
+        // A narrower value is rewritten at the column's scale.
+        let narrow = make_point(
+            "meter",
+            &[],
+            &[("v", FieldValue::Decimal("1.5".parse().unwrap()))],
+            2,
+        );
+        let out = registry.normalize_decimals(&[&narrow]).unwrap().unwrap();
+        match out[0].field("v") {
+            Some(FieldValue::Decimal(d)) => {
+                assert_eq!(d.scale(), 4);
+                assert_eq!(d.to_string(), "1.5000");
+            }
+            other => panic!("expected a decimal, got {other:?}"),
+        }
     }
 
     #[test]

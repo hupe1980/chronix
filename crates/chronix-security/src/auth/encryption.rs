@@ -209,7 +209,7 @@ impl KeyProvider for FileKeyProvider {
 /// * Grace period reduced from 30 s → 5 s (configurable).
 /// * [`clear_cache`](EnvKeyProvider::clear_cache) lets operators
 ///   explicitly discard the cached key once rotation is complete.
-/// * Every cache-fallback hit emits the `chronix.auth.env_key.grace_hit`
+/// * Every cache-fallback hit emits the `chronix_auth_env_key_grace_hit`
 ///   counter so operators can detect prolonged rotation windows.
 pub struct EnvKeyProvider {
     env_var: String,
@@ -290,7 +290,7 @@ impl KeyProvider for EnvKeyProvider {
                             grace_remaining_secs = (self.grace_period.saturating_sub(fetched_at.elapsed())).as_secs(),
                             "env var missing, using cached key within grace period"
                         );
-                        metrics::counter!("chronix.auth.env_key.grace_hit").increment(1);
+                        metrics::counter!("chronix_auth_env_key_grace_hit").increment(1);
                         return Ok((cached_key.clone(), self.key_id.clone()));
                     }
                 }

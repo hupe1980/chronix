@@ -222,6 +222,12 @@ fn the_prelude_is_the_one_that_was_reviewed() {
         "ColumnType",
         "CompressionCodec",
         "DbError",
+        // Exact fixed-point. In the prelude because writing one is the
+        // point: `FieldValue::Decimal("1234.5678".parse()?)` needs the type
+        // in scope, and a settlement quantity that reaches an `f64` because
+        // the exact type was one import away is the failure it exists to
+        // prevent.
+        "Decimal",
         "FieldValue",
         "FloatEncoding",
         "FsyncPolicy",

@@ -742,7 +742,9 @@ fn arrow_batch_to_points(
     tag_indices: &[(usize, String)],
     field_indices: &[(usize, String)],
 ) -> Result<Vec<Point>, Status> {
-    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+    use arrow::array::{
+        BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+    };
 
     let num_rows = batch.num_rows();
 
@@ -776,6 +778,13 @@ fn arrow_batch_to_points(
         U64(&'a UInt64Array),
         Bool(&'a BooleanArray),
         Str(&'a StringArray),
+        /// An exact decimal, with the scale off its Arrow type.
+        ///
+        /// Flight is the zero-copy bulk path — a `pyarrow` table of meter
+        /// registers arrives here — and without this arm a `Decimal128`
+        /// column was refused outright, so the one write surface built for
+        /// loading a lot of exact values could not carry any.
+        Decimal(&'a Decimal128Array, u8),
     }
 
     let typed_fields: Vec<(&String, TypedField<'_>)> = field_indices
@@ -792,6 +801,13 @@ fn arrow_batch_to_points(
                 TypedField::Bool(a)
             } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
                 TypedField::Str(a)
+            } else if let Some(a) = col.as_any().downcast_ref::<Decimal128Array>() {
+                let scale = u8::try_from(a.scale()).map_err(|_| {
+                    Status::invalid_argument(format!(
+                        "field '{name}' has a negative decimal scale, which Chronix does not store"
+                    ))
+                })?;
+                TypedField::Decimal(a, scale)
             } else {
                 return Err(Status::invalid_argument(format!(
                     "unsupported Arrow data type for field '{name}'"
@@ -836,6 +852,16 @@ fn arrow_batch_to_points(
                 TypedField::Bool(a) if !a.is_null(row) => FieldValue::Bool(a.value(row)),
                 TypedField::Str(a) if !a.is_null(row) => {
                     FieldValue::String(a.value(row).to_string())
+                }
+                TypedField::Decimal(a, scale) if !a.is_null(row) => {
+                    // A value Arrow accepted that Chronix cannot store — a
+                    // precision above 38 — is an error, not a skipped
+                    // field: dropping it would write a point that is
+                    // missing the column the caller sent.
+                    let value = chronix_core::Decimal::new(a.value(row), *scale).map_err(|e| {
+                        Status::invalid_argument(format!("field '{name}' row {row}: {e}"))
+                    })?;
+                    FieldValue::Decimal(value)
                 }
                 _ => continue,
             };

@@ -43,6 +43,15 @@ pub struct CatalogColumnStats {
     pub data_type: u8,
     /// Column role tag (0= timestamp, 1= tag, 2= field).
     pub role: u8,
+    /// Digits after the decimal point, for a decimal column; `None`
+    /// otherwise.
+    ///
+    /// Here as well as in the segment because the schema repair at open
+    /// works from *this* summary and never opens a `.csx` file: without the
+    /// scale, a decimal column the manifest had lost could only be restored
+    /// as some other type, which is worse than not restoring it.
+    #[serde(default)]
+    pub decimal_scale: Option<u8>,
     /// Min/max/null statistics.
     pub stats: ColumnStats,
 }
@@ -1167,8 +1176,11 @@ impl SegmentCatalog {
     }
 }
 
-/// Current catalog snapshot format version.
-const CATALOG_FORMAT_VERSION: u32 = 2;
+/// Current catalog snapshot format version — 1, the first that ships.
+///
+/// Unlike the segment header this is compared with `>`: a snapshot from a
+/// *newer* Chronix is refused, an older one is read.
+const CATALOG_FORMAT_VERSION: u32 = 1;
 
 /// Serializable snapshot of the catalog state.
 #[derive(Debug, Serialize, Deserialize)]

@@ -136,8 +136,42 @@ Write one or more time-series points in native JSON format.
 
 - `measurement` (string, required): Target measurement name.
 - `tags` (object, optional): String key-value pairs for series grouping.
-- `fields` (object, required): Numeric/boolean/string field values.
+- `fields` (object, required): Numeric/boolean/string field values, or
+  `{"decimal": "…"}` for an exact one — see below.
 - `timestamp` (i64, optional): Nanosecond Unix epoch. Defaults to server time.
+
+#### Exact decimal fields
+
+A JSON number is parsed as a `double` by `serde_json` and by every client
+library there is, so writing `1234.5678` loses the digits before the server
+ever sees them. An exact field therefore travels as **digits in a string**:
+
+```json
+{
+  "measurement": "meter",
+  "tags": {"device": "main"},
+  "fields": {"z1nb_q": {"decimal": "1234.5678"}},
+  "timestamp": 1700000000000000000
+}
+```
+
+A JSON *number* inside the wrapper is refused, not converted.
+
+Reading the point back gives the same shape, so a point you read is a point
+you can write. A SQL result cell is a plain string of digits, with
+`decimal(38, 4)` in the column metadata beside it.
+
+The column's **scale is fixed when the column is created**, and a value
+needing more fractional digits is refused, naming both. Declare it first when
+the first value might not carry the digits you mean to keep:
+
+```bash
+curl -XPOST 'http://localhost:8086/api/v1/measurements/meter/schema/fields' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"z1nb_q","type":"decimal","scale":4}'
+```
+
+See [Data Model](/docs/data-model/#exact-decimals-for-money-and-meters).
 
 **Query parameters:** `backfill=true` writes points **outside** the
 out-of-order window — see [Backfilling history](#backfilling-history).
@@ -223,6 +257,24 @@ Chronix implements the Line Protocol escape rules in full:
 | Tag key / tag value | `,` `=` ` ` | `"` is an **ordinary character** here |
 | Field key | `,` `=` ` ` | |
 | String field value | `"` `\` | |
+
+#### Field value suffixes
+
+| Written | Type |
+|---|---|
+| `72.5` | float (`f64`) — the default for a bare number |
+| `42i` | signed integer |
+| `42u` | unsigned integer |
+| `t` / `true` / `f` / `false` | boolean |
+| `"text"` | string |
+| `1234.5678d` | **exact decimal** — a Chronix extension |
+
+`d` is a Chronix extension — Influx has no exact type, so no line written for
+Influx changes meaning here. The digits are parsed as digits.
+
+```text
+meter,device=main z1nb_q=1234.5678d 1700000000000000000
+```
 
 Two consequences worth calling out:
 
@@ -353,6 +405,15 @@ ChronixExec: measurement=cpu, time=[1700000000000000000..9223372036854775807], f
 
 A full `[-9223372036854775808..9223372036854775807]` range means the filter
 did not reach the scan and the whole measurement is being read.
+
+**A decimal literal is a decimal.** `0.05` is `DECIMAL`, not `DOUBLE`, as in
+PostgreSQL — so comparison, `BETWEEN`, `IN`, `GROUP BY` **and** arithmetic on
+an exact column all stay exact.
+
+A `DOUBLE` column is unaffected: `Float64 op Decimal128` yields `Float64`, so
+`usage * 1.5` is a float. The exponent form is not an escape hatch (`1.5e0`
+is a decimal too) — write `CAST(1.5 AS DOUBLE)` for a literal that must be a
+float whatever it meets.
 
 **Catalog.** `SHOW TABLES`, `SHOW COLUMNS FROM <measurement>`, `DESCRIBE
 <measurement>` and the `information_schema` views list the measurements the
@@ -961,6 +1022,7 @@ have it retry the same doomed batch for ever.
 | `GET` | `/api/v1/measurements` | List all measurements with schema info |
 | `GET` | `/api/v1/measurements/{name}/schema` | Get schema for a measurement |
 | `DELETE` | `/api/v1/measurements/{name}` | Drop an entire measurement |
+| `POST` | `/api/v1/measurements/{name}/restore` | Undo a pending drop, inside the `soft_delete_ttl_secs` grace period |
 | `POST` | `/api/v1/delete` | Delete points matching predicates |
 | `GET` | `/api/v1/rollups` | List rollup configurations, each with its watermark and any pending repairs |
 | `POST` | `/api/v1/rollups` | Create a rollup configuration |
@@ -1558,3 +1620,23 @@ All REST endpoints return errors in a consistent format:
 - [Cluster Guide](@/docs/cluster.md) — Distributed setup and scaling
 - [Security Guide](@/docs/security.md) — Authentication and authorization
 - [Performance Guide](@/docs/performance.md) — Tuning and benchmarks
+
+### Undoing a drop
+
+`DELETE /api/v1/measurements/{name}` is the most destructive single call in
+this API, and by default it is irreversible.
+
+Set `[database] soft_delete_ttl_secs` and it stops being: the drop marks the
+measurement pending, a background pass hard-deletes it once the deadline
+passes, and until then it can be brought back with its data.
+
+```bash
+curl -X DELETE http://localhost:8086/api/v1/measurements/power   # 204
+curl -X POST http://localhost:8086/api/v1/measurements/power/restore   # 204
+```
+
+`404` means there is nothing to undo — the measurement was never dropped, the
+grace period has passed, or `soft_delete_ttl_secs` is not configured, and the
+message says which. Under multi-tenancy a drop removes *this namespace's
+series* rather than the measurement (the schema is shared between tenants), so
+there is no pending drop and the answer is also `404`.

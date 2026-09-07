@@ -44,7 +44,9 @@ use chronix_core::config::{CompressionCodec, FloatEncoding};
 use chronix_core::types::{FieldValue, Point};
 use chronix_encoding::{ColumnEncoder, EncodedBlock};
 
-use arrow::array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{
+    Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
@@ -734,6 +736,7 @@ fn encode_row_groups_streaming<W: Write>(
                 bloom_filter: None,
                 encrypted,
                 key_id,
+                decimal_scale: col.decimal_scale,
                 row_group_blooms: None,
             }
         })
@@ -953,6 +956,8 @@ struct ColumnDef {
     data_type: u8,
     role: u8,
     default_encoding: u8,
+    /// Digits after the decimal point, for a decimal column; `None` otherwise.
+    decimal_scale: Option<u8>,
 }
 
 /// Discover the column schema by scanning all points.
@@ -969,6 +974,7 @@ fn discover_schema(points: &[Point]) -> Vec<ColumnDef> {
         data_type: data_types::TIMESTAMP,
         role: roles::TIMESTAMP,
         default_encoding: chronix_encoding::EncodingType::DeltaOfDelta.tag(),
+        decimal_scale: None,
     });
 
     // Discover tag columns and compute cardinality
@@ -998,30 +1004,47 @@ fn discover_schema(points: &[Point]) -> Vec<ColumnDef> {
             data_type: data_types::STRING,
             role: roles::TAG,
             default_encoding: chronix_encoding::EncodingType::Dictionary.tag(),
+            decimal_scale: None,
         });
     }
 
-    // Discover field columns
-    let mut field_defs: BTreeMap<String, u8> = BTreeMap::new();
+    // Discover field columns.
+    //
+    // A decimal field also carries its scale, and the *widest* scale in the
+    // batch wins rather than whichever point happened to come first. The
+    // write path has already normalised every value to the column's declared
+    // scale, so in practice they all agree; taking the maximum means a
+    // segment written from points that had not been through that path — a
+    // test, a tool, a future caller — still produces one scale for the
+    // column instead of silently truncating to the first one seen.
+    let mut field_defs: BTreeMap<String, (u8, Option<u8>)> = BTreeMap::new();
     for p in points {
         for (key, val) in p.fields() {
-            field_defs
-                .entry(key.to_string())
-                .or_insert_with(|| match val {
+            let entry = field_defs.entry(key.to_string()).or_insert_with(|| {
+                let dt = match val {
                     FieldValue::F64(_) => data_types::F64,
                     FieldValue::I64(_) => data_types::I64,
                     FieldValue::U64(_) => data_types::U64,
                     FieldValue::Bool(_) => data_types::BOOL,
                     FieldValue::String(_) => data_types::STRING,
-                });
+                    FieldValue::Decimal(_) => data_types::DECIMAL,
+                };
+                (dt, None)
+            });
+            if let FieldValue::Decimal(d) = val {
+                if entry.0 == data_types::DECIMAL {
+                    entry.1 = Some(entry.1.unwrap_or(0).max(d.scale()));
+                }
+            }
         }
     }
-    for (name, dt) in field_defs {
+    for (name, (dt, scale)) in field_defs {
         let enc = match dt {
             data_types::F64 => chronix_encoding::EncodingType::Chimp.tag(),
             data_types::I64 => chronix_encoding::EncodingType::IntegerI64.tag(),
             data_types::U64 => chronix_encoding::EncodingType::IntegerU64.tag(),
             data_types::BOOL => chronix_encoding::EncodingType::Bitmap.tag(),
+            data_types::DECIMAL => chronix_encoding::EncodingType::DecimalI128.tag(),
             _ => chronix_encoding::EncodingType::Dictionary.tag(),
         };
         columns.push(ColumnDef {
@@ -1029,6 +1052,7 @@ fn discover_schema(points: &[Point]) -> Vec<ColumnDef> {
             data_type: dt,
             role: roles::FIELD,
             default_encoding: enc,
+            decimal_scale: scale,
         });
     }
 
@@ -1168,6 +1192,43 @@ fn encode_column(
             let block = ColumnEncoder::encode_bool(&values)?;
             Ok(EncodedColumn::new(block, stats, validity))
         }
+        (_, data_types::DECIMAL) => {
+            // The scale is the column's, recorded once in its metadata; what
+            // is encoded is the mantissa column. A value that arrived at a
+            // different scale is widened losslessly rather than dropped — the
+            // write path normalises, so this only catches a caller that
+            // bypassed it.
+            let scale = col.decimal_scale.unwrap_or(0);
+            let mut values = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                match points[idx].field(&col.name) {
+                    Some(FieldValue::Decimal(d)) => match d.rescale(scale) {
+                        Ok(v) => {
+                            values.push(v.mantissa());
+                            stats.update_decimal(v.mantissa());
+                            validity.push(true);
+                        }
+                        Err(e) => {
+                            return Err(SegmentError::CorruptFile {
+                                detail: format!(
+                                    "decimal field '{}' at scale {} cannot be stored in a \
+                                     scale-{scale} column: {e}",
+                                    col.name,
+                                    d.scale()
+                                ),
+                            })
+                        }
+                    },
+                    _ => {
+                        values.push(0);
+                        stats.record_null();
+                        validity.push(false);
+                    }
+                }
+            }
+            let block = ColumnEncoder::encode_decimal(&values)?;
+            Ok(EncodedColumn::new(block, stats, validity))
+        }
         (_, data_types::STRING) => {
             // Collect owned strings, then borrow as &str for encoding
             let mut owned: Vec<String> = Vec::with_capacity(indices.len());
@@ -1300,6 +1361,7 @@ fn discover_schema_from_batch(
         data_type: data_types::TIMESTAMP,
         role: roles::TIMESTAMP,
         default_encoding: chronix_encoding::EncodingType::DeltaOfDelta.tag(),
+        decimal_scale: None,
     });
 
     // Tags (sorted for consistency)
@@ -1312,6 +1374,7 @@ fn discover_schema_from_batch(
                 data_type: data_types::STRING,
                 role: roles::TAG,
                 default_encoding: chronix_encoding::EncodingType::Dictionary.tag(),
+                decimal_scale: None,
             });
         }
     }
@@ -1340,6 +1403,10 @@ fn discover_schema_from_batch(
                 data_types::STRING,
                 chronix_encoding::EncodingType::Dictionary.tag(),
             ),
+            DataType::Decimal128(_, _) => (
+                data_types::DECIMAL,
+                chronix_encoding::EncodingType::DecimalI128.tag(),
+            ),
             other => {
                 return Err(SegmentError::CorruptFile {
                     detail: format!(
@@ -1349,11 +1416,22 @@ fn discover_schema_from_batch(
                 });
             }
         };
+        // The Arrow scale is authoritative on this path: the batch came out
+        // of a segment or a memtable, both of which already fixed it.
+        let decimal_scale = match field.data_type() {
+            DataType::Decimal128(_, scale) => {
+                Some(u8::try_from(*scale).map_err(|_| SegmentError::CorruptFile {
+                    detail: format!("negative decimal scale {scale} for field '{name}'"),
+                })?)
+            }
+            _ => None,
+        };
         columns.push(ColumnDef {
             name: name.to_string(),
             data_type: dt,
             role: roles::FIELD,
             default_encoding: enc,
+            decimal_scale,
         });
     }
 
@@ -1438,6 +1516,7 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
                 bloom_filter: None,
                 encrypted,
                 key_id,
+                decimal_scale: col.decimal_scale,
                 row_group_blooms: None,
             }
         })
@@ -1786,6 +1865,45 @@ fn encode_column_from_batch(
                 }
             }
             let block = ColumnEncoder::encode_u64(&values)?;
+            Ok(EncodedColumn::new(block, stats, validity))
+        }
+        (_, data_types::DECIMAL) => {
+            let arr = batch
+                .column_by_name(&col.name)
+                .and_then(|c| c.as_any().downcast_ref::<Decimal128Array>())
+                .ok_or_else(|| SegmentError::CorruptFile {
+                    detail: format!("missing decimal column '{}'", col.name),
+                })?;
+            // The column's scale and the array's must agree: the mantissas
+            // are stored raw, so writing a scale-2 array into a scale-4
+            // column would multiply every value by a hundred.
+            let column_scale = col.decimal_scale.unwrap_or(0);
+            let array_scale = u8::try_from(arr.scale()).map_err(|_| SegmentError::CorruptFile {
+                detail: format!("negative decimal scale for column '{}'", col.name),
+            })?;
+            if array_scale != column_scale {
+                return Err(SegmentError::CorruptFile {
+                    detail: format!(
+                        "decimal column '{}' is scale {column_scale} but the batch is scale \
+                         {array_scale}",
+                        col.name
+                    ),
+                });
+            }
+            let mut values = Vec::with_capacity(end - start);
+            for i in start..end {
+                if arr.is_null(i) {
+                    values.push(0);
+                    stats.record_null();
+                    validity.push(false);
+                } else {
+                    let v = arr.value(i);
+                    values.push(v);
+                    stats.update_decimal(v);
+                    validity.push(true);
+                }
+            }
+            let block = ColumnEncoder::encode_decimal(&values)?;
             Ok(EncodedColumn::new(block, stats, validity))
         }
         (_, data_types::BOOL) => {

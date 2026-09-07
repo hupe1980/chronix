@@ -44,6 +44,10 @@ Walk-forward error asks the only question that transfers across families:
    └── select_differencing_order(): difference while KPSS rejects level
        stationarity, up to max_d
 
+2b. Seasonal differencing order
+   └── select_seasonal_differencing_order(): STL seasonal strength
+       1 - Var(remainder)/Var(remainder + seasonal) against 0.64
+
 3. Candidate set
    └── pruned by series length before anything is fitted
 
@@ -179,3 +183,28 @@ decides.
 
 MASE is not computed. It needs a naïve-baseline MAE over the *training* window
 to normalise against, which the fold result does not carry.
+
+## Choosing `D`
+
+The seasonal differencing order comes from the **seasonal strength** measure of
+Wang, Smith & Hyndman over the STL decomposition:
+
+```text
+Fs = max(0, min(1, 1 - Var(remainder) / Var(remainder + seasonal)))
+D  = 1 if Fs > 0.64 else 0
+```
+
+Both the measure and the threshold are R's `forecast::nsdiffs` default; the
+0.64 was fitted by minimising MASE across M3 and M4. Two guards come with it:
+a **constant** series has zero variance in both terms, so the ratio says
+nothing, and a series shorter than two periods cannot be decomposed.
+
+`D = 0` matters when a period is detected but the seasonal term explains
+almost none of the variance: differencing there spends `m` observations, adds
+a moving-average term the data does not support, and widens the intervals.
+
+**This is a strength test, not a unit-root test.** A *stochastic* seasonal
+level — each season drifting from cycle to cycle — scores **low** and is not
+differenced, because STL's cycle-subseries smoother cannot fit a shape that
+keeps moving and the variation lands in the remainder. OCSB and Canova–Hansen
+are the tests for that case; R keeps them as options beside this default.

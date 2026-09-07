@@ -101,6 +101,65 @@ pub async fn get_schema_handler(
     Ok(Json(measurement_schema_to_info(&name, &schema)))
 }
 
+/// `POST /api/v1/measurements/:name/schema/fields` — declare a field column.
+///
+/// Schema-on-write covers everything else: a column appears when the first
+/// point carrying it is written. A **decimal** column is the exception,
+/// because its scale is part of its type and cannot change afterwards, so the
+/// request body carries `type: "decimal"` and the `scale` the column is fixed
+/// at.
+///
+/// Returns the measurement's schema as it now stands. Declaring a column
+/// that already exists with exactly this type is a no-op and succeeds;
+/// declaring one that exists with a different type is a 400, because that
+/// is a type change and Chronix does not have those.
+pub async fn declare_field_handler(
+    State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    Path(name): Path<String>,
+    Json(req): Json<crate::http::types::DeclareFieldRequest>,
+) -> Result<Json<MeasurementInfo>, ServerError> {
+    // Under multi-tenancy a measurement is **shared** — every tenant writing
+    // `meter` writes the same measurement, distinguished by the namespace
+    // tag — so its schema is shared too, and a declaration is a declaration
+    // for all of them. That is the same thing a write does when it
+    // introduces a column, so it needs no extra scoping; the extension is
+    // taken only so the handler signature matches the other schema routes.
+    let _ = &ns_ctx;
+    let measurement = name.clone();
+
+    let mut column_type: chronix_core::ColumnType = req
+        .column_type
+        .parse()
+        .map_err(|e: chronix_core::SchemaError| ServerError::BadRequest(e.to_string()))?;
+    // `scale` is a shorthand for the scale inside `type`, and only means
+    // anything for a decimal: silently ignoring it on an `int64` would let
+    // `{"type": "int64", "scale": 4}` look like it had been honoured.
+    if let Some(scale) = req.scale {
+        match column_type {
+            chronix_core::ColumnType::Decimal { .. } => {
+                column_type = chronix_core::ColumnType::Decimal { scale };
+            }
+            other => {
+                return Err(ServerError::BadRequest(format!(
+                    "'scale' applies only to a decimal column, not to {other}"
+                )))
+            }
+        }
+    }
+
+    state
+        .db
+        .declare_field(&measurement, &req.name, column_type)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let schema = state
+        .db
+        .schema(&measurement)
+        .ok_or_else(|| ServerError::NotFound(measurement.clone()))?;
+    Ok(Json(measurement_schema_to_info(&name, &schema)))
+}
+
 /// `DELETE /api/v1/measurements/:name` — drop a measurement.
 pub async fn drop_measurement_handler(
     State(state): State<AppState>,
@@ -144,6 +203,61 @@ pub async fn drop_measurement_handler(
         "audit: measurement dropped"
     );
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/measurements/{name}/restore` — undo a pending drop.
+///
+/// Only meaningful when `[database] soft_delete_ttl_secs` is set: a drop then
+/// marks the measurement pending and a background pass hard-deletes it once
+/// the deadline passes, so until then it can be brought back. Without the
+/// setting a drop is immediate and there is nothing to restore, which is what
+/// `404` means here.
+///
+/// This exists because the setting did not: `soft_delete_ttl` and
+/// `restore_measurement` were both in the engine, tested, and reachable only
+/// from the embedded API — so the server's most destructive call, dropping a
+/// measurement, had no undo even though the engine implemented one. A grace
+/// window nothing can act on is worse than none, because it reads as a safety
+/// net.
+///
+/// Under multi-tenancy the drop handler deletes *this namespace's series*
+/// rather than the measurement, so there is no pending drop to undo and the
+/// answer is the same `404`.
+///
+/// # Errors
+///
+/// `404` when the measurement is not pending deletion; `500` if the restore
+/// itself fails.
+pub async fn restore_measurement_handler(
+    State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, ServerError> {
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
+    if scope.is_some() {
+        return Err(ServerError::NotFound(format!(
+            "measurement '{name}' is not pending deletion: under multi-tenancy a drop \
+             removes this namespace's series rather than the measurement, and that is \
+             not reversible"
+        )));
+    }
+
+    let db = state.db.clone();
+    let measurement = name.clone();
+    let restored = tokio::task::spawn_blocking(move || db.restore_measurement(&measurement))
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .map_err(ServerError::Db)?;
+
+    if !restored {
+        return Err(ServerError::NotFound(format!(
+            "measurement '{name}' is not pending deletion: either it was never dropped, \
+             the grace period has passed, or `soft_delete_ttl_secs` is not configured"
+        )));
+    }
+
+    tracing::info!(measurement = %name, "audit: pending measurement drop restored");
     Ok(StatusCode::NO_CONTENT)
 }
 

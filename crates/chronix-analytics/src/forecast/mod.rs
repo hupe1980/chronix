@@ -51,8 +51,9 @@ mod traits;
 pub mod util;
 
 pub use arima::{
-    auto_arima, kpss_statistic, select_differencing_order, ArimaModel, AutoArimaOptions,
-    AutoArimaResult, SarimaConfig, SarimaModel, SearchStrategy, KPSS_CRITICAL_5PCT,
+    auto_arima, kpss_statistic, select_differencing_order, select_seasonal_differencing_order,
+    ArimaModel, AutoArimaOptions, AutoArimaResult, SarimaConfig, SarimaModel, SearchStrategy,
+    KPSS_CRITICAL_5PCT, SEASONAL_STRENGTH_THRESHOLD,
 };
 pub use cross_validation::{
     CrossValidationMode, CrossValidationResult, CrossValidator, FoldResult,

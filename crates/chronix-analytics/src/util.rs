@@ -22,13 +22,14 @@ pub(crate) fn extract_numeric_value(
 }
 
 /// Convert a `FieldValue` to `f64` if numeric.
+///
+/// A decimal comes through, and comes through lossily: every model in this
+/// crate — forecasting, anomaly detection, seasonality — is defined over
+/// floating point and produces an estimate, so converting is what an answer
+/// here *means*. The exactness that matters is on the storage and
+/// aggregation paths, which never come this way.
 pub(crate) fn field_to_f64(fv: &FieldValue) -> Option<f64> {
-    match fv {
-        FieldValue::F64(v) => Some(*v),
-        FieldValue::I64(v) => Some(*v as f64),
-        FieldValue::U64(v) => Some(*v as f64),
-        _ => None,
-    }
+    fv.as_f64_lossy()
 }
 
 /// Build a deterministic, collision-free canonical key for a tags map.

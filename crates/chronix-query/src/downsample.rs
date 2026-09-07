@@ -92,10 +92,11 @@ pub fn downsample(
 
     // Validate the value column is a supported numeric type
     match value_col.data_type() {
-        DataType::Float64 | DataType::Int64 | DataType::UInt64 => {}
+        DataType::Float64 | DataType::Int64 | DataType::UInt64 | DataType::Decimal128(_, _) => {}
         dt => {
             return Err(QueryError::Validation(format!(
-                "'{value_column}' column has unsupported type {dt} (expected Float64, Int64, or UInt64)"
+                "'{value_column}' column has unsupported type {dt} \
+                 (expected Float64, Int64, UInt64, or Decimal128)"
             )));
         }
     }
@@ -367,10 +368,12 @@ impl StreamingDownsampler {
             .ok_or_else(|| QueryError::Validation("'timestamp' column is not Int64".into()))?;
         let value_col = batch.column(val_idx).as_ref();
         match value_col.data_type() {
-            DataType::Float64 | DataType::Int64 | DataType::UInt64 => {}
+            DataType::Float64 | DataType::Int64 | DataType::UInt64 | DataType::Decimal128(_, _) => {
+            }
             dt => {
                 return Err(QueryError::Validation(format!(
-                    "'{}' column has unsupported type {dt} (expected Float64, Int64, or UInt64)",
+                    "'{}' column has unsupported type {dt} \
+                     (expected Float64, Int64, UInt64, or Decimal128)",
                     self.value_column
                 )));
             }

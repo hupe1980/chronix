@@ -107,6 +107,79 @@ impl super::Chronix {
         self.write_batch(points, false)
     }
 
+    /// Declare a field column before anything is written to it.
+    ///
+    /// Chronix is schema-on-write: a measurement's columns appear as the
+    /// first point that carries them is written, and for a float or a
+    /// counter that is all anyone needs. A **decimal** column is the
+    /// exception, because its scale is part of its type and is fixed by
+    /// whatever creates the column. Letting the first meter reading decide
+    /// how many fractional digits a settlement register keeps is a coin
+    /// toss: a device that happens to report `231.4` first pins the column
+    /// at one digit, and `231.45` is then refused for ever.
+    ///
+    /// Declaring it makes that a decision:
+    ///
+    /// ```no_run
+    /// # use chronix::Chronix;
+    /// # use chronix_core::{ChronixConfig, ColumnType};
+    /// # let config = ChronixConfig::builder().data_dir("/tmp/d").build().unwrap();
+    /// # let db = Chronix::open(config).unwrap();
+    /// // A quarter-hour register under BK 618-25-02, in kWh to four places.
+    /// db.declare_field("meter", "z1nb_q", ColumnType::Decimal { scale: 4 })?;
+    /// # Ok::<(), chronix::DbError>(())
+    /// ```
+    ///
+    /// The measurement is created if it does not exist. Declaring a column
+    /// that already exists with exactly this type is a no-op; declaring one
+    /// that exists with a different type — including a different decimal
+    /// scale — is an error, because that is a type change and Chronix does
+    /// not have those.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is closed, the column exists with a
+    /// different type, the name is invalid or reserved, or the catalog
+    /// cannot be written.
+    pub fn declare_field(
+        &self,
+        measurement: &str,
+        field: &str,
+        column_type: chronix_core::ColumnType,
+    ) -> Result<()> {
+        self.check_open()?;
+        let actions = self.schema.declare_field(measurement, field, column_type)?;
+        if !actions.is_empty() {
+            self.persist_schema_actions(&actions)?;
+        }
+        Ok(())
+    }
+
+    /// Write the schemas the given actions touched to the catalog manifest.
+    ///
+    /// The manifest is a schema's only durable record, and it is written
+    /// before any data that needs it.
+    fn persist_schema_actions(&self, actions: &[chronix_core::schema::SchemaAction]) -> Result<()> {
+        let measurements: HashSet<&str> = actions
+            .iter()
+            .map(|a| match a {
+                chronix_core::schema::SchemaAction::CreateMeasurement(ms) => ms.measurement(),
+                chronix_core::schema::SchemaAction::AddColumn { measurement, .. } => {
+                    measurement.as_str()
+                }
+            })
+            .collect();
+        let mut catalog = self.catalog.write();
+        for measurement in measurements {
+            if let Some(ms) = self.schema.lookup(measurement) {
+                catalog
+                    .set_schema((*ms).clone())
+                    .map_err(|e| DbError::Internal(format!("persisting schema: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The write path. `enforce_window` is the only difference between a
     /// live insert and a backfill.
     fn write_batch(&self, points: &[Point], enforce_window: bool) -> Result<InsertResult> {
@@ -170,24 +243,25 @@ impl super::Chronix {
             Err(e) => return Err(e.into()),
         };
         if !actions.is_empty() {
-            let measurements: HashSet<&str> = actions
-                .iter()
-                .map(|a| match a {
-                    chronix_core::schema::SchemaAction::CreateMeasurement(ms) => ms.measurement(),
-                    chronix_core::schema::SchemaAction::AddColumn { measurement, .. } => {
-                        measurement.as_str()
-                    }
-                })
-                .collect();
-            let mut catalog = self.catalog.write();
-            for measurement in measurements {
-                if let Some(ms) = self.schema.lookup(measurement) {
-                    catalog
-                        .set_schema((*ms).clone())
-                        .map_err(|e| DbError::Internal(format!("persisting schema: {e}")))?;
-                }
-            }
+            self.persist_schema_actions(&actions)?;
         }
+
+        // ── 2b. Decimals take their column's scale, before the WAL ─────
+        //
+        // A decimal column stores one number of fractional digits. A value
+        // that arrived with fewer is widened here — `1.5` into a scale-4
+        // column becomes `1.5000` — so that the WAL record, the memtable
+        // batch and every segment written from it agree. Without it two
+        // segments of the same column could carry different scales, and a
+        // scan across them could not produce one Arrow schema.
+        //
+        // A batch with no decimal fields returns `None` and copies nothing,
+        // which is every batch on the ordinary metrics path.
+        let normalized = self.schema.normalize_decimals(&admitted)?;
+        let admitted: Vec<&Point> = match &normalized {
+            Some(points) => points.iter().collect(),
+            None => admitted,
+        };
 
         // ── 3. WAL: one record, one acknowledgement ────────────────────
         let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(admitted.len());

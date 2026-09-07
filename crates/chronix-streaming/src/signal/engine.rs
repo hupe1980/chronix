@@ -718,18 +718,24 @@ impl std::fmt::Debug for TriggerEngine {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+/// A field as an `f64`, for a threshold comparison.
+///
+/// A decimal is converted, because a signal condition is a threshold in
+/// floating point and comparing a register against one is a reasonable
+/// thing to want. The conversion is lossy in the last few digits and cannot
+/// be otherwise; a rule that has to be exact belongs in a SQL trigger,
+/// where the comparison stays in the decimal domain.
 fn extract_f64(fields: &BTreeMap<String, FieldValue>, name: &str) -> Option<f64> {
-    match fields.get(name)? {
-        FieldValue::F64(v) => Some(*v),
-        FieldValue::I64(v) => Some(*v as f64),
-        FieldValue::U64(v) => Some(*v as f64),
-        other => {
+    let value = fields.get(name)?;
+    match value.as_f64_lossy() {
+        Some(v) => Some(v),
+        None => {
             warn!(
                 field = name,
-                actual_type = other.type_name(),
+                actual_type = value.type_name(),
                 "condition expects numeric field but got non-numeric type",
             );
-            counter!("signal.condition.type_mismatch").increment(1);
+            counter!("chronix_signal_condition_type_mismatch_total").increment(1);
             None
         }
     }
@@ -738,18 +744,14 @@ fn extract_f64(fields: &BTreeMap<String, FieldValue>, name: &str) -> Option<f64>
 fn first_f64(fields: &BTreeMap<String, FieldValue>) -> Option<f64> {
     let mut saw_non_numeric = false;
     for v in fields.values() {
-        match v {
-            FieldValue::F64(f) => return Some(*f),
-            FieldValue::I64(i) => return Some(*i as f64),
-            FieldValue::U64(u) => return Some(*u as f64),
-            _ => {
-                saw_non_numeric = true;
-            }
+        match v.as_f64_lossy() {
+            Some(f) => return Some(f),
+            None => saw_non_numeric = true,
         }
     }
     if saw_non_numeric {
         warn!("no numeric field found but non-numeric fields present — possible type mismatch");
-        counter!("signal.condition.type_mismatch").increment(1);
+        counter!("chronix_signal_condition_type_mismatch_total").increment(1);
     }
     None
 }

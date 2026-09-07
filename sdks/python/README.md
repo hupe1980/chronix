@@ -54,6 +54,29 @@ async def main():
 asyncio.run(main())
 ```
 
+## Exact Decimals
+
+`f64` cannot represent `0.1`. For a meter register a bill is computed from,
+write a `decimal.Decimal` and the digits stay digits — in the request body,
+in storage, and in the query result:
+
+```python
+from decimal import Decimal
+
+await client.write([
+    Point("meter", {"z1nb_q": Decimal("1234.5678")}, tags={"device": "main"})
+])
+```
+
+The client sends `{"z1nb_q": {"decimal": "1234.5678"}}` rather than a JSON
+number, because a JSON number is parsed as a `double` at the other end. Line
+protocol uses the `d` suffix: `meter,device=main z1nb_q=1234.5678d`.
+
+A decimal column stores a fixed number of fractional digits, set when the
+column is created; a value needing more is refused rather than rounded.
+Declare it first when the first value might not carry the digits you mean to
+keep — see [Data Model](https://hupe1980.github.io/chronix/docs/data-model/#exact-decimals-for-money-and-meters).
+
 ## Line Protocol Writes
 
 ```python
@@ -149,8 +172,8 @@ await client.write(
 
 | Type | Description |
 |------|-------------|
-| `Point` | Data point with measurement, tags, fields, timestamp |
-| `TimeRange` | Half-open `[start, end)` in nanoseconds |
+| `Point` | Data point with measurement, tags, fields, timestamp. A `decimal.Decimal` field is written exactly |
+| `TimeRange` | **Closed** `[start, end]` in nanoseconds — both ends inclusive |
 | `QueryResult` | Query result with `.rows`, `.to_dataframe()` |
 | `ColumnSchema` | Column metadata (name, role, data_type) |
 | `MeasurementInfo` | Measurement summary (name) |

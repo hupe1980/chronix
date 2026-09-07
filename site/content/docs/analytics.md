@@ -62,10 +62,11 @@ let forecast = model.predict(24)?;
 #### Letting Chronix choose the model
 
 `auto_forecast` detects the seasonal period, picks a differencing order with a
-KPSS unit-root test, searches an ARIMA order, and scores every eligible
-candidate by rolling-origin cross-validation **at the horizon asked for** — the
-only comparison that transfers across model families. The winner is refitted on
-the whole window.
+KPSS unit-root test and a *seasonal* differencing order from STL seasonal
+strength (the same measure and 0.64 threshold R's `nsdiffs` uses by default),
+searches an ARIMA order, and scores every eligible candidate by rolling-origin
+cross-validation **at the horizon asked for** — the only comparison that
+transfers across model families. The winner is refitted on the whole window.
 
 ```rust
 use chronix_analytics::forecast::{auto_forecast, AutoForecastOptions};

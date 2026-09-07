@@ -647,9 +647,9 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
 /// Convert an Arrow array cell to a protobuf `SqlValue`.
 fn arrow_to_sql_value(col: &arrow::array::ArrayRef, row: usize) -> proto::SqlValue {
     use arrow::array::{
-        Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        Int8Array, StringArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array,
-        UInt8Array,
+        Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, Int8Array, StringArray, TimestampNanosecondArray, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array,
     };
 
     if col.is_null(row) {
@@ -685,6 +685,11 @@ fn arrow_to_sql_value(col: &arrow::array::ArrayRef, row: usize) -> proto::SqlVal
         Some(proto::sql_value::Value::String(a.value(row).to_string()))
     } else if let Some(a) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
         Some(proto::sql_value::Value::Int64(a.value(row)))
+    } else if let Some(a) = col.as_any().downcast_ref::<Decimal128Array>() {
+        // Digits, not a double: this branch has to come before nothing and
+        // after nothing in particular, but it must exist — without it a
+        // decimal cell fell through to the `<unsupported>` string below.
+        crate::util::decimal_cell_to_string(a, row).map(proto::sql_value::Value::Decimal)
     } else {
         // Fallback: render the data type rather than the entire array so we
         // don't accidentally Debug-print all N values for every single row,
@@ -777,6 +782,10 @@ fn proto_field_to_field_value(v: proto::field_value::Value) -> Result<FieldValue
         proto::field_value::Value::Uint64(u) => Ok(FieldValue::U64(u)),
         proto::field_value::Value::Boolean(b) => Ok(FieldValue::Bool(b)),
         proto::field_value::Value::String(s) => Ok(FieldValue::String(s)),
+        proto::field_value::Value::Decimal(d) => d
+            .parse::<chronix_core::Decimal>()
+            .map(FieldValue::Decimal)
+            .map_err(|e| ServerError::BadRequest(format!("invalid decimal \"{d}\": {e}"))),
     }
 }
 
@@ -803,7 +812,7 @@ fn schema_to_proto_columns(schema: &MeasurementSchema) -> Vec<proto::ColumnSchem
             columns.push(proto::ColumnSchema {
                 name: col.name.clone(),
                 role: "field".to_string(),
-                data_type: crate::util::column_type_to_str(col.column_type).to_string(),
+                data_type: crate::util::column_type_to_str(col.column_type),
             });
         }
     }
@@ -915,6 +924,22 @@ fn record_batch_to_proto_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<p
                                     value: Some(proto::field_value::Value::Boolean(
                                         arr.value(row_idx),
                                     )),
+                                }),
+                            });
+                        }
+                    }
+                }
+                DataType::Decimal128(_, _) => {
+                    // Without this arm a decimal column fell through to the
+                    // "unsupported" branch below and was dropped from the
+                    // response entirely — a query that returned rows, with
+                    // the one column the caller asked for missing.
+                    if let Some(arr) = col.as_any().downcast_ref::<Decimal128Array>() {
+                        if let Some(digits) = crate::util::decimal_cell_to_string(arr, row_idx) {
+                            fields.push(proto::Field {
+                                key: name,
+                                value: Some(proto::FieldValue {
+                                    value: Some(proto::field_value::Value::Decimal(digits)),
                                 }),
                             });
                         }

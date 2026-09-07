@@ -23,8 +23,18 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lib]
 doctest = false
 
+[features]
+## `TryFrom` conversions between [`Decimal`] and `rust_decimal::Decimal`.
+##
+## Off by default — nothing in Chronix needs it, and this is the crate every
+## other crate depends on. The ranges differ: `rust_decimal` is a 96-bit
+## mantissa with scale 0..=28, Chronix 128-bit with scale 0..=38, so the
+## conversion into Chronix always succeeds and the one out can fail.
+rust_decimal = ["dep:rust_decimal"]
+
 [dependencies]
 postcard = { workspace = true }
+rust_decimal = { workspace = true, optional = true }
 dashmap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

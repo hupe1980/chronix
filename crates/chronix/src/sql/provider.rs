@@ -142,15 +142,13 @@ fn schema_to_arrow(ms: &MeasurementSchema, keep_namespace: bool) -> SchemaRef {
             ),
             ColumnRole::Tag => Field::new(&col.name, DataType::Utf8, true),
             ColumnRole::Field => {
-                let dt = match col.column_type {
-                    ColumnType::F64 => DataType::Float64,
-                    ColumnType::I64 => DataType::Int64,
-                    ColumnType::U64 => DataType::UInt64,
-                    ColumnType::Bool => DataType::Boolean,
-                    ColumnType::String => DataType::Utf8,
-                    ColumnType::Timestamp => {
-                        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
-                    }
+                // A *field* of timestamp type is an ordinary column here, so
+                // it is presented as SQL's timestamp rather than the storage
+                // layer's `Int64`; everything else is the shared mapping.
+                let dt = if col.column_type == ColumnType::Timestamp {
+                    DataType::Timestamp(TimeUnit::Nanosecond, None)
+                } else {
+                    chronix_query::column_type_to_arrow(col.column_type)
                 };
                 Field::new(&col.name, dt, true)
             }

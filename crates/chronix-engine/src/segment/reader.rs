@@ -48,9 +48,11 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "field-encryption")]
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{
+    ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+};
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 
@@ -59,8 +61,7 @@ use chronix_encoding::{ColumnDecoder, DecodedColumn, EncodedBlock};
 use crate::segment::compression::decompress_block_with_optional_dict;
 use crate::segment::error::{Result, SegmentError};
 use crate::segment::header::{SegmentFooter, SegmentHeader, FOOTER_SIZE, HEADER_SIZE};
-use crate::segment::metadata::roles;
-use crate::segment::metadata::{data_types, ColumnBlockMeta, SegmentMetadata};
+use crate::segment::metadata::{data_types, ColumnBlockMeta, ColumnMeta, SegmentMetadata};
 use crate::segment::stats::ordered_i64_to_f64;
 
 // ── Zone-map field predicates for late-materialisation ─────────────────
@@ -142,6 +143,38 @@ impl FieldPredicate {
             ZoneMapOp::Lt => lo < self.value,
             ZoneMapOp::LtEq => lo <= self.value,
         }
+    }
+
+    /// Test whether a row group of decimal *mantissas* could match.
+    ///
+    /// The zone map holds mantissas; the predicate holds an `f64`. Rather
+    /// than pretend those are the same number, the bounds are widened by a
+    /// whole mantissa unit before the comparison, so a predicate value that
+    /// binary floating point cannot represent exactly — which is most of the
+    /// values anyone writes against a decimal column — can never prune a row
+    /// group that contains it. The rule from
+    /// [`may_match_f64`](Self::may_match_f64) holds here too: wrong in the
+    /// direction of more work, never in the direction of fewer rows.
+    ///
+    /// Above 2⁵³ the `i64 → f64` conversion loses more than the widening
+    /// covers, so the group is kept rather than compared wrongly. Saturated
+    /// bounds — what a mantissa beyond `i64` records — land there by
+    /// construction.
+    fn may_match_decimal(&self, rg_min: i64, rg_max: i64, scale: u8) -> bool {
+        if rg_min > rg_max {
+            return true;
+        }
+        const EXACT: i64 = 1 << 53;
+        if rg_min <= -EXACT || rg_max >= EXACT {
+            return true;
+        }
+        let pow = 10f64.powi(i32::from(scale));
+        if !pow.is_finite() || pow <= 0.0 {
+            return true;
+        }
+        #[allow(clippy::cast_precision_loss)] // bounded above by 2^53
+        let (lo, hi) = ((rg_min as f64 - 1.0) / pow, (rg_max as f64 + 1.0) / pow);
+        self.may_match_f64(lo, hi)
     }
 }
 
@@ -483,14 +516,7 @@ impl SegmentReader {
                     .ok_or_else(|| SegmentError::CorruptFile {
                         detail: format!("column '{name}' not in segment metadata"),
                     })?;
-                let dt = match col_meta.data_type {
-                    data_types::TIMESTAMP | data_types::I64 => DataType::Int64,
-                    data_types::U64 => DataType::UInt64,
-                    data_types::F64 => DataType::Float64,
-                    data_types::BOOL => DataType::Boolean,
-                    _ => DataType::Utf8,
-                };
-                Ok(Field::new(name, dt, true).with_metadata(roles::arrow_metadata(col_meta.role)))
+                Ok(col_meta.arrow_field())
             })
             .collect::<Result<Vec<_>>>()?;
         let schema = std::sync::Arc::new(Schema::new(fields));
@@ -652,22 +678,7 @@ impl SegmentReader {
                                     .ok_or_else(|| SegmentError::CorruptFile {
                                         detail: format!("column '{name}' not in metadata"),
                                     })?;
-                                let ea: ArrayRef = match cm.data_type {
-                                    data_types::TIMESTAMP | data_types::I64 => {
-                                        std::sync::Arc::new(Int64Array::from(Vec::<i64>::new()))
-                                    }
-                                    data_types::U64 => {
-                                        std::sync::Arc::new(UInt64Array::from(Vec::<u64>::new()))
-                                    }
-                                    data_types::F64 => {
-                                        std::sync::Arc::new(Float64Array::from(Vec::<f64>::new()))
-                                    }
-                                    data_types::BOOL => {
-                                        std::sync::Arc::new(BooleanArray::from(Vec::<bool>::new()))
-                                    }
-                                    _ => std::sync::Arc::new(StringArray::from(Vec::<&str>::new())),
-                                };
-                                empty_arrays.push(ea);
+                                empty_arrays.push(cm.empty_array());
                             }
                             let fields: Vec<Field> = names
                                 .iter()
@@ -680,15 +691,7 @@ impl SegmentReader {
                                         .ok_or_else(|| SegmentError::CorruptFile {
                                             detail: format!("column '{n}' not in metadata"),
                                         })?;
-                                    let dt = match cm2.data_type {
-                                        data_types::TIMESTAMP | data_types::I64 => DataType::Int64,
-                                        data_types::U64 => DataType::UInt64,
-                                        data_types::F64 => DataType::Float64,
-                                        data_types::BOOL => DataType::Boolean,
-                                        _ => DataType::Utf8,
-                                    };
-                                    Ok(Field::new(n, dt, true)
-                                        .with_metadata(roles::arrow_metadata(cm2.role)))
+                                    Ok(cm2.arrow_field())
                                 })
                                 .collect::<Result<Vec<_>>>()?;
                             let schema = Schema::new(fields);
@@ -826,6 +829,11 @@ impl SegmentReader {
                                         block.stats.min_value,
                                         block.stats.max_value,
                                     ),
+                                    data_types::DECIMAL => pred.may_match_decimal(
+                                        block.stats.min_value,
+                                        block.stats.max_value,
+                                        col_meta.decimal_scale.unwrap_or(0),
+                                    ),
                                     _ => true, // non-numeric → can't prune
                                 }
                             };
@@ -866,16 +874,7 @@ impl SegmentReader {
                     .ok_or_else(|| SegmentError::CorruptFile {
                         detail: format!("projected column '{name}' not in segment metadata"),
                     })?;
-                let empty_array: ArrayRef = match col_meta.data_type {
-                    data_types::TIMESTAMP | data_types::I64 => {
-                        std::sync::Arc::new(Int64Array::from(Vec::<i64>::new()))
-                    }
-                    data_types::U64 => std::sync::Arc::new(UInt64Array::from(Vec::<u64>::new())),
-                    data_types::F64 => std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())),
-                    data_types::BOOL => std::sync::Arc::new(BooleanArray::from(Vec::<bool>::new())),
-                    _ => std::sync::Arc::new(StringArray::from(Vec::<&str>::new())),
-                };
-                final_arrays.push(empty_array);
+                final_arrays.push(col_meta.empty_array());
             }
         } else {
             for (col_idx, arrays) in all_arrays.iter().enumerate() {
@@ -901,14 +900,7 @@ impl SegmentReader {
                     .ok_or_else(|| SegmentError::CorruptFile {
                         detail: format!("projected column '{name}' not in segment metadata"),
                     })?;
-                let dt = match col_meta.data_type {
-                    data_types::TIMESTAMP | data_types::I64 => DataType::Int64,
-                    data_types::U64 => DataType::UInt64,
-                    data_types::F64 => DataType::Float64,
-                    data_types::BOOL => DataType::Boolean,
-                    _ => DataType::Utf8,
-                };
-                Ok(Field::new(name, dt, true).with_metadata(roles::arrow_metadata(col_meta.role)))
+                Ok(col_meta.arrow_field())
             })
             .collect::<Result<Vec<Field>>>()?;
 
@@ -1061,7 +1053,7 @@ impl SegmentReader {
 
         // Convert to Arrow array
         let col_meta = &self.metadata.columns[col_idx];
-        decoded_to_arrow(decoded, col_meta.data_type, nulls)
+        decoded_to_arrow(decoded, col_meta, nulls)
     }
 
     /// Load a block's validity bitmap, if it has one (`.csx` v2).
@@ -1143,9 +1135,10 @@ where
 /// Consumes the decoded column to avoid redundant cloning.
 fn decoded_to_arrow(
     decoded: DecodedColumn,
-    data_type: u8,
+    col_meta: &ColumnMeta,
     nulls: Option<NullBuffer>,
 ) -> Result<ArrayRef> {
+    let data_type = col_meta.data_type;
     match (decoded, data_type) {
         (DecodedColumn::I64(values), data_types::TIMESTAMP | data_types::I64) => Ok(
             std::sync::Arc::new(apply_nulls(Int64Array::from(values), nulls)?),
@@ -1168,6 +1161,27 @@ fn decoded_to_arrow(
                 StringArray::from(refs),
                 nulls,
             )?))
+        }
+        (DecodedColumn::Decimal(values), data_types::DECIMAL) => {
+            // The scale is applied here and nowhere else: the mantissas were
+            // stored raw, and this is where they become a number again.
+            let scale = i8::try_from(col_meta.decimal_scale.unwrap_or(0)).map_err(|_| {
+                SegmentError::CorruptFile {
+                    detail: format!(
+                        "decimal column '{}' declares an unrepresentable scale",
+                        col_meta.name
+                    ),
+                }
+            })?;
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(chronix_core::DECIMAL_PRECISION, scale)
+                .map_err(|e| SegmentError::CorruptFile {
+                    detail: format!(
+                        "decimal column '{}' does not fit decimal(38, {scale}): {e}",
+                        col_meta.name
+                    ),
+                })?;
+            Ok(std::sync::Arc::new(apply_nulls(array, nulls)?))
         }
         (decoded, _) => Err(SegmentError::CorruptFile {
             detail: format!(

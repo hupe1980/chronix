@@ -1,6 +1,6 @@
 name: Release
 
-# Tag-driven. `git push origin v0.2.0` publishes the eight library crates to
+# Tag-driven. `git push origin v0.3.0` publishes the eight library crates to
 # crates.io, builds the `chronixd` binaries and attaches them to the GitHub
 # release.
 #

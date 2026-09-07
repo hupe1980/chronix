@@ -387,6 +387,22 @@ fn parse_field_value(s: &str, line_no: usize) -> Result<FieldValue, ServerError>
         });
     }
 
+    // Exact decimal: 231.45d
+    //
+    // A Chronix extension to line protocol, beside `i` and `u`. Influx has
+    // no exact type, so there is no suffix to borrow and no compatibility to
+    // break: a line written for Influx never carries a `d`. The digits are
+    // parsed as digits — a decimal field never passes through an `f64`, on
+    // this path or any other.
+    if let Some(num) = s.strip_suffix('d') {
+        return num
+            .parse::<chronix_core::Decimal>()
+            .map(FieldValue::Decimal)
+            .map_err(|e| {
+                ServerError::BadRequest(format!("line {line_no}: invalid decimal {s}: {e}"))
+            });
+    }
+
     // Float (default for numbers without suffix)
     s.parse::<f64>()
         .map(FieldValue::F64)
@@ -472,6 +488,51 @@ mod tests {
             Some(FieldValue::U64(42)) => {}
             other => panic!("expected UInt64(42), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_decimal_field() {
+        let input = "meter,dev=z1 z1nb=1234.5678d 1000000000";
+        let points = parse_line_protocol(input).unwrap();
+        match points[0].field("z1nb") {
+            Some(FieldValue::Decimal(d)) => {
+                assert_eq!(d.mantissa(), 12_345_678);
+                assert_eq!(d.scale(), 4);
+                assert_eq!(d.to_string(), "1234.5678");
+            }
+            other => panic!("expected Decimal(1234.5678), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_decimal_field_keeps_digits_a_float_would_lose() {
+        // Written as a float, this line protocol value comes back as
+        // 0.30000000000000004; written as a decimal it comes back as itself.
+        let input = "meter price=0.3d,approx=0.3 1000000000";
+        let points = parse_line_protocol(input).unwrap();
+        match points[0].field("price") {
+            Some(FieldValue::Decimal(d)) => assert_eq!(d.to_string(), "0.3"),
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        assert!(matches!(
+            points[0].field("approx"),
+            Some(FieldValue::F64(_))
+        ));
+    }
+
+    #[test]
+    fn an_invalid_decimal_is_rejected_not_rounded() {
+        let input = "meter z=1.2.3d 1000000000";
+        assert!(parse_line_protocol(input).is_err());
+    }
+
+    #[test]
+    fn a_decimal_field_round_trips_through_display() {
+        // `FieldValue`'s Display is the line-protocol rendering, so what a
+        // decimal prints must be what the parser reads back.
+        let value = FieldValue::Decimal("1234.5678".parse().unwrap());
+        assert_eq!(value.to_string(), "1234.5678d");
+        assert_eq!(parse_field_value("1234.5678d", 1).unwrap(), value);
     }
 
     #[test]

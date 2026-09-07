@@ -298,6 +298,24 @@ impl ShardRouter {
         self.shards.read().keys().copied().collect()
     }
 
+    /// The canonical form of every series held in memory, across every
+    /// shard's active and frozen memtables.
+    ///
+    /// Read by the cardinality repair that runs after retention or GC drops
+    /// segments: what the database *holds* is the segments on disk plus
+    /// this, and anything else left in the budget is a series whose data is
+    /// gone.
+    #[must_use]
+    pub fn live_series(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for entry in self.shards.read().values() {
+            for key in entry.controller.all_series_canonical_forms() {
+                out.insert(key.to_string());
+            }
+        }
+        out
+    }
+
     /// Returns the total memory usage across all shards.
     #[must_use]
     pub fn total_memory(&self) -> usize {

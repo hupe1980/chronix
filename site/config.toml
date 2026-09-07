@@ -57,7 +57,7 @@ repo_url = "https://github.com/hupe1980/chronix"
 crates_url = "https://crates.io/crates/chronix"
 docsrs_url = "https://docs.rs/chronix"
 # Shown in the footer and used for the JSON-LD `softwareVersion`.
-version = "0.2.0"
+version = "0.3.0"
 license = "MIT OR Apache-2.0"
 # Default social preview.
 #

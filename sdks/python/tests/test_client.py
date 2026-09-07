@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import pytest
 import httpx
@@ -71,6 +72,57 @@ class TestPoint:
         p = Point("cpu", {"idle": 80.0, "usage": 20.0}, tags={"host": "b"}, timestamp=600)
         lp = p.to_line_protocol()
         assert "idle=80.0,usage=20.0" in lp
+
+
+class TestExactDecimals:
+    """A ``decimal.Decimal`` must never be rendered through a float.
+
+    ``json.dumps`` cannot serialise a ``Decimal`` at all, and the obvious
+    fix — ``float(v)`` — would silently destroy the digits the caller chose
+    this type to keep. So the wire form is the digits, and these tests pin
+    the two places they are produced.
+    """
+
+    def test_json_field_is_a_digit_string_not_a_number(self):
+        p = Point("meter", {"z1nb_q": Decimal("1234.5678")}, timestamp=100)
+        assert p.to_dict()["fields"] == {"z1nb_q": {"decimal": "1234.5678"}}
+        # And the whole body is serialisable, which it is not if a raw
+        # Decimal reaches `json.dumps`.
+        assert '"1234.5678"' in json.dumps(p.to_dict())
+
+    def test_line_protocol_uses_the_d_suffix(self):
+        p = Point("meter", {"z1nb_q": Decimal("1234.5678")}, timestamp=100)
+        assert p.to_line_protocol() == "meter z1nb_q=1234.5678d 100"
+
+    def test_trailing_zeros_are_the_scale_and_are_kept(self):
+        # `1.50` is scale 2 and `1.5` is scale 1; the column stores one of
+        # them, so the client must not normalise on the caller's behalf.
+        p = Point("meter", {"v": Decimal("1.50")}, timestamp=1)
+        assert p.to_dict()["fields"]["v"] == {"decimal": "1.50"}
+
+    def test_exponent_notation_is_written_out(self):
+        # `str(Decimal("1E+3"))` is "1E+3", which the server rejects.
+        p = Point("meter", {"v": Decimal("1E+3")}, timestamp=1)
+        assert p.to_dict()["fields"]["v"] == {"decimal": "1000"}
+        p = Point("meter", {"v": Decimal("1e-5")}, timestamp=1)
+        assert p.to_dict()["fields"]["v"] == {"decimal": "0.00001"}
+
+    def test_negative_and_zero(self):
+        assert Point("m", {"v": Decimal("-0.001")}, timestamp=1).to_dict()["fields"]["v"] == {
+            "decimal": "-0.001"
+        }
+        assert Point("m", {"v": Decimal("0")}, timestamp=1).to_dict()["fields"]["v"] == {
+            "decimal": "0"
+        }
+
+    def test_a_non_finite_decimal_is_refused(self):
+        with pytest.raises(ValueError):
+            Point("m", {"v": Decimal("NaN")}, timestamp=1).to_dict()
+
+    def test_a_float_field_is_still_a_number(self):
+        # The new branch must not capture the ordinary case.
+        p = Point("cpu", {"usage": 72.5}, timestamp=1)
+        assert p.to_dict()["fields"] == {"usage": 72.5}
 
 
 class TestTimeRange:

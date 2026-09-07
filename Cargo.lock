@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "chronix"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "async-stream",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-analytics"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-cluster"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chronix-analytics",
@@ -1180,12 +1180,13 @@ dependencies = [
 
 [[package]]
 name = "chronix-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dashmap",
  "fnv",
  "postcard",
  "proptest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tempfile",
@@ -1196,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-dsim"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chronix-meta",
  "openraft",
@@ -1209,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-encoding"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chronix-core",
  "criterion",
@@ -1221,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -1256,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-meta"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures",
  "metrics",
@@ -1280,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1293,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-security"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1324,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-streaming"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1353,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "chronixd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow",
  "arrow-flight",

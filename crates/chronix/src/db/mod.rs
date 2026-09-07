@@ -99,23 +99,39 @@ pub struct DatabaseStatistics {
     pub wal_sequence: u64,
     /// Number of tombstoned (soft-deleted) series.
     pub tombstone_count: usize,
-    /// Number of entries in the segment metadata cache.
+    /// Number of entries in the segment metadata index — one per live
+    /// segment.
     pub metadata_cache_entries: usize,
+    /// Heap held by the segment metadata index: each segment's header, column
+    /// statistics and per-tag bloom filters.
+    ///
+    /// Grows with the segment count, so on a long-lived deployment with a
+    /// multi-year rollup tier this is the term that grows — and it was the
+    /// one term [`resident_memory_bytes`](Self::resident_memory_bytes) did
+    /// not sum, under a comment estimating it at "~1 KB per entry" that no
+    /// bloom filter was ever going to honour.
+    pub metadata_cache_bytes: usize,
 }
 
 impl DatabaseStatistics {
-    /// The engine's resident heap: memtables, interners, WAL buffer, catalog.
+    /// The engine's resident heap: memtables, interners, WAL buffer, catalog
+    /// and the segment metadata index.
     ///
     /// This is the number a memory budget is about. It does **not** include a
     /// query's working set — a DataFusion plan allocates against its own
     /// memory pool ([`ChronixConfig::per_query_memory_limit`](chronix_core::ChronixConfig::per_query_memory_limit))
     /// — nor the encoder scratch a flush allocates and frees.
+    ///
+    /// Every term it sums is also reported on its own, and a test asserts the
+    /// sum: a total that quietly omits a term is worse than no total, because
+    /// it is the number a 48 MB budget is checked against.
     #[must_use]
     pub const fn resident_memory_bytes(&self) -> usize {
         self.memtable_memory_bytes
             + self.interner_memory_bytes
             + self.wal_buffer_bytes
             + self.catalog_memory_bytes
+            + self.metadata_cache_bytes
     }
 }
 
@@ -739,6 +755,14 @@ impl Chronix {
                     data_types::I64 => ColumnType::I64,
                     data_types::U64 => ColumnType::U64,
                     data_types::BOOL => ColumnType::Bool,
+                    // A decimal column carries its scale in the catalog for
+                    // exactly this: repairing it as `decimal(38, 0)` would
+                    // be wrong by a power of ten, and skipping it would
+                    // leave the schema missing a column the data has.
+                    data_types::DECIMAL => match cs.decimal_scale {
+                        Some(scale) => ColumnType::Decimal { scale },
+                        None => continue,
+                    },
                     _ => continue,
                 };
                 let known = schema
@@ -2300,31 +2324,39 @@ mod tests {
         let config = ChronixConfig::builder()
             .data_dir(tmp.path())
             .memtable_flush_threshold(128)
-            // "metrics" gets a very short retention (1 nanosecond) so
-            // everything is expired. "cpu" uses the global retention.
-            .measurement_retention("metrics", Duration::from_nanos(1))
+            // "metrics" gets a one-minute retention; "cpu" uses the global
+            // hour. The two measurements are written an hour apart so the
+            // override is what decides, and so the test does not depend on
+            // the wall clock having advanced past its own fixture: retention
+            // measures age from the newest timestamp the database holds
+            // (`retention::retention_reference`), which is `now_ns` here, so
+            // a degenerate 1 ns override would expire nothing at all — the
+            // newest data always survives its own window, by construction.
+            .measurement_retention("metrics", Duration::from_secs(60))
             .build()
             .unwrap();
         let db = Chronix::open(config).unwrap();
 
-        // Use recent timestamps so global retention (1 hour) keeps them.
         #[allow(clippy::cast_possible_truncation)]
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
+        let hour_ns = 3_600_000_000_000i64;
 
-        // Insert data for two measurements, flush each separately
+        // "metrics" is an hour old — past its own minute, inside the global
+        // hour. Written first so the out-of-order window moves forward.
         for i in 0..3u64 {
-            let ts = now_ns - (i as i64 * 1_000_000); // recent timestamps
-            let p = test_point("cpu", "srv-1", ts, i as f64);
+            let ts = now_ns - hour_ns + (i as i64 * 1_000_000);
+            let p = test_point("metrics", "srv-1", ts, i as f64);
             db.insert(&p).unwrap();
         }
         db.flush().unwrap();
 
+        // "cpu" is current, and it is also what anchors the reference.
         for i in 0..3u64 {
-            let ts = now_ns - (i as i64 * 1_000_000); // recent timestamps
-            let p = test_point("metrics", "srv-1", ts, i as f64);
+            let ts = now_ns - (i as i64 * 1_000_000);
+            let p = test_point("cpu", "srv-1", ts, i as f64);
             db.insert(&p).unwrap();
         }
         db.flush().unwrap();

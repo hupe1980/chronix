@@ -7,6 +7,9 @@
 #[path = "suite/client_compat.rs"]
 mod client_compat;
 
+#[path = "suite/decimal_wire.rs"]
+mod decimal_wire;
+
 #[path = "suite/errors_test.rs"]
 mod errors_test;
 
@@ -26,6 +29,9 @@ mod tenancy_test;
 mod tls_test;
 #[path = "suite/triggers_test.rs"]
 mod triggers_test;
+
+#[path = "suite/soft_delete.rs"]
+mod soft_delete;
 
 #[path = "suite/stopping.rs"]
 mod stopping;

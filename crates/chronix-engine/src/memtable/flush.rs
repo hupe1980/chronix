@@ -425,6 +425,16 @@ impl FlushController {
         merge_newest_first(sources)
     }
 
+    /// Every series held by this shard's active and frozen memtables.
+    #[must_use]
+    pub fn all_series_canonical_forms(&self) -> Vec<std::sync::Arc<str>> {
+        let mut out = self.active.read().series_canonical_forms();
+        for frozen in self.frozen.read().iter() {
+            out.extend(frozen.series_canonical_forms());
+        }
+        out
+    }
+
     /// Returns the total estimated memory across active and all frozen memtables.
     #[must_use]
     pub fn total_memory(&self) -> usize {
