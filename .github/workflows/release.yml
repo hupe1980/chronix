@@ -50,10 +50,34 @@ jobs:
           # same tag. `skip-existing` on the PyPI upload turns a stale version
           # into a *silent success* — the release completes having published
           # nothing — so the mismatch has to fail here instead.
-          sdk=$(sed -n 's/^version = "\(.*\)"/\1/p' sdks/python/pyproject.toml | head -1)
+          #
+          # The version is dynamic (`[tool.hatch.version]` reads it out of
+          # this same Cargo.toml), so there is no static `version = "…"` left
+          # to `sed` for — resolve it the same way hatchling does: `tomllib`
+          # for the `path`/`pattern` it declares, then that regex against the
+          # file it points at.
+          sdk=$(python3 - <<'PY'
+          import pathlib
+          import re
+          import tomllib
+
+          proj = tomllib.loads(pathlib.Path("sdks/python/pyproject.toml").read_text())
+          if "version" not in proj.get("project", {}).get("dynamic", []):
+              raise SystemExit("sdks/python/pyproject.toml must declare a dynamic version")
+          hatch_version = proj.get("tool", {}).get("hatch", {}).get("version", {})
+          path, pattern = hatch_version.get("path"), hatch_version.get("pattern")
+          if not path or not pattern:
+              raise SystemExit("[tool.hatch.version] must set path and pattern")
+          text = (pathlib.Path("sdks/python") / path).resolve().read_text()
+          match = re.search(pattern, text, re.MULTILINE)
+          if not match:
+              raise SystemExit(f"version pattern did not match {path}")
+          print(match.group("version"))
+          PY
+          )
           echo "python sdk=$sdk"
           [ "$sdk" = "$manifest" ] || {
-            echo "::error::sdks/python/pyproject.toml is $sdk, workspace is $manifest" >&2
+            echo "::error::sdks/python/pyproject.toml resolves to $sdk, workspace is $manifest" >&2
             exit 1
           }
           # `[workspace.dependencies]` repeats the version for each internal
