@@ -40,7 +40,7 @@ impl super::Chronix {
         // The background GC pass will hard-delete it after the TTL elapses.
         //
         // Persisted in the catalog manifest, not an in-memory map: the same
-        // fix as a tombstone (D43) — an in-memory-only pending drop is
+        // fix as a tombstone — an in-memory-only pending drop is
         // undone by every restart, which silently un-drops a measurement an
         // operator was told was gone and forgets the deadline that was
         // supposed to reclaim its disk.

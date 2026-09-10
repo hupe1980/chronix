@@ -2048,7 +2048,7 @@ fn soft_delete_and_restore_measurement() {
 /// `Chronix` handle, so a restart forgot it — silently un-dropping a
 /// measurement an operator was told was gone, and forgetting the deadline
 /// that was supposed to reclaim its disk. The fix is the same one a
-/// tombstone got (D43): durable in the catalog manifest, reconstructed by
+/// tombstone got: durable in the catalog manifest, reconstructed by
 /// `open()`, exactly like every other fact a restart must not lose.
 #[test]
 fn a_pending_measurement_drop_survives_a_restart() {

@@ -1079,8 +1079,8 @@ let config = WebhookConfig::new(
 
 The body carries the fired [`SignalEvent`] under `data`, so anything already
 parsing that shape keeps working; `type`, `source`, `id` and `time` are what
-make it recognisable to a CloudEvents-aware receiver with no chronix-specific
-code:
+make it recognisable to a CloudEvents-aware receiver with no code specific to
+chronix:
 
 ```json
 {
@@ -1105,7 +1105,7 @@ webhook-signature: v1,base64(HMAC-SHA256(secret, "{webhook-id}.{webhook-timestam
 ```
 
 Any [Standard Webhooks reference library](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries)
-verifies this without chronix-specific code.
+verifies this without any code specific to chronix.
 
 ### Webhook Auth Header — Environment Variable Expansion
 

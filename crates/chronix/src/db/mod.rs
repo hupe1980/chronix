@@ -153,11 +153,11 @@ pub(super) fn chrono_timestamp_ms() -> u64 {
 /// Any code path that holds more than one lock simultaneously must obey
 /// this total order:
 ///
-/// 1. `catalog` ([`RwLock<SegmentCatalog>`])
-/// 2. `time_index` ([`RwLock<BTreeMap<ShardId, TimeIndex>>`])
-/// 3. `blooms` ([`RwLock<BTreeMap<u64, SeriesBloomFilter>>`])
-/// 4. `tombstones` ([`RwLock<TombstoneSet>`])
-/// 5. `rollup_registry` ([`RwLock<RollupRegistry>`])
+/// 1. `catalog` (`RwLock<SegmentCatalog>`)
+/// 2. `time_index` (`RwLock<BTreeMap<ShardId, TimeIndex>>`)
+/// 3. `blooms` (`RwLock<BTreeMap<u64, SeriesBloomFilter>>`)
+/// 4. `tombstones` (`RwLock<TombstoneSet>`)
+/// 5. `rollup_registry` (`RwLock<RollupRegistry>`)
 ///
 /// `known_series` uses [`DashSet`] (sharded concurrent hash set) and does
 /// **not** participate in this ordering — its per-shard internal locks

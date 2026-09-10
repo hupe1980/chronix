@@ -18,9 +18,9 @@
 //!
 //! A webhook receiver is somebody else's code, so the bar is the same one
 //! the wire protocols are held to: conformance with what a receiver already
-//! knows how to verify, not a bespoke scheme with one implementation
-//! ([SERVER.md](../../../../concepts/SERVER.md) §2a). The body is a
-//! [CloudEvents](https://cloudevents.io) 1.0 structured-mode JSON envelope —
+//! knows how to verify, not a bespoke scheme with one implementation. The
+//! body is a [CloudEvents](https://cloudevents.io) 1.0 structured-mode JSON
+//! envelope —
 //! `specversion`, `id`, `source`, `type`, `time`, `data` — so any
 //! CloudEvents-aware router (Knative, EventBridge, an OTel Collector
 //! receiver) can consume a fired signal without knowing chronix's own shape;
@@ -33,7 +33,7 @@
 //! the body alone, so a captured request could be replayed indefinitely with
 //! nothing to bound its age. A receiver that already speaks Standard
 //! Webhooks — Svix, Stripe-alikes, the reference libraries the spec ships —
-//! verifies a chronix signal with no chronix-specific code at all.
+//! verifies a chronix signal with no code specific to chronix at all.
 //!
 //! ## Delivery does not block evaluation
 //!
@@ -210,8 +210,8 @@ pub struct WebhookConfig {
     /// Webhooks](https://www.standardwebhooks.com) `v1` scheme and carried in
     /// the `webhook-id` / `webhook-timestamp` / `webhook-signature` headers,
     /// so receivers can verify authenticity — and the request's age — with
-    /// any Standard Webhooks-compatible library rather than chronix-specific
-    /// code.
+    /// any Standard Webhooks-compatible library rather than code specific to
+    /// chronix.
     pub signing_secret: String,
     /// Custom headers to include.
     pub headers: Vec<(String, String)>,

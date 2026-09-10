@@ -137,7 +137,7 @@ enum ManifestEntry {
     /// A measurement was soft-deleted: it is pending a hard delete at
     /// `deadline_ms` unless cancelled first.
     ///
-    /// Durable for the same reason a tombstone is (D43): an in-memory-only
+    /// Durable for the same reason a tombstone is: an in-memory-only
     /// pending-drop map is undone by every restart, silently un-dropping a
     /// measurement an operator was told was gone and forgetting the deadline
     /// that was supposed to reclaim its disk.
