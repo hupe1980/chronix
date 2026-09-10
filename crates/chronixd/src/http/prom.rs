@@ -564,6 +564,11 @@ fn parse_selectors(
             None if name_filters.is_empty() => continue,
             None => chronix::promql::all_metrics(registry),
         };
+        // The registry still lists a measurement pending a soft-delete;
+        // `db.schema` is where every discovery surface agrees on "gone or
+        // not", so a dropped metric does not linger in `/series` or
+        // `/labels` for its whole grace period.
+        targets.retain(|t| db.schema(&t.measurement).is_some());
         targets.retain(|t| {
             let labels = [("__name__".to_string(), t.name.clone())];
             name_filters.iter().all(|f| f.matches(&labels))
@@ -685,7 +690,10 @@ fn observed_label_sets(
     // for the metric being edited rather than for the whole database.
     let all;
     let targets: Vec<(&chronix::promql::MetricRef, Option<usize>)> = if selectors.is_empty() {
-        all = chronix::promql::all_metrics(db.schema_registry());
+        all = chronix::promql::all_metrics(db.schema_registry())
+            .into_iter()
+            .filter(|t| db.schema(&t.measurement).is_some())
+            .collect::<Vec<_>>();
         all.iter().map(|t| (t, None)).collect()
     } else {
         selectors

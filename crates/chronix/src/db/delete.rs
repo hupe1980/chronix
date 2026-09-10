@@ -38,13 +38,18 @@ impl super::Chronix {
         // When soft_delete_ttl is configured, mark the measurement
         // as pending deletion instead of immediately removing data.
         // The background GC pass will hard-delete it after the TTL elapses.
+        //
+        // Persisted in the catalog manifest, not an in-memory map: the same
+        // fix as a tombstone (D43) — an in-memory-only pending drop is
+        // undone by every restart, which silently un-drops a measurement an
+        // operator was told was gone and forgets the deadline that was
+        // supposed to reclaim its disk.
         if let Some(ttl) = self.config.soft_delete_ttl {
             let now_ms = super::chrono_timestamp_ms();
             let deadline_ms = now_ms + ttl.as_millis() as u64;
-            {
-                let mut pending = self.pending_measurement_drops.write();
-                pending.insert(measurement.to_string(), deadline_ms);
-            }
+            self.catalog
+                .write()
+                .set_measurement_pending_drop(measurement, deadline_ms)?;
             info!(
                 measurement,
                 deadline_ms,
@@ -104,6 +109,12 @@ impl super::Chronix {
 
             // 4. Remove schema from catalog
             catalog.remove_schema(measurement)?;
+
+            // Cancel any pending soft-delete: this *is* the hard delete it
+            // was waiting for, and a stale pending-drop entry left behind
+            // would apply to a measurement re-created under the same name
+            // by a later write.
+            catalog.cancel_measurement_pending_drop(measurement)?;
         }
 
         // 5. Remove schema from in-memory registry

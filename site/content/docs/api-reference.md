@@ -479,7 +479,8 @@ Two: `log` and `webhook('https://…')`. Anything else — `nats(…)`, `mqtt(�
 `DELIVER TO log` — is a parse error naming the channels that exist.
 
 Each webhook URL is its own channel, so two triggers can deliver to two
-endpoints. Every payload is HMAC-SHA256 signed with
+endpoints. Every delivery is a CloudEvents envelope, signed per the
+[Standard Webhooks](https://www.standardwebhooks.com) `v1` scheme with
 `triggers.webhook_signing_secret`; without it configured, `DELIVER webhook(…)`
 is refused at creation. The URL must be `https`, carry no userinfo, and name
 neither an internal host nor a non-routable address — see
@@ -1629,6 +1630,13 @@ this API, and by default it is irreversible.
 Set `[database] soft_delete_ttl_secs` and it stops being: the drop marks the
 measurement pending, a background pass hard-deletes it once the deadline
 passes, and until then it can be brought back with its data.
+
+A measurement pending drop is invisible everywhere a genuinely dropped one
+would be — `SHOW TABLES`, `/api/v1/measurements`, PromQL discovery, and every
+query answer nothing for it — while its data is untouched, so a restore
+before the deadline is instant and loses nothing. The pending state survives
+a restart, so a restart between the drop and the restore neither un-drops it
+nor forgets the deadline.
 
 ```bash
 curl -X DELETE http://localhost:8086/api/v1/measurements/power   # 204

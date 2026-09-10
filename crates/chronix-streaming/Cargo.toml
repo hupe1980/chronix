@@ -47,6 +47,11 @@ parking_lot.workspace = true
 fnv.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+# Standard Webhooks (https://www.standardwebhooks.com) signatures are
+# base64, not hex, and the `time` a CloudEvents envelope carries needs
+# calendar math `std` does not have.
+base64.workspace = true
+chrono.workspace = true
 reqwest = { workspace = true }
 # The webhook SSRF check must parse a URL exactly the way the client that
 # will make the request parses it; hand-rolled splitting is what let

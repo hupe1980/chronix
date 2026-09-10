@@ -545,7 +545,9 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
 
         let names: Vec<String> = tokio::task::spawn_blocking(move || match scope.as_deref() {
-            None => db.schema_registry().measurement_names(),
+            // Through `measurement_names_in`, not the raw registry: it
+            // still lists a measurement pending a soft-delete.
+            None => db.measurement_names_in(None),
             Some(ns) => {
                 let now_ns = crate::util::now_nanos().unwrap_or(i64::MAX);
                 crate::namespace::measurements_in(&db, Some(ns), i64::MIN, now_ns, usize::MAX)

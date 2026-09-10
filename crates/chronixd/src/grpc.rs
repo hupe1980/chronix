@@ -441,9 +441,12 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
 
         let measurements = tokio::task::spawn_blocking(move || {
-            let registry = db.schema_registry();
             let names = match scope.as_deref() {
-                None => registry.measurement_names(),
+                // Through `measurement_names_in`, not the raw registry: it
+                // still lists a measurement pending a soft-delete, and a
+                // JDBC-style schema browser is exactly the caller a pending
+                // drop must be invisible to.
+                None => db.measurement_names_in(None),
                 Some(ns) => {
                     let now_ns = crate::util::now_nanos().unwrap_or(i64::MAX);
                     crate::namespace::measurements_in(&db, Some(ns), i64::MIN, now_ns, usize::MAX)
@@ -452,7 +455,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
 
             let mut infos = Vec::new();
             for name in names {
-                if let Some(schema) = registry.lookup(&name) {
+                if let Some(schema) = db.schema(&name) {
                     let columns = schema_to_proto_columns(&schema);
                     infos.push(proto::MeasurementInfo { name, columns });
                 }

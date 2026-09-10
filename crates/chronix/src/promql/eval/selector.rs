@@ -169,6 +169,12 @@ impl PromQLEvaluator {
             None => metric::all_metrics(registry),
         };
 
+        // The registry still lists a measurement pending a soft-delete;
+        // `db.schema` is the one place that answers "gone or not" and every
+        // discovery surface has to agree with it, or a metric a query can
+        // no longer read stays offered by the browser that found it.
+        candidates.retain(|m| self.db.schema(&m.measurement).is_some());
+
         if !name_matchers.is_empty() {
             candidates.retain(|m| {
                 let labels = [("__name__".to_string(), m.name.clone())];

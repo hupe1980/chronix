@@ -130,6 +130,31 @@ async fn a_dropped_measurement_can_be_restored_within_the_grace_period() {
         .expect("drop");
     assert_eq!(dropped.status(), 204, "the drop must be accepted");
 
+    // A drop that leaves the data fully readable through its whole grace
+    // period is not a drop: the listing and the query API must both treat
+    // it as gone, exactly as they would a measurement that never existed.
+    assert!(
+        !measurements(&base).await.contains(&"power".to_string()),
+        "a pending-drop measurement must not be listed"
+    );
+    let scan_during_grace: serde_json::Value = client()
+        .post(format!("{base}/api/v1/chronix/query"))
+        .json(&serde_json::json!({
+            "measurement": "power",
+            "range": { "start": 0, "end": i64::MAX / 2 },
+        }))
+        .send()
+        .await
+        .expect("query")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        scan_during_grace.as_array().map_or(0, Vec::len),
+        0,
+        "a pending-drop measurement's rows must not be scannable: {scan_during_grace}"
+    );
+
     let restored = client()
         .post(format!("{base}/api/v1/measurements/power/restore"))
         .send()
@@ -140,6 +165,11 @@ async fn a_dropped_measurement_can_be_restored_within_the_grace_period() {
         204,
         "a drop inside the grace period must be reversible: {}",
         restored.text().await.unwrap_or_default()
+    );
+
+    assert!(
+        measurements(&base).await.contains(&"power".to_string()),
+        "a restored measurement must be listed again"
     );
 
     // The data, not just the name: a restore that brought back an empty

@@ -13,7 +13,7 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
-# Not published to crates.io for v0.3.0; distributed as a binary through
+# Not published to crates.io for v0.4.0; distributed as a binary through
 # GitHub Releases instead.
 #
 # The reason is a manifest fact with a product cause: the `cluster`
@@ -22,7 +22,7 @@ readme.workspace = true
 # requires a version for every dependency it packages, optional ones included.
 # The three options were to publish the frozen crates (inviting use of a tier
 # that is explicitly not developed), to strip the two features from `chronixd`
-# (76 `cfg` gates and a 547-line module, for a mode v0.3.0 cannot run anyway),
+# (76 `cfg` gates and a 547-line module, for a mode v0.4.0 cannot run anyway),
 # or this. The library — which is the product — publishes normally.
 #
 # What would change it: splitting the cluster server integration into

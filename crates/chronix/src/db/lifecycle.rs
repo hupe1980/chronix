@@ -1189,24 +1189,24 @@ impl super::Chronix {
 
     /// Hard-delete measurements whose soft-delete TTL has elapsed.
     ///
-    /// Scans the `pending_measurement_drops` map and removes any entries
-    /// whose deadline is in the past. For each expired entry, the full
-    /// hard-delete path (segment removal, schema cleanup, index cleanup)
-    /// is executed.
+    /// Scans the catalog's pending-drop set and hard-deletes any entry whose
+    /// deadline is in the past. Each hard delete cancels its own pending-drop
+    /// entry once it has actually removed the data (`hard_delete_measurement`),
+    /// so a delete that fails part-way leaves the entry pending for the next
+    /// pass to retry rather than forgetting it.
     ///
     /// Returns the number of measurements hard-deleted.
     pub fn gc_pending_measurement_drops(&self) -> Result<usize> {
         let now_ms = super::chrono_timestamp_ms();
 
-        // Collect expired measurements under a short read lock.
-        let expired: Vec<String> = {
-            let pending = self.pending_measurement_drops.read();
-            pending
-                .iter()
-                .filter(|(_, &deadline)| now_ms >= deadline)
-                .map(|(m, _)| m.clone())
-                .collect()
-        };
+        let expired: Vec<String> = self
+            .catalog
+            .read()
+            .pending_measurement_drops()
+            .iter()
+            .filter(|(_, &deadline)| now_ms >= deadline)
+            .map(|(m, _)| m.clone())
+            .collect();
 
         if expired.is_empty() {
             return Ok(0);
@@ -1214,13 +1214,6 @@ impl super::Chronix {
 
         for measurement in &expired {
             info!(measurement, "GC: hard-deleting soft-deleted measurement");
-            // Remove from pending map first so concurrent queries stop
-            // filtering it out even if the hard-delete partially fails.
-            {
-                let mut pending = self.pending_measurement_drops.write();
-                pending.remove(measurement.as_str());
-            }
-            // Execute the hard-delete path (same as immediate drop).
             self.hard_delete_measurement(measurement)?;
         }
 
@@ -1230,18 +1223,20 @@ impl super::Chronix {
     /// Restore a measurement that was soft-deleted but whose TTL hasn't
     /// elapsed yet.
     ///
-    /// Removes the measurement from the pending-deletion map so it
-    /// becomes visible in queries again. Returns `true` if the
-    /// measurement was pending deletion and was restored, `false` if it
-    /// was not pending.
+    /// Cancels the pending drop, durably, so it becomes visible in queries
+    /// again. Returns `true` if the measurement was pending deletion and was
+    /// restored, `false` if it was not pending.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database is closed.
+    /// Returns an error if the database is closed, or the manifest cannot be
+    /// written.
     pub fn restore_measurement(&self, measurement: &str) -> Result<bool> {
         self.check_open()?;
-        let mut pending = self.pending_measurement_drops.write();
-        let was_pending = pending.remove(measurement).is_some();
+        let was_pending = self
+            .catalog
+            .write()
+            .cancel_measurement_pending_drop(measurement)?;
         if was_pending {
             info!(measurement, "Measurement restored from soft-delete");
         }
@@ -1251,8 +1246,7 @@ impl super::Chronix {
     /// Check whether a measurement is pending soft-delete.
     #[must_use]
     pub fn is_measurement_pending_drop(&self, measurement: &str) -> bool {
-        let pending = self.pending_measurement_drops.read();
-        pending.contains_key(measurement)
+        self.catalog.read().is_measurement_pending_drop(measurement)
     }
 
     /// Flush a single shard to per-measurement segment files.

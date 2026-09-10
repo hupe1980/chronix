@@ -1062,8 +1062,11 @@ reg.register_model_with_info(info, factory)?;
 
 ## Webhook Signing
 
-All webhook deliveries are HMAC-SHA256 signed. The `signing_secret` is a
-mandatory parameter — unsigned webhooks are not permitted.
+Every webhook delivery is a [CloudEvents](https://cloudevents.io) 1.0
+structured-mode JSON envelope, signed per the
+[Standard Webhooks](https://www.standardwebhooks.com) `v1` scheme. The
+`signing_secret` is a mandatory parameter — unsigned webhooks are not
+permitted.
 
 ```rust
 use chronix_streaming::signal::WebhookConfig;
@@ -1074,11 +1077,35 @@ let config = WebhookConfig::new(
 );
 ```
 
-Receivers verify the `X-Chronix-Signature` header:
+The body carries the fired [`SignalEvent`] under `data`, so anything already
+parsing that shape keeps working; `type`, `source`, `id` and `time` are what
+make it recognisable to a CloudEvents-aware receiver with no chronix-specific
+code:
+
+```json
+{
+  "specversion": "1.0",
+  "id": "3f9c1e2a-...",
+  "source": "chronix:trigger/high_cpu",
+  "type": "io.chronix.signal.fired",
+  "time": "2026-01-15T10:30:00.123456789+00:00",
+  "datacontenttype": "application/json",
+  "data": { "trigger_id": "high_cpu", "measurement": "cpu", "value": 92.5, "..." : "..." }
+}
+```
+
+Receivers verify the `webhook-signature` header, which — unlike a signature
+over the body alone — also binds the request's age, so a captured request
+cannot be replayed indefinitely:
 
 ```text
-X-Chronix-Signature: sha256=<hex HMAC-SHA256 of the JSON body>
+webhook-id: msg_3f9c1e2a5b6d4e8f9a0b1c2d3e4f5a6b
+webhook-timestamp: 1768473000
+webhook-signature: v1,base64(HMAC-SHA256(secret, "{webhook-id}.{webhook-timestamp}.{body}"))
 ```
+
+Any [Standard Webhooks reference library](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries)
+verifies this without chronix-specific code.
 
 ### Webhook Auth Header — Environment Variable Expansion
 

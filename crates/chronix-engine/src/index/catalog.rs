@@ -134,6 +134,22 @@ enum ManifestEntry {
         /// Postcard-encoded state.
         state: Vec<u8>,
     },
+    /// A measurement was soft-deleted: it is pending a hard delete at
+    /// `deadline_ms` unless cancelled first.
+    ///
+    /// Durable for the same reason a tombstone is (D43): an in-memory-only
+    /// pending-drop map is undone by every restart, silently un-dropping a
+    /// measurement an operator was told was gone and forgetting the deadline
+    /// that was supposed to reclaim its disk.
+    SetPendingMeasurementDrop {
+        /// The measurement pending deletion.
+        measurement: String,
+        /// Unix-ms deadline after which the next GC pass hard-deletes it.
+        deadline_ms: u64,
+    },
+    /// A pending drop was cancelled — by a restore, or by the hard delete
+    /// that finally acted on it.
+    CancelPendingMeasurementDrop(String),
 }
 
 /// A rollup's persisted definition and state, as opaque payloads.
@@ -203,6 +219,9 @@ pub struct SegmentCatalog {
     /// that believed it had no rollups, and a retention pass that then
     /// dropped the raw data those rollups existed to preserve.
     rollups: BTreeMap<String, RollupRecord>,
+    /// Measurements pending a hard delete, by the unix-ms deadline a GC pass
+    /// acts on. See [`ManifestEntry::SetPendingMeasurementDrop`].
+    pending_measurement_drops: BTreeMap<String, u64>,
     /// Monotonically increasing catalog version.
     manifest_seq: u64,
     /// Directory for manifest files.
@@ -268,6 +287,7 @@ impl SegmentCatalog {
             tombstones: TombstoneSet::new(),
             wal_floor: 0,
             rollups: BTreeMap::new(),
+            pending_measurement_drops: BTreeMap::new(),
             manifest_seq: 0,
             manifest_dir,
             changes_since_snapshot: 0,
@@ -312,6 +332,7 @@ impl SegmentCatalog {
                 tombstones: snapshot.tombstones,
                 wal_floor: snapshot.wal_floor,
                 rollups: snapshot.rollups,
+                pending_measurement_drops: snapshot.pending_measurement_drops,
                 manifest_seq: snapshot.manifest_seq,
                 manifest_dir: manifest_dir.clone(),
                 changes_since_snapshot: 0,
@@ -328,6 +349,7 @@ impl SegmentCatalog {
                 tombstones: TombstoneSet::new(),
                 wal_floor: 0,
                 rollups: BTreeMap::new(),
+                pending_measurement_drops: BTreeMap::new(),
                 manifest_seq: 0,
                 manifest_dir: manifest_dir.clone(),
                 changes_since_snapshot: 0,
@@ -433,9 +455,16 @@ impl SegmentCatalog {
 
     /// Get all *active* segments belonging to a specific measurement.
     ///
-    /// Excludes segments that are soft-deleted (waiting for GC).
+    /// Excludes segments that are soft-deleted (waiting for GC), and every
+    /// segment of a measurement pending a hard delete — a "drop" that leaves
+    /// its rows scannable for the whole grace period is not a drop. The
+    /// segments themselves are untouched, so a restore before the deadline
+    /// costs nothing and loses nothing.
     #[must_use]
     pub fn active_segments_for_measurement(&self, measurement: &str) -> Vec<&SegmentCatalogEntry> {
+        if self.pending_measurement_drops.contains_key(measurement) {
+            return Vec::new();
+        }
         self.segments
             .values()
             .flat_map(|v| v.iter())
@@ -616,6 +645,61 @@ impl SegmentCatalog {
         }
         self.append_manifest(&ManifestEntry::RemoveRollup(name.to_string()))?;
         self.rollups.remove(name);
+        self.sync_manifest()?;
+        self.maybe_snapshot()?;
+        Ok(true)
+    }
+
+    /// Every measurement pending a hard delete, and the unix-ms deadline
+    /// each was given.
+    #[must_use]
+    pub fn pending_measurement_drops(&self) -> &BTreeMap<String, u64> {
+        &self.pending_measurement_drops
+    }
+
+    /// Whether `measurement` is pending a hard delete.
+    #[must_use]
+    pub fn is_measurement_pending_drop(&self, measurement: &str) -> bool {
+        self.pending_measurement_drops.contains_key(measurement)
+    }
+
+    /// Mark `measurement` pending a hard delete at `deadline_ms`, durably.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be written or synced.
+    pub fn set_measurement_pending_drop(
+        &mut self,
+        measurement: &str,
+        deadline_ms: u64,
+    ) -> Result<()> {
+        self.append_manifest(&ManifestEntry::SetPendingMeasurementDrop {
+            measurement: measurement.to_string(),
+            deadline_ms,
+        })?;
+        self.pending_measurement_drops
+            .insert(measurement.to_string(), deadline_ms);
+        self.sync_manifest()?;
+        self.maybe_snapshot()?;
+        Ok(())
+    }
+
+    /// Cancel a pending drop \u2014 a restore, or the hard delete that finally
+    /// acted on it \u2014 durably.
+    ///
+    /// Returns whether `measurement` was pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be written or synced.
+    pub fn cancel_measurement_pending_drop(&mut self, measurement: &str) -> Result<bool> {
+        if !self.pending_measurement_drops.contains_key(measurement) {
+            return Ok(false);
+        }
+        self.append_manifest(&ManifestEntry::CancelPendingMeasurementDrop(
+            measurement.to_string(),
+        ))?;
+        self.pending_measurement_drops.remove(measurement);
         self.sync_manifest()?;
         self.maybe_snapshot()?;
         Ok(true)
@@ -1094,6 +1178,16 @@ impl SegmentCatalog {
             ManifestEntry::Compacted { inputs, output } => {
                 self.tombstones.extend_to_compaction_output(&inputs, output);
             }
+            ManifestEntry::SetPendingMeasurementDrop {
+                measurement,
+                deadline_ms,
+            } => {
+                self.pending_measurement_drops
+                    .insert(measurement, deadline_ms);
+            }
+            ManifestEntry::CancelPendingMeasurementDrop(measurement) => {
+                self.pending_measurement_drops.remove(&measurement);
+            }
         }
     }
 
@@ -1106,6 +1200,7 @@ impl SegmentCatalog {
             tombstones: self.tombstones.clone(),
             wal_floor: self.wal_floor,
             rollups: self.rollups.clone(),
+            pending_measurement_drops: self.pending_measurement_drops.clone(),
             manifest_seq: self.manifest_seq,
             next_segment_id: self.next_segment_id,
         };
@@ -1202,6 +1297,9 @@ struct CatalogSnapshot {
     /// they mean something.
     #[serde(default)]
     rollups: BTreeMap<String, RollupRecord>,
+    /// See [`SegmentCatalog::pending_measurement_drops`].
+    #[serde(default)]
+    pending_measurement_drops: BTreeMap<String, u64>,
     manifest_seq: u64,
     next_segment_id: u64,
 }

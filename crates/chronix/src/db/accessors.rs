@@ -193,8 +193,17 @@ impl Chronix {
     }
 
     /// Return the schema for a measurement, if it exists.
+    ///
+    /// `None` for a measurement pending a soft-delete, exactly as for one
+    /// that never existed: a "drop" that leaves the data fully readable for
+    /// its whole grace period is not a drop. The segments and the schema
+    /// registry entry are untouched, so a restore before the deadline is
+    /// instant and lossless.
     #[must_use]
     pub fn schema(&self, measurement: &str) -> Option<Arc<MeasurementSchema>> {
+        if self.catalog.read().is_measurement_pending_drop(measurement) {
+            return None;
+        }
         self.schema.lookup(measurement)
     }
 
@@ -324,7 +333,13 @@ impl Chronix {
     #[must_use]
     pub fn measurement_names_in(&self, namespace: Option<&str>) -> Vec<String> {
         let Some(namespace) = namespace else {
-            return self.schema.measurement_names();
+            let pending = self.catalog.read().pending_measurement_drops().clone();
+            return self
+                .schema
+                .measurement_names()
+                .into_iter()
+                .filter(|m| !pending.contains_key(m))
+                .collect();
         };
         let mut names: Vec<String> = self
             .namespace_measurements

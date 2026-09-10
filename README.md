@@ -275,9 +275,10 @@ Each claim below is pinned by a test; the depth is in the
 - A **trigger engine** — anomaly score, forecast deviation, threshold,
   MA crossover, rate of change, composite — managed with
   `CREATE/SHOW/DROP/ALTER TRIGGER`, embedded or over HTTP, scoped per tenant.
-  Webhook delivery is HMAC-SHA256 signed with SSRF protection at parse *and*
-  connect time. Each channel has its own worker and bounded queue, so a
-  webhook that is retrying delays nothing but itself.
+  Webhook delivery is a [CloudEvents](https://cloudevents.io) envelope,
+  [Standard Webhooks](https://www.standardwebhooks.com)-signed with SSRF
+  protection at parse *and* connect time. Each channel has its own worker and
+  bounded queue, so a webhook that is retrying delays nothing but itself.
 
 **Server (`chronixd`)** — [API reference](https://hupe1980.github.io/chronix/docs/api-reference/)
 
@@ -445,7 +446,8 @@ arrow-flight 59, tonic 0.14**. `cargo clippy --all-targets` is clean on the
 default build at the configured lint level; the frozen cluster crates
 (`chronix-meta`, `chronix-cluster`, `chronix-dsim`, outside
 `default-members`) are compile-checked in CI but not lint-clean. The release
-procedure and version policy are in [CONTRIBUTING.md](CONTRIBUTING.md).
+procedure and version policy are in [CONTRIBUTING.md](CONTRIBUTING.md), and
+notable changes are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

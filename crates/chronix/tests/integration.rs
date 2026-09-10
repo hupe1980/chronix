@@ -2011,10 +2011,87 @@ fn soft_delete_and_restore_measurement() {
     db.drop_measurement("cpu").unwrap();
     assert!(db.is_measurement_pending_drop("cpu"));
 
+    // A "drop" that leaves the data fully readable for the whole grace
+    // period is not a drop: the schema, the listing and every scan must
+    // treat a pending-drop measurement as absent, exactly as a genuinely
+    // dropped one is — while the segments underneath stay untouched so a
+    // restore is instant and lossless.
+    assert!(
+        db.schema("cpu").is_none(),
+        "a pending-drop measurement's schema must be invisible"
+    );
+    assert!(
+        !db.measurement_names_in(None).contains(&"cpu".to_string()),
+        "a pending-drop measurement must not be listed"
+    );
+    assert_eq!(
+        db.execute(&plan).unwrap().num_rows(),
+        0,
+        "a pending-drop measurement's rows must not be scannable"
+    );
+
     // Restore measurement before TTL expires
     let restored = db.restore_measurement("cpu").unwrap();
     assert!(restored, "measurement should be restorable before GC");
     assert!(!db.is_measurement_pending_drop("cpu"));
+
+    // The data comes back whole, not just the name.
+    assert!(db.schema("cpu").is_some());
+    assert_eq!(db.execute(&plan).unwrap().num_rows(), 20);
+
+    db.close().unwrap();
+}
+
+/// A pending drop is catalog state, not a process-local fact.
+///
+/// The pending-drop map used to live only in an in-memory `HashMap` on the
+/// `Chronix` handle, so a restart forgot it — silently un-dropping a
+/// measurement an operator was told was gone, and forgetting the deadline
+/// that was supposed to reclaim its disk. The fix is the same one a
+/// tombstone got (D43): durable in the catalog manifest, reconstructed by
+/// `open()`, exactly like every other fact a restart must not lose.
+#[test]
+fn a_pending_measurement_drop_survives_a_restart() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = || {
+        ChronixConfig::builder()
+            .data_dir(tmp.path())
+            .memtable_flush_threshold(1024 * 1024)
+            .soft_delete_ttl(Some(std::time::Duration::from_secs(3600)))
+            .build()
+            .unwrap()
+    };
+
+    let db = Chronix::open(cfg()).unwrap();
+    for i in 0..10 {
+        db.insert(&cpu_point("srv", i * 1000, i as f64)).unwrap();
+    }
+    db.flush().unwrap();
+    db.drop_measurement("cpu").unwrap();
+    assert!(db.is_measurement_pending_drop("cpu"));
+    db.close().unwrap();
+
+    // Reopen: the pending drop, and the masking it causes, must both
+    // still hold — not reset by the restart that a real deployment sees
+    // every time it upgrades or is rescheduled.
+    let db = Chronix::open(cfg()).unwrap();
+    assert!(
+        db.is_measurement_pending_drop("cpu"),
+        "a restart must not silently un-drop a measurement"
+    );
+    assert!(db.schema("cpu").is_none());
+    assert!(!db.measurement_names_in(None).contains(&"cpu".to_string()));
+
+    // And it is still reversible, across the restart, until the deadline.
+    assert!(db.restore_measurement("cpu").unwrap());
+    assert!(db.schema("cpu").is_some());
+    let plan = db
+        .query()
+        .measurement("cpu")
+        .range(0, i64::MAX)
+        .build()
+        .unwrap();
+    assert_eq!(db.execute(&plan).unwrap().num_rows(), 10);
 
     db.close().unwrap();
 }

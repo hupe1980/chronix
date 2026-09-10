@@ -1,5 +1,7 @@
 """Chronix Python client — async-first SDK for Chronix time-series database."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from chronix_client.client import ChronixClient
 from chronix_client.exceptions import (
     BackpressureError,
@@ -38,4 +40,8 @@ __all__ = [
     "WriteError",
 ]
 
-__version__ = "0.3.0"
+try:
+    __version__ = version("chronix-client")
+except PackageNotFoundError:
+    # Not installed — e.g. run from a checkout with sdks/python on PYTHONPATH.
+    __version__ = "0.0.0+unknown"

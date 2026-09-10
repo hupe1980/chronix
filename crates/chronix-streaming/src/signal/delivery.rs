@@ -7,12 +7,33 @@
 //!                      │
 //!                      ▼
 //!               DeliveryRouter
-//!                 ├── WebhookChannel (HMAC-SHA256 signed)
+//!                 ├── WebhookChannel (CloudEvents body, Standard Webhooks signature)
 //!                 ├── LogChannel (structured tracing)
 //!                 └── (NATS / MQTT / Kafka behind feature flags)
 //!                      │
 //!                      └── Retry + Dead Letter Queue
 //! ```
+//!
+//! ## The wire format is two open standards, not one of our own
+//!
+//! A webhook receiver is somebody else's code, so the bar is the same one
+//! the wire protocols are held to: conformance with what a receiver already
+//! knows how to verify, not a bespoke scheme with one implementation
+//! ([SERVER.md](../../../../concepts/SERVER.md) §2a). The body is a
+//! [CloudEvents](https://cloudevents.io) 1.0 structured-mode JSON envelope —
+//! `specversion`, `id`, `source`, `type`, `time`, `data` — so any
+//! CloudEvents-aware router (Knative, EventBridge, an OTel Collector
+//! receiver) can consume a fired signal without knowing chronix's own shape;
+//! `data` carries the [`SignalEvent`] verbatim, so nothing already reading it
+//! for `trigger_id`, `measurement` or `value` has to change. The signature is
+//! [Standard Webhooks](https://www.standardwebhooks.com) `v1`: `webhook-id`,
+//! `webhook-timestamp` and `webhook-signature` headers over
+//! `{id}.{timestamp}.{body}`, which is what turns a payload signature into a
+//! request signature — the old `X-Chronix-Signature: sha256=<hex>` covered
+//! the body alone, so a captured request could be replayed indefinitely with
+//! nothing to bound its age. A receiver that already speaks Standard
+//! Webhooks — Svix, Stripe-alikes, the reference libraries the spec ships —
+//! verifies a chronix signal with no chronix-specific code at all.
 //!
 //! ## Delivery does not block evaluation
 //!
@@ -35,6 +56,7 @@ use std::time::Duration;
 
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
+use serde::Serialize;
 use tracing::{debug, error, warn};
 
 use crate::signal::error::{Result, SignalError};
@@ -134,6 +156,45 @@ impl DeliveryChannel for MetricChannel {
     }
 }
 
+// ── CloudEvent envelope ───────────────────────────────────────────────
+
+/// A [CloudEvents 1.0](https://cloudevents.io) structured-mode JSON envelope
+/// around a fired [`SignalEvent`].
+///
+/// `data` carries the event exactly as chronix's own APIs return it — a
+/// receiver that already parses `SignalEvent` does not have to change — and
+/// the envelope is what makes the body recognisable to anything that speaks
+/// CloudEvents without knowing chronix at all: `source` is the trigger that
+/// fired, `id` is the event's own idempotency key (so a redelivered signal
+/// keeps the id a receiver already deduplicated on), and `time` is the data
+/// point's own timestamp, not the delivery attempt's — the two differ across
+/// a retry, and `time` is defined as when the thing described *happened*.
+#[derive(Debug, Serialize)]
+struct CloudEvent<'a> {
+    specversion: &'static str,
+    id: &'a str,
+    source: String,
+    #[serde(rename = "type")]
+    ty: &'static str,
+    time: String,
+    datacontenttype: &'static str,
+    data: &'a SignalEvent,
+}
+
+impl<'a> CloudEvent<'a> {
+    fn from_signal(event: &'a SignalEvent) -> Self {
+        Self {
+            specversion: "1.0",
+            id: &event.event_id,
+            source: format!("chronix:trigger/{}", event.trigger_id),
+            ty: "io.chronix.signal.fired",
+            time: chrono::DateTime::from_timestamp_nanos(event.timestamp).to_rfc3339(),
+            datacontenttype: "application/json",
+            data: event,
+        }
+    }
+}
+
 // ── WebhookChannel ──────────────────────────────────────────────────
 
 /// Configuration for webhook delivery.
@@ -145,8 +206,12 @@ pub struct WebhookConfig {
     pub timeout: Duration,
     /// HMAC-SHA256 signing secret (required).
     ///
-    /// Every webhook payload is signed with this secret so receivers can
-    /// verify authenticity via the `X-Chronix-Signature` header.
+    /// Every delivery is signed per the [Standard
+    /// Webhooks](https://www.standardwebhooks.com) `v1` scheme and carried in
+    /// the `webhook-id` / `webhook-timestamp` / `webhook-signature` headers,
+    /// so receivers can verify authenticity — and the request's age — with
+    /// any Standard Webhooks-compatible library rather than chronix-specific
+    /// code.
     pub signing_secret: String,
     /// Custom headers to include.
     pub headers: Vec<(String, String)>,
@@ -324,18 +389,31 @@ impl WebhookChannel {
             .spawn(move || {
                 runtime.block_on(async {
                     while let Ok(req) = rx.recv() {
+                        // Standard Webhooks' own replay-attack mitigation:
+                        // the timestamp is signed alongside the body, so a
+                        // captured request has an age a receiver can refuse.
+                        // `msg_` is the spec's own convention for the id
+                        // prefix.
+                        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+
                         let mut request = client
                             .post(&url)
-                            .header("Content-Type", "application/json")
-                            .header("User-Agent", "chronix-signal/1.0");
+                            .header("Content-Type", "application/cloudevents+json")
+                            .header("User-Agent", "chronix-signal/1.0")
+                            .header("webhook-id", &msg_id)
+                            .header("webhook-timestamp", timestamp.to_string());
 
                         for (name, value) in &headers {
                             request = request.header(name, value);
                         }
 
                         // signing_secret is always present (mandatory).
-                        let sig = Self::compute_signature(&signing_secret, &req.payload);
-                        request = request.header("X-Chronix-Signature", format!("sha256={sig}"));
+                        let sig = Self::sign(&signing_secret, &msg_id, timestamp, &req.payload);
+                        request = request.header("webhook-signature", format!("v1,{sig}"));
 
                         let result = match request.body(req.payload).send().await {
                             Ok(response) => {
@@ -361,17 +439,28 @@ impl WebhookChannel {
         Ok(Self { config, name, tx })
     }
 
-    /// Compute HMAC-SHA256 signature for a payload.
+    /// Standard Webhooks `v1` signature: `base64(HMAC-SHA256(secret,
+    /// "{msg_id}.{timestamp}.{payload}"))`.
+    ///
+    /// Signing the id and the timestamp alongside the body — not the body
+    /// alone, which is what `X-Chronix-Signature: sha256=<hex>` did — is
+    /// what lets a receiver refuse a captured request that is replayed
+    /// later: nothing about a bare payload signature says how old the
+    /// request is.
     #[must_use]
-    pub fn compute_signature(secret: &str, payload: &[u8]) -> String {
+    pub fn sign(secret: &str, msg_id: &str, timestamp: u64, payload: &[u8]) -> String {
+        use base64::Engine as _;
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
         let mut mac =
             Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC can take any key size");
+        mac.update(msg_id.as_bytes());
+        mac.update(b".");
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
         mac.update(payload);
-        let result = mac.finalize();
-        hex::encode(result.into_bytes())
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
     }
 }
 
@@ -381,8 +470,9 @@ impl DeliveryChannel for WebhookChannel {
     }
 
     fn deliver(&self, event: &SignalEvent) -> Result<()> {
+        let envelope = CloudEvent::from_signal(event);
         let payload =
-            serde_json::to_vec(event).map_err(|e| SignalError::Serialization { source: e })?;
+            serde_json::to_vec(&envelope).map_err(|e| SignalError::Serialization { source: e })?;
 
         debug!(
             url = %self.config.url,
@@ -1087,22 +1177,6 @@ impl Default for SignalStore {
     }
 }
 
-// ── hex encoding helper ─────────────────────────────────────────────
-
-mod hex {
-    const CHARS: &[u8; 16] = b"0123456789abcdef";
-
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        let bytes = bytes.as_ref();
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for &b in bytes {
-            s.push(CHARS[(b >> 4) as usize] as char);
-            s.push(CHARS[(b & 0x0f) as usize] as char);
-        }
-        s
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,15 +1249,51 @@ mod tests {
     }
 
     #[test]
-    fn webhook_hmac_signature() {
-        let sig = WebhookChannel::compute_signature("secret", b"hello");
-        assert_eq!(sig.len(), 64); // hex-encoded SHA256 = 32 bytes = 64 hex chars
-                                   // Verify deterministic
-        assert_eq!(sig, WebhookChannel::compute_signature("secret", b"hello"));
-        // Different payload
-        assert_ne!(sig, WebhookChannel::compute_signature("secret", b"world"));
-        // Different key
-        assert_ne!(sig, WebhookChannel::compute_signature("other", b"hello"));
+    fn webhook_standard_signature() {
+        let sig = WebhookChannel::sign("secret", "msg_1", 1_700_000_000, b"hello");
+        // base64 of a 32-byte HMAC-SHA256 digest, no padding stripped.
+        assert_eq!(sig.len(), 44);
+        // Deterministic.
+        assert_eq!(
+            sig,
+            WebhookChannel::sign("secret", "msg_1", 1_700_000_000, b"hello")
+        );
+        // Every signed field changes the signature: the payload,
+        assert_ne!(
+            sig,
+            WebhookChannel::sign("secret", "msg_1", 1_700_000_000, b"world")
+        );
+        // the message id (so one delivery's signature can't cover another's),
+        assert_ne!(
+            sig,
+            WebhookChannel::sign("secret", "msg_2", 1_700_000_000, b"hello")
+        );
+        // the timestamp (so a captured request can't be replayed silently),
+        assert_ne!(
+            sig,
+            WebhookChannel::sign("secret", "msg_1", 1_700_000_001, b"hello")
+        );
+        // and the key.
+        assert_ne!(
+            sig,
+            WebhookChannel::sign("other", "msg_1", 1_700_000_000, b"hello")
+        );
+    }
+
+    #[test]
+    fn signal_event_wraps_in_a_cloudevents_envelope() {
+        let event = test_signal("t1", "cpu", Severity::Critical);
+        let envelope = CloudEvent::from_signal(&event);
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["specversion"], "1.0");
+        assert_eq!(json["id"], event.event_id);
+        assert_eq!(json["source"], "chronix:trigger/t1");
+        assert_eq!(json["type"], "io.chronix.signal.fired");
+        assert_eq!(json["data"]["trigger_id"], "t1");
+        // `time` is the data point's own timestamp, RFC 3339, round-trippable.
+        let time = json["time"].as_str().unwrap();
+        let parsed = chrono::DateTime::parse_from_rfc3339(time).unwrap();
+        assert_eq!(parsed.timestamp_nanos_opt(), Some(event.timestamp));
     }
 
     #[test]
@@ -1367,14 +1477,6 @@ mod tests {
         let all = store.all();
         assert_eq!(all[0].trigger_id, "t2");
         assert_eq!(all[1].trigger_id, "t3");
-    }
-
-    // ── hex tests ──────────────────
-
-    #[test]
-    fn hex_encode() {
-        assert_eq!(hex::encode([0xde, 0xad, 0xbe, 0xef]), "deadbeef");
-        assert_eq!(hex::encode([0x00, 0xff]), "00ff");
     }
 
     #[test]

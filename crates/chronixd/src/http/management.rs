@@ -40,16 +40,19 @@ pub async fn list_measurements_handler(
     // `prom_series_limit` of them. A per-namespace measurement index would
     // make it a lookup; that is a backlog item, not a hazard.
     let all_infos = tokio::task::spawn_blocking(move || {
-        let registry = db.schema_registry();
         let names = if scope.is_some() {
             crate::namespace::measurements_in(&db, scope.as_deref(), i64::MIN, i64::MAX, usize::MAX)
         } else {
-            registry.measurement_names()
+            // Through `measurement_names_in`, not the raw schema registry:
+            // the registry still lists a measurement pending a soft-delete,
+            // and listing it back is the same defect as scanning it back —
+            // a "drop" a caller can still see is not a drop.
+            db.measurement_names_in(None)
         };
 
         let mut infos = Vec::with_capacity(names.len());
         for name in names {
-            if let Some(schema) = registry.lookup(&name) {
+            if let Some(schema) = db.schema(&name) {
                 infos.push(measurement_schema_to_info(&name, &schema));
             }
         }

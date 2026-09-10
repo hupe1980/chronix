@@ -17,14 +17,13 @@ mod write;
 pub use query::{role_metadata, ROLE_KEY};
 pub use stream::BatchStream;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use dashmap::{DashMap, DashSet};
 use fs2::FileExt;
-use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::lock_order::{
@@ -313,14 +312,6 @@ pub struct DbInner {
     /// a database-wide statement and two flushes computing it against
     /// each other's half-done state is how records fell below it.
     pub(super) flush_gate: parking_lot::Mutex<()>,
-    /// Measurements pending soft-delete.
-    ///
-    /// Maps measurement name → deadline (unix-ms). When `soft_delete_ttl`
-    /// is configured, `drop_measurement` inserts here instead of
-    /// immediately deleting data.  The periodic GC pass hard-deletes
-    /// measurements whose deadline has elapsed.  Queries filter out
-    /// pending-drop measurements so they are invisible to users.
-    pub(super) pending_measurement_drops: Arc<RwLock<HashMap<String, u64>>>,
     /// Lock file handle — dropped on close to release lock.
     pub(super) _lock_file: std::fs::File,
     /// Closed flag.
@@ -656,7 +647,6 @@ impl Chronix {
                 lifecycle: Arc::new(parking_lot::Mutex::new(())),
                 write_epoch: parking_lot::RwLock::new(()),
                 flush_gate: parking_lot::Mutex::new(()),
-                pending_measurement_drops: Arc::new(RwLock::new(HashMap::new())),
                 _lock_file: lock_file,
                 closed: AtomicBool::new(false),
                 #[cfg(feature = "sql")]
