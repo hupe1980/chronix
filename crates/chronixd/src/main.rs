@@ -155,14 +155,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("invalid HTTP bind address '{bind}': {e}"))?;
     }
     if let Some(ref grpc_bind) = cli.grpc_bind {
-        config.server.grpc_addr = grpc_bind
-            .parse()
-            .map_err(|e| format!("invalid gRPC bind address '{grpc_bind}': {e}"))?;
+        config.server.grpc_addr = Some(
+            grpc_bind
+                .parse()
+                .map_err(|e| format!("invalid gRPC bind address '{grpc_bind}': {e}"))?,
+        );
     }
     if let Some(ref flight_bind) = cli.flight_bind {
-        config.server.flight_addr = flight_bind
-            .parse()
-            .map_err(|e| format!("invalid Flight SQL bind address '{flight_bind}': {e}"))?;
+        config.server.flight_addr = Some(
+            flight_bind
+                .parse()
+                .map_err(|e| format!("invalid Flight SQL bind address '{flight_bind}': {e}"))?,
+        );
     }
     if let Some(ref cert) = cli.tls_cert {
         let key = cli
@@ -232,8 +236,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // the check is the difference between the two.
         println!("configuration is valid");
         println!("  http_addr        {}", config.server.http_addr);
-        println!("  grpc_addr        {}", config.server.grpc_addr);
-        println!("  flight_addr      {}", config.server.flight_addr);
+        println!("  grpc_addr        {}", config.server.grpc_addr());
+        println!("  flight_addr      {}", config.server.flight_addr());
         println!("  data_dir         {}", config.database.data_dir.display());
         println!("  log_format       {:?}", config.server.log_format);
         println!("  log_level        {}", config.server.log_level);
@@ -262,10 +266,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sections.join(", ")
             }
         );
-        if config.auth.is_none() {
+        let exposed = chronixd::server::exposed_listeners(&config);
+        if !exposed.is_empty() {
             println!(
-                "  warning          no [auth] section: every listener accepts \
-                 reads, writes and deletes from anyone who can reach it"
+                "  warning          no [auth] section: {} accept reads, writes \
+                 and deletes from anyone who can reach them",
+                exposed.join(", ")
             );
         }
         return Ok(());

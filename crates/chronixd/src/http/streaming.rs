@@ -258,9 +258,17 @@ pub async fn annotations_stream_handler(
             }
         };
 
-        let mut seen_order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        let mut seen_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        const MAX_SEEN: usize = 10_000;
+        // Annotations are deduplicated by a 64-bit hash of their JSON rather
+        // than by the JSON itself. The identity is the same — an annotation
+        // has no id of its own, so its rendering *is* its identity — but at 8
+        // bytes an entry instead of 200–500 the window can cover far more
+        // history than one poll returns. It has to: each wake-up re-scans up
+        // to `POLL_LIMIT` annotations, and a set that evicts an entry still
+        // inside that scan makes Grafana draw the annotation twice.
+        let mut seen_order: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+        let mut seen_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        const POLL_LIMIT: usize = 1_000;
+        const MAX_SEEN: usize = 100 * POLL_LIMIT;
 
         // Do an initial poll immediately.
         let mut poll_now = true;
@@ -280,7 +288,7 @@ pub async fn annotations_stream_handler(
             let db_ref = db.clone();
             let scope_ref = scope.clone();
             let annotations = match tokio::task::spawn_blocking(move || {
-                collect_annotations(&db_ref, scope_ref.as_deref(), 1_000)
+                collect_annotations(&db_ref, scope_ref.as_deref(), POLL_LIMIT)
             }).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -298,8 +306,14 @@ pub async fn annotations_stream_handler(
                     }
                 };
 
-                if seen_set.insert(id.clone()) {
-                    seen_order.push_back(id.clone());
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    id.hash(&mut h);
+                    h.finish()
+                };
+                if seen_set.insert(key) {
+                    seen_order.push_back(key);
                     yield Ok(Event::default().data(id));
                 }
             }

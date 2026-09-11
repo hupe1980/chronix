@@ -185,7 +185,7 @@ Chronix supports:
 
 ### TLS Certificate Hot-Reload
 
-The `TlsWatcher` polls certificate and key files on a configurable
+`spawn_tls_watcher()` polls certificate and key files on a configurable
 interval (`reload_interval_secs`) and calls
 `RustlsConfig::reload_from_config()` when file modification times
 change. This enables **zero-downtime certificate rotation** — new

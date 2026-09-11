@@ -73,8 +73,8 @@ Space amplification is the ratio of disk space used to the logical data size.
 LSM-trees can have temporary space amplification during compaction (old + new
 segments coexist). Chronix mitigates this with:
 
-- **Soft-delete with grace period** — old segments are marked for deletion but
-  retained briefly for in-flight queries.
+- **Retirement is immediate** — a compaction's inputs are unlinked as soon as
+  no running scan holds them, rather than after a fixed wait.
 - **Per-measurement segments** — each measurement flushes independently,
   limiting the blast radius of compaction.
 - **Columnar compression** — **6.2×** end to end on 2-decimal meter readings,
@@ -90,7 +90,7 @@ amplification through **multi-level pruning**:
 
 | Level | Technique | Eliminates |
 |-------|-----------|------------|
-| 1 | Time-range index | Segments outside the query window |
+| 1 | Catalog time range | Segments outside the query window |
 | 2 | Bloom filter | Segments that don't contain the target series |
 | 3 | Column stats | Segments where all values are NULL for a column |
 | 4 | Tag inverted index | Segments without matching tag values |
@@ -117,8 +117,8 @@ The complete lifecycle of a write:
    b. it freezes the memtable (atomic swap) and writes the segment
    c. a new empty memtable has already replaced it for writers
    e. Frozen memtable is flushed to segment(s) via `spawn_blocking`
-   f. Time index, bloom filter, tag index, zone maps are updated
-   g. Segment catalog is persisted
+   f. Segment catalog is persisted — the moment the segment exists
+   g. Bloom filter and tag index are updated from the writer's series keys
    h. WAL is truncated
 7. Background compaction merges L0 segments
 ```

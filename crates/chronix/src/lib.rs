@@ -83,7 +83,6 @@ pub mod retention;
 pub mod rollup;
 #[cfg(feature = "sql")]
 pub mod sql;
-pub mod timebucket;
 
 // The engine crates, for advanced use. No aliases: a module alias is a
 // second name for the same thing, and every one of them was a name the
@@ -111,9 +110,9 @@ pub use rollup::{RollupAggFn, RollupBuilder, RollupConfig, RollupRegistry, Rollu
 /// Everything a typical program needs: `use chronix::prelude::*;`.
 pub mod prelude {
     pub use chronix_core::{
-        ChronixConfig, ChronixConfigBuilder, ChronixError, ColumnDef, ColumnRole, ColumnType,
-        CompressionCodec, Decimal, FieldValue, FloatEncoding, FsyncPolicy, MeasurementSchema,
-        Point, SeriesKey, Timestamp,
+        BucketWidth, ChronixConfig, ChronixConfigBuilder, ChronixError, ColumnDef, ColumnRole,
+        ColumnType, CompressionCodec, Decimal, FieldValue, FloatEncoding, FsyncPolicy,
+        MeasurementSchema, Point, SeriesKey, TimeBucket, Timestamp,
     };
     pub use chronix_query::{AggFn, QueryBuilder, QueryPlan};
 

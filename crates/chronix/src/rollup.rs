@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::timebucket::TimeBucket;
+use chronix_core::timebucket::TimeBucket;
 
 /// Error type for rollup configuration and validation.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -108,6 +108,13 @@ pub struct RollupBuilder {
     target_measurement: Option<String>,
     width: Option<String>,
     timezone: Option<String>,
+    origin: Option<String>,
+    /// Set by [`RollupBuilder::bucket`], which supplies a bucket that is
+    /// already complete. It takes precedence over the three strings above:
+    /// decomposing it into `width` + `timezone` and re-parsing used to drop
+    /// its origin, so a tier declared through a protocol handler silently
+    /// bucketed from the 1st however the caller had asked.
+    bucket: Option<TimeBucket>,
     aggregations: Vec<RollupAggFn>,
     group_by_tags: Vec<String>,
     retention_ns: Option<i64>,
@@ -123,6 +130,8 @@ impl RollupBuilder {
             target_measurement: None,
             width: None,
             timezone: None,
+            origin: None,
+            bucket: None,
             aggregations: Vec::new(),
             group_by_tags: Vec::new(),
             retention_ns: None,
@@ -155,7 +164,7 @@ impl RollupBuilder {
     ///
     /// The **unit** decides what the bucket means — sub-day units are a fixed
     /// span, super-day units follow the calendar — and the month is `mo`,
-    /// never `M`. See [`crate::timebucket`]. Refused at
+    /// never `M`. See [`chronix_core::timebucket`]. Refused at
     /// [`build`](Self::build) if it does not parse, so a typo is an error at
     /// the point the rollup is declared rather than a tier that quietly
     /// aggregates the wrong thing for three years.
@@ -167,13 +176,26 @@ impl RollupBuilder {
 
     /// Set the bucket directly, for a caller that already has one.
     ///
-    /// [`every`](Self::every) and [`timezone`](Self::timezone) are the
-    /// spelling a person writes; this is the one a protocol handler uses once
-    /// it has validated the strings it was sent.
+    /// [`every`](Self::every), [`timezone`](Self::timezone) and
+    /// [`origin`](Self::origin) are the spelling a person writes; this is the
+    /// one a protocol handler uses once it has validated the strings it was
+    /// sent. It supersedes all three.
     #[must_use]
     pub fn bucket(mut self, bucket: TimeBucket) -> Self {
-        self.width = Some(bucket.width().to_string());
-        self.timezone = bucket.timezone().map(str::to_string);
+        self.bucket = Some(bucket);
+        self
+    }
+
+    /// Move the bucket boundary off midnight on the 1st.
+    ///
+    /// A date, a local date and time read in [`timezone`](Self::timezone), or
+    /// an RFC 3339 instant — `"2024-01-15"` is a billing month that runs from
+    /// the 15th, `"2024-01-01 06:00:00"` a shift day that starts at six. Only
+    /// the phase matters. Refused at [`build`](Self::build) if it does not
+    /// parse, or if a monthly tier would start after day 28.
+    #[must_use]
+    pub fn origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
         self
     }
 
@@ -225,12 +247,23 @@ impl RollupBuilder {
         let target = self.target_measurement.ok_or(RollupError::InvalidConfig(
             "target measurement is required".into(),
         ))?;
-        let width = self.width.ok_or(RollupError::InvalidConfig(
-            "a bucket width is required — say every(\"15m\"), every(\"1d\") or every(\"1mo\")"
-                .into(),
-        ))?;
-        let bucket = TimeBucket::parse(&width, self.timezone.as_deref())
-            .map_err(|e| RollupError::InvalidConfig(e.0))?;
+        let bucket = match self.bucket {
+            Some(bucket) => bucket,
+            None => {
+                let width = self.width.ok_or(RollupError::InvalidConfig(
+                    "a bucket width is required — say every(\"15m\"), every(\"1d\") or every(\"1mo\")"
+                        .into(),
+                ))?;
+                let bucket = TimeBucket::parse(&width, self.timezone.as_deref())
+                    .map_err(|e| RollupError::InvalidConfig(e.0))?;
+                match self.origin.as_deref() {
+                    None => bucket,
+                    Some(origin) => bucket
+                        .with_origin_str(origin)
+                        .map_err(|e| RollupError::InvalidConfig(e.0))?,
+                }
+            }
+        };
 
         if self.aggregations.is_empty() {
             return Err(RollupError::InvalidConfig(
@@ -1328,7 +1361,7 @@ mod tests {
             .name("test")
             .source("cpu_raw")
             .target("cpu_10s")
-            .bucket(crate::timebucket::TimeBucket::fixed_ns(10))
+            .bucket(chronix_core::timebucket::TimeBucket::fixed_ns(10))
             .aggregation(RollupAggFn::Avg)
             .aggregation(RollupAggFn::Min)
             .aggregation(RollupAggFn::Max)
@@ -1483,7 +1516,7 @@ mod tests {
                     .name("m_1m")
                     .source("m")
                     .target("m_1m")
-                    .bucket(crate::timebucket::TimeBucket::fixed_ns(60))
+                    .bucket(chronix_core::timebucket::TimeBucket::fixed_ns(60))
                     .aggregation(RollupAggFn::Avg)
                     .build()
                     .unwrap(),
@@ -1508,7 +1541,7 @@ mod tests {
                 .name(name)
                 .source(from)
                 .target(to)
-                .bucket(crate::timebucket::TimeBucket::fixed_ns(60))
+                .bucket(chronix_core::timebucket::TimeBucket::fixed_ns(60))
                 .aggregation(RollupAggFn::Avg)
                 .build()
                 .unwrap()
@@ -1524,7 +1557,7 @@ mod tests {
             .name("self")
             .source("a")
             .target("a")
-            .bucket(crate::timebucket::TimeBucket::fixed_ns(60))
+            .bucket(chronix_core::timebucket::TimeBucket::fixed_ns(60))
             .aggregation(RollupAggFn::Avg)
             .build()
             .is_err());

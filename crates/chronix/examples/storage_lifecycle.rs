@@ -180,10 +180,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         export_path.display()
     );
 
-    // ── 8. GC soft-deleted segments ────────────────────────────
-    println!("\n─── 7. Garbage collecting soft-deleted segments ───");
-    let gc_count = db.gc_with_grace(0)?; // 0ms grace for demo
-    println!("   Segments cleaned: {gc_count}");
+    // ── 8. Collect segments a running read had been holding ────
+    //
+    // Retirement unlinks a segment's file in the same step that takes it out
+    // of the catalog, unless a scan had already been handed the path; then the
+    // bytes wait for this call. With nothing reading, there is normally
+    // nothing here to do — which is what makes zero the interesting answer.
+    println!("\n─── 7. Collecting retired segments ───");
+    let gc_count = db.gc()?;
+    println!("   Segment files removed: {gc_count}");
 
     // ── 9. Database stats ──────────────────────────────────────
     println!("\n─── 8. Database introspection ───");

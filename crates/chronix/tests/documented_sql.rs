@@ -28,6 +28,16 @@ fn fixture(dir: &tempfile::TempDir) -> Arc<Chronix> {
         .unwrap();
     let db = Arc::new(Chronix::open(config).unwrap());
 
+    // The docs' canonical exact-decimal measurement: a meter register whose
+    // value a bill is computed from. Declared rather than inferred, so its
+    // scale is the one the documentation says it is.
+    db.declare_field(
+        "meter",
+        "reading",
+        chronix_core::ColumnType::Decimal { scale: 4 },
+    )
+    .unwrap();
+
     let now = 1_700_000_000_000_000_000i64;
     let insert = |measurement: &str, tags, fields, ts: i64| {
         db.insert(&Point::new(SeriesKey::new(measurement, tags).unwrap(), fields, ts).unwrap())
@@ -58,6 +68,12 @@ fn fixture(dir: &tempfile::TempDir) -> Arc<Chronix> {
             "temp",
             tags! { "site" => "a" },
             fields! { "value" => 1.0 },
+            ts,
+        );
+        insert(
+            "meter",
+            tags! { "device" => "main" },
+            fields! { "reading" => "1234.5678".parse::<chronix_core::Decimal>().unwrap() },
             ts,
         );
     }

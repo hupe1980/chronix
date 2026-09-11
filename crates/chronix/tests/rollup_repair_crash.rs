@@ -53,7 +53,7 @@ fn rollup_config() -> chronix::RollupConfig {
         .name("raw_1m")
         .source("raw")
         .target("raw_1m")
-        .bucket(chronix::timebucket::TimeBucket::fixed_ns(MINUTE))
+        .bucket(TimeBucket::fixed_ns(MINUTE))
         .aggregation(RollupAggFn::Sum)
         .aggregation(RollupAggFn::Count)
         .group_by("h")

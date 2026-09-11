@@ -32,6 +32,28 @@ chronixd
 chronixd --config /etc/chronix/chronixd.toml
 ```
 
+**Validate the file before it reaches a node.** `--check-config` applies the
+file, the environment and the flags, runs every startup validation, prints
+what it resolved to, and exits without opening the database or binding a
+port — so a typo, a `[tracing]` section this build cannot honour, or an
+`[auth]` section that authenticates nobody fails in CI rather than on the
+node:
+
+```bash
+chronixd --config /etc/chronix/chronixd.toml --check-config
+```
+
+In a container, with the file mounted:
+
+```bash
+docker run --rm -v /etc/chronix:/etc/chronix:ro \
+  ghcr.io/hupe1980/chronixd:latest \
+  --config /etc/chronix/chronixd.toml --check-config
+```
+
+It exits non-zero on a bad file, so it works as a deploy gate. See
+[Configuration](/docs/configuration/).
+
 ### Multi-Node Cluster
 
 The distributed tier is frozen and excluded from the default build; it needs

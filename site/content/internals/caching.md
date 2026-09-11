@@ -67,31 +67,22 @@ acquire a write lock. Cache entries are keyed by `(segment_id, column_name)`
 and hold `Arc<dyn arrow::Array>`, enabling zero-copy sharing across
 concurrent readers.
 
-## Metadata Cache
-
-Segment header metadata (time range, row count, column stats, encoding info)
-is cached in memory on startup. At approximately **1 KB per segment**,
-even a database with 100 000 segments uses only ~100 MB for metadata.
-
-This cache enables the query engine to perform multi-level pruning (time
-index, stats-based column elimination) without any disk I/O.
-
 ## Cache Coherence
 
-All three caches follow a simple coherence model:
+Both caches follow a simple coherence model:
 
-| Event | LVC | Segment Cache | Metadata Cache |
-|-------|-----|---------------|----------------|
-| Insert | Update | No change | No change |
-| Flush | No change | No change | Add segment |
-| Compaction | No change | Invalidate old | Replace old |
-| Delete series | Remove | No change | No change |
-| Drop measurement | Clear | Invalidate | Remove |
-| Retention / GC / cold archive | **Remove released series** | Invalidate | Remove |
+| Event | LVC | Segment Cache |
+|-------|-----|---------------|
+| Insert | Update | No change |
+| Flush | No change | No change |
+| Compaction | No change | Invalidate old |
+| Delete series | Remove | No change |
+| Drop measurement | Clear | Invalidate |
+| Retention / GC / cold archive | **Remove released series** | Invalidate |
 
-Because segment files are immutable, the segment and metadata caches never
-need invalidation except when a segment stops existing — compaction replacing
-it, or a delete, retention, GC or an archive removing it.
+Because segment files are immutable, the segment cache never needs
+invalidation except when a segment stops existing — compaction replacing it,
+or a delete, retention, GC or an archive removing it.
 
 The LVC is a **copy** of each series' newest row, so retention, GC and cold
 archiving prune it through the same repair that releases the cardinality

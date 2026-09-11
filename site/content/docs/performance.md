@@ -20,7 +20,7 @@ monitoring.
 
 ```toml
 [database]
-wal_fsync_policy = "periodic"    # Trade durability for throughput
+wal_fsync_policy = "periodic_5000" # fsync every 5 s, not every batch
 memtable_flush_threshold = 200000  # Rows; fewer, larger flushes
 max_memtable_memory = 268435456    # 256 MiB across all shards
 compaction_concurrency = 4         # More parallel compaction
@@ -29,8 +29,8 @@ compression = "lz4"                # Cheapest to write
 
 `wal_fsync_policy` is the one with a real trade: `per_write` survives a
 power cut with no loss, `per_batch` loses at most one in-flight batch, and
-`periodic` bounds the fsync *rate* — which on flash is the wear rate — at
-the cost of a bounded window of unsynced writes.
+`periodic_<ms>` bounds the fsync *rate* — which on flash is the wear rate —
+at the cost of a bounded window of unsynced writes.
 
 ### Query-heavy
 
@@ -65,7 +65,6 @@ reported separately and each exported as a gauge:
 | String interners | `chronix_interner_memory_bytes` | **Cardinality** — tag keys, tag values, measurement names |
 | WAL writer buffer | `chronix_wal_buffer_bytes` | Fixed |
 | Catalog, schemas, tombstones | `chronix_catalog_memory_bytes` | Segment count; reclaimed by compaction |
-| Segment metadata index | `chronix_metadata_cache_bytes` | Segment count and each segment's tag cardinality (it holds per-tag bloom filters). Bounded by the segments on disk, not by eviction |
 
 Two things are deliberately *not* in that sum, because they are not the
 engine's to hold:

@@ -79,13 +79,24 @@ pub struct ServerSettings {
     #[serde(default = "default_http_addr")]
     pub http_addr: SocketAddr,
 
-    /// gRPC bind address.
-    #[serde(default = "default_grpc_addr")]
-    pub grpc_addr: SocketAddr,
+    /// gRPC bind address, or `None` to take the host from `http_addr`.
+    ///
+    /// **Unset is not the same as the default**, which is why this is an
+    /// `Option`. `chronixd --bind 127.0.0.1:8086` is the line in every
+    /// quickstart, and it used to bind HTTP to loopback and leave gRPC and
+    /// Flight SQL listening on `0.0.0.0` — two unauthenticated listeners on
+    /// every interface, from a command whose whole point was not to do that.
+    /// Unset, the host follows `http_addr` and only the port is this
+    /// endpoint's own; set, it is used exactly as written, so a deployment
+    /// that really does want HTTP local and gRPC public can still say so.
+    #[serde(default)]
+    pub grpc_addr: Option<SocketAddr>,
 
-    /// Flight SQL bind address.
-    #[serde(default = "default_flight_addr")]
-    pub flight_addr: SocketAddr,
+    /// Flight SQL bind address, or `None` to take the host from `http_addr`.
+    ///
+    /// See [`grpc_addr`](Self::grpc_addr).
+    #[serde(default)]
+    pub flight_addr: Option<SocketAddr>,
 
     /// Absolute base URL clients use to reach this server, e.g.
     /// `https://metrics.example.com/chronix`.
@@ -848,12 +859,30 @@ pub struct ClusterTlsConfig {
     pub key: PathBuf,
 }
 
+impl ServerSettings {
+    /// The gRPC address this server binds: the configured one, or the port
+    /// gRPC owns on whatever host `http_addr` names.
+    #[must_use]
+    pub fn grpc_addr(&self) -> SocketAddr {
+        self.grpc_addr
+            .unwrap_or_else(|| SocketAddr::new(self.http_addr.ip(), default_grpc_addr().port()))
+    }
+
+    /// The Flight SQL address this server binds — see
+    /// [`grpc_addr`](Self::grpc_addr).
+    #[must_use]
+    pub fn flight_addr(&self) -> SocketAddr {
+        self.flight_addr
+            .unwrap_or_else(|| SocketAddr::new(self.http_addr.ip(), default_flight_addr().port()))
+    }
+}
+
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             http_addr: default_http_addr(),
-            grpc_addr: default_grpc_addr(),
-            flight_addr: default_flight_addr(),
+            grpc_addr: None,
+            flight_addr: None,
             multi_tenancy: false,
             connector_start_retries: 0,
             connector_start_retry_backoff_ms: default_connector_backoff_ms(),
@@ -936,22 +965,22 @@ impl ServerConfig {
     ///
     /// Returns [`ServerConfigError::Invalid`] describing the conflicting ports.
     pub fn validate_ports(&self) -> Result<(), ServerConfigError> {
-        if self.server.http_addr == self.server.grpc_addr {
+        let http = self.server.http_addr;
+        let grpc = self.server.grpc_addr();
+        let flight = self.server.flight_addr();
+        if http == grpc {
             return Err(ServerConfigError::Invalid(format!(
-                "HTTP and gRPC addresses must be distinct, both set to {}",
-                self.server.http_addr,
+                "HTTP and gRPC addresses must be distinct, both set to {http}",
             )));
         }
-        if self.server.http_addr == self.server.flight_addr {
+        if http == flight {
             return Err(ServerConfigError::Invalid(format!(
-                "HTTP and Flight SQL addresses must be distinct, both set to {}",
-                self.server.http_addr,
+                "HTTP and Flight SQL addresses must be distinct, both set to {http}",
             )));
         }
-        if self.server.grpc_addr == self.server.flight_addr {
+        if grpc == flight {
             return Err(ServerConfigError::Invalid(format!(
-                "gRPC and Flight SQL addresses must be distinct, both set to {}",
-                self.server.grpc_addr,
+                "gRPC and Flight SQL addresses must be distinct, both set to {grpc}",
             )));
         }
         Ok(())
@@ -1498,12 +1527,42 @@ fn default_max_query_result_bytes() -> usize {
 mod tests {
     use super::*;
 
+    /// `chronixd --bind 127.0.0.1:8086` binds *all three* listeners to
+    /// loopback.
+    ///
+    /// It used to bind HTTP there and leave gRPC and Flight SQL on
+    /// `0.0.0.0` — two unauthenticated listeners on every interface, from the
+    /// command every quickstart shows for keeping the server off the network.
+    #[test]
+    fn an_unset_grpc_address_follows_the_http_host() {
+        let mut config = ServerConfig::default();
+        config.server.http_addr = "127.0.0.1:8086".parse().unwrap();
+        assert_eq!(
+            config.server.grpc_addr().to_string(),
+            "127.0.0.1:8087",
+            "gRPC keeps its own port and takes the host it was asked for"
+        );
+        assert_eq!(config.server.flight_addr().to_string(), "127.0.0.1:8817");
+        config.validate_ports().expect("three distinct ports");
+    }
+
+    /// An address that *is* set is used exactly as written — a deployment
+    /// wanting HTTP local and gRPC public can still say so.
+    #[test]
+    fn a_set_grpc_address_is_not_derived() {
+        let mut config = ServerConfig::default();
+        config.server.http_addr = "127.0.0.1:8086".parse().unwrap();
+        config.server.grpc_addr = Some("0.0.0.0:9090".parse().unwrap());
+        assert_eq!(config.server.grpc_addr().to_string(), "0.0.0.0:9090");
+        assert_eq!(config.server.flight_addr().to_string(), "127.0.0.1:8817");
+    }
+
     #[test]
     fn default_config_is_valid() {
         let config = ServerConfig::default();
         assert_eq!(config.server.http_addr.port(), 8086);
-        assert_eq!(config.server.grpc_addr.port(), 8087);
-        assert_eq!(config.server.flight_addr.port(), 8817);
+        assert_eq!(config.server.grpc_addr().port(), 8087);
+        assert_eq!(config.server.flight_addr().port(), 8817);
         assert!(config.tls.is_none());
         assert_eq!(config.server.max_body_size, 10 * 1024 * 1024);
         assert_eq!(config.server.log_format, LogFormat::Text);
@@ -1530,8 +1589,8 @@ mod tests {
 
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server.http_addr.port(), 9086);
-        assert_eq!(config.server.grpc_addr.port(), 9087);
-        assert_eq!(config.server.flight_addr.port(), 9817);
+        assert_eq!(config.server.grpc_addr().port(), 9087);
+        assert_eq!(config.server.flight_addr().port(), 9817);
         assert_eq!(config.server.log_format, LogFormat::Json);
         assert_eq!(config.server.log_level, "debug");
         assert_eq!(config.server.max_body_size, 5 * 1024 * 1024);
@@ -1635,7 +1694,7 @@ mod tests {
     #[test]
     fn validate_ports_http_grpc_conflict() {
         let mut config = ServerConfig::default();
-        config.server.grpc_addr = config.server.http_addr; // same as HTTP
+        config.server.grpc_addr = Some(config.server.http_addr); // same as HTTP
         let err = config.validate_ports().unwrap_err();
         assert!(err.to_string().contains("HTTP and gRPC"), "{err}");
     }
@@ -1643,7 +1702,7 @@ mod tests {
     #[test]
     fn validate_ports_http_flight_conflict() {
         let mut config = ServerConfig::default();
-        config.server.flight_addr = config.server.http_addr;
+        config.server.flight_addr = Some(config.server.http_addr);
         let err = config.validate_ports().unwrap_err();
         assert!(err.to_string().contains("HTTP and Flight SQL"), "{err}");
     }
@@ -1651,7 +1710,7 @@ mod tests {
     #[test]
     fn validate_ports_grpc_flight_conflict() {
         let mut config = ServerConfig::default();
-        config.server.flight_addr = config.server.grpc_addr;
+        config.server.flight_addr = Some(config.server.grpc_addr());
         let err = config.validate_ports().unwrap_err();
         assert!(err.to_string().contains("gRPC and Flight SQL"), "{err}");
     }

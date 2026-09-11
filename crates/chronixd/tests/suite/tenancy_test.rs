@@ -86,7 +86,8 @@ async fn start_server_with(multi_tenancy: bool) -> (String, TempDir) {
         openapi_json: std::sync::OnceLock::new(),
     });
 
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+    let metrics_handle = chronixd::server::prometheus_builder()
+        .expect("bucket config")
         .build_recorder()
         .handle();
     let app = build_router(state, "/metrics", metrics_handle, 10 * 1024 * 1024, None);
@@ -518,7 +519,8 @@ async fn start_authenticated_server() -> (String, TempDir) {
         openapi_json: std::sync::OnceLock::new(),
     });
 
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+    let metrics_handle = chronixd::server::prometheus_builder()
+        .expect("bucket config")
         .build_recorder()
         .handle();
     let app = build_router(
@@ -861,7 +863,8 @@ async fn start_confined_server() -> (String, TempDir) {
         openapi_json: std::sync::OnceLock::new(),
     });
 
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+    let metrics_handle = chronixd::server::prometheus_builder()
+        .expect("bucket config")
         .build_recorder()
         .handle();
     let app = build_router(

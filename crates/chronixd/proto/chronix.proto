@@ -30,6 +30,13 @@ message FieldValue {
     /// every client library can already produce, and carries the scale
     /// along with the value ("1.50" is scale 2, "1.5" is scale 1).
     string decimal = 6;
+    /// A value with no scalar representation here, as its JSON encoding.
+    ///
+    /// The storage layer's field types are exactly the six above, so this is
+    /// reached only by a plan that introduces another Arrow type. It exists
+    /// so that such a column is *reported* rather than silently dropped from
+    /// the row, which is what used to happen. See `SqlValue.json`.
+    string json = 7;
   }
 }
 
@@ -191,6 +198,14 @@ message SqlValue {
     string string  = 5;
     /// An exact decimal cell, as its digits. See `FieldValue.decimal`.
     string decimal = 7;
+    /// A value with no scalar representation here — a list, struct, map,
+    /// interval, or binary cell — as its JSON encoding.
+    ///
+    /// Distinct from `string` on purpose: a caller must be able to tell a
+    /// structured value from a string that happens to look like JSON. These
+    /// used to arrive as the literal text `"<unsupported: List(Float64)>"`
+    /// in the `string` field, which no client could tell from data.
+    string json = 8;
   }
   bool is_null = 6;
 }

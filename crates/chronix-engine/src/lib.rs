@@ -12,7 +12,7 @@
 //!   optional AES-256-GCM field encryption (feature `field-encryption`).
 //! - [`storage`] — pluggable storage backend trait with an atomic
 //!   local-filesystem implementation and transparent encryption wrapper.
-//! - [`index`] — pruning structures: time index, series bloom filters,
+//! - [`index`] — pruning structures: series bloom filters,
 //!   inverted tag index, skip index, zone maps, and the segment catalog with
 //!   its manifest WAL + snapshots.
 //! - [`compaction`] — hybrid TWCS + size-tiered compaction with streaming

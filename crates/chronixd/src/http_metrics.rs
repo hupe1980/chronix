@@ -25,7 +25,12 @@ pub async fn request_duration_layer(request: Request, next: Next) -> Response {
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| request.uri().path().to_owned());
 
-    let start = tokio::time::Instant::now();
+    // `std::time::Instant`, not `tokio::time::Instant`: the tokio clock is
+    // pausable, and under `start_paused = true` it advances only when every
+    // task is idle — so a latency histogram taken from it reads zero for work
+    // that took a second. Nothing here pauses time today; a latency number
+    // that would silently become zero if something did is not one to keep.
+    let start = std::time::Instant::now();
     let response = next.run(request).await;
     let elapsed = start.elapsed().as_secs_f64();
 

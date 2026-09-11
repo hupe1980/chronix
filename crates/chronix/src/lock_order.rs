@@ -11,10 +11,9 @@
 //! | Level | Field              | Type                                     |
 //! |-------|--------------------|------------------------------------------|
 //! | 1     | `catalog`          | `RwLock<SegmentCatalog>`                 |
-//! | 2     | `time_index`       | `RwLock<BTreeMap<ShardId, TimeIndex>>`    |
-//! | 3     | `blooms`           | `RwLock<BTreeMap<u64, SeriesBloomFilter>>`|
-//! | 4     | `tombstones`       | `RwLock<TombstoneSet>`                   |
-//! | 5     | `rollup_registry`  | `RwLock<RollupRegistry>`                 |
+//! | 2     | `blooms`           | `RwLock<BTreeMap<u64, SeriesBloomFilter>>`|
+//! | 3     | `tombstones`       | `RwLock<TombstoneSet>`                   |
+//! | 4     | `rollup_registry`  | `RwLock<RollupRegistry>`                 |
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -22,14 +21,12 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub mod level {
     /// Level 1: segment catalog.
     pub const CATALOG: usize = 1;
-    /// Level 2: per-shard time indices.
-    pub const TIME_INDEX: usize = 2;
-    /// Level 3: per-segment bloom filters.
-    pub const BLOOMS: usize = 3;
-    /// Level 4: tombstoned series set.
-    pub const TOMBSTONES: usize = 4;
-    /// Level 5: rollup definitions.
-    pub const ROLLUP_REGISTRY: usize = 5;
+    /// Level 2: per-segment bloom filters.
+    pub const BLOOMS: usize = 2;
+    /// Level 3: tombstoned series set.
+    pub const TOMBSTONES: usize = 3;
+    /// Level 4: rollup definitions.
+    pub const ROLLUP_REGISTRY: usize = 4;
 }
 
 // ── Thread-local ordering tracker (debug builds only) ───────────────
@@ -51,7 +48,7 @@ fn push_level(level: usize) {
                 level > top,
                 "lock ordering violation — attempted to acquire level {level} \
                  while holding level {top}. Required order: catalog(1) → \
-                 time_index(2) → blooms(3) → tombstones(4) → rollup_registry(5)"
+                 blooms(2) → tombstones(3) → rollup_registry(4)"
             );
         }
         stack.push(level);
@@ -165,17 +162,15 @@ impl<const LEVEL: usize, T: ?Sized> Drop for OrderedWriteGuard<'_, LEVEL, T> {
     }
 }
 
-// ── Type aliases for the five ordered locks ─────────────────────────
+// ── Type aliases for the four ordered locks ─────────────────────────
 
 /// Level-1 lock protecting the segment catalog.
 pub type CatalogLock<T> = OrderedRwLock<{ level::CATALOG }, T>;
-/// Level-2 lock protecting per-shard time indices.
-pub type TimeIndexLock<T> = OrderedRwLock<{ level::TIME_INDEX }, T>;
-/// Level-3 lock protecting per-segment bloom filters.
+/// Level-2 lock protecting per-segment bloom filters.
 pub type BloomsLock<T> = OrderedRwLock<{ level::BLOOMS }, T>;
-/// Level-4 lock protecting tombstoned series.
+/// Level-3 lock protecting tombstoned series.
 pub type TombstonesLock<T> = OrderedRwLock<{ level::TOMBSTONES }, T>;
-/// Level-5 lock protecting rollup definitions.
+/// Level-4 lock protecting rollup definitions.
 pub type RollupRegistryLock<T> = OrderedRwLock<{ level::ROLLUP_REGISTRY }, T>;
 
 #[cfg(test)]

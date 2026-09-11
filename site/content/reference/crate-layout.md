@@ -20,9 +20,9 @@ chronix/
 │   │   ├── memtable/        #   Concurrent in-memory write buffer
 │   │   ├── segment/         #   Immutable columnar segment files (.csx)
 │   │   ├── storage/         #   Pluggable async storage backend
-│   │   ├── index/           #   Time index, blooms, tag index, segment catalog
+│   │   ├── index/           #   Blooms, tag index, series sidecar, segment catalog
 │   │   ├── compaction/      #   TWCS compaction engine (picker, executor)
-│   │   ├── cache/           #   LVC, segment cache, metadata cache
+│   │   ├── cache/           #   LVC, segment cache
 │   │   └── objstore/        #   S3/GCS/Azure cold tier (feature: object-store)
 │   ├── chronix-query/       # Query planner, pruning, filter, aggregate
 │   ├── chronix-analytics/   # Analytics engine

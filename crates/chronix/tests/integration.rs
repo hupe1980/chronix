@@ -720,7 +720,7 @@ fn downsampling_end_to_end() {
         .measurement("cpu")
         .range(0, i64::MAX)
         .field("usage_idle")
-        .downsample(std::time::Duration::from_nanos(10_000), AggFn::Avg)
+        .downsample(TimeBucket::fixed_ns(10_000), AggFn::Avg)
         .build()
         .unwrap();
     let batch = db.execute(&plan).unwrap();
@@ -1446,7 +1446,14 @@ fn downsample_negative_timestamps() {
     let batch = RecordBatch::try_new(schema, vec![timestamps, values]).unwrap();
 
     // Downsample with 10-unit buckets
-    let result = downsample(&batch, "value", 10, &AggFn::Sum, None).unwrap();
+    let result = downsample(
+        &batch,
+        "value",
+        &TimeBucket::fixed_ns(10),
+        &AggFn::Sum,
+        None,
+    )
+    .unwrap();
 
     let ts_col = result
         .column_by_name(chronix_core::TIME_COLUMN)
@@ -2297,4 +2304,76 @@ fn statistics_reflect_operations() {
     );
 
     db.close().unwrap();
+}
+
+/// A soft delete's grace period is not at the mercy of the wall clock.
+///
+/// The deadline is a wall-clock instant stamped when the measurement was
+/// dropped, and the GC pass used to compare it against `SystemTime::now()`
+/// alone. One bad reading — a gateway with no battery-backed RTC, an NTP
+/// server handing out a date in the next century, a restored VM snapshot —
+/// closed the window instantly and hard-deleted the data it existed to
+/// protect. It now measures from the same reference retention does: the
+/// clock **capped by the newest timestamp the database holds**.
+///
+/// No clock is manipulated here. A database whose newest data is a year old
+/// *is* the case where the clock has run ahead of the data, which is what the
+/// cap is for.
+#[test]
+fn a_soft_deletes_grace_survives_a_clock_that_ran_ahead() {
+    let tmp = TempDir::new().unwrap();
+    let config = ChronixConfig::builder()
+        .data_dir(tmp.path())
+        .memtable_flush_threshold(1024 * 1024)
+        // Already elapsed by the time the pass runs, on the wall clock.
+        .soft_delete_ttl(Some(std::time::Duration::from_millis(1)))
+        .build()
+        .unwrap();
+    let db = Chronix::open(config).unwrap();
+
+    // Data from a year ago — the database's own clock is a year behind the
+    // wall clock, which is the shape a jumped clock produces.
+    let now_ns = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
+    let year_ago = now_ns - 365 * 86_400 * 1_000_000_000;
+    for i in 0..10i64 {
+        let _ = db
+            .backfill(&[cpu_point("srv", year_ago + i * 1000, i as f64)])
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    db.drop_measurement("cpu").unwrap();
+    assert!(db.is_measurement_pending_drop("cpu"));
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // The wall clock is far past the deadline, but the data is not.
+    let collected = db.gc_pending_measurement_drops().unwrap();
+    assert_eq!(
+        collected, 0,
+        "the grace period must not be closed by a clock the data does not support"
+    );
+    assert!(
+        db.is_measurement_pending_drop("cpu"),
+        "the measurement is still restorable"
+    );
+    assert!(db.restore_measurement("cpu").unwrap());
+
+    let plan = db
+        .query()
+        .measurement("cpu")
+        .range(0, i64::MAX)
+        .build()
+        .unwrap();
+    assert_eq!(
+        db.execute(&plan).unwrap().num_rows(),
+        10,
+        "restoring brings every point back"
+    );
 }

@@ -40,7 +40,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use chrono_tz::{OffsetComponents, Tz};
 use serde::{Deserialize, Serialize};
 
@@ -198,6 +198,9 @@ impl FromStr for BucketWidth {
 pub struct TimeBucket {
     width: BucketWidth,
     tz: Option<Tz>,
+    /// The instant bucket boundaries are aligned to, if not the default
+    /// anchor. See [`TimeBucket::with_origin`].
+    origin: Option<i64>,
 }
 
 /// The on-disk and on-the-wire form.
@@ -214,6 +217,9 @@ pub struct TimeBucket {
 struct TimeBucketRepr {
     width: BucketWidth,
     timezone: Option<String>,
+    /// Always written, for the same reason `timezone` is: `postcard` is not
+    /// self-describing, so an omitted field is one the reader still expects.
+    origin: Option<i64>,
 }
 
 impl Serialize for TimeBucket {
@@ -221,6 +227,7 @@ impl Serialize for TimeBucket {
         TimeBucketRepr {
             width: self.width,
             timezone: self.tz.map(|tz| tz.name().to_owned()),
+            origin: self.origin,
         }
         .serialize(s)
     }
@@ -233,10 +240,18 @@ impl<'de> Deserialize<'de> for TimeBucket {
             None => None,
             Some(name) => Some(name.parse::<Tz>().map_err(serde::de::Error::custom)?),
         };
-        Ok(Self {
+        let bucket = Self {
             width: repr.width,
             tz,
-        })
+            origin: None,
+        };
+        // Through `with_origin`, not past it: a deserialiser is a
+        // constructor, and the day-of-month rule has to hold for a bucket
+        // read back from the catalog exactly as it does for one just built.
+        match repr.origin {
+            None => Ok(bucket),
+            Some(origin) => bucket.with_origin(origin).map_err(serde::de::Error::custom),
+        }
     }
 }
 
@@ -244,13 +259,30 @@ impl TimeBucket {
     /// A bucket of `width`, read against UTC.
     #[must_use]
     pub const fn utc(width: BucketWidth) -> Self {
-        Self { width, tz: None }
+        Self {
+            width,
+            tz: None,
+            origin: None,
+        }
     }
 
-    /// A fixed span of nanoseconds against UTC — what an `interval_ns` was.
+    /// A fixed span of nanoseconds against UTC.
     #[must_use]
     pub const fn fixed_ns(ns: i64) -> Self {
         Self::utc(BucketWidth::Fixed(ns))
+    }
+
+    /// A fixed span, from a [`Duration`](std::time::Duration).
+    ///
+    /// A `Duration` *is* a fixed span, so this conversion loses nothing —
+    /// which is exactly why it cannot produce a calendar bucket. For a day in
+    /// a zone or a calendar month, say so by name: [`parse`](Self::parse)
+    /// with `"1d"` or `"1mo"`.
+    ///
+    /// Saturates at [`i64::MAX`] nanoseconds, about 292 years.
+    #[must_use]
+    pub fn fixed(span: std::time::Duration) -> Self {
+        Self::fixed_ns(i64::try_from(span.as_nanos()).unwrap_or(i64::MAX))
     }
 
     /// Read this bucket against an IANA time zone.
@@ -258,6 +290,114 @@ impl TimeBucket {
     pub const fn in_zone(mut self, tz: Tz) -> Self {
         self.tz = Some(tz);
         self
+    }
+
+    /// Align bucket boundaries to `origin` instead of the default anchor.
+    ///
+    /// The origin is an instant in epoch nanoseconds; what is taken from it
+    /// is its **local** position in this bucket's zone:
+    ///
+    /// - a fixed width takes the whole instant, and buckets tile outwards
+    ///   from it in both directions;
+    /// - a day or week width takes the origin's local **time of day**, so a
+    ///   `1d` bucket runs 06:00 → 06:00 for a shift that starts at six;
+    /// - a month or year width takes its local **day of month** and time of
+    ///   day, so a `1mo` bucket runs from the 15th to the 15th for a billing
+    ///   period that starts then.
+    ///
+    /// The origin may sit before, inside or after the data — only where it
+    /// falls in the cycle matters, not how far away it is. For a width of
+    /// **one** unit that is just the phase, so any date with the right time
+    /// of day (or day of month) will do. For a **multi-unit** width it also
+    /// selects which of the `n` units opens a bucket: `3mo` anchored on
+    /// January gives calendar quarters, anchored on February gives
+    /// February–April.
+    ///
+    /// It replaces the default anchor entirely, so a `1w` bucket with an
+    /// origin no longer starts on a Monday unless the origin does.
+    ///
+    /// # Errors
+    ///
+    /// [`BucketParseError`] if the origin's local day of month is 29, 30 or
+    /// 31 for a month or year width. Those days do not exist in every month,
+    /// so such a boundary is not a monthly one: it would have to be clamped,
+    /// and a clamp makes the buckets drift (31 January → 28 February → 28
+    /// March) or stop being a fixed day of the month. A month-end boundary is
+    /// a different question this type does not answer.
+    pub fn with_origin(mut self, origin: i64) -> Result<Self, BucketParseError> {
+        if matches!(self.width, BucketWidth::Months(_)) {
+            let day = self.local_datetime(origin).map_or(1, |dt| dt.day());
+            if day > 28 {
+                return Err(BucketParseError(format!(
+                    "a monthly bucket cannot start on day {day}: that day is missing from some months, so it is not a monthly boundary. Use 1 to 28."
+                )));
+            }
+        }
+        self.origin = Some(origin);
+        Ok(self)
+    }
+
+    /// Align boundaries to an origin written as text.
+    ///
+    /// Accepts an RFC 3339 instant (`2024-01-15T06:00:00+01:00`), or a local
+    /// wall-clock time read **in this bucket's zone**: `2024-01-15`,
+    /// `2024-01-15 06:00:00`, or `2024-01-15T06:00:00`. A bare date is local
+    /// midnight.
+    ///
+    /// Reading it in the bucket's own zone is the point: "the billing month
+    /// starts on the 15th" means the local 15th, and a caller who writes
+    /// `2024-01-15` against a `Europe/Berlin` tier means Berlin's.
+    ///
+    /// # Errors
+    ///
+    /// [`BucketParseError`] if the text is not one of those forms, if it is
+    /// outside the representable range, or if [`Self::with_origin`] refuses
+    /// the resulting day of month.
+    pub fn with_origin_str(self, text: &str) -> Result<Self, BucketParseError> {
+        let text = text.trim();
+        let ns = if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
+            dt.timestamp_nanos_opt()
+        } else {
+            let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S"))
+                .or_else(|_| {
+                    NaiveDate::parse_from_str(text, "%Y-%m-%d").map(|d| d.and_time(NaiveTime::MIN))
+                })
+                .map_err(|_| {
+                    BucketParseError(format!(
+                        "could not read '{text}' as an origin — write it as '2024-01-15', \
+                         '2024-01-15 06:00:00', or an RFC 3339 instant"
+                    ))
+                })?;
+            match self.tz {
+                None => naive.and_utc().timestamp_nanos_opt(),
+                // A local time that does not exist or happens twice resolves
+                // the same way a bucket boundary does.
+                Some(tz) => match tz.from_local_datetime(&naive) {
+                    chrono::LocalResult::Single(dt) => dt.timestamp_nanos_opt(),
+                    chrono::LocalResult::Ambiguous(earliest, _) => earliest.timestamp_nanos_opt(),
+                    chrono::LocalResult::None => {
+                        return Err(BucketParseError(format!(
+                            "the local time '{text}' does not exist in {} — \
+                             it falls in a daylight-saving gap",
+                            tz.name()
+                        )))
+                    }
+                },
+            }
+        };
+        let ns = ns.ok_or_else(|| {
+            BucketParseError(format!(
+                "origin '{text}' is outside the representable range"
+            ))
+        })?;
+        self.with_origin(ns)
+    }
+
+    /// The instant this bucket's boundaries are aligned to, if any.
+    #[must_use]
+    pub const fn origin(&self) -> Option<i64> {
+        self.origin
     }
 
     /// Parse a width, and optionally a zone.
@@ -274,7 +414,11 @@ impl TimeBucket {
                 ))
             })?),
         };
-        Ok(Self { width, tz })
+        Ok(Self {
+            width,
+            tz,
+            origin: None,
+        })
     }
 
     /// This bucket's width.
@@ -310,33 +454,46 @@ impl TimeBucket {
         match self.width {
             BucketWidth::Fixed(n) => {
                 let n = n.max(1);
-                // Aligned to the zone's *standard* offset, not to whatever
-                // offset is in force at `ts`: an alignment that moved with
-                // summer time would make one bucket an hour long and its
-                // neighbour two, which is the defect this rule exists to
-                // avoid. In a whole-hour zone this leaves hour buckets on
-                // UTC hour boundaries; in Asia/Kolkata (+05:30) they land at
-                // half past, which is the local clock's hour.
-                let offset = self.standard_offset_ns(ts);
-                ts.saturating_sub(ts.wrapping_sub(offset).rem_euclid(n))
+                // With an origin, buckets tile outwards from that instant.
+                // Without one they align to the zone's *standard* offset,
+                // not to whatever offset is in force at `ts`: an alignment
+                // that moved with summer time would make one bucket an hour
+                // long and its neighbour two, which is the defect this rule
+                // exists to avoid. In a whole-hour zone this leaves hour
+                // buckets on UTC hour boundaries; in Asia/Kolkata (+05:30)
+                // they land at half past, which is the local clock's hour.
+                let anchor = self.origin.unwrap_or_else(|| self.standard_offset_ns(ts));
+                ts.saturating_sub(ts.wrapping_sub(anchor).rem_euclid(n))
             }
             BucketWidth::Days(n) => {
                 let n = i64::from(n.max(1));
-                let Some(date) = self.local_date(ts) else {
+                let Some(local) = self.local_datetime(ts) else {
                     return ts;
                 };
-                let days = days_from_epoch(date);
-                let start = (days - DAY_ANCHOR).div_euclid(n) * n + DAY_ANCHOR;
-                self.local_midnight(date_from_epoch_days(start), ts)
+                let (anchor_day, tod) = self.day_phase();
+                // A `ts` earlier in the day than the boundary belongs to the
+                // bucket that opened the previous day.
+                let mut days = days_from_epoch(local.date());
+                if local.time() < tod {
+                    days -= 1;
+                }
+                let start = (days - anchor_day).div_euclid(n) * n + anchor_day;
+                self.local_at(date_from_epoch_days(start), tod, ts)
             }
             BucketWidth::Months(n) => {
                 let n = i64::from(n.max(1));
-                let Some(date) = self.local_date(ts) else {
+                let Some(local) = self.local_datetime(ts) else {
                     return ts;
                 };
-                let months = i64::from(date.year() - 1970) * 12 + i64::from(date.month0());
-                let start = months.div_euclid(n) * n;
-                self.local_midnight(first_of_month(start), ts)
+                let (anchor_month, dom, tod) = self.month_phase();
+                let mut months = i64::from(local.year() - 1970) * 12 + i64::from(local.month0());
+                // Before this month's boundary day (or at it but earlier in
+                // the day) is still the previous month's bucket.
+                if local.day() < dom || (local.day() == dom && local.time() < tod) {
+                    months -= 1;
+                }
+                let start = (months - anchor_month).div_euclid(n) * n + anchor_month;
+                self.local_at(day_of_month(start, dom), tod, ts)
             }
         }
     }
@@ -352,41 +509,76 @@ impl TimeBucket {
         match self.width {
             BucketWidth::Fixed(n) => bucket_start.saturating_add(n.max(1)),
             BucketWidth::Days(n) => {
-                let Some(date) = self.local_date(bucket_start) else {
+                let Some(local) = self.local_datetime(bucket_start) else {
                     return bucket_start.saturating_add(self.nominal_ns());
                 };
-                let next = days_from_epoch(date).saturating_add(i64::from(n.max(1)));
-                self.local_midnight(date_from_epoch_days(next), bucket_start)
+                let (_, tod) = self.day_phase();
+                let next = days_from_epoch(local.date()).saturating_add(i64::from(n.max(1)));
+                self.local_at(date_from_epoch_days(next), tod, bucket_start)
             }
             BucketWidth::Months(n) => {
-                let Some(date) = self.local_date(bucket_start) else {
+                let Some(local) = self.local_datetime(bucket_start) else {
                     return bucket_start.saturating_add(self.nominal_ns());
                 };
-                let months = i64::from(date.year() - 1970) * 12 + i64::from(date.month0());
-                self.local_midnight(
-                    first_of_month(months.saturating_add(i64::from(n.max(1)))),
+                let (_, dom, tod) = self.month_phase();
+                let months = i64::from(local.year() - 1970) * 12 + i64::from(local.month0());
+                self.local_at(
+                    day_of_month(months.saturating_add(i64::from(n.max(1))), dom),
+                    tod,
                     bucket_start,
                 )
             }
         }
     }
 
-    /// The local calendar date `ts` falls on.
-    fn local_date(&self, ts: i64) -> Option<NaiveDate> {
+    /// The local wall-clock date and time `ts` falls on.
+    fn local_datetime(&self, ts: i64) -> Option<NaiveDateTime> {
         let utc = DateTime::from_timestamp_nanos(ts);
         Some(match self.tz {
-            None => utc.date_naive(),
-            Some(tz) => utc.with_timezone(&tz).date_naive(),
+            None => utc.naive_utc(),
+            Some(tz) => utc.with_timezone(&tz).naive_local(),
         })
     }
 
-    /// The instant local midnight of `date` happens at.
+    /// The day anchor and the local time of day boundaries fall on.
+    ///
+    /// Without an origin: Monday 1970-01-05 at local midnight, so `1w`
+    /// starts on a Monday rather than on the Thursday the epoch happens to
+    /// be.
+    fn day_phase(&self) -> (i64, NaiveTime) {
+        match self.origin.and_then(|o| self.local_datetime(o)) {
+            Some(local) => (days_from_epoch(local.date()), local.time()),
+            None => (DAY_ANCHOR, NaiveTime::MIN),
+        }
+    }
+
+    /// The month anchor, the day of month, and the local time of day.
+    ///
+    /// Without an origin: January 1970, the 1st, at local midnight — so
+    /// `3mo` is a calendar quarter and `1y` a calendar year.
+    ///
+    /// The day of month is 1–28 by construction: [`TimeBucket::with_origin`]
+    /// refuses anything higher, because it is not a day every month has.
+    fn month_phase(&self) -> (i64, u32, NaiveTime) {
+        match self.origin.and_then(|o| self.local_datetime(o)) {
+            Some(local) => (
+                i64::from(local.year() - 1970) * 12 + i64::from(local.month0()),
+                // 1–28 by construction: `with_origin` is the only way in,
+                // including from a deserialiser, and it refuses the rest.
+                local.day().min(28),
+                local.time(),
+            ),
+            None => (0, 1, NaiveTime::MIN),
+        }
+    }
+
+    /// The instant local `time` on `date` happens at.
     ///
     /// `fallback` is returned only where the date cannot be represented at
     /// all, which needs a timestamp outside the ±292 years an `i64` of
     /// nanoseconds can hold.
-    fn local_midnight(&self, date: Option<NaiveDate>, fallback: i64) -> i64 {
-        let Some(naive) = date.and_then(|d| d.and_hms_opt(0, 0, 0)) else {
+    fn local_at(&self, date: Option<NaiveDate>, time: NaiveTime, fallback: i64) -> i64 {
+        let Some(naive) = date.map(|d| d.and_time(time)) else {
             return fallback;
         };
         let Some(tz) = self.tz else {
@@ -460,6 +652,14 @@ fn date_from_epoch_days(days: i64) -> Option<NaiveDate> {
     i32::try_from(days.checked_add(EPOCH_DAYS_FROM_CE)?)
         .ok()
         .and_then(NaiveDate::from_num_days_from_ce_opt)
+}
+
+/// Day `dom` of the month `months` after January 1970.
+///
+/// `dom` is 1–28, so this never has to clamp — which is exactly why
+/// [`TimeBucket::with_origin`] refuses a higher one.
+fn day_of_month(months: i64, dom: u32) -> Option<NaiveDate> {
+    first_of_month(months)?.with_day(dom)
 }
 
 /// The first of the month `months` after January 1970.
@@ -790,6 +990,28 @@ mod tests {
             TimeBucket::utc(BucketWidth::Days(1)).in_zone(berlin()),
             TimeBucket::utc(BucketWidth::Months(1)).in_zone(berlin()),
             TimeBucket::utc(BucketWidth::Days(7)),
+            // An origin must not break the tiling — it only moves the phase.
+            TimeBucket::fixed_ns(HOUR)
+                .with_origin(ts("2020-01-01T00:17:00Z"))
+                .unwrap(),
+            TimeBucket::utc(BucketWidth::Days(1))
+                .in_zone(berlin())
+                .with_origin(ts("2020-01-01T05:00:00Z"))
+                .unwrap(),
+            TimeBucket::utc(BucketWidth::Months(1))
+                .in_zone(berlin())
+                .with_origin(ts("2020-01-15T00:00:00Z"))
+                .unwrap(),
+            TimeBucket::utc(BucketWidth::Days(7))
+                .with_origin(ts("2020-01-01T00:00:00Z"))
+                .unwrap(),
+            // The hard one: a boundary at local 02:30, which **does not
+            // exist** on Berlin's spring-forward day. The bucket that day has
+            // to start somewhere, and the tiling must still hold across it.
+            TimeBucket::utc(BucketWidth::Days(1))
+                .in_zone(berlin())
+                .with_origin(ts("2020-01-15T01:30:00Z"))
+                .unwrap(),
         ];
         // A span that crosses both of Berlin's 2026 transitions and a
         // February.
@@ -874,6 +1096,193 @@ mod tests {
             let b = TimeBucket::parse(width, zone).unwrap();
             assert_eq!(b.width().to_string(), width);
             assert_eq!(b.timezone(), zone);
+        }
+    }
+
+    // ── Origin ─────────────────────────────────────────────────────────
+
+    /// A shift that starts at 06:00 gets days that start at 06:00.
+    #[test]
+    fn a_day_bucket_takes_its_boundary_from_the_origin() {
+        let b = TimeBucket::utc(BucketWidth::Days(1))
+            .with_origin(ts("2020-01-01T06:00:00Z"))
+            .unwrap();
+        // 05:00 is still the previous shift.
+        assert_eq!(
+            b.start_of(ts("2024-03-15T05:00:00Z")),
+            ts("2024-03-14T06:00:00Z")
+        );
+        // 06:00 opens the new one.
+        assert_eq!(
+            b.start_of(ts("2024-03-15T06:00:00Z")),
+            ts("2024-03-15T06:00:00Z")
+        );
+        assert_eq!(
+            b.next(ts("2024-03-15T06:00:00Z")),
+            ts("2024-03-16T06:00:00Z")
+        );
+    }
+
+    /// A billing period that runs from the 15th to the 15th.
+    #[test]
+    fn a_month_bucket_takes_its_day_from_the_origin() {
+        let b = TimeBucket::utc(BucketWidth::Months(1))
+            .with_origin(ts("2020-01-15T00:00:00Z"))
+            .unwrap();
+        assert_eq!(
+            b.start_of(ts("2024-03-14T23:59:59Z")),
+            ts("2024-02-15T00:00:00Z")
+        );
+        assert_eq!(
+            b.start_of(ts("2024-03-15T00:00:00Z")),
+            ts("2024-03-15T00:00:00Z")
+        );
+        // February is short, and the boundary is still the 15th.
+        assert_eq!(
+            b.next(ts("2024-01-15T00:00:00Z")),
+            ts("2024-02-15T00:00:00Z")
+        );
+    }
+
+    /// A day of month that does not exist in every month is refused rather
+    /// than clamped: clamping makes the boundary drift or stop being a fixed
+    /// day, and both are wrong answers delivered silently.
+    #[test]
+    fn a_monthly_origin_after_the_twenty_eighth_is_refused() {
+        for day in ["2020-01-29", "2020-01-30", "2020-01-31"] {
+            let err = TimeBucket::utc(BucketWidth::Months(1))
+                .with_origin(ts(&format!("{day}T00:00:00Z")))
+                .unwrap_err();
+            assert!(err.0.contains("missing from some months"), "{}", err.0);
+        }
+        // 28 is fine — every month has one.
+        assert!(TimeBucket::utc(BucketWidth::Months(1))
+            .with_origin(ts("2020-01-28T00:00:00Z"))
+            .is_ok());
+        // And a day width has no such restriction.
+        assert!(TimeBucket::utc(BucketWidth::Days(1))
+            .with_origin(ts("2020-01-31T00:00:00Z"))
+            .is_ok());
+    }
+
+    /// For a multi-unit width the origin picks *which* unit opens a bucket,
+    /// not only the phase inside it.
+    ///
+    /// The documentation says so because the one-unit case ("any date with
+    /// the right day will do") is the intuition, and it is wrong here: two
+    /// origins that differ only in month give different quarters.
+    #[test]
+    fn a_multi_unit_origin_selects_which_unit_opens_a_bucket() {
+        let jan = TimeBucket::utc(BucketWidth::Months(3))
+            .with_origin(ts("2024-01-15T00:00:00Z"))
+            .unwrap();
+        let feb = TimeBucket::utc(BucketWidth::Months(3))
+            .with_origin(ts("2024-02-15T00:00:00Z"))
+            .unwrap();
+        let probe = ts("2024-05-20T00:00:00Z");
+        assert_eq!(jan.start_of(probe), ts("2024-04-15T00:00:00Z"));
+        assert_eq!(feb.start_of(probe), ts("2024-05-15T00:00:00Z"));
+
+        // A one-unit width has no such choice: only the phase is left, so
+        // two origins a year apart agree.
+        let a = TimeBucket::utc(BucketWidth::Months(1))
+            .with_origin(ts("2024-01-15T00:00:00Z"))
+            .unwrap();
+        let b = TimeBucket::utc(BucketWidth::Months(1))
+            .with_origin(ts("2020-07-15T00:00:00Z"))
+            .unwrap();
+        assert_eq!(a.start_of(probe), b.start_of(probe));
+    }
+
+    /// The origin is read in the bucket's own zone, so the same instant
+    /// gives a different local boundary in a different zone.
+    #[test]
+    fn the_origin_is_read_in_the_buckets_zone() {
+        // 04:00Z is 05:00 in Berlin (winter).
+        let utc = TimeBucket::utc(BucketWidth::Days(1))
+            .with_origin(ts("2024-01-01T04:00:00Z"))
+            .unwrap();
+        let berlin = TimeBucket::utc(BucketWidth::Days(1))
+            .in_zone(berlin())
+            .with_origin(ts("2024-01-01T04:00:00Z"))
+            .unwrap();
+        assert_eq!(
+            utc.start_of(ts("2024-01-10T12:00:00Z")),
+            ts("2024-01-10T04:00:00Z")
+        );
+        // Local 05:00 in Berlin is 04:00Z in winter.
+        assert_eq!(
+            berlin.start_of(ts("2024-01-10T12:00:00Z")),
+            ts("2024-01-10T04:00:00Z")
+        );
+        // …and 03:00Z in summer, because the boundary is a local time.
+        assert_eq!(
+            berlin.start_of(ts("2024-07-10T12:00:00Z")),
+            ts("2024-07-10T03:00:00Z")
+        );
+    }
+
+    /// A fixed width tiles outwards from the origin in both directions.
+    #[test]
+    fn a_fixed_bucket_tiles_outwards_from_its_origin() {
+        let b = TimeBucket::fixed_ns(HOUR)
+            .with_origin(ts("2024-01-01T00:30:00Z"))
+            .unwrap();
+        assert_eq!(
+            b.start_of(ts("2024-01-01T01:00:00Z")),
+            ts("2024-01-01T00:30:00Z")
+        );
+        // Before the origin, too.
+        assert_eq!(
+            b.start_of(ts("2023-12-31T23:00:00Z")),
+            ts("2023-12-31T22:30:00Z")
+        );
+    }
+
+    /// The origin survives the format the rollup catalog actually uses.
+    #[test]
+    fn an_origin_round_trips_through_the_catalog_format() {
+        let b = TimeBucket::parse("1mo", Some("Europe/Berlin"))
+            .unwrap()
+            .with_origin(ts("2020-01-15T00:00:00Z"))
+            .unwrap();
+        // In a sequence, so a short read shows up as a corrupted neighbour.
+        let seq = vec![b, TimeBucket::fixed_ns(HOUR)];
+        let bytes = postcard::to_stdvec(&seq).unwrap();
+        let back: Vec<TimeBucket> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, seq);
+        assert_eq!(back[0].origin(), Some(ts("2020-01-15T00:00:00Z")));
+    }
+
+    /// A catalog entry carrying an impossible origin is refused on the way
+    /// in, not clamped.
+    ///
+    /// The deserialiser is a constructor: nothing else guards a bucket read
+    /// back from the rollup catalog, and a silently clamped boundary is a
+    /// tier that aggregates the wrong window for as long as it exists.
+    #[test]
+    fn a_deserialised_origin_goes_through_the_same_rule() {
+        // Hand-built JSON, the way a corrupted or edited catalog would be.
+        let json = r#"{"width":{"Months":1},"timezone":null,"origin":1706659200000000000}"#;
+        let err = serde_json::from_str::<TimeBucket>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("missing from some months"),
+            "{err}"
+        );
+        // 2024-01-31 is day 31; the 28th is fine.
+        let ok = r#"{"width":{"Months":1},"timezone":null,"origin":1706400000000000000}"#;
+        assert!(serde_json::from_str::<TimeBucket>(ok).is_ok());
+    }
+
+    /// A zero or negative width is refused where the width is *named*, which
+    /// is why nothing downstream has to re-check it.
+    #[test]
+    fn a_width_of_zero_is_refused() {
+        for spec in ["0s", "0d", "0mo", "-1h"] {
+            assert!(
+                spec.parse::<BucketWidth>().is_err(),
+                "'{spec}' should be refused"
+            );
         }
     }
 }

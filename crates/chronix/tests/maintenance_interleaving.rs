@@ -48,6 +48,23 @@ fn count_rows(db: &Chronix) -> usize {
     db.execute(&plan).unwrap().num_rows()
 }
 
+/// The same count, narrowed to one writer's host.
+///
+/// A tag filter is a different read path — it consults the inverted tag
+/// index, which is derived state updated *after* the catalog — and it is the
+/// shape every query on `chronixd` has, because tenancy injects a
+/// `__namespace__` filter into each one.
+fn count_rows_for_host(db: &Chronix, host: &str) -> usize {
+    let plan = db
+        .query()
+        .measurement("load")
+        .tag("host", host)
+        .range(i64::MIN, i64::MAX)
+        .build()
+        .unwrap();
+    db.execute(&plan).unwrap().num_rows()
+}
+
 /// Writers, a deleter, and every background pass, all at once.
 ///
 /// Each writer owns a disjoint host and a disjoint timestamp range, so the
@@ -77,11 +94,18 @@ fn concurrent_maintenance_never_loses_an_acknowledged_write() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let written = Arc::new(AtomicUsize::new(0));
+    // Acknowledged writes, per host and in total. Nothing in this test
+    // removes a row — the retention horizon is a year — so these are a
+    // *lower* bound on what a query issued afterwards must return.
+    let acked = Arc::new(AtomicUsize::new(0));
+    let acked_h0 = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
 
     for w in 0..WRITERS {
         let db = Arc::clone(&db);
         let written = Arc::clone(&written);
+        let acked = Arc::clone(&acked);
+        let acked_h0 = Arc::clone(&acked_h0);
         handles.push(std::thread::spawn(move || {
             let host = format!("h{w}");
             for i in 0..PER_WRITER {
@@ -93,6 +117,10 @@ fn concurrent_maintenance_never_loses_an_acknowledged_write() {
                 // the assertion was racy, not the database.
                 written.fetch_add(1, Ordering::Relaxed);
                 db.insert(&point(&host, ts, i as f64)).unwrap();
+                acked.fetch_add(1, Ordering::Relaxed);
+                if w == 0 {
+                    acked_h0.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }));
     }
@@ -129,27 +157,51 @@ fn concurrent_maintenance_never_loses_an_acknowledged_write() {
         }));
     }
 
-    // A reader, asserting only that a query never fails and never sees more
-    // rows than have been attempted.
+    // Two readers, each asserting the answer from **both** sides.
     //
-    // The ordering of these two reads is the whole invariant, and both ways of
-    // getting it wrong were tried. A writer counts *before* it inserts, so a
-    // row that exists has already been counted; the query must therefore
-    // finish **before** the counter is read, or writers that landed during the
-    // scan are visible in `seen` and missing from `attempted`. Count after
-    // insert and read the counter first, and it fails the other way.
-    {
+    // The upper bound was the only one here for several passes, and a query
+    // returning zero rows satisfies it — which is exactly what a tag-filtered
+    // read did during a compaction, for 36 % of the reads issued, while this
+    // test stayed green. A ceiling that cannot fail is not coverage.
+    //
+    // The ordering of the three reads is the whole invariant, and both ways
+    // of getting it wrong were tried. A writer counts *before* it inserts and
+    // again *after*, so: read the acknowledged floor first, then run the
+    // query, then read the attempted ceiling. A row in `floor` was
+    // acknowledged before the scan began and nothing here removes one, so the
+    // scan has to return it.
+    for reader in 0..2 {
         let db = Arc::clone(&db);
         let stop = Arc::clone(&stop);
         let written = Arc::clone(&written);
+        let acked = Arc::clone(&acked);
+        let acked_h0 = Arc::clone(&acked_h0);
         background.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let seen = count_rows(&db);
-                let attempted = written.load(Ordering::Relaxed);
-                assert!(
-                    seen <= attempted,
-                    "a query returned {seen} rows against {attempted} attempted writes"
-                );
+                if reader == 0 {
+                    let floor = acked.load(Ordering::Relaxed);
+                    let seen = count_rows(&db);
+                    let attempted = written.load(Ordering::Relaxed);
+                    assert!(
+                        seen >= floor,
+                        "a query returned {seen} rows against {floor} already acknowledged"
+                    );
+                    assert!(
+                        seen <= attempted,
+                        "a query returned {seen} rows against {attempted} attempted writes"
+                    );
+                } else {
+                    let floor = acked_h0.load(Ordering::Relaxed);
+                    let seen = count_rows_for_host(&db, "h0");
+                    assert!(
+                        seen >= floor,
+                        "host=h0 returned {seen} rows against {floor} already acknowledged"
+                    );
+                    assert!(
+                        seen <= PER_WRITER,
+                        "host=h0 returned {seen} rows, more than the {PER_WRITER} that host wrote"
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(3));
             }
         }));

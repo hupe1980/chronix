@@ -472,24 +472,19 @@ impl SegmentCatalog {
             .collect()
     }
 
-    /// Get segments that are past the soft-delete grace period and can
-    /// be hard-deleted.
+    /// Segments that have been retired — taken out of every query — but
+    /// whose files are still on disk.
+    ///
+    /// A retirement unlinks the file in the same step that removes the
+    /// catalog entry; an entry reaches this state only when a running scan
+    /// had already been handed the path, so garbage collection is what
+    /// finishes the job once the reader has gone.
     #[must_use]
-    pub fn expired_soft_deleted(
-        &self,
-        now_ms: u64,
-        grace_period_ms: u64,
-    ) -> Vec<&SegmentCatalogEntry> {
+    pub fn retired_segments(&self) -> Vec<&SegmentCatalogEntry> {
         self.segments
             .values()
             .flat_map(|v| v.iter())
-            .filter(|e| {
-                if let SegmentState::SoftDeleted { deleted_at_ms } = e.state {
-                    now_ms.saturating_sub(deleted_at_ms) >= grace_period_ms
-                } else {
-                    false
-                }
-            })
+            .filter(|e| matches!(e.state, SegmentState::SoftDeleted { .. }))
             .collect()
     }
 
@@ -570,6 +565,19 @@ impl SegmentCatalog {
             .sum();
 
         entries + schemas + self.tombstones.len() * std::mem::size_of::<u64>() * 4
+    }
+    /// Shards holding at least one active segment.
+    ///
+    /// Derived rather than tracked: a `TimeIndex` was maintained beside the
+    /// catalog on every flush, compaction and retirement to answer this and
+    /// nothing else, and its own count drifted — a shard emptied by
+    /// per-measurement retention kept its entry and stayed counted.
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.segments
+            .values()
+            .filter(|entries| entries.iter().any(|e| e.state == SegmentState::Active))
+            .count()
     }
 
     /// Total number of segments the catalog holds, in any state.
@@ -963,10 +971,15 @@ impl SegmentCatalog {
     /// its compaction output, which reads deduplicate and the next compaction
     /// clears.
     ///
-    /// **Only for a transition that ends in a sync.** The retention, GC and
-    /// cold-tier loops call `remove_segment` without one and rely on the
-    /// per-append fsync, which is why this is opt-in rather than a batch size.
-    fn in_one_sync<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    /// **Only for a transition that ends in a sync**, and only where the
+    /// caller does nothing irreversible until it returns: a file unlinked
+    /// while the appends are still unsynced would survive a crash as a
+    /// catalog entry naming a path that is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns `body`'s error, or the error of the fsync that follows it.
+    pub fn in_one_sync<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.defer_sync += 1;
         let out = body(self);
         self.defer_sync -= 1;

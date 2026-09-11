@@ -52,8 +52,12 @@ failover, rebalancing, and multi-tenancy.
 
 ### MetaNode Configuration
 
+The node files below are a **design sketch**: today's `chronixd` has no
+`[node]`, `[meta]` or `[data]` table and will refuse a file containing one.
+They describe the topology the frozen tier is built for.
+
 ```toml
-# /etc/chronix/chronixd.toml — MetaNode
+# MetaNode (design sketch — not loadable today)
 [node]
 mode = "meta"
 node_id = 1
@@ -70,7 +74,7 @@ snapshot_threshold = 10000
 ### DataNode Configuration
 
 ```toml
-# /etc/chronix/chronixd.toml — DataNode
+# DataNode (design sketch — not loadable today)
 [node]
 mode = "data"
 node_id = 101
@@ -152,11 +156,12 @@ derived via `checked_mul(2)` / `checked_add(1)` — if the arithmetic would
 overflow `u64` (after ~63 recursive splits), the split is safely aborted and the
 source region is restored to `Active` state.
 
-```toml
-[cluster.autoscale]
-region_size_threshold = "10GB"
-region_series_threshold = 100000
-scan_interval_secs = 60
+`AutoScaleConfig` (`chronix-cluster::autoscale`) — defaults:
+
+```text
+region_size_threshold     10 GB
+region_series_threshold   100 000
+scan_interval             60 s
 ```
 
 **Metric:** `chronix_cluster_region_splits_total` counter (labeled by measurement)
@@ -166,10 +171,9 @@ scan_interval_secs = 60
 When disk usage deviation exceeds 20% from the cluster mean, the rebalancer
 proposes migrations from overloaded to underloaded nodes.
 
-```toml
-[cluster.autoscale]
-disk_deviation_threshold = 0.20
-max_concurrent_migrations = 2
+```text
+disk_deviation_threshold    0.20
+max_concurrent_migrations   2
 ```
 
 Migrations are rate-limited to avoid impacting foreground traffic.
@@ -333,12 +337,9 @@ index ≤ last_applied. This ensures idempotent log application — replayed ent
 > prevent false-positive dead-node declarations after failover. During the
 > grace period, all nodes are treated as healthy until fresh heartbeats arrive.
 
-```toml
-[cluster.health]
-heartbeat_interval_ms = 500
-suspect_timeout_ms = 5000
-dead_timeout_ms = 15000
-```
+`ClusterConfig` (`chronix-meta::types`) carries `heartbeat_interval_secs` and
+`heartbeat_suspect_threshold`; a node is suspect after that many missed
+heartbeats.
 
 ### Node Restart Recovery
 
@@ -434,10 +435,7 @@ The routing cache uses **exponential backoff with jitter** when retrying failed 
 
 ### Replication Factor
 
-```toml
-[cluster]
-default_replication_factor = 3  # 1, 2, or 3
-```
+`ClusterConfig::default_replication_factor` — 1, 2 or 3:
 
 - **RF=1:** No replication (development only)
 - **RF=2:** Tolerates 1 node failure (reads continue, writes need manual recovery)

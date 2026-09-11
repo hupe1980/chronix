@@ -65,7 +65,7 @@ async fn start_tls_server() -> (String, Vec<u8>, TempDir) {
         openapi_json: std::sync::OnceLock::new(),
     });
 
-    let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let metrics_builder = chronixd::server::prometheus_builder().expect("bucket config");
     let metrics_handle = metrics_builder.build_recorder().handle();
     let app = build_router(state, "/metrics", metrics_handle, 10 * 1024 * 1024, None);
 

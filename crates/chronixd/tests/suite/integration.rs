@@ -56,7 +56,7 @@ pub(crate) async fn start_test_server() -> (String, TempDir) {
 
     // Use the metrics builder without installing a global recorder to avoid
     // conflicts across parallel tests.
-    let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    let metrics_builder = chronixd::server::prometheus_builder().expect("bucket config");
     let metrics_handle = metrics_builder.build_recorder().handle();
 
     let app = build_router(state, "/metrics", metrics_handle, 10 * 1024 * 1024, None);
@@ -630,5 +630,121 @@ async fn sql_endpoint_rejects_mutations_without_side_effects() {
         explained.status(),
         StatusCode::OK,
         "EXPLAIN of a read is a read"
+    );
+}
+
+/// What the rollup listing reports can be typed straight back in.
+///
+/// That promise is in `RollupInfo`'s own documentation, and `origin` broke it:
+/// a tier created with one read back without it, so re-creating a rollup from
+/// the listing would have silently moved every boundary — a "monthly" total
+/// running from the 1st where the billing period runs from the 15th.
+#[tokio::test]
+async fn a_rollups_listing_round_trips_through_its_own_create_request() {
+    let (base, _tmp) = start_test_server().await;
+    let c = client();
+
+    let create = serde_json::json!({
+        "name": "energy_billing",
+        "source_measurement": "energy",
+        "target_measurement": "energy_billing",
+        "every": "1mo",
+        "timezone": "Europe/Berlin",
+        "origin": "2024-01-15",
+        "aggregations": ["sum"],
+    });
+    let created = c
+        .post(format!("{base}/api/v1/rollups"))
+        .json(&create)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "creating the rollup failed: {}",
+        created.text().await.unwrap()
+    );
+
+    let body: Value = c
+        .get(format!("{base}/api/v1/rollups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rollup = &body["items"][0];
+    assert_eq!(rollup["every"], "1mo");
+    assert_eq!(rollup["timezone"], "Europe/Berlin");
+    let origin = rollup["origin"]
+        .as_str()
+        .expect("the origin must be reported, or the round trip is a lie");
+
+    // Feed the listing back in under a new name: it must be accepted, and
+    // describe the same bucket.
+    let echoed = c
+        .post(format!("{base}/api/v1/rollups"))
+        .json(&serde_json::json!({
+            "name": "energy_billing_copy",
+            "source_measurement": "energy",
+            "target_measurement": "energy_billing_copy",
+            "every": rollup["every"],
+            "timezone": rollup["timezone"],
+            "origin": origin,
+            "aggregations": ["sum"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        echoed.status().is_success(),
+        "the listing did not round trip: {}",
+        echoed.text().await.unwrap()
+    );
+
+    let body: Value = c
+        .get(format!("{base}/api/v1/rollups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = body["items"].as_array().unwrap();
+    let copy = items
+        .iter()
+        .find(|r| r["name"] == "energy_billing_copy")
+        .expect("the copy");
+    assert_eq!(
+        copy["origin"], rollup["origin"],
+        "the copy buckets differently from the original"
+    );
+}
+
+/// A monthly boundary that does not exist in every month is refused.
+#[tokio::test]
+async fn a_monthly_rollup_origin_after_the_twenty_eighth_is_refused() {
+    let (base, _tmp) = start_test_server().await;
+    let resp = client()
+        .post(format!("{base}/api/v1/rollups"))
+        .json(&serde_json::json!({
+            "name": "bad_billing",
+            "source_measurement": "energy",
+            "target_measurement": "bad_billing",
+            "every": "1mo",
+            "origin": "2024-01-31",
+            "aggregations": ["sum"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing from some months"),
+        "the error should say why: {body}"
     );
 }

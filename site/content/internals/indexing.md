@@ -9,15 +9,17 @@ read from disk during query execution. Together they form a **multi-level
 pruning pipeline** that can eliminate >99% of segments before any data
 decoding occurs.
 
-## Time-Range Index
+## Time Range
 
-The simplest index: each segment records its `[time_min, time_max]` range.
-A query with a time predicate `WHERE _time BETWEEN t₁ AND t₂` skips any
-segment whose range does not overlap `[t₁, t₂]`.
+The simplest level, and it needs no index of its own: every catalog entry
+records its segment's `[min_timestamp, max_timestamp]`, so a query with a time
+predicate `WHERE _time BETWEEN t₁ AND t₂` skips any entry whose range does not
+overlap `[t₁, t₂]`.
 
-The index is stored sorted by `time_min`, enabling **O(log N) binary search**
-for the first overlapping segment. For typical time-range queries this
-eliminates all historical segments outside the query window.
+A query is already scoped to one measurement, so this is one pass over that
+measurement's entries. There is no secondary time index: it would answer
+nothing the catalog cannot, and would have to be maintained on every flush,
+compaction and retirement.
 
 ## Bloom Filters
 
@@ -90,8 +92,13 @@ tag inverted index maps `(tag_key, tag_value) → {segment_ids}`:
 ("region", "us-east") → [seg_003, seg_004, seg_007, seg_008, seg_012]
 ```
 
-This enables O(1) lookup of candidate segments for a tag predicate, avoiding
-Bloom filter probes entirely when exact tag match is specified.
+A per-segment reverse map answers the question the query path actually asks:
+*can this index prove that this segment does not carry every filtered pair?*
+Only a segment it can prove that of is pruned. The index is rebuilt from the
+`.series` sidecars at open and updated after the catalog, so a segment can be
+queryable before it is indexed — and pruning what has not been seen would drop
+its rows from the answer with no error anywhere. A pruning structure may only
+ever fail towards more work.
 
 ## Zone Maps (Min/Max Predicate Pushdown)
 
@@ -118,7 +125,7 @@ that cannot hold the queried value is never decoded.
 ## Segment Catalog
 
 The catalog maintains a persistent inventory of all segments, their metadata,
-and lifecycle state (active, compacting, soft-deleted). It uses a
+and lifecycle state (active, compacting, retired). It uses a
 **manifest WAL** for crash-safe updates:
 
 ```text

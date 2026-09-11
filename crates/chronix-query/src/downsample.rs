@@ -38,10 +38,12 @@ fn extract_f64(col: &dyn Array, index: usize) -> Option<f64> {
     crate::extract_f64(col, index)
 }
 
-/// Downsample a `RecordBatch` into fixed-width time buckets.
+/// Downsample a `RecordBatch` into time buckets.
 ///
-/// For each bucket `[bucket_start, bucket_start + interval)`, the
+/// For each bucket `[bucket.start_of(ts), bucket.next(start))`, the
 /// aggregation function is applied to the values in the `value_column`.
+/// The bucket may be a fixed span or a calendar one — it is the same type
+/// SQL's `time_bucket()` and a rollup tier use, so the three agree.
 ///
 /// Returns a new `RecordBatch` with two columns: `_time` (bucket start)
 /// and the aggregated value column.
@@ -50,7 +52,7 @@ fn extract_f64(col: &dyn Array, index: usize) -> Option<f64> {
 ///
 /// * `batch` – input data (must have a `_time` Int64 column)
 /// * `value_column` – name of the column to aggregate
-/// * `interval` – bucket width in the same unit as timestamps (e.g. nanos)
+/// * `bucket` – the bucket width and the calendar it is read against
 /// * `function` – aggregation function to apply per bucket
 ///
 /// # Errors
@@ -60,16 +62,10 @@ fn extract_f64(col: &dyn Array, index: usize) -> Option<f64> {
 pub fn downsample(
     batch: &RecordBatch,
     value_column: &str,
-    interval: i64,
+    bucket: &chronix_core::TimeBucket,
     function: &AggFn,
     memory_tracker: Option<&crate::memory::MemoryTracker>,
 ) -> Result<RecordBatch> {
-    if interval <= 0 {
-        return Err(QueryError::Validation(
-            "downsample interval must be positive".into(),
-        ));
-    }
-
     let schema = batch.schema();
 
     let time_idx = schema
@@ -109,10 +105,11 @@ pub fn downsample(
             continue;
         }
         let ts = timestamps.value(i);
-        // Overflow-safe bucket alignment: subtracting the remainder avoids
-        // the `div_euclid * interval` multiplication that can overflow i64
-        // for extreme negative timestamps.
-        let bucket_start = ts - ts.rem_euclid(interval);
+        // The bucket knows its own calendar: a fixed width aligns on the
+        // epoch, a `1d` in a zone on local midnight, a `1mo` on the first of
+        // the month. Doing the arithmetic here is what made this surface
+        // disagree with SQL's `time_bucket()`.
+        let bucket_start = bucket.start_of(ts);
         buckets.entry(bucket_start).or_default().push(i);
     }
 
@@ -220,8 +217,13 @@ pub fn downsample(
 /// # use chronix_query::downsample::StreamingDownsampler;
 /// # use chronix_query::aggregate::AggFn;
 /// # use arrow::record_batch::RecordBatch;
+/// # use chronix_core::TimeBucket;
+/// # use std::time::Duration;
 /// # fn batches() -> Vec<RecordBatch> { vec![] }
-/// let mut ds = StreamingDownsampler::new("value", 60_000_000_000, AggFn::Avg)?;
+/// // A fixed minute. `TimeBucket::parse("1d", Some("Europe/Berlin"))` for a
+/// // calendar bucket — the same type SQL's `time_bucket()` uses.
+/// let bucket = TimeBucket::fixed(Duration::from_secs(60));
+/// let mut ds = StreamingDownsampler::new("value", bucket, AggFn::Avg)?;
 /// let mut out = Vec::new();
 /// for batch in batches() {
 ///     out.extend(ds.push(&batch)?);
@@ -231,7 +233,7 @@ pub fn downsample(
 /// ```
 pub struct StreamingDownsampler {
     value_column: String,
-    interval: i64,
+    bucket: chronix_core::TimeBucket,
     function: AggFn,
     /// Start timestamp of the bucket currently being accumulated.
     open_bucket: Option<i64>,
@@ -315,22 +317,22 @@ impl StreamingDownsampler {
     /// Rows per emitted batch.
     const DEFAULT_CHUNK_ROWS: usize = 65_536;
 
-    /// Create a downsampler for `value_column` over `interval`-wide buckets.
+    /// Create a downsampler for `value_column` over `bucket`-wide buckets.
     ///
     /// # Errors
     ///
-    /// Returns an error if `interval` is not positive.
-    pub fn new(value_column: &str, interval: i64, function: AggFn) -> Result<Self> {
-        if interval <= 0 {
-            return Err(QueryError::Validation(
-                "downsample interval must be positive".into(),
-            ));
-        }
+    /// Never fails today; the signature is fallible because `push` is, and
+    /// callers already handle a `Result` here.
+    pub fn new(
+        value_column: &str,
+        bucket: chronix_core::TimeBucket,
+        function: AggFn,
+    ) -> Result<Self> {
         let mut acc = BucketAcc::default();
         acc.reset();
         Ok(Self {
             value_column: value_column.to_string(),
-            interval,
+            bucket,
             function,
             open_bucket: None,
             acc,
@@ -384,10 +386,8 @@ impl StreamingDownsampler {
                 continue;
             }
             let ts = timestamps.value(i);
-            // Overflow-safe bucket alignment: subtracting the remainder avoids
-            // the `div_euclid * interval` multiplication that can overflow i64
-            // for extreme negative timestamps.
-            let bucket = ts - ts.rem_euclid(self.interval);
+            // See `downsample` above: the bucket owns its own calendar.
+            let bucket = self.bucket.start_of(ts);
 
             match self.open_bucket {
                 Some(open) if bucket == open => {}
@@ -469,6 +469,7 @@ fn build_batch(value_column: &str, rows: &[(i64, f64)]) -> Result<RecordBatch> {
 mod tests {
     use super::*;
     use arrow::array::UInt64Array;
+    use chronix_core::TimeBucket;
 
     fn make_batch(times: Vec<i64>, values: Vec<f64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -493,7 +494,14 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
 
-        let result = downsample(&batch, "value", 10, &AggFn::Avg, None).unwrap();
+        let result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Avg,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.num_rows(), 3);
 
         let times = result
@@ -524,7 +532,14 @@ mod tests {
     fn downsample_sum() {
         let batch = make_batch(vec![0, 5, 10, 15], vec![10.0, 20.0, 30.0, 40.0]);
 
-        let result = downsample(&batch, "value", 10, &AggFn::Sum, None).unwrap();
+        let result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Sum,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.num_rows(), 2);
 
         let values = result
@@ -541,7 +556,14 @@ mod tests {
     fn downsample_count() {
         let batch = make_batch(vec![0, 1, 2, 10, 20, 21, 22, 23], vec![1.0; 8]);
 
-        let result = downsample(&batch, "value", 10, &AggFn::Count, None).unwrap();
+        let result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Count,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.num_rows(), 3);
 
         let values = result
@@ -559,8 +581,22 @@ mod tests {
     fn downsample_min_max() {
         let batch = make_batch(vec![0, 5, 10, 15], vec![3.0, 1.0, 4.0, 2.0]);
 
-        let min_result = downsample(&batch, "value", 10, &AggFn::Min, None).unwrap();
-        let max_result = downsample(&batch, "value", 10, &AggFn::Max, None).unwrap();
+        let min_result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Min,
+            None,
+        )
+        .unwrap();
+        let max_result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Max,
+            None,
+        )
+        .unwrap();
 
         let min_vals = min_result
             .column(1)
@@ -583,8 +619,22 @@ mod tests {
     fn downsample_first_last() {
         let batch = make_batch(vec![0, 5, 10, 15], vec![10.0, 20.0, 30.0, 40.0]);
 
-        let first = downsample(&batch, "value", 10, &AggFn::First, None).unwrap();
-        let last = downsample(&batch, "value", 10, &AggFn::Last, None).unwrap();
+        let first = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::First,
+            None,
+        )
+        .unwrap();
+        let last = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Last,
+            None,
+        )
+        .unwrap();
 
         let first_vals = first
             .column(1)
@@ -604,15 +654,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_interval_fails() {
-        let batch = make_batch(vec![0], vec![1.0]);
-        assert!(downsample(&batch, "value", 0, &AggFn::Avg, None).is_err());
-    }
-
-    #[test]
     fn empty_batch() {
         let batch = make_batch(vec![], vec![]);
-        let result = downsample(&batch, "value", 10, &AggFn::Avg, None).unwrap();
+        let result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Avg,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.num_rows(), 0);
     }
 
@@ -631,7 +682,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = downsample(&batch, "value", 10, &AggFn::Sum, None).unwrap();
+        let result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Sum,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.num_rows(), 2);
 
         let values = result
@@ -658,7 +716,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = downsample(&batch, "value", 10, &AggFn::Avg, None).unwrap();
+        let result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Avg,
+            None,
+        )
+        .unwrap();
         assert_eq!(result.num_rows(), 2);
 
         let values = result
@@ -685,7 +750,14 @@ mod tests {
         )
         .unwrap();
 
-        let err = downsample(&batch, "value", 10, &AggFn::Avg, None).unwrap_err();
+        let err = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Avg,
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("unsupported"),
@@ -697,7 +769,14 @@ mod tests {
     fn downsample_respects_memory_tracker() {
         let batch = make_batch(vec![0, 5, 10, 15], vec![1.0, 2.0, 3.0, 4.0]);
         let tracker = crate::memory::MemoryTracker::new(1_000_000);
-        let result = downsample(&batch, "value", 10, &AggFn::Avg, Some(&tracker)).unwrap();
+        let result = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Avg,
+            Some(&tracker),
+        )
+        .unwrap();
         assert!(tracker.allocated() > 0);
         assert_eq!(result.num_rows(), 2);
     }
@@ -706,7 +785,14 @@ mod tests {
     fn downsample_exceeds_memory_budget() {
         let batch = make_batch(vec![0, 5, 10, 15], vec![1.0, 2.0, 3.0, 4.0]);
         let tracker = crate::memory::MemoryTracker::new(1);
-        let err = downsample(&batch, "value", 10, &AggFn::Avg, Some(&tracker)).unwrap_err();
+        let err = downsample(
+            &batch,
+            "value",
+            &TimeBucket::fixed_ns(10),
+            &AggFn::Avg,
+            Some(&tracker),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             crate::error::QueryError::QueryMemoryExceeded { .. }

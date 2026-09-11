@@ -8,10 +8,9 @@ use tracing::warn;
 
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
-use chronix_core::{MeasurementSchema, Point, SegmentState, SeriesKey, ShardId, TombstoneSet};
+use chronix_core::{MeasurementSchema, Point, SegmentState, SeriesKey, TombstoneSet};
 use chronix_engine::index::{
-    SegmentCatalog, SegmentCatalogEntry, SeriesBloomFilter, TagInvertedIndex, TimeIndex,
-    TimeIndexEntry,
+    SegmentCatalog, SegmentCatalogEntry, SeriesBloomFilter, TagInvertedIndex,
 };
 use chronix_engine::segment::reader::SegmentReader;
 use chronix_query::plan::{extract_scan, QueryPlan};
@@ -38,7 +37,12 @@ pub(super) struct SegmentFilterCtx<'a> {
 /// Read by `chronixd`'s HTTP, gRPC and Flight SQL result encoders, and by the
 /// series-key extractor. Public so an embedded caller reading batches from
 /// `execute_iter` can tell a tag from a string field without guessing.
-pub const ROLE_KEY: &str = "role";
+///
+/// **Re-exported, not re-declared.** The writer that stamps this metadata
+/// lives in `chronix-engine`; this used to be a second `const` with the same
+/// spelling, beside three string literals that also spelled it out. One key
+/// written in five places is one key that can drift in four of them.
+pub use chronix_engine::segment::metadata::roles::ARROW_ROLE_KEY as ROLE_KEY;
 
 /// `role` metadata for one column.
 #[must_use]
@@ -220,7 +224,7 @@ impl super::Chronix {
             // ── Downsample(Scan): one open bucket carried across batches ──
             QueryPlan::Downsample {
                 source,
-                interval,
+                bucket,
                 function,
             } if matches!(source.as_ref(), QueryPlan::Scan { .. }) => {
                 let mut stream = self.execute_iter(source)?;
@@ -242,11 +246,8 @@ impl super::Chronix {
                             )
                     })
                     .map_or("value", |f| f.name().as_str());
-                let interval_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
                 let mut ds = chronix_query::downsample::StreamingDownsampler::new(
-                    value_col,
-                    interval_ns,
-                    *function,
+                    value_col, *bucket, *function,
                 )?;
                 let mut results = ds.push(&first)?;
                 drop(first);
@@ -416,8 +417,8 @@ impl super::Chronix {
     }
 
     /// Rebuild the in-memory indexes from the catalog and the per-segment
-    /// series sidecars: per-shard time indexes, series blooms, the inverted
-    /// tag index, and the exact set of series the segments hold.
+    /// series sidecars: series blooms, the inverted tag index, and the exact
+    /// set of series the segments hold.
     ///
     /// No segment is decoded on this path. A segment whose sidecar is
     /// missing or corrupt has its series list rebuilt from its tag columns
@@ -425,12 +426,10 @@ impl super::Chronix {
     pub(super) fn load_catalog_state(
         catalog: &SegmentCatalog,
     ) -> (
-        BTreeMap<ShardId, TimeIndex>,
         BTreeMap<u64, SeriesBloomFilter>,
         TagInvertedIndex,
         std::collections::HashSet<String>,
     ) {
-        let mut time_indices: BTreeMap<ShardId, TimeIndex> = BTreeMap::new();
         let mut blooms: BTreeMap<u64, SeriesBloomFilter> = BTreeMap::new();
         let tag_index = TagInvertedIndex::new();
         let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -441,13 +440,6 @@ impl super::Chronix {
             if entry.state != SegmentState::Active {
                 continue;
             }
-            let idx = time_indices.entry(entry.shard_id).or_default();
-            idx.add_segment(TimeIndexEntry {
-                segment_id: entry.segment_id,
-                min_ts: entry.min_timestamp,
-                max_ts: entry.max_timestamp,
-            });
-
             let keys = Self::series_keys_of(&entry.path, &entry.measurement);
             Self::index_series_keys(&mut blooms, &tag_index, entry.segment_id, &keys);
             for key in &keys {
@@ -455,7 +447,7 @@ impl super::Chronix {
             }
         }
 
-        (time_indices, blooms, tag_index, known)
+        (blooms, tag_index, known)
     }
 
     /// One segment's series, read from its sidecar.
@@ -646,7 +638,12 @@ impl super::Chronix {
         let memtable_best = self.shards.scan(&key, 0, i64::MAX).into_iter().last();
 
         // 2. Check on-disk segments in reverse time order (with bloom pruning)
-        let entries: Vec<SegmentCatalogEntry> = {
+        //
+        // The lease is taken under the catalog read lock for the same reason
+        // the scan takes one: the loop below opens these paths later, and a
+        // retention pass would otherwise unlink one between the snapshot and
+        // the open. See `db::leases`.
+        let (entries, _lease) = {
             let catalog = self.catalog.read();
             let blooms = self.blooms.read();
             let mut segs: Vec<SegmentCatalogEntry> = catalog
@@ -663,7 +660,10 @@ impl super::Chronix {
                 .collect();
             // Sort by max_timestamp descending to check newest segments first
             segs.sort_by_key(|s| std::cmp::Reverse(s.max_timestamp));
-            segs
+            let lease = self
+                .segment_leases
+                .acquire(segs.iter().map(|e| e.segment_id));
+            (segs, lease)
         };
 
         // Track the best result across ALL segments. We cannot return after
@@ -684,13 +684,12 @@ impl super::Chronix {
                 }
             }
 
-            let reader = match SegmentReader::open(&entry.path) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(segment = %entry.path.display(), error = %e, "Skipping unreadable segment");
-                    continue;
-                }
-            };
+            // A segment that cannot be opened fails this lookup, as it fails
+            // a scan: the lease guarantees the file is still there, so the
+            // only remaining reason is a damaged one, and skipping it would
+            // answer a *stale* reading as though it were current — which for
+            // a meter is the wrong number rather than a missing one.
+            let reader = SegmentReader::open(&entry.path)?;
 
             let tag_refs: Vec<(&str, &str)> =
                 tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -936,12 +935,17 @@ impl super::Chronix {
         Arc::new(arrow::datatypes::Schema::new(fields))
     }
 
-    /// The segment pruning pipeline — time index, inverted tag index, then
-    /// series blooms — shared by every scan.
+    /// The segment pruning pipeline — catalog time range, inverted tag index,
+    /// then series blooms and column statistics — shared by every scan.
     ///
-    /// Collects entries under read locks, then releases locks
-    /// before the bloom-filter scan pass. This narrows the lock scope so
-    /// concurrent `flush()` operations are not blocked during pruning.
+    /// Each level holds its own lock and releases it before the next, so a
+    /// concurrent `flush()` is blocked for one map read rather than for the
+    /// whole pipeline.
+    ///
+    /// Returns a **lease** on the candidate set alongside it. The scan opens
+    /// these paths later, one bucket at a time; the lease is what stops a
+    /// retirement pass unlinking one in between, and is released when the
+    /// caller drops it (see `db::leases`).
     pub(super) fn prune_segments(
         &self,
         measurement: &str,
@@ -950,6 +954,7 @@ impl super::Chronix {
     ) -> (
         Vec<SegmentCatalogEntry>,
         chronix_query::pruning::PruningStats,
+        super::leases::SegmentLease<'_>,
     ) {
         let (candidate_key, tag_keys) = Self::build_series_key(measurement, tag_filters);
         let tag_key_refs: Vec<&str> = tag_keys.iter().map(String::as_str).collect();
@@ -983,14 +988,17 @@ impl super::Chronix {
             .iter()
             .map(|f| (f.key.as_str(), f.value.as_str()))
             .collect();
-        let index_seg_ids = if tag_filter_pairs.is_empty() {
-            None
-        } else {
-            Some(self.tag_index.segments_for_tags(&tag_filter_pairs))
-        };
 
-        // Phase 1: Collect time+index-filtered entries under catalog read lock.
-        let (time_filtered, segments_total) = {
+        // Phase 1: Collect time-filtered entries under the catalog read lock,
+        // and lease them before releasing it.
+        //
+        // The lease is what makes the paths in `filtered` still openable when
+        // the scan reaches them: a retirement pass takes the catalog *write*
+        // lock, so it cannot run between the snapshot and the count. Leasing
+        // here rather than after the remaining pruning levels over-leases a
+        // little — a segment a bloom eliminates is never opened — and that
+        // costs a `HashMap` entry, against a window that costs a failed query.
+        let (time_filtered, segments_total, lease) = {
             let catalog = self.catalog.read();
             let all_measurement: Vec<&SegmentCatalogEntry> = catalog
                 .active_segments_for_measurement(measurement)
@@ -1002,15 +1010,35 @@ impl super::Chronix {
                 .filter(|e| {
                     e.max_timestamp >= time_range.start && e.min_timestamp <= time_range.end
                 })
-                .filter(|e| {
-                    index_seg_ids
-                        .as_ref()
-                        .is_none_or(|ids| ids.contains(&e.segment_id))
-                })
                 .cloned()
                 .collect();
-            (filtered, total)
+            let lease = self
+                .segment_leases
+                .acquire(filtered.iter().map(|e| e.segment_id));
+            (filtered, total, lease)
             // catalog read lock dropped here
+        };
+
+        // Phase 1b: Tag-index pruning, under the index's own lock and after
+        // the catalog's is released — the two are separate locks and this is
+        // the only place a read path holds either, so nesting them would be
+        // the tree's only catalog → tag-index order.
+        //
+        // The index answers what it can *prove* absent rather than what it
+        // holds. It is updated after the catalog, so a segment can be active
+        // and unindexed — the window between a compaction's catalog swap and
+        // its index swap, or a segment whose series sidecar could not be
+        // read. Treating "not returned by the index" as "cannot match" made
+        // that window return **no rows at all** for any tag-filtered query,
+        // which on a tenanted server is every query.
+        let time_filtered: Vec<SegmentCatalogEntry> = if tag_filter_pairs.is_empty() {
+            time_filtered
+        } else {
+            let pruner = self.tag_index.pruner(&tag_filter_pairs);
+            time_filtered
+                .into_iter()
+                .filter(|e| !pruner.excludes(e.segment_id))
+                .collect()
         };
 
         let pruned_by_time_and_index = segments_total - time_filtered.len();
@@ -1039,7 +1067,7 @@ impl super::Chronix {
 
         let entries: Vec<SegmentCatalogEntry> =
             pruned.segments.into_iter().map(|ps| ps.entry).collect();
-        (entries, stats)
+        (entries, stats, lease)
     }
 
     /// Build a canonical series key and tag filter keys from tag filters.
@@ -1223,7 +1251,7 @@ impl super::Chronix {
                 }
             }
             QueryPlan::Downsample {
-                interval, function, ..
+                bucket, function, ..
             } => {
                 let schema = batch.schema();
                 let value_col = schema
@@ -1240,11 +1268,10 @@ impl super::Chronix {
                     })
                     .map_or("value", |f| f.name().as_str());
 
-                let interval_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
                 chronix_query::downsample::downsample(
                     &batch,
                     value_col,
-                    interval_ns,
+                    bucket,
                     function,
                     memory_tracker,
                 )?

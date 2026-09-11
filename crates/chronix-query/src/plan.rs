@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use chronix_core::Timestamp;
+use chronix_core::{TimeBucket, Timestamp};
 
 use crate::aggregate::AggFn;
 use crate::error::{QueryError, Result};
@@ -76,19 +76,18 @@ pub enum QueryPlan {
     },
     /// Downsample results into time buckets.
     ///
-    /// **Fixed-width buckets only.** A `Duration` is a span of nanoseconds,
-    /// so this cannot express a calendar bucket — a day in a time zone is 23
-    /// or 25 hours across a transition, and a month is not a span at all. The
-    /// type says so rather than pretending: the two surfaces that *do* offer
-    /// calendar buckets are `time_bucket()` in SQL and a rollup tier, and both
-    /// go through `chronix::timebucket::TimeBucket`. Threading that through
-    /// here would put the tz database inside the query engine for a surface
-    /// nobody has asked it of.
+    /// The bucket is a [`TimeBucket`], so this surface means the same thing
+    /// as `time_bucket()` in SQL and as a rollup tier — all three ask the
+    /// same type where a bucket starts and where the next one does. It used
+    /// to take a `Duration`, which cannot be a calendar bucket at all: a day
+    /// in a zone is 23 or 25 hours across a transition and a month is not a
+    /// span, so `1d` here quietly meant 86 400 seconds of UTC while `1d` in
+    /// SQL meant the zone's day.
     Downsample {
         /// The underlying scan plan.
         source: Box<QueryPlan>,
-        /// Bucket interval — a fixed span, aligned to the Unix epoch in UTC.
-        interval: Duration,
+        /// The bucket, fixed-width or calendar, and the zone it is read in.
+        bucket: TimeBucket,
         /// Aggregation function per bucket.
         function: AggFn,
     },
@@ -134,7 +133,7 @@ pub struct QueryBuilder {
     time_range: Option<TimeRange>,
     aggregate_fns: Vec<AggFn>,
     group_by: Vec<String>,
-    downsample: Option<(Duration, AggFn)>,
+    downsample: Option<(TimeBucket, AggFn)>,
     limit: Option<usize>,
     offset: Option<usize>,
     window_fns: Vec<WindowFn>,
@@ -264,17 +263,22 @@ impl QueryBuilder {
         self
     }
 
-    /// Set downsampling parameters.
-    #[must_use]
-    /// Bucket results into fixed spans of `interval`, aligned to the Unix
-    /// epoch in UTC.
+    /// Bucket results by `bucket`, and aggregate each bucket with `function`.
     ///
-    /// For a bucket that follows a **calendar** — local midnight to local
-    /// midnight, or a calendar month — use `time_bucket()` in SQL or declare
-    /// a rollup tier; see `chronix::timebucket`. A `Duration` cannot be
-    /// either, and this API does not pretend it can.
-    pub fn downsample(mut self, interval: Duration, function: AggFn) -> Self {
-        self.downsample = Some((interval, function));
+    /// The bucket carries its own calendar, so all three of these mean what
+    /// they say:
+    ///
+    /// ```ignore
+    /// // A fixed five minutes, aligned to the Unix epoch.
+    /// .downsample(TimeBucket::fixed(Duration::from_secs(300)), AggFn::Avg)
+    /// // A calendar day in Berlin — 23 hours on the spring transition.
+    /// .downsample(TimeBucket::parse("1d", Some("Europe/Berlin"))?, AggFn::Max)
+    /// // A calendar month, which is not a span of anything.
+    /// .downsample(TimeBucket::parse("1mo", None)?, AggFn::Sum)
+    /// ```
+    #[must_use]
+    pub fn downsample(mut self, bucket: TimeBucket, function: AggFn) -> Self {
+        self.downsample = Some((bucket, function));
         self
     }
 
@@ -396,10 +400,10 @@ impl QueryBuilder {
         }
 
         // Wrap in downsample if requested
-        let plan = if let Some((interval, function)) = self.downsample {
+        let plan = if let Some((bucket, function)) = self.downsample {
             QueryPlan::Downsample {
                 source: Box::new(scan),
-                interval,
+                bucket,
                 function,
             }
         } else if !self.aggregate_fns.is_empty() {
@@ -590,7 +594,7 @@ mod tests {
         let plan = QueryBuilder::new()
             .measurement("cpu")
             .range(0, 3_600_000_000_000)
-            .downsample(Duration::from_secs(60), AggFn::Avg)
+            .downsample(TimeBucket::fixed_ns(60 * 1_000_000_000), AggFn::Avg)
             .build()
             .unwrap();
 
@@ -679,7 +683,7 @@ mod tests {
         let err = QueryBuilder::new()
             .measurement("cpu")
             .range(0, 100)
-            .downsample(Duration::from_secs(60), AggFn::Max)
+            .downsample(TimeBucket::fixed_ns(60 * 1_000_000_000), AggFn::Max)
             .aggregate(AggFn::Avg)
             .build()
             .unwrap_err();

@@ -46,8 +46,6 @@ const STATISTICS_GAUGES: &[&str] = &[
     "chronix_measurement_count",
     "chronix_wal_sequence",
     "chronix_tombstone_count",
-    "chronix_metadata_cache_entries",
-    "chronix_metadata_cache_bytes",
     "chronix_storage_disk_usage_bytes",
 ];
 
@@ -143,6 +141,141 @@ async fn a_scrape_carries_every_gauge_the_engine_publishes() {
     );
 }
 
+/// Every histogram reaches a scrape as a **histogram**, never a summary.
+///
+/// `metrics-exporter-prometheus` renders `histogram!` as a Prometheus
+/// *summary* unless buckets are configured, and a summary is not a smaller
+/// histogram — it is a different metric with no `_bucket` series. So
+/// `histogram_quantile()` had nothing to read, and **every latency panel in
+/// `dashboards/` was permanently empty**: 24 of 45 panel targets, found by
+/// pointing Grafana at a running server rather than by any test here.
+///
+/// The estimator was also wrong for anything that is not a latency —
+/// `chronix_batch_size{quantile="0.5"}` read `0.9998` for a metric whose
+/// observed values were 1 and 4320.
+///
+/// The assertion is on the **type line**, not on a list of metric names, so
+/// it covers a histogram added tomorrow and one this deployment's features
+/// do not reach.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_histogram_reaches_a_scrape_as_a_summary() {
+    let recorder = chronixd::server::prometheus_builder()
+        .expect("bucket config")
+        .build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        // One of each shape the matchers distinguish.
+        metrics::histogram!("chronix_write_duration_seconds").record(0.004);
+        metrics::histogram!("chronix_batch_size").record(4320.0);
+        metrics::histogram!("chronix_segment_compression_ratio").record(7.5);
+        // And one that matches no matcher, to prove the *default* is a
+        // histogram — the arm that made all of this a summary.
+        metrics::histogram!("chronix_unmatched_example").record(1.0);
+    });
+    let rendered = handle.render();
+
+    let summaries: Vec<&str> = rendered
+        .lines()
+        .filter(|l| l.starts_with("# TYPE ") && l.ends_with(" summary"))
+        .collect();
+    assert!(
+        summaries.is_empty(),
+        "these reached the scrape as summaries, so `histogram_quantile()` \
+         cannot read them and their dashboard panels are empty:\n{summaries:#?}"
+    );
+
+    for name in [
+        "chronix_write_duration_seconds",
+        "chronix_batch_size",
+        "chronix_segment_compression_ratio",
+        "chronix_unmatched_example",
+    ] {
+        assert!(
+            rendered.contains(&format!("# TYPE {name} histogram")),
+            "{name} is not a histogram in the scrape:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("{name}_bucket{{")),
+            "{name} has no _bucket series, so histogram_quantile() has nothing to read"
+        );
+    }
+
+    // The buckets must bracket the value, or every observation lands in +Inf
+    // and the quantile is useless. A 4 ms write belongs below 5 ms.
+    assert!(
+        rendered.contains(r#"chronix_write_duration_seconds_bucket{le="0.005"} 1"#),
+        "a 4 ms write should fall in the 5 ms bucket:\n{rendered}"
+    );
+}
+
+/// Every `histogram_quantile()` in the bundled dashboards reads a metric this
+/// build exports as a histogram.
+///
+/// The dashboards are the product surface `documented_metrics` checks the
+/// *names* of; this checks that the name it reads — `X_bucket` — can exist at
+/// all. A name that only ever renders as a summary passes a name check and
+/// draws an empty panel.
+#[test]
+fn every_dashboard_quantile_reads_a_histogram_metric() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("repo root");
+    let recorder = chronixd::server::prometheus_builder()
+        .expect("bucket config")
+        .build_recorder();
+    let handle = recorder.handle();
+
+    // Record one observation per metric the dashboards take a quantile of,
+    // then check each renders with buckets.
+    let mut wanted: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(root.join("dashboards")).expect("dashboards") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("dashboard");
+        for hit in text.split("histogram_quantile(").skip(1) {
+            let Some(start) = hit.find("chronix_") else {
+                continue;
+            };
+            let rest = &hit[start..];
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            let metric = &rest[..end];
+            if let Some(base) = metric.strip_suffix("_bucket") {
+                wanted.push(base.to_owned());
+            }
+        }
+    }
+    wanted.sort();
+    wanted.dedup();
+    assert!(
+        !wanted.is_empty(),
+        "no histogram_quantile targets found — this test's premise is gone"
+    );
+
+    metrics::with_local_recorder(&recorder, || {
+        for name in &wanted {
+            metrics::histogram!(name.clone()).record(0.01);
+        }
+    });
+    let rendered = handle.render();
+
+    let bad: Vec<&String> = wanted
+        .iter()
+        .filter(|n| !rendered.contains(&format!("{n}_bucket{{")))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "{} dashboard metrics render without `_bucket`, so their panels are \
+         permanently empty: {bad:#?}",
+        bad.len()
+    );
+}
+
 /// A metric name with dots in it is not the name that reaches Prometheus.
 ///
 /// The exposition format allows `[a-zA-Z_:][a-zA-Z0-9_:]*`, so the exporter
@@ -154,7 +287,9 @@ async fn a_scrape_carries_every_gauge_the_engine_publishes() {
 /// `every_metric_name_is_prometheus_safe` enforces.
 #[test]
 fn a_dotted_metric_name_is_rewritten_before_it_reaches_a_scrape() {
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let recorder = chronixd::server::prometheus_builder()
+        .expect("bucket config")
+        .build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
         metrics::counter!("chronix.example.dotted.name").increment(1);

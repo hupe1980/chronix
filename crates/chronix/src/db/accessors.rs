@@ -246,10 +246,7 @@ impl Chronix {
             let catalog = self.catalog.read();
             catalog.segment_count()
         };
-        let shard_count = {
-            let ti = self.time_index.read();
-            ti.len()
-        };
+        let shard_count = self.catalog.read().shard_count();
         let memtable_memory_bytes = self.shards.total_memory();
         let interner_memory_bytes = self.shards.total_interner_memory();
         let wal_buffer_bytes = self.wal.memory_bytes();
@@ -260,8 +257,7 @@ impl Chronix {
             let ts = self.tombstones.read();
             ts.len()
         };
-        let metadata_cache_entries = self.metadata_cache.len();
-        let metadata_cache_bytes = self.metadata_cache.memory_bytes();
+        let leased_segments = self.segment_leases.len();
 
         // Emit gauge metrics so Prometheus/OTLP scrapers pick them up.
         gauge!("chronix_series_count").set(series_count as f64);
@@ -274,8 +270,7 @@ impl Chronix {
         gauge!("chronix_measurement_count").set(measurement_count as f64);
         gauge!("chronix_wal_sequence").set(wal_sequence as f64);
         gauge!("chronix_tombstone_count").set(tombstone_count as f64);
-        gauge!("chronix_metadata_cache_entries").set(metadata_cache_entries as f64);
-        gauge!("chronix_metadata_cache_bytes").set(metadata_cache_bytes as f64);
+        gauge!("chronix_leased_segments").set(leased_segments as f64);
         gauge!("chronix_storage_disk_usage_bytes").set(self.disk_usage_bytes() as f64);
 
         DatabaseStatistics {
@@ -289,8 +284,7 @@ impl Chronix {
             measurement_count,
             wal_sequence,
             tombstone_count,
-            metadata_cache_entries,
-            metadata_cache_bytes,
+            leased_segments,
         }
     }
 
@@ -330,10 +324,15 @@ impl Chronix {
     /// `SELECT * FROM another_tenants_measurement` returned zero rows where a
     /// name that does not exist errors, so a tenant could enumerate the
     /// others by probing.
+    /// A measurement pending a whole-measurement drop is filtered out of
+    /// **both** branches. It used to be filtered out of the unscoped one
+    /// only, so a drop with a grace period configured was invisible on a
+    /// single-tenant server and fully listed on a tenanted one — one
+    /// question, two answers, in one function.
     #[must_use]
     pub fn measurement_names_in(&self, namespace: Option<&str>) -> Vec<String> {
+        let pending = self.catalog.read().pending_measurement_drops().clone();
         let Some(namespace) = namespace else {
-            let pending = self.catalog.read().pending_measurement_drops().clone();
             return self
                 .schema
                 .measurement_names()
@@ -344,7 +343,12 @@ impl Chronix {
         let mut names: Vec<String> = self
             .namespace_measurements
             .get(namespace)
-            .map(|set| set.iter().map(|m| m.clone()).collect())
+            .map(|set| {
+                set.iter()
+                    .filter(|m| !pending.contains_key(m.as_str()))
+                    .map(|m| m.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         names.sort_unstable();
         names
@@ -353,9 +357,15 @@ impl Chronix {
     /// Whether `namespace` holds any series of `measurement`.
     ///
     /// `None` means unscoped, and then only the measurement's existence
-    /// matters.
+    /// matters. A measurement pending a drop exists for nobody, on either
+    /// branch — the scoped one used to say yes, so under tenancy a dropped
+    /// table still planned and answered zero rows where a name that does not
+    /// exist is a planning error.
     #[must_use]
     pub fn has_measurement_in(&self, namespace: Option<&str>, measurement: &str) -> bool {
+        if self.is_measurement_pending_drop(measurement) {
+            return false;
+        }
         match namespace {
             None => self.schema(measurement).is_some(),
             Some(namespace) => self

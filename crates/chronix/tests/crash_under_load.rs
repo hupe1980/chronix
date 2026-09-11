@@ -53,7 +53,7 @@ fn child(dir: &std::path::Path) -> ! {
             .name("raw_1m")
             .source("raw")
             .target("raw_1m")
-            .bucket(chronix::timebucket::TimeBucket::fixed_ns(MINUTE))
+            .bucket(TimeBucket::fixed_ns(MINUTE))
             .aggregation(RollupAggFn::Avg)
             .aggregation(RollupAggFn::Count)
             .group_by("h")
@@ -70,7 +70,7 @@ fn child(dir: &std::path::Path) -> ! {
             while !stop.load(Ordering::Relaxed) {
                 let _ = db.flush();
                 let _ = db.compact();
-                let _ = db.gc_with_grace(0);
+                let _ = db.gc();
                 let _ = db.materialise_rollups();
             }
         })

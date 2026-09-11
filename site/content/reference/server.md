@@ -247,6 +247,24 @@ Common parsing and conversion utilities shared across HTTP, Kafka, and MQTT:
 - **`column_type_to_str()` / `column_type_to_arrow()`** — Schema introspection
   helpers for gRPC and Flight SQL responses.
 
+### Result encoding (`wire::value`)
+
+One Arrow → JSON encoding, shared by every surface that answers a query in
+JSON or protobuf. Its `match` over `DataType` has no catch-all arm, so an
+Arrow release that adds a variant fails the build.
+
+- **`to_json(col, idx)`** — a single cell, per the table in
+  [API reference](@/docs/api-reference.md).
+- **gRPC** keeps native proto scalars where one exists — `double` carries
+  `NaN`, which JSON cannot — and routes the rest through `to_json` into
+  `SqlValue.json`, distinct from `SqlValue.string`.
+- **Arrow Flight SQL** streams the `RecordBatch` unmodified, preserving the
+  Arrow types themselves.
+
+`chronix_query::arrow_cell_to_field_value` is the inverse, used by the
+region-snapshot and distributed-read paths: total over the six storage column
+types, and an error for any other Arrow type.
+
 ### Server Metrics
 
 | Metric | Type | Description |
@@ -304,10 +322,11 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | `chronix_interner_memory_bytes` | Gauge | `statistics()` | String interners — grows with cardinality, not row count |
 | `chronix_wal_buffer_bytes` | Gauge | `statistics()` | WAL writer's buffer; fixed size |
 | `chronix_catalog_memory_bytes` | Gauge | `statistics()` | Segment catalog, schema registry and tombstones |
-| `chronix_metadata_cache_bytes` | Gauge | `statistics()` | Segment metadata index — one entry per live segment: header, column statistics, per-tag bloom filters. Grows with segment count |
 | `chronix_retention_shards_dropped_total` | Counter | `enforce_retention()` | Shards retention **removed** — not the ones it considered. A pass that declines an expired shard because a rollup still needs it counts zero here |
 | `chronix_series_released_total` | Counter | `enforce_retention()`, `gc()`, `archive_cold_segments()` | Series returned to the cardinality budget because the last of their data was deleted |
-| `chronix_gc_segments_deleted_total` | Counter | `gc_with_grace()` | Number of segments hard-deleted by garbage collection |
+| `chronix_gc_segments_deleted_total` | Counter | `gc()` | Segment files unlinked by garbage collection — the ones a retirement pass had to leave because a running read still held them |
+| `chronix_segments_retired_awaiting_readers_total` | Counter | every retirement pass | Segments taken out of the database whose files could not be unlinked yet, because a running scan had already been handed the path |
+| `chronix_leased_segments` | Gauge | `statistics()` | Segment files a running read is holding. Near zero at rest; a number that only grows is a scan nobody dropped |
 | `chronix_rollup_invalidations_total` | Counter | `backfill()`, `execute_delete()` | Rollups whose buckets were marked for recomputation by a late write or a delete |
 | `chronix_rollup_ranges_recomputed_total` | Counter | `materialise_rollups()` | Invalidated ranges recomputed |
 | `chronix_rollup_failures_total` | Counter | `materialise_rollups()` | Rollups whose materialisation failed this pass (the others still run) |

@@ -73,7 +73,8 @@ async fn server(soft_delete_ttl: Option<Duration>) -> (String, TempDir) {
         openapi_json: std::sync::OnceLock::new(),
     });
 
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+    let metrics_handle = chronixd::server::prometheus_builder()
+        .expect("bucket config")
         .build_recorder()
         .handle();
     let app = build_router(state, "/metrics", metrics_handle, 10 * 1024 * 1024, None);

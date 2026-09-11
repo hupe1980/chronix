@@ -105,6 +105,12 @@ z1nb_q > 0.1` and `SELECT z1nb_q + 0.05` are both exact. A `DOUBLE` column is
 unaffected; write `CAST(1.5 AS DOUBLE)` for a literal that must be a float
 whatever it meets.
 
+**Integer arithmetic in SQL wraps on overflow.** `SELECT v + 1` where `v` is
+`9223372036854775807` answers `-9223372036854775808` rather than failing, and
+there is no setting for it. Sum an `i64` column whose values approach the
+type's range as `DECIMAL` or `DOUBLE`, or bound it in the query. Decimal
+arithmetic is unaffected: exact, or rejected.
+
 #### The scale belongs to the column
 
 A decimal column stores a fixed number of fractional digits, and that number

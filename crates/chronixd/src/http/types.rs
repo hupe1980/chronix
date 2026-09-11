@@ -195,12 +195,6 @@ impl WriteDedupCache {
 /// the SQL provider and the PromQL evaluator.
 pub(super) use crate::namespace::NAMESPACE_TAG;
 
-/// Extract the namespace from request extensions.
-///
-/// Falls back to `"default"` when no [`NamespaceContext`] is present
-/// (e.g. standalone mode without multi-tenancy).
-pub(super) use crate::namespace::resolve as resolve_namespace;
-
 // ─── Safe numeric helpers ────────────────────────────────────────────
 
 /// The wall clock in nanoseconds since the epoch, clamped.
@@ -373,148 +367,11 @@ pub struct ColumnInfo {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// Convert an Arrow array value at a given row to JSON.
-pub(super) fn arrow_value_to_json(col: &dyn arrow::array::Array, idx: usize) -> serde_json::Value {
-    use arrow::array::*;
-    use arrow::datatypes::DataType;
-
-    if col.is_null(idx) {
-        return serde_json::Value::Null;
-    }
-
-    match col.data_type() {
-        DataType::Int8 => col
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Int16 => col
-            .as_any()
-            .downcast_ref::<Int16Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Int32 => col
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Int64 => col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::UInt8 => col
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::UInt16 => col
-            .as_any()
-            .downcast_ref::<UInt16Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::UInt32 => col
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::UInt64 => col
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Float32 => col
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Float64 => col
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Boolean => col
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Utf8 => col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::LargeUtf8 => col
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .map(|a| serde_json::json!(a.value(idx)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Timestamp(unit, _) => {
-            use arrow::datatypes::TimeUnit;
-            let ts = match unit {
-                TimeUnit::Nanosecond => col
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .map(|a| a.value(idx)),
-                TimeUnit::Microsecond => col
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .map(|a| a.value(idx)),
-                TimeUnit::Millisecond => col
-                    .as_any()
-                    .downcast_ref::<TimestampMillisecondArray>()
-                    .map(|a| a.value(idx)),
-                TimeUnit::Second => col
-                    .as_any()
-                    .downcast_ref::<TimestampSecondArray>()
-                    .map(|a| a.value(idx)),
-            };
-            serde_json::json!(ts)
-        }
-        // A list becomes a JSON array, recursively.
-        //
-        // Every analytics aggregate returns one — `forecast`, `auto_forecast`,
-        // `multivariate_forecast` are `LIST(DOUBLE)` — so without this the
-        // documented headline feature answered
-        // `"<unsupported: List(Float64)>"` over the JSON API, which is the one
-        // surface most callers use. The fallback string is kept for a type
-        // genuinely not handled, because a silent `null` would be worse.
-        DataType::List(_) => col
-            .as_any()
-            .downcast_ref::<arrow::array::ListArray>()
-            .map_or(serde_json::Value::Null, |a| {
-                let inner = a.value(idx);
-                serde_json::Value::Array(
-                    (0..inner.len())
-                        .map(|i| arrow_value_to_json(&inner, i))
-                        .collect(),
-                )
-            }),
-        DataType::LargeList(_) => col
-            .as_any()
-            .downcast_ref::<arrow::array::LargeListArray>()
-            .map_or(serde_json::Value::Null, |a| {
-                let inner = a.value(idx);
-                serde_json::Value::Array(
-                    (0..inner.len())
-                        .map(|i| arrow_value_to_json(&inner, i))
-                        .collect(),
-                )
-            }),
-        // An exact decimal reaches JSON as its digits, in a string.
-        //
-        // A JSON number would be parsed back through an `f64` by every
-        // client on the planet, which is precisely the loss the column type
-        // exists to prevent — the value would survive storage, the query
-        // and the wire, and be destroyed by `JSON.parse`. The column's own
-        // type travels beside it in the result metadata
-        // (`decimal(38, s)`), so a string here is unambiguous.
-        DataType::Decimal128(_, _) => col
-            .as_any()
-            .downcast_ref::<arrow::array::Decimal128Array>()
-            .and_then(|a| crate::util::decimal_cell_to_string(a, idx))
-            .map_or(serde_json::Value::Null, serde_json::Value::String),
-        _ => serde_json::Value::String(format!("<unsupported: {}>", col.data_type())),
-    }
-}
+///
+/// Re-exported from [`crate::wire::value`], which is the single encoding
+/// every response shares — see its module docs for the type table and for
+/// why coverage is a compile error rather than a promise.
+pub(super) use crate::wire::value::to_json as arrow_value_to_json;
 
 /// Convert a [`MeasurementSchema`] to the REST API info struct.
 pub(super) fn measurement_schema_to_info(

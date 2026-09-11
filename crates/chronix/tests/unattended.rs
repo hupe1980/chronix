@@ -296,13 +296,16 @@ fn retention_reports_the_shards_it_actually_dropped() {
     );
 }
 
-/// Every byte the engine holds is in the resident-memory total.
+/// Nothing the engine holds grows per segment without being reported.
 ///
-/// The metadata cache is one entry per segment and it is never evicted, so
-/// on the design partner's three-year rollup tier it is the term that grows
-/// — and it was the one term `resident_memory_bytes()` did not sum.
+/// The per-segment term used to be a metadata index holding every segment's
+/// header, column statistics and per-tag bloom filters — 890 bytes a segment,
+/// the term that grows on a multi-year rollup tier, read by nothing but its
+/// own gauge. It is gone; what is left has to stay accounted for, so the sum
+/// is asserted here across twenty days of segments as well as in
+/// `resident_memory`.
 #[test]
-fn resident_memory_counts_the_metadata_cache() {
+fn resident_memory_is_the_sum_of_its_terms_at_every_size() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir, 3650);
     let key = SeriesKey::new("power", tags! { "device" => "meter" }).unwrap();
@@ -314,23 +317,21 @@ fn resident_memory_counts_the_metadata_cache() {
 
     let stats = db.statistics();
     assert!(
-        stats.metadata_cache_entries >= 20,
-        "premise: one metadata entry per segment ({} entries)",
-        stats.metadata_cache_entries
-    );
-    assert!(
-        stats.metadata_cache_bytes > 0,
-        "the metadata cache reports no memory while holding {} segments",
-        stats.metadata_cache_entries
+        stats.segment_count >= 20,
+        "premise: at least one segment a day ({} segments)",
+        stats.segment_count
     );
     assert_eq!(
         stats.resident_memory_bytes(),
         stats.memtable_memory_bytes
             + stats.interner_memory_bytes
             + stats.wal_buffer_bytes
-            + stats.catalog_memory_bytes
-            + stats.metadata_cache_bytes,
+            + stats.catalog_memory_bytes,
         "resident memory must be the sum of every term it reports"
+    );
+    assert!(
+        stats.catalog_memory_bytes > 0,
+        "the catalog is the per-segment term now, and it has to report itself"
     );
 }
 

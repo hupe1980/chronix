@@ -479,15 +479,6 @@ pub async fn get_namespace_usage_handler(
 /// paths stamped it and one of seven read paths filtered on it.
 pub use chronix_core::NAMESPACE_TAG;
 
-/// Namespace for a request, from its resolved [`NamespaceContext`].
-///
-/// Falls back to `"default"` when the namespace layer did not run — a
-/// standalone server, or an internal caller such as an ingestion connector.
-#[must_use]
-pub fn resolve(ns_ctx: Option<&NamespaceContext>) -> &str {
-    ns_ctx.map_or(DEFAULT_NAMESPACE, |ctx| &ctx.namespace)
-}
-
 /// The namespace a request is confined to, or `None` when tenancy is off.
 ///
 /// Tenancy is a deployment switch rather than always-on because a point

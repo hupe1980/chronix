@@ -24,6 +24,8 @@ use tracing::debug;
 use chronix::prelude::*;
 use chronix::Chronix;
 
+use crate::util::WriteMode;
+
 /// The Chronix Flight SQL service.
 pub struct ChronixFlightSqlService {
     db: Arc<Chronix>,
@@ -277,6 +279,13 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             return Ok(0);
         }
 
+        // Every other write surface takes `?backfill=true`; a Flight client
+        // importing history had no way to say so, because
+        // `CommandStatementUpdate` carries the measurement name and nothing
+        // else. `app_metadata` is the Flight protocol's extension point, so
+        // the flag travels there.
+        let mode = write_mode_from_app_metadata(&flight_data)?;
+
         // First message contains the Arrow IPC schema
         let schema = Arc::new(
             Schema::try_from(&flight_data[0])
@@ -348,7 +357,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
                     DataType::Utf8 | DataType::LargeUtf8 => {
                         let is_field = field
                             .metadata()
-                            .get("role")
+                            .get(chronix::db::ROLE_KEY)
                             .map(|r| r == "field")
                             .unwrap_or(false);
                         if is_field {
@@ -362,7 +371,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
                     {
                         let is_field = field
                             .metadata()
-                            .get("role")
+                            .get(chronix::db::ROLE_KEY)
                             .map(|r| r == "field")
                             .unwrap_or(false);
                         if is_field {
@@ -392,9 +401,15 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             )?;
 
             let n = points.len() as i64;
-            crate::util::insert_with_timeout(&db, scope.as_deref(), points, self.write_timeout)
-                .await
-                .map_err(|e| e.to_grpc_status())?;
+            crate::util::insert_batch_with_mode(
+                &db,
+                scope.as_deref(),
+                points,
+                self.write_timeout,
+                mode,
+            )
+            .await
+            .map_err(|e| e.to_grpc_status())?;
 
             total_rows += n;
         }
@@ -737,6 +752,51 @@ fn measurement_to_arrow_schema(schema: &MeasurementSchema) -> Schema {
 /// downcasting (O(rows × columns)).  Tag strings are borrowed from the
 /// Arrow array and only cloned into the per-point `BTreeMap`.
 #[allow(clippy::result_large_err)]
+/// What a `DoPut` stream's `app_metadata` asks for.
+///
+/// The Flight protocol has no field for a write mode, and
+/// `CommandStatementUpdate` carries only the measurement name — so a Flight
+/// client importing history had no way to ask for a backfill while every
+/// other surface took `?backfill=true`. `FlightData.app_metadata` is the
+/// protocol's own extension point, and this is the shape that travels in it:
+///
+/// ```json
+/// {"backfill": true}
+/// ```
+///
+/// Put it on any message of the stream; the first non-empty one decides. An
+/// empty or absent `app_metadata` is a live write, which is what every
+/// existing client already sends.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DoPutOptions {
+    /// Write outside the out-of-order window — importing history rather than
+    /// ingesting live.
+    #[serde(default)]
+    backfill: bool,
+}
+
+/// Read the write mode from the first message carrying `app_metadata`.
+///
+/// A key this server does not know is **refused**, not ignored: a client that
+/// misspells `backfill` would otherwise have its history silently rejected
+/// point by point, which is the failure the flag exists to avoid.
+fn write_mode_from_app_metadata(flight_data: &[FlightData]) -> Result<WriteMode, Status> {
+    let Some(raw) = flight_data
+        .iter()
+        .map(|d| d.app_metadata.as_ref())
+        .find(|m| !m.is_empty())
+    else {
+        return Ok(WriteMode::Live);
+    };
+    let opts: DoPutOptions = serde_json::from_slice(raw).map_err(|e| {
+        Status::invalid_argument(format!(
+            "FlightData.app_metadata must be JSON like {{\"backfill\": true}}: {e}"
+        ))
+    })?;
+    Ok(WriteMode::from_flag(opts.backfill))
+}
+
 fn arrow_batch_to_points(
     measurement: &str,
     batch: &RecordBatch,

@@ -1118,3 +1118,57 @@ async fn an_unscoped_request_reads_the_default_namespace_only() {
     }
     assert_eq!(rows, 1, "it reads the default namespace, and only that");
 }
+
+#[tokio::test]
+async fn grpc_carries_a_value_with_no_scalar_proto_field() {
+    // Every cell used to go through a chain of `downcast_ref` attempts that
+    // ended in `<unsupported: {type}>` *in the string field*, which no client
+    // could tell from a string. Structured values now arrive in `json`, and a
+    // caller can tell the two apart.
+    let (mut client, _endpoint, _tmp) = start_grpc_server().await;
+
+    let resp = client
+        .execute_sql(tonic::Request::new(chronixd::proto::SqlRequest {
+            query: "SELECT make_array(1, 2) AS l, CAST(arrow_cast('2025-09-11', 'Date32') AS DATE) AS d"
+                .to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let row = &resp.rows[0].values;
+    assert_eq!(
+        row[0].value,
+        Some(chronixd::proto::sql_value::Value::Json("[1,2]".to_string())),
+        "a list belongs in `json`, not in `string`"
+    );
+    // A date is an integer in the unit its `data_type` names, as every other
+    // temporal value is.
+    assert_eq!(
+        row[1].value,
+        Some(chronixd::proto::sql_value::Value::Int64(20_342)),
+        "a date is days since the epoch"
+    );
+}
+
+#[tokio::test]
+async fn grpc_keeps_a_non_finite_float_that_json_cannot() {
+    // protobuf `double` carries NaN; JSON has no literal for it. So the gRPC
+    // encoder deliberately does not route floats through the JSON encoder.
+    let (mut client, _endpoint, _tmp) = start_grpc_server().await;
+
+    let resp = client
+        .execute_sql(tonic::Request::new(chronixd::proto::SqlRequest {
+            query: "SELECT arrow_cast('NaN', 'Float64') AS n".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    match resp.rows[0].values[0].value {
+        Some(chronixd::proto::sql_value::Value::Float64(v)) => {
+            assert!(v.is_nan(), "expected NaN, got {v}");
+        }
+        ref other => panic!("expected a float64 cell, got {other:?}"),
+    }
+}

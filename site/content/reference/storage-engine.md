@@ -460,7 +460,7 @@ using streaming I/O with incremental CRC32c.
    using the database's configured `compression_codec` and `float_encoding`
    (not hardcoded defaults)
 5. **Register** — new compacted segment added to catalog with column stats,
-   metadata cache, bloom filter, time index, and tag index entries — all
+   bloom filter and tag index entries — all
    from the series keys the writer recorded (`SegmentMeta::series_keys`),
    persisted beside the segment as its `.series` sidecar. The compacted
    segment is never read back.
@@ -491,11 +491,10 @@ holding only a `Weak` reference so it never keeps the database alive:
   the database, so dropping the last *user* handle mid-pass still closes,
   on the thread.
 
-There is nothing for a caller — embedded or `chronixd` — to start.
-- **Graceful shutdown** — `stop_and_wait()` signals via `Notify` and awaits
-  the task handle; `stop()` is fire-and-forget
-- **Non-blocking** — compaction runs on a separate Tokio task, never blocking
-  the write or query paths
+There is nothing for a caller — embedded or `chronixd` — to start. It runs on
+its own OS thread, so a pass never blocks the write or query paths; `close()`
+sets the stop flag and joins it.
+
 ## Caching Layer (`chronix-engine::cache`)
 
 ### Last Value Cache (LVC)
@@ -551,7 +550,7 @@ catalog.
 `enforce_retention(retention)` takes a `Duration`, as `ChronixConfig::retention`
 does, and identifies shards whose `max_timestamp` falls
 before the cutoff and drops all segments, catalog entries, bloom filters, tag
-index entries, and metadata index entries for those shards.
+index entries for those shards.
 
 The cutoff is `reference − retention`, where the reference is
 `retention::retention_reference(now, newest_timestamp_held)` —
@@ -588,8 +587,11 @@ Per-measurement retention follows the same ordering principle.
 is a **`TimeBucket`**: a fixed span for sub-day widths, the local calendar for
 `d`/`w`/`mo`/`y`, so a daily tier runs local midnight to local midnight and a
 monthly one is a calendar month. `RollupBuilder` takes `every("15m")` /
-`every("1mo")` with an optional `timezone("Europe/Berlin")`, and refuses a
-width or a zone it cannot parse at `build()`.
+`every("1mo")` with an optional `timezone("Europe/Berlin")` and
+`origin("2024-01-15")`, and refuses a width, a zone or an origin it cannot
+parse at `build()`. `bucket()` supplies a `TimeBucket` whole, for a protocol
+handler that has already validated the strings; it supersedes the three.
+
 `RollupRegistry` manages CRUD via `add()`, `remove()`, `list()`, `get()` and
 `rollups_for_source()`, refuses a definition that would make a measurement
 feed itself (`would_cycle()`), and carries a

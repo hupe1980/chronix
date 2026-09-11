@@ -642,3 +642,168 @@ async fn flight_get_tables_is_namespace_scoped() {
         "another tenant must not learn the measurement exists; got {b}"
     );
 }
+
+/// Flight `DoPut` can import history, like every other write surface.
+///
+/// `CommandStatementUpdate` carries the measurement name and nothing else, so
+/// a Flight client loading a year of meter data had no way to ask for a
+/// backfill — every point outside the out-of-order window was refused, and
+/// the only workaround was to use a different protocol. The flag travels in
+/// `FlightData.app_metadata`, which is the Flight protocol's own extension
+/// point.
+#[tokio::test]
+async fn flight_do_put_can_backfill_history() {
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let (mut client, db, _tmp) = start_flight_server().await;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(chronix::chronix_core::TIME_COLUMN, DataType::Int64, false),
+        Field::new("host", DataType::Utf8, true),
+        Field::new("v", DataType::Float64, true),
+    ]));
+
+    // Establish "now" for the out-of-order window with a live write.
+    let now = chronixd::util::now_nanos().unwrap();
+    let live = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![now])),
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(Float64Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+    put(&mut client, &schema, live, "hist", None)
+        .await
+        .expect("the live write establishes the out-of-order window");
+
+    // A year ago is far outside the window.
+    let old = now - 365 * 86_400 * 1_000_000_000_i64;
+    let historic = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![old])),
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(Float64Array::from(vec![2.0])),
+        ],
+    )
+    .unwrap();
+
+    // Without the flag it is refused — otherwise this test would pass on a
+    // server that ignored the flag entirely.
+    let refused = put(&mut client, &schema, historic.clone(), "hist", None).await;
+    assert!(
+        refused.is_err(),
+        "a live write a year in the past must be refused"
+    );
+
+    // With it, the point lands.
+    put(
+        &mut client,
+        &schema,
+        historic,
+        "hist",
+        Some(br#"{"backfill": true}"#.to_vec()),
+    )
+    .await
+    .expect("a backfill DoPut must be accepted");
+
+    let plan = db
+        .query()
+        .measurement("hist")
+        .range(i64::MIN, i64::MAX)
+        .build()
+        .unwrap();
+    assert_eq!(
+        db.execute(&plan).unwrap().num_rows(),
+        2,
+        "both the live point and the backfilled one"
+    );
+}
+
+/// A key the server does not know is refused, not ignored.
+///
+/// A client that misspells `backfill` would otherwise have its history
+/// rejected point by point, which is exactly what the flag exists to avoid.
+#[tokio::test]
+async fn flight_do_put_refuses_app_metadata_it_does_not_understand() {
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let (mut client, _db, _tmp) = start_flight_server().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(chronix::chronix_core::TIME_COLUMN, DataType::Int64, false),
+        Field::new("host", DataType::Utf8, true),
+        Field::new("v", DataType::Float64, true),
+    ]));
+    let now = chronixd::util::now_nanos().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![now])),
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(Float64Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+
+    let err = put(
+        &mut client,
+        &schema,
+        batch,
+        "typo",
+        Some(br#"{"backfil": true}"#.to_vec()),
+    )
+    .await
+    .expect_err("a misspelled option must not be silently ignored");
+    assert!(
+        err.to_string().contains("app_metadata"),
+        "the error should name the field: {err}"
+    );
+}
+
+/// Send one batch over `DoPut`, optionally with `app_metadata`.
+async fn put(
+    client: &mut arrow_flight::flight_service_client::FlightServiceClient<
+        tonic::transport::Channel,
+    >,
+    schema: &Arc<arrow::datatypes::Schema>,
+    batch: RecordBatch,
+    measurement: &str,
+    app_metadata: Option<Vec<u8>>,
+) -> Result<(), tonic::Status> {
+    use arrow_flight::sql::CommandStatementUpdate;
+
+    let cmd = CommandStatementUpdate {
+        query: measurement.to_string(),
+        transaction_id: None,
+    };
+    let descriptor = FlightDescriptor::new_cmd(pack_any(&cmd));
+    let flight_data: Vec<arrow_flight::FlightData> =
+        arrow_flight::utils::batches_to_flight_data(schema.as_ref(), vec![batch])
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                if i == 0 {
+                    d.flight_descriptor = Some(descriptor.clone());
+                    if let Some(ref meta) = app_metadata {
+                        d.app_metadata = meta.clone().into();
+                    }
+                }
+                d
+            })
+            .collect();
+
+    // The per-batch error arrives on the result stream, not on `do_put`.
+    let mut stream = client
+        .do_put(futures::stream::iter(flight_data))
+        .await?
+        .into_inner();
+    while let Some(item) = stream.message().await.transpose() {
+        item?;
+    }
+    Ok(())
+}

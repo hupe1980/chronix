@@ -72,8 +72,9 @@ impl super::Chronix {
 
     /// Internal hard-delete implementation for a measurement.
     ///
-    /// Flushes memtables, removes all segment files, cleans up catalog,
-    /// schema, indexes, and caches. Used by the immediate `drop_measurement`
+    /// Flushes memtables, retires every segment of the measurement, and
+    /// clears the catalog, schema, indexes and caches. Used by the immediate
+    /// `drop_measurement`
     pub(super) fn hard_delete_measurement(&self, measurement: &str) -> Result<()> {
         // 1. Flush all shards so memtable data lands in segments
         self.flush()?;
@@ -88,25 +89,14 @@ impl super::Chronix {
                 .collect()
         };
 
-        // 3. Delete segment files and remove from catalog
+        // 3. Retire every segment of the measurement — the same path
+        //    retention, compaction and archiving take, so a scan already
+        //    holding one of these paths keeps its answer and the file goes on
+        //    the next GC instead.
+        self.retire_segments(&entries);
+
         {
             let mut catalog = self.catalog.write();
-            for entry in &entries {
-                // Remove segment file from disk (best-effort)
-                if let Err(e) = std::fs::remove_file(&entry.path) {
-                    warn!(
-                        path = %entry.path.display(),
-                        error = %e,
-                        "Failed to delete segment file"
-                    );
-                }
-                if let Err(e) = chronix_engine::index::series_index::remove(&entry.path) {
-                    warn!(path = %entry.path.display(), error = %e, "failed to remove series index");
-                }
-                // Remove from catalog manifest
-                catalog.remove_segment(entry.segment_id)?;
-            }
-
             // 4. Remove schema from catalog
             catalog.remove_schema(measurement)?;
 
@@ -120,21 +110,7 @@ impl super::Chronix {
         // 5. Remove schema from in-memory registry
         let _ = self.schema.remove(measurement);
 
-        // 6. Clean up time-index and bloom entries for removed segments
-        {
-            let mut time_idx = self.time_index.write();
-            let mut blooms = self.blooms.write();
-            for entry in &entries {
-                if let Some(idx) = time_idx.get_mut(&entry.shard_id) {
-                    if !idx.remove_segment(entry.segment_id) {
-                        warn!(segment_id = ?entry.segment_id, "drop: time-index entry not found");
-                    }
-                }
-                blooms.remove(&entry.segment_id.0);
-            }
-        }
-
-        // 7. Reset cardinality tracker.
+        // 6. Reset cardinality tracker.
         //
         // Selectively remove only series belonging to the dropped measurement.
         // Canonical forms are prefixed with `measurement\0`, so `starts_with`
@@ -145,7 +121,7 @@ impl super::Chronix {
                 .retain(|canonical| !canonical.starts_with(&prefix));
         }
 
-        // 8. Forget the measurement in the namespace index.
+        // 7. Forget the measurement in the namespace index.
         //
         // That index answers "may this namespace see this measurement", and a
         // dropped measurement exists for nobody. It follows the *measurement*
@@ -158,13 +134,9 @@ impl super::Chronix {
             !set.is_empty()
         });
 
-        // 9. Evict measurement from caches and inverted index
+        // 8. Evict the measurement from the last-value cache. The
+        //    per-segment indexes went with the retirement in step 3.
         self.lvc.evict_measurement(measurement);
-        for entry in &entries {
-            self.tag_index.remove_segment(entry.segment_id);
-            self.metadata_cache.remove(entry.segment_id);
-            self.segment_cache.invalidate_segment(entry.segment_id);
-        }
 
         info!(measurement, segments = entries.len(), "Measurement dropped");
 
@@ -302,15 +274,23 @@ impl super::Chronix {
         let measurement = &req.measurement;
         let (start, end) = req.effective_range();
 
-        // Find active segments for measurement in the time range
-        let entries: Vec<SegmentCatalogEntry> = {
+        // Find active segments for measurement in the time range, and lease
+        // them: the scan below opens each one, and a retirement pass running
+        // beside it would otherwise unlink one and count it as "skipped" —
+        // turning a complete delete into a partial one for a reason that has
+        // nothing to do with the data (see `db::leases`).
+        let (entries, _lease) = {
             let catalog = self.catalog.read();
-            catalog
+            let entries: Vec<SegmentCatalogEntry> = catalog
                 .active_segments_for_measurement(measurement)
                 .into_iter()
                 .filter(|e| e.min_timestamp <= end && e.max_timestamp >= start)
                 .cloned()
-                .collect()
+                .collect();
+            let lease = self
+                .segment_leases
+                .acquire(entries.iter().map(|e| e.segment_id));
+            (entries, lease)
         };
 
         // Per matched series: the newest timestamp seen inside the requested

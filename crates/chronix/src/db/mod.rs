@@ -8,6 +8,7 @@ mod accessors;
 mod analytics_api;
 mod backup;
 mod delete;
+pub(crate) mod leases;
 mod lifecycle;
 mod query;
 mod rollup;
@@ -26,19 +27,15 @@ use dashmap::{DashMap, DashSet};
 use fs2::FileExt;
 use tracing::{debug, error, info, warn};
 
-use crate::lock_order::{
-    BloomsLock, CatalogLock, RollupRegistryLock, TimeIndexLock, TombstonesLock,
-};
+use crate::lock_order::{BloomsLock, CatalogLock, RollupRegistryLock, TombstonesLock};
 
 use chronix_core::{
     wal_decode, ChronixConfig, SchemaRegistry, SegmentState, ShardId, TombstoneSet, WalEntry,
 };
 use chronix_engine::cache::lvc::LastValueCache;
-use chronix_engine::cache::metadata::{CachedSegmentMeta, MetadataCache};
 use chronix_engine::cache::SegmentCache;
-use chronix_engine::index::{SegmentCatalog, SeriesBloomFilter, TagInvertedIndex, TimeIndex};
+use chronix_engine::index::{SegmentCatalog, SeriesBloomFilter, TagInvertedIndex};
 use chronix_engine::memtable::{FlushConfig, ShardRouter, ShardRouterConfig};
-use chronix_engine::segment::reader::SegmentReader;
 use chronix_engine::segment::SegmentWriterConfig;
 use chronix_engine::wal::WalWriter;
 
@@ -90,7 +87,10 @@ pub struct DatabaseStatistics {
     /// Heap held by the WAL writer's buffer. Fixed size.
     pub wal_buffer_bytes: usize,
     /// Heap held by the segment catalog, schema registry and tombstone set.
-    /// Grows with segment count, and lives for the process's lifetime.
+    ///
+    /// The per-segment term: it grows with the segment count and lives for
+    /// the process's lifetime, so on a deployment with a multi-year rollup
+    /// tier this is the one that grows.
     pub catalog_memory_bytes: usize,
     /// Number of distinct measurements (schemas).
     pub measurement_count: usize,
@@ -98,23 +98,19 @@ pub struct DatabaseStatistics {
     pub wal_sequence: u64,
     /// Number of tombstoned (soft-deleted) series.
     pub tombstone_count: usize,
-    /// Number of entries in the segment metadata index — one per live
-    /// segment.
-    pub metadata_cache_entries: usize,
-    /// Heap held by the segment metadata index: each segment's header, column
-    /// statistics and per-tag bloom filters.
+    /// Segment files a running scan has been handed and may still open.
     ///
-    /// Grows with the segment count, so on a long-lived deployment with a
-    /// multi-year rollup tier this is the term that grows — and it was the
-    /// one term [`resident_memory_bytes`](Self::resident_memory_bytes) did
-    /// not sum, under a comment estimating it at "~1 KB per entry" that no
-    /// bloom filter was ever going to honour.
-    pub metadata_cache_bytes: usize,
+    /// A retirement pass unlinks a segment's file in the same step that takes
+    /// it out of the catalog, unless this count says a reader is still on it —
+    /// then the bytes wait for the next garbage collection. Ordinarily near
+    /// zero and briefly the size of one query's segment set; a number that
+    /// only grows is a stream nobody dropped.
+    pub leased_segments: usize,
 }
 
 impl DatabaseStatistics {
-    /// The engine's resident heap: memtables, interners, WAL buffer, catalog
-    /// and the segment metadata index.
+    /// The engine's resident heap: memtables, interners, WAL buffer and
+    /// catalog.
     ///
     /// This is the number a memory budget is about. It does **not** include a
     /// query's working set — a DataFusion plan allocates against its own
@@ -130,7 +126,6 @@ impl DatabaseStatistics {
             + self.interner_memory_bytes
             + self.wal_buffer_bytes
             + self.catalog_memory_bytes
-            + self.metadata_cache_bytes
     }
 }
 
@@ -154,10 +149,9 @@ pub(super) fn chrono_timestamp_ms() -> u64 {
 /// this total order:
 ///
 /// 1. `catalog` (`RwLock<SegmentCatalog>`)
-/// 2. `time_index` (`RwLock<BTreeMap<ShardId, TimeIndex>>`)
-/// 3. `blooms` (`RwLock<BTreeMap<u64, SeriesBloomFilter>>`)
-/// 4. `tombstones` (`RwLock<TombstoneSet>`)
-/// 5. `rollup_registry` (`RwLock<RollupRegistry>`)
+/// 2. `blooms` (`RwLock<BTreeMap<u64, SeriesBloomFilter>>`)
+/// 3. `tombstones` (`RwLock<TombstoneSet>`)
+/// 4. `rollup_registry` (`RwLock<RollupRegistry>`)
 ///
 /// `known_series` uses [`DashSet`] (sharded concurrent hash set) and does
 /// **not** participate in this ordering — its per-shard internal locks
@@ -222,9 +216,7 @@ pub struct DbInner {
     pub(super) schema: Arc<SchemaRegistry>,
     /// Segment catalog (persisted).  Level-1 ordered lock.
     pub(super) catalog: Arc<CatalogLock<SegmentCatalog>>,
-    /// Per-shard time index for segment pruning.  Level-2 ordered lock.
-    pub(super) time_index: Arc<TimeIndexLock<BTreeMap<ShardId, TimeIndex>>>,
-    /// Per-segment bloom filters (loaded from sidecar files on open).  Level-3 ordered lock.
+    /// Per-segment bloom filters (loaded from sidecar files on open).  Level-2 ordered lock.
     pub(super) blooms: Arc<BloomsLock<BTreeMap<u64, SeriesBloomFilter>>>,
     /// Unique series canonical forms for cardinality enforcement.
     /// Uses canonical form (`measurement\0tag1=v1\0tag2=v2`) instead of
@@ -247,8 +239,6 @@ pub struct DbInner {
     pub(super) tombstones: Arc<TombstonesLock<TombstoneSet>>,
     /// Last-value cache for fast latest-point queries.
     pub(super) lvc: LastValueCache,
-    /// Metadata cache for segment-level stats.
-    pub(super) metadata_cache: Arc<MetadataCache>,
 
     /// Which measurements each namespace holds series for.
     ///
@@ -269,6 +259,9 @@ pub struct DbInner {
     pub(super) segment_cache: Arc<SegmentCache>,
     /// Inverted index: tag-value → segment IDs for fast tag filtering.
     pub(super) tag_index: Arc<TagInvertedIndex>,
+    /// Segment files a live reader may still open — see
+    /// `db::leases` for why unlinking one of them has to wait.
+    pub(super) segment_leases: Arc<leases::SegmentLeases>,
     /// Rollup registry for managing rollup definitions.  Level-5 ordered lock.
     pub(super) rollup_registry: Arc<RollupRegistryLock<RollupRegistry>>,
     /// Compaction picker for selecting segments to compact.
@@ -415,38 +408,7 @@ impl Chronix {
         // Rebuild the indexes and the series set from the catalog and the
         // per-segment series sidecars — no segment is decoded here.
         let namespace_measurements;
-        let (time_indices, blooms, tag_index, mut known_series) =
-            Self::load_catalog_state(&catalog);
-
-        // Populate metadata cache from existing segments on disk
-        let metadata_cache = {
-            let cache = MetadataCache::new();
-            for entry in catalog.all_segments() {
-                match SegmentReader::open(&entry.path) {
-                    Ok(reader) => {
-                        cache.insert(CachedSegmentMeta {
-                            segment_id: entry.segment_id,
-                            header: reader.header().clone(),
-                            columns: reader.column_metadata().to_vec(),
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            segment = %entry.path.display(),
-                            error = %e,
-                            "Could not load segment metadata into cache"
-                        );
-                    }
-                }
-            }
-            if !cache.is_empty() {
-                info!(
-                    segments = cache.len(),
-                    "Metadata cache populated on startup"
-                );
-            }
-            Arc::new(cache)
-        };
+        let (blooms, tag_index, mut known_series) = Self::load_catalog_state(&catalog);
 
         // Open WAL
         let wal = WalWriter::open(&wal_dir, config.wal.clone())?;
@@ -619,7 +581,6 @@ impl Chronix {
                 shards,
                 schema,
                 catalog: Arc::new(CatalogLock::new(catalog)),
-                time_index: Arc::new(TimeIndexLock::new(time_indices)),
                 blooms: Arc::new(BloomsLock::new(blooms)),
                 known_series: {
                     let set: DashSet<String> = known_series.into_iter().collect();
@@ -628,11 +589,11 @@ impl Chronix {
                 },
                 tombstones: Arc::new(TombstonesLock::new(replay_tombstones)),
                 lvc: LastValueCache::new(),
-                metadata_cache,
                 namespace_measurements,
                 disk_usage: parking_lot::RwLock::new(None),
                 segment_cache: Arc::new(SegmentCache::new(segment_cache_size)),
                 tag_index: Arc::new(tag_index),
+                segment_leases: Arc::new(leases::SegmentLeases::default()),
                 rollup_registry: Arc::new(RollupRegistryLock::new(rollup_registry)),
                 compaction_picker: CompactionPicker::default(),
                 cdc_bus: EventBus::new(cdc_capacity),
@@ -2203,7 +2164,7 @@ mod tests {
         }
 
         // GC with 0 grace period — should clean up immediately
-        let gc_cleaned = db.gc_with_grace(0).unwrap();
+        let gc_cleaned = db.gc().unwrap();
         assert!(gc_cleaned > 0, "GC should have cleaned up segments");
 
         // After GC: soft-deleted files should be removed
@@ -2277,7 +2238,7 @@ mod tests {
         assert!(compacted >= 1, "expected at least 1 compaction task");
 
         // GC soft-deleted segments so catalog count actually drops
-        let _gc = db.gc_with_grace(0).unwrap();
+        let _gc = db.gc().unwrap();
 
         let l0_after = {
             let cat = db.catalog.read();
@@ -2435,7 +2396,7 @@ mod tests {
             // Compact and GC periodically to prevent backpressure
             if i % 10 == 9 {
                 let _ = db.compact();
-                let _ = db.gc_with_grace(0);
+                let _ = db.gc();
                 let _ = db.wal.truncate_before(u64::MAX);
             }
         }

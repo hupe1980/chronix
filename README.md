@@ -44,7 +44,7 @@ crate.
   decimals — a meter reporting `231.45` W — and pco recovers the integer
   instead of XOR-ing bit patterns, then entropy-codes the deltas. On realistic
   meter and inverter data (noise, plateaus, dropouts) that is worth **5–29×**,
-  against 3–9× for ALP and 1.0–2.5× for the XOR codecs; on clean
+  against 3–8× for ALP and 1.0–2.5× for the XOR codecs; on clean
   low-precision counters it reaches 46–85×. Timestamps use pco too: a jittered
   1-second sampler compresses 2.7× where delta-of-delta manages 0.9×, worse
   than plain. Every number here is pinned by a test — including the *gap*
@@ -186,8 +186,7 @@ Each claim below is pinned by a test; the depth is in the
   25 MiB peak heap** for an hour of the design partner's workload — rollups
   and dashboards included — settling at 1.6 MiB, and
   `DatabaseStatistics::resident_memory_bytes` breaks that down term by term:
-  memtables, interners, the WAL buffer, the catalog and the segment metadata
-  index.
+  memtables, interners, the WAL buffer and the catalog.
 - **Immutable `.csx` segments**: row groups, per-column stats, validity
   bitmaps, LZ4/Zstd with dictionary training, mmap reads, atomic
   temp→fsync→rename. Footer size is proportional to the data, not a fixed
@@ -195,7 +194,7 @@ Each claim below is pinned by a test; the depth is in the
 - **Compaction never blocks writes** — hybrid TWCS + size-tiered, streaming
   K-way merge in `O(chunk + K)` memory, with write-amplification budgeting and
   backpressure.
-- **Layered pruning**: time index → series blooms → inverted tag index →
+- **Layered pruning**: catalog time range → inverted tag index → series blooms →
   column stats → zone maps. Each level can only keep a segment it could have
   dropped, never the reverse. Every segment carries a `.series` sidecar, so
   blooms, the tag index and the exact cardinality are rebuilt at open without
@@ -218,8 +217,11 @@ Each claim below is pinned by a test; the depth is in the
 - **A tier can be a calendar tier.** `every("1d").timezone("Europe/Berlin")`
   runs local midnight to local midnight — 23 or 25 hours on a daylight-saving
   day — and `every("1mo")` is a calendar month. The **unit decides**: sub-day
-  widths are a fixed span, super-day widths follow the calendar. `time_bucket()`
-  in SQL takes the same widths and the same zone.
+  widths are a fixed span, super-day widths follow the calendar. One
+  `TimeBucket` answers this for all three surfaces that bucket time — a rollup
+  tier, `time_bucket()` in SQL, and the native `downsample()` — so they cannot
+  disagree about where a day begins. An `origin` moves the boundary, for a
+  billing month that starts on the 15th or a shift day that starts at 06:00.
 - **Parquet cold archive** reads each cold `(measurement, shard)` group
   *through the read path* — deduplicated, tombstones applied — writes one
   Hive-partitioned object to S3/GCS/Azure, verifies it, and only then drops

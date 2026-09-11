@@ -7,12 +7,12 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 
-use crate::timebucket::TimeBucket;
+use chronix_core::timebucket::TimeBucket;
 
 // ── time_bucket ─────────────────────────────────────────────────────────
 
 /// `time_bucket(width, timestamp [, timezone])` — the SQL face of
-/// [`TimeBucket`](crate::timebucket::TimeBucket).
+/// [`TimeBucket`](chronix_core::timebucket::TimeBucket).
 ///
 /// Widths: `'30s'`, `'15m'`, `'1h'`, `'1d'`, `'1w'`, `'1mo'`, `'3mo'`, `'1y'`.
 /// The **unit** decides what the bucket means — sub-day units are a fixed span
@@ -60,6 +60,21 @@ impl TimeBucketUdf {
                         DataType::Timestamp(TimeUnit::Nanosecond, None),
                         DataType::Utf8,
                     ]),
+                    // …and with an origin. Written as a timestamp, or as a
+                    // string DataFusion coerces to one — `'2024-01-15'` is
+                    // what anybody actually types.
+                    TypeSignature::Exact(vec![
+                        DataType::Utf8,
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        DataType::Utf8,
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    ]),
+                    TypeSignature::Exact(vec![
+                        DataType::Utf8,
+                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                        DataType::Utf8,
+                        DataType::Utf8,
+                    ]),
                 ]),
                 Volatility::Immutable,
             ),
@@ -100,8 +115,36 @@ impl ScalarUDFImpl for TimeBucketUdf {
         } else {
             None
         };
-        let bucket = TimeBucket::parse(&interval_str, tz_str)
+        let mut bucket = TimeBucket::parse(&interval_str, tz_str)
             .map_err(|e| datafusion::common::DataFusionError::Plan(format!("time_bucket: {e}")))?;
+
+        // The origin is the optional fourth argument. `TimeBucket` is
+        // `Copy`, and both forms go through the same parser the rollup API
+        // uses, so a local origin lands in the bucket's own zone.
+        if let Some(origin) = args.get(3) {
+            let plan_err = |e: chronix_core::timebucket::BucketParseError| {
+                datafusion::common::DataFusionError::Plan(format!("time_bucket: {e}"))
+            };
+            bucket = match origin {
+                ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(ts), _)) => {
+                    bucket.with_origin(*ts).map_err(plan_err)?
+                }
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(text))) => {
+                    bucket.with_origin_str(text).map_err(plan_err)?
+                }
+                // A NULL origin is the default anchor, not an error, so
+                // `time_bucket(w, t, tz, NULL)` stays writable in generated
+                // SQL.
+                ColumnarValue::Scalar(s) if s.is_null() => bucket,
+                _ => {
+                    return Err(datafusion::common::DataFusionError::Plan(
+                        "time_bucket: the origin must be a constant timestamp or date string, \
+                         e.g. TIMESTAMP '2024-01-15 00:00:00' or '2024-01-15'"
+                            .into(),
+                    ))
+                }
+            };
+        }
 
         // Get timestamps
         match &args[1] {
@@ -132,7 +175,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::timebucket::BucketWidth;
+    use chronix_core::timebucket::BucketWidth;
 
     /// The widths a `time_bucket()` caller writes, parsed by the one parser.
     ///

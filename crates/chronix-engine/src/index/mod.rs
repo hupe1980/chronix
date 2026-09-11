@@ -4,7 +4,6 @@
 //!
 //! This crate provides indexing structures for efficient segment pruning:
 //!
-//! - [`TimeIndex`] — Sorted time-range index for O(log N) segment lookup
 //! - [`SeriesBloomFilter`] — Per-segment bloom filters for series key pruning
 //! - [`series_index`] — The per-segment series list the blooms, the tag index
 //!   and the cardinality budget are rebuilt from at open
@@ -23,14 +22,12 @@ pub mod catalog;
 pub mod error;
 pub mod inverted;
 pub mod series_index;
-pub mod time_index;
 pub mod zone_map;
 
 pub use bloom::SeriesBloomFilter;
 pub use catalog::{CatalogColumnStats, SegmentCatalog, SegmentCatalogEntry};
 pub use error::IndexError;
 pub use inverted::TagInvertedIndex;
-pub use time_index::{TimeIndex, TimeIndexEntry};
 pub use zone_map::{
     prune_row_groups, segment_overlaps_range, ZoneMapOp, ZoneMapPredicate, ZoneMapResult,
 };

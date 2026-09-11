@@ -74,7 +74,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
                 Some(ClusterState::Meta(state))
             }
             ClusterMode::Data => {
-                let grpc_addr = config.server.grpc_addr.to_string();
+                let grpc_addr = config.server.grpc_addr().to_string();
                 let state =
                     crate::cluster::start_data_node(cluster_cfg, &grpc_addr, db.clone()).await?;
                 Some(ClusterState::Data(state))
@@ -86,6 +86,10 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
 
     // ── Prometheus metrics ─────────────────────────────────────────────
     let metrics_handle = setup_prometheus()?;
+    // Publish the write path's counters at zero, so a dashboard reads "0
+    // errors" rather than "No data" — which is what an operator sees when a
+    // metric does not exist at all.
+    crate::util::register_write_metrics();
 
     // ── Connector manager ───────────────────────────────────────────────
     let connector_manager = Arc::new(
@@ -443,7 +447,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     };
 
     // ── gRPC server (tonic) ────────────────────────────────────────────
-    let grpc_addr = config.server.grpc_addr;
+    let grpc_addr = config.server.grpc_addr();
     let grpc_service = ChronixGrpcService::with_streaming_config(
         db.clone(),
         start_time,
@@ -597,7 +601,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     });
 
     // ── Flight SQL server ──────────────────────────────────────────────
-    let flight_addr = config.server.flight_addr;
+    let flight_addr = config.server.flight_addr();
     let flight_drain_timeout = shutdown_timeout;
     let flight_service = ChronixFlightSqlService::new(db.clone())
         .with_multi_tenancy(config.server.multi_tenancy)
@@ -716,8 +720,8 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         version = env!("CARGO_PKG_VERSION"),
         mode = %mode_label,
         http = %config.server.http_addr,
-        grpc = %config.server.grpc_addr,
-        flight_sql = %config.server.flight_addr,
+        grpc = %config.server.grpc_addr(),
+        flight_sql = %config.server.flight_addr(),
         data_dir = %config.database.data_dir.display(),
         tls = config.tls.is_some(),
         "chronixd started"
@@ -848,10 +852,9 @@ pub fn build_router(
                 // answers "no data" for a metric nobody writes exactly as it
                 // does for a quiet one.
                 //
-                // The cost is one pass over the catalog's segments and column
-                // statistics. The two expensive terms are paid for elsewhere:
-                // `disk_usage_bytes()` caches its directory walk for a minute,
-                // and the metadata index keeps a running byte total.
+                // The cost is one pass over the catalog's segments. The one
+                // expensive term is paid for elsewhere: `disk_usage_bytes()`
+                // caches its directory walk for a minute.
                 let stats_state = state_for_metrics.clone();
                 move || {
                     let handle = metrics_handle.clone();
@@ -1243,10 +1246,78 @@ pub fn build_router(
         .with_state(state)
 }
 
+/// Latency buckets, in seconds, for every `*_duration_seconds` histogram.
+///
+/// Spread from 100 µs to a minute because the same suffix covers a memtable
+/// write (microseconds) and a compaction (seconds). Eighteen buckets is
+/// eighteen extra series per label set, which is the cost of being able to
+/// aggregate a quantile across replicas at all.
+const DURATION_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0, 30.0, 60.0,
+];
+
+/// Points per write batch: one point at a time through to a bulk import.
+const BATCH_SIZE_BUCKETS: &[f64] = &[
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 50000.0,
+];
+
+/// Compression ratio — a multiple, never below 1.
+const RATIO_BUCKETS: &[f64] = &[
+    1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0,
+];
+
+/// The Prometheus exporter, with buckets configured.
+///
+/// **Without buckets `metrics-exporter-prometheus` renders every `histogram!`
+/// as a Prometheus *summary*** — a different metric with no `_bucket` series,
+/// so `histogram_quantile()` has nothing to read and every latency panel in
+/// `dashboards/` draws nothing. Summary quantiles also cannot be aggregated
+/// across replicas.
+///
+/// `set_buckets` sets the **default**, so a histogram added later renders as
+/// a histogram even if nobody adds a matcher for it; the matchers only refine.
+///
+/// The test harness builds its recorder from here too, so a test can observe
+/// the exposition format the server actually serves.
+///
+/// # Errors
+///
+/// [`ServerError::Internal`] if a bucket list is empty, which the constants
+/// above are not.
+pub fn prometheus_builder() -> Result<metrics_exporter_prometheus::PrometheusBuilder, ServerError> {
+    use metrics_exporter_prometheus::Matcher;
+    let bad = |e: metrics_exporter_prometheus::BuildError| {
+        ServerError::Internal(format!("invalid Prometheus buckets: {e}"))
+    };
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets(DURATION_BUCKETS)
+        .map_err(bad)?
+        .set_buckets_for_metric(
+            Matcher::Suffix("_duration_seconds".to_owned()),
+            DURATION_BUCKETS,
+        )
+        .map_err(bad)?
+        .set_buckets_for_metric(
+            Matcher::Full("chronix_batch_size".to_owned()),
+            BATCH_SIZE_BUCKETS,
+        )
+        .map_err(bad)?
+        .set_buckets_for_metric(
+            Matcher::Full("chronix_segment_compression_ratio".to_owned()),
+            RATIO_BUCKETS,
+        )
+        .map_err(bad)
+}
+
 /// Set up Prometheus metrics exporter and return the handle for rendering.
+///
+/// # Errors
+///
+/// [`ServerError::Internal`] if the recorder cannot be installed — which
+/// happens when one already is, since the recorder is process-global.
 pub fn setup_prometheus() -> Result<metrics_exporter_prometheus::PrometheusHandle, ServerError> {
-    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
-    builder
+    prometheus_builder()?
         .install_recorder()
         .map_err(|e| ServerError::Internal(format!("failed to install Prometheus recorder: {e}")))
 }
@@ -1386,18 +1457,7 @@ async fn wait_for_os_signal() {
 /// legitimate deployment, and a server that will not start is a server people
 /// work around with `--i-know-what-i-am-doing`.
 fn warn_if_exposed_without_auth(config: &crate::config::ServerConfig) {
-    if config.auth.is_some() {
-        return;
-    }
-    let exposed: Vec<String> = [
-        ("HTTP", config.server.http_addr),
-        ("gRPC", config.server.grpc_addr),
-        ("Flight SQL", config.server.flight_addr),
-    ]
-    .into_iter()
-    .filter(|(_, addr)| !addr.ip().is_loopback())
-    .map(|(name, addr)| format!("{name} {addr}"))
-    .collect();
+    let exposed = exposed_listeners(config);
     if exposed.is_empty() {
         return;
     }
@@ -1407,6 +1467,31 @@ fn warn_if_exposed_without_auth(config: &crate::config::ServerConfig) {
          from anyone who can reach them. Add [[auth.api_keys]], or bind to \
          127.0.0.1."
     );
+}
+
+/// The listeners this configuration would open to the network with nothing
+/// authenticating them, named. Empty when `[auth]` is configured or every
+/// listener is on loopback.
+///
+/// **`--check-config` and the running server ask this through one function.**
+/// They asked it separately, and disagreed: `--check-config` warned whenever
+/// `[auth]` was absent, whatever the addresses were, so the pre-deploy check
+/// the deployment guide recommends printed a security warning for a server
+/// bound entirely to loopback — every time, which is how a warning stops
+/// being read.
+pub fn exposed_listeners(config: &crate::config::ServerConfig) -> Vec<String> {
+    if config.auth.is_some() {
+        return Vec::new();
+    }
+    [
+        ("HTTP", config.server.http_addr),
+        ("gRPC", config.server.grpc_addr()),
+        ("Flight SQL", config.server.flight_addr()),
+    ]
+    .into_iter()
+    .filter(|(_, addr)| !addr.ip().is_loopback())
+    .map(|(name, addr)| format!("{name} {addr}"))
+    .collect()
 }
 
 fn build_trigger_pipeline(

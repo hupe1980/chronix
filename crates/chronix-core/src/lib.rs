@@ -13,6 +13,9 @@
 //!   settlement. See [`decimal`] for why a `f64` cannot carry those.
 //! - **Schema:** [`MeasurementSchema`], [`SchemaRegistry`] — schema-on-write with
 //!   additive evolution.
+//! - **Calendar buckets:** [`TimeBucket`] — the one answer to "what is a day",
+//!   shared by SQL's `time_bucket()`, a rollup tier and the native
+//!   `downsample()` plan, so the three cannot disagree. See [`timebucket`].
 //! - **Errors:** [`ChronixError`] — crate-level and top-level error hierarchy.
 //! - **Configuration:** [`ChronixConfig`], [`WalConfig`] — full database
 //!   configuration with builder pattern.
@@ -25,6 +28,7 @@ pub mod config;
 pub mod decimal;
 pub mod error;
 pub mod schema;
+pub mod timebucket;
 pub mod types;
 pub mod wal_codec;
 
@@ -39,6 +43,7 @@ pub use error::{ChronixError, ConfigError, SchemaError, WalError};
 pub use schema::{
     ColumnDef, ColumnRole, ColumnType, MeasurementSchema, SchemaAction, SchemaRegistry,
 };
+pub use timebucket::{BucketParseError, BucketWidth, TimeBucket};
 pub use types::{
     canonical_from_pairs, push_canonical, FieldValue, Fields, NamespaceId, NamespaceQuota,
     NamespaceUsage, Point, SegmentId, SegmentState, SeriesKey, ShardId, Tags, Timestamp, Tombstone,

@@ -12,13 +12,13 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use arrow::array::Array;
-use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array};
+use arrow::array::{Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
 use chronix::Chronix;
 use chronix_cluster::data_service::RegionQuery;
 use chronix_cluster::{RegionManager, RegionStorage};
-use chronix_core::{ColumnRole, FieldValue, Point, SeriesKey};
+use chronix_core::{ColumnRole, Point, SeriesKey};
 use chronix_meta::RegionId;
 
 /// [`RegionStorage`] adapter that delegates to the Chronix embedded engine.
@@ -309,29 +309,17 @@ fn batch_to_points(
             if col.is_null(row) {
                 continue;
             }
-            let val = match field_ref.data_type() {
-                arrow::datatypes::DataType::Float64 => col
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .map(|a| FieldValue::F64(a.value(row))),
-                arrow::datatypes::DataType::Int64 => col
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .map(|a| FieldValue::I64(a.value(row))),
-                arrow::datatypes::DataType::UInt64 => col
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .map(|a| FieldValue::U64(a.value(row))),
-                arrow::datatypes::DataType::Boolean => col
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .map(|a| FieldValue::Bool(a.value(row))),
-                arrow::datatypes::DataType::Utf8 => col
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .map(|a| FieldValue::String(a.value(row).to_string())),
-                _ => None,
-            };
+            // One shared conversion, and an *error* rather than a quiet
+            // arm: this function's output is stored — a distributed read and
+            // a Raft region snapshot — so a field it cannot represent must
+            // stop the snapshot, not vanish from it. `Decimal128` was
+            // missing from the match this replaces, which meant replicating
+            // a region silently discarded every exact-decimal field.
+            let val = chronix_query::arrow_cell_to_field_value(col.as_ref(), row).map_err(|e| {
+                chronix_cluster::ClusterError::Internal(format!(
+                    "column '{name}' cannot be converted back to a point: {e}"
+                ))
+            })?;
             if let Some(v) = val {
                 fields.insert(name.to_string(), v);
             }
@@ -374,7 +362,7 @@ mod tests {
             .collect();
         let key = SeriesKey::new(measurement, tags).unwrap();
         let mut fields = BTreeMap::new();
-        fields.insert("usage".to_string(), FieldValue::F64(value));
+        fields.insert("usage".to_string(), chronix_core::FieldValue::F64(value));
         Point::new(key, fields, ts).unwrap()
     }
 

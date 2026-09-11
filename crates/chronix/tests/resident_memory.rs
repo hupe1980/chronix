@@ -179,8 +179,7 @@ fn the_resident_heap_is_reported_term_by_term() {
         s.memtable_memory_bytes
             + s.interner_memory_bytes
             + s.wal_buffer_bytes
-            + s.catalog_memory_bytes
-            + s.metadata_cache_bytes,
+            + s.catalog_memory_bytes,
         "the sum must be the sum"
     );
 

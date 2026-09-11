@@ -32,7 +32,7 @@
   "links": [],
   "panels": [
     {
-      "title": "Query Latency (p50 / p99)",
+      "title": "Query Latency \u2014 native scan",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -51,21 +51,21 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(chronix_cluster_query_latency_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(chronix_query_duration_seconds_bucket[5m]))",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(chronix_cluster_query_latency_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, rate(chronix_query_duration_seconds_bucket[5m]))",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(chronix_cluster_query_latency_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, rate(chronix_query_duration_seconds_bucket[5m]))",
           "legendFormat": "p99"
         }
       ]
     },
     {
-      "title": "Write Latency (p50 / p99)",
+      "title": "Write Latency",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -84,15 +84,15 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(chronix_cluster_write_latency_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(chronix_write_duration_seconds_bucket[5m]))",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(chronix_cluster_write_latency_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, rate(chronix_write_duration_seconds_bucket[5m]))",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(chronix_cluster_write_latency_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.99, rate(chronix_write_duration_seconds_bucket[5m]))",
           "legendFormat": "p99"
         }
       ]
@@ -102,7 +102,7 @@
       "type": "timeseries",
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 8
       },
@@ -117,8 +117,16 @@
       },
       "targets": [
         {
-          "expr": "rate(chronix_cluster_query_latency_seconds_count[5m])",
-          "legendFormat": "Queries/s"
+          "expr": "rate(chronix_query_duration_seconds_count[5m])",
+          "legendFormat": "native scans/s"
+        },
+        {
+          "expr": "rate(chronix_sql_queries_total[5m])",
+          "legendFormat": "SQL queries/s"
+        },
+        {
+          "expr": "rate(chronix_promql_scans_total[5m])",
+          "legendFormat": "PromQL scans/s"
         }
       ]
     },
@@ -127,8 +135,8 @@
       "type": "timeseries",
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 8
       },
       "datasource": {
@@ -137,13 +145,125 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "wps"
         }
       },
       "targets": [
         {
-          "expr": "rate(chronix_cluster_write_latency_seconds_count[5m])",
-          "legendFormat": "Writes/s"
+          "expr": "rate(chronix_write_duration_seconds_count[5m])",
+          "legendFormat": "batches/s"
+        },
+        {
+          "expr": "rate(chronix_points_written_total[5m])",
+          "legendFormat": "points/s"
+        }
+      ]
+    },
+    {
+      "title": "Batch Size",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_batch_size_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_batch_size_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "title": "SQL Plan Cache Hit Ratio",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(chronix_sql_plan_cache_hits_total[5m]) / clamp_min(rate(chronix_sql_plan_cache_hits_total[5m]) + rate(chronix_sql_plan_cache_misses_total[5m]), 1e-9)",
+          "legendFormat": "hit ratio"
+        }
+      ]
+    },
+    {
+      "title": "PromQL Scan Cache Hit Ratio",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(chronix_promql_scan_cache_hits_total[5m]) / clamp_min(rate(chronix_promql_scans_total[5m]), 1e-9)",
+          "legendFormat": "hit ratio"
+        }
+      ]
+    },
+    {
+      "title": "Segments Pruned Before Reading",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(chronix_segments_pruned_by_time_and_index_total[5m])",
+          "legendFormat": "pruned/s"
         }
       ]
     }
@@ -165,5 +285,6 @@
   "timezone": "browser",
   "title": "Chronix \u2014 Query Performance",
   "uid": "chronix-query-performance",
-  "version": 1
+  "version": 1,
+  "description": "Single-node query and write performance. The cluster tier is frozen and excluded from the default build, so its scatter-gather latencies live in Chronix \u2014 Cluster Overview rather than here."
 }

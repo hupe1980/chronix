@@ -430,6 +430,13 @@ pub struct RollupInfo {
     pub every: String,
     /// The IANA zone the buckets are read against, or `null` for UTC.
     pub timezone: Option<String>,
+    /// The instant the boundaries are aligned to, RFC 3339, or `null` for
+    /// the default anchor (midnight on the 1st).
+    ///
+    /// Reported so the round trip this struct promises actually holds: a
+    /// rollup created with an `origin` used to read back without one, and
+    /// typing the response back in would have silently moved every boundary.
+    pub origin: Option<String>,
     /// Aggregation functions applied.
     pub aggregations: Vec<String>,
     /// Exclusive end of the newest bucket materialised so far, in
@@ -474,6 +481,10 @@ pub async fn list_rollups_handler(
                 target_measurement: r.target_measurement.clone(),
                 every: r.bucket.width().to_string(),
                 timezone: r.bucket.timezone().map(str::to_string),
+                origin: r
+                    .bucket
+                    .origin()
+                    .map(|ns| chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339()),
                 aggregations: r.aggregations.iter().map(|a| format!("{a:?}")).collect(),
                 materialised_until: state.materialised_until,
                 pending_repairs: state.pending_invalidations().to_vec(),
@@ -572,6 +583,14 @@ pub struct CreateRollupRequest {
     /// somebody else's day.
     #[serde(default)]
     pub timezone: Option<String>,
+    /// Move the bucket boundary off midnight on the 1st.
+    ///
+    /// An RFC 3339 instant, or `"2024-01-15"` / `"2024-01-15 06:00:00"` read
+    /// in `timezone`. Only its phase matters: a `1mo` tier takes its day of
+    /// month (a billing period from the 15th), a `1d` tier its time of day (a
+    /// shift that starts at 06:00). A monthly origin after day 28 is refused.
+    #[serde(default)]
+    pub origin: Option<String>,
     /// Aggregation functions to apply (avg, min, max, sum, count, last).
     pub aggregations: Vec<String>,
     /// Tags to group by.
@@ -621,8 +640,14 @@ pub async fn create_rollup_handler(
 
     // Parsed here rather than inside the blocking task so a typo is a `400`
     // naming what was wrong, not a `500`.
-    let bucket = chronix::timebucket::TimeBucket::parse(&body.every, body.timezone.as_deref())
-        .map_err(|e| ServerError::BadRequest(e.0))?;
+    let mut bucket =
+        chronix_core::timebucket::TimeBucket::parse(&body.every, body.timezone.as_deref())
+            .map_err(|e| ServerError::BadRequest(e.0))?;
+    if let Some(origin) = body.origin.as_deref() {
+        bucket = bucket
+            .with_origin_str(origin)
+            .map_err(|e| ServerError::BadRequest(e.0))?;
+    }
 
     let name_for_builder = rollup_name.clone();
     tokio::task::spawn_blocking(move || {

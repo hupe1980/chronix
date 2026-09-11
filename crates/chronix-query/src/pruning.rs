@@ -1,15 +1,22 @@
 //! Multi-level segment pruning pipeline.
 //!
 //! Eliminates segments from query processing before any data is decoded:
-//! 1. **Time pruning** — Exclude segments whose time range doesn't overlap
-//! 2. **Bloom pruning** — Exclude segments that don't contain the series key
-//! 3. **Stats pruning** — Exclude segments where column statistics exclude the predicate
+//! 1. **Bloom pruning** — Exclude segments that cannot contain the series key
+//! 2. **Stats pruning** — Exclude segments where column statistics exclude the predicate
+//!
+//! Time and tag-index pruning happen one level up, in `Chronix::prune_segments`,
+//! where the candidate set is already scoped to one measurement: the catalog
+//! entry carries `min_timestamp`/`max_timestamp`, so a separate time index
+//! answered nothing the catalog could not.
+//!
+//! **Every level here may only ever fail towards more work.** A segment with
+//! no bloom, or with no statistics for the filtered tag, is kept — both
+//! structures are derived from a segment's sidecar and can lag the catalog,
+//! and pruning what has not been seen loses rows with no error anywhere.
 
-use std::collections::HashMap;
-use std::hash::BuildHasher;
 use std::path::PathBuf;
 
-use chronix_engine::index::{SegmentCatalog, SegmentCatalogEntry, SeriesBloomFilter, TimeIndex};
+use chronix_engine::index::{SegmentCatalogEntry, SeriesBloomFilter};
 
 /// Statistics about segment pruning during query execution.
 #[derive(Debug, Clone, Default)]
@@ -50,59 +57,6 @@ pub struct PrunedSegment {
     pub entry: SegmentCatalogEntry,
     /// Filesystem path to the segment file.
     pub path: PathBuf,
-}
-
-/// Run the multi-level pruning pipeline.
-///
-/// # Levels
-///
-/// 1. **Time pruning**: Uses `TimeIndex` to find segments overlapping `[start, end]`
-/// 2. **Bloom pruning**: Uses bloom filters to exclude segments missing the series key
-/// 3. **Stats pruning**: Uses column statistics to exclude segments where
-///    required tag columns have zero `distinct_count` (column exists but is
-///    all-null — cannot possibly match a tag equality filter).
-///
-/// # Arguments
-///
-/// - `time_index` — Time range index
-/// - `catalog` — Segment catalog for metadata lookup
-/// - `bloom_filters` — Per-segment bloom filters (`segment_id` → filter)
-/// - `start_ts`, `end_ts` — Query time range
-/// - `series_key` — Canonical series key (for bloom), or `None`
-/// - `tag_filter_keys` — Tag column names used in equality filters (for stats pruning)
-#[must_use]
-pub fn prune_segments<S: BuildHasher>(
-    time_index: &TimeIndex,
-    catalog: &SegmentCatalog,
-    bloom_filters: &HashMap<u64, SeriesBloomFilter, S>,
-    start_ts: i64,
-    end_ts: i64,
-    series_key: Option<&chronix_core::SeriesKey>,
-    tag_filter_keys: &[&str],
-) -> PruningResult {
-    let segments_total = catalog.segment_count();
-
-    // Level 1: Time pruning
-    let time_matching_ids = time_index.segments_for_range(start_ts, end_ts);
-    let pruned_by_time = segments_total - time_matching_ids.len();
-
-    // Resolve IDs to catalog entries via HashMap for O(1) lookup per ID
-    let entries: Vec<&SegmentCatalogEntry> = {
-        let all = catalog.all_segments();
-        let id_map: std::collections::HashMap<u64, &SegmentCatalogEntry> =
-            all.iter().map(|e| (e.segment_id.0, *e)).collect();
-        time_matching_ids
-            .iter()
-            .filter_map(|seg_id| id_map.get(&seg_id.0).copied())
-            .collect()
-    };
-
-    let bloom_lookup = |seg_id: u64| bloom_filters.get(&seg_id);
-
-    let mut result = prune_entries(entries, bloom_lookup, series_key, tag_filter_keys);
-    result.stats.segments_total = segments_total;
-    result.stats.pruned_by_time = pruned_by_time;
-    result
 }
 
 /// Prune a pre-filtered set of segment entries through bloom and stats levels.
@@ -178,8 +132,6 @@ where
 mod tests {
     use super::*;
     use chronix_core::{SegmentId, SegmentState, ShardId};
-    use chronix_engine::index::time_index::TimeIndexEntry;
-    use std::collections::BTreeMap;
 
     fn make_entry(id: u64, shard: i64, min_ts: i64, max_ts: i64) -> SegmentCatalogEntry {
         SegmentCatalogEntry {
@@ -199,199 +151,101 @@ mod tests {
         }
     }
 
-    fn setup() -> (TimeIndex, SegmentCatalog) {
-        let dir = tempfile::tempdir().unwrap();
-        let time_index = TimeIndex::new();
-        let mut catalog = SegmentCatalog::new(dir.path()).unwrap();
-
-        // Add 4 segments with different time ranges
-        let entries = vec![
-            make_entry(1, 0, 100, 200),
-            make_entry(2, 0, 300, 400),
-            make_entry(3, 0, 500, 600),
-            make_entry(4, 0, 700, 800),
-        ];
-
-        for entry in &entries {
-            time_index.add_segment(TimeIndexEntry {
-                segment_id: entry.segment_id,
-                min_ts: entry.min_timestamp,
-                max_ts: entry.max_timestamp,
-            });
-            catalog.add_segment(entry.clone()).unwrap();
-        }
-
-        (time_index, catalog)
-    }
-
-    #[test]
-    fn time_pruning() {
-        let (time_index, catalog) = setup();
-        let blooms = HashMap::new();
-
-        let result = prune_segments(
-            &time_index,
-            &catalog,
-            &blooms,
-            250,
-            550, // should match segments 2 and 3
-            None,
-            &[],
-        );
-
-        assert_eq!(result.stats.segments_total, 4);
-        assert_eq!(result.stats.pruned_by_time, 2);
-        assert_eq!(result.segments.len(), 2);
-        assert_eq!(result.segments[0].entry.segment_id, SegmentId(2));
-        assert_eq!(result.segments[1].entry.segment_id, SegmentId(3));
-    }
-
-    #[test]
-    fn bloom_pruning() {
-        let (time_index, catalog) = setup();
-
-        let key1 = chronix_core::SeriesKey::new(
-            "cpu",
-            BTreeMap::from([("host".to_string(), "srv1".to_string())]),
-        )
-        .unwrap();
-
-        let key2 = chronix_core::SeriesKey::new(
-            "cpu",
-            BTreeMap::from([("host".to_string(), "srv2".to_string())]),
-        )
-        .unwrap();
-
-        // Create bloom filters: only segment 2 contains key1
-        let mut bloom2 = SeriesBloomFilter::new(100, 0.01);
-        bloom2.insert(&key1);
-
-        let mut bloom3 = SeriesBloomFilter::new(100, 0.01);
-        bloom3.insert(&key2); // doesn't contain key1
-
-        let mut bloom_map = HashMap::new();
-        bloom_map.insert(2, bloom2);
-        bloom_map.insert(3, bloom3);
-
-        let result = prune_segments(
-            &time_index,
-            &catalog,
-            &bloom_map,
-            250,
-            550,
-            Some(&key1),
-            &["host"],
-        );
-
-        // Segment 3 should be pruned by bloom
-        assert_eq!(result.stats.pruned_by_bloom, 1);
-        assert_eq!(result.segments.len(), 1);
-        assert_eq!(result.segments[0].entry.segment_id, SegmentId(2));
-    }
-
-    #[test]
-    fn no_pruning_when_all_match() {
-        let (time_index, catalog) = setup();
-        let blooms = HashMap::new();
-
-        let result = prune_segments(&time_index, &catalog, &blooms, 0, 1000, None, &[]);
-
-        assert_eq!(result.stats.pruned_by_time, 0);
-        assert_eq!(result.stats.pruned_by_bloom, 0);
-        assert_eq!(result.segments.len(), 4);
-    }
-
-    #[test]
-    fn all_pruned() {
-        let (time_index, catalog) = setup();
-        let blooms = HashMap::new();
-
-        let result = prune_segments(
-            &time_index,
-            &catalog,
-            &blooms,
-            900,
-            1000, // no segments in this range
-            None,
-            &[],
-        );
-
-        assert_eq!(result.segments.len(), 0);
-        assert_eq!(result.stats.pruned_by_time, 4);
-    }
-
-    #[test]
-    fn stats_pruning_by_all_null_tag() {
-        use chronix_engine::index::CatalogColumnStats;
-        use chronix_engine::segment::stats::ColumnStats;
-
-        let dir = tempfile::tempdir().unwrap();
-        let time_index = TimeIndex::new();
-        let mut catalog = SegmentCatalog::new(dir.path()).unwrap();
-
-        // Segment 1: has "host" tag with real data (distinct_count > 0)
-        let mut entry1 = make_entry(1, 0, 100, 200);
-        entry1.column_stats = vec![CatalogColumnStats {
-            name: "host".to_string(),
+    fn tag_stats(
+        name: &str,
+        distinct: u32,
+        values: u64,
+    ) -> chronix_engine::index::CatalogColumnStats {
+        chronix_engine::index::CatalogColumnStats {
+            name: name.to_string(),
             data_type: 1, // STRING
             role: 1,      // TAG
             decimal_scale: None,
-            stats: ColumnStats {
+            stats: chronix_engine::segment::stats::ColumnStats {
                 min_value: 0,
                 max_value: 0,
                 min_value_u64: 0,
                 max_value_u64: 0,
                 null_count: 0,
-                value_count: 10,
+                value_count: values,
                 sum: 0.0,
                 sum_i128: 0,
-                distinct_count: 2, // has real values
+                distinct_count: distinct,
             },
-        }];
-
-        // Segment 2: has "host" tag but all null (distinct_count == 0)
-        let mut entry2 = make_entry(2, 0, 300, 400);
-        entry2.column_stats = vec![CatalogColumnStats {
-            name: "host".to_string(),
-            data_type: 1,
-            role: 1,
-            decimal_scale: None,
-            stats: ColumnStats {
-                min_value: 0,
-                max_value: 0,
-                min_value_u64: 0,
-                max_value_u64: 0,
-                null_count: 10,
-                value_count: 0,
-                sum: 0.0,
-                sum_i128: 0,
-                distinct_count: 0, // all null
-            },
-        }];
-
-        for entry in [&entry1, &entry2] {
-            time_index.add_segment(TimeIndexEntry {
-                segment_id: entry.segment_id,
-                min_ts: entry.min_timestamp,
-                max_ts: entry.max_timestamp,
-            });
-            catalog.add_segment(entry.clone()).unwrap();
         }
+    }
 
-        let blooms = HashMap::new();
-        let result = prune_segments(
-            &time_index,
-            &catalog,
-            &blooms,
-            0,
-            500,
-            None,
-            &["host"], // filtering on "host" tag
+    #[test]
+    fn nothing_is_pruned_without_a_series_key_or_a_tag_filter() {
+        let entries = [make_entry(1, 0, 100, 200), make_entry(2, 0, 300, 400)];
+        let refs: Vec<&SegmentCatalogEntry> = entries.iter().collect();
+        let result = prune_entries(refs, |_| None, None, &[]);
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(result.stats.total_pruned(), 0);
+    }
+
+    /// A missing bloom keeps its segment.
+    ///
+    /// A pruning structure may only ever fail towards more work: the blooms
+    /// are rebuilt from sidecars and a segment can be in the catalog before
+    /// its bloom is, so "no bloom" has to mean "may match".
+    #[test]
+    fn a_segment_without_a_bloom_is_kept() {
+        use chronix_engine::index::SeriesBloomFilter;
+        let entries = [make_entry(1, 0, 100, 200), make_entry(2, 0, 300, 400)];
+        let refs: Vec<&SegmentCatalogEntry> = entries.iter().collect();
+
+        let key = chronix_core::SeriesKey::new(
+            "cpu",
+            [("host".to_string(), "a".to_string())]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .unwrap();
+
+        // Segment 1 has a bloom that does not hold the key; segment 2 has none.
+        let mut bloom = SeriesBloomFilter::new(8, 0.01);
+        bloom.insert(
+            &chronix_core::SeriesKey::new(
+                "cpu",
+                [("host".to_string(), "z".to_string())]
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+            .unwrap(),
         );
 
-        // Segment 2 should be pruned by stats (all-null host column)
+        let result = prune_entries(refs, |id| (id == 1).then_some(&bloom), Some(&key), &[]);
+        assert_eq!(result.stats.pruned_by_bloom, 1);
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(result.segments[0].entry.segment_id, SegmentId(2));
+    }
+
+    /// A tag column that exists and is entirely null cannot match an equality
+    /// filter on it.
+    #[test]
+    fn an_all_null_tag_column_is_pruned_by_its_statistics() {
+        let mut with_values = make_entry(1, 0, 100, 200);
+        with_values.column_stats = vec![tag_stats("host", 2, 10)];
+        let mut all_null = make_entry(2, 0, 300, 400);
+        all_null.column_stats = vec![tag_stats("host", 0, 0)];
+
+        let entries = [with_values, all_null];
+        let refs: Vec<&SegmentCatalogEntry> = entries.iter().collect();
+        let result = prune_entries(refs, |_| None, None, &["host"]);
+
         assert_eq!(result.stats.pruned_by_stats, 1);
         assert_eq!(result.segments.len(), 1);
         assert_eq!(result.segments[0].entry.segment_id, SegmentId(1));
+    }
+
+    /// A segment carrying no statistics for the filtered tag is kept.
+    #[test]
+    fn a_segment_with_no_statistics_for_the_tag_is_kept() {
+        let entries = [make_entry(1, 0, 100, 200)];
+        let refs: Vec<&SegmentCatalogEntry> = entries.iter().collect();
+        let result = prune_entries(refs, |_| None, None, &["host"]);
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(result.stats.pruned_by_stats, 0);
     }
 }

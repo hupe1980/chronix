@@ -648,12 +648,17 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
 // ── Conversion helpers ─────────────────────────────────────────────────
 
 /// Convert an Arrow array cell to a protobuf `SqlValue`.
+///
+/// Scalars keep a native proto field — in particular a `double` carries `NaN`
+/// and the infinities, which JSON cannot, so floats deliberately do **not**
+/// take the JSON route. Everything with no scalar home goes through
+/// [`crate::wire::value::to_json`], the encoding every surface shares, and
+/// arrives in `SqlValue.json`. It used to arrive as the literal text
+/// `"<unsupported: List(Float64)>"` in the `string` field, which no client
+/// could tell from a string.
 fn arrow_to_sql_value(col: &arrow::array::ArrayRef, row: usize) -> proto::SqlValue {
-    use arrow::array::{
-        Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int16Array, Int32Array,
-        Int64Array, Int8Array, StringArray, TimestampNanosecondArray, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
-    };
+    use arrow::array::*;
+    use arrow::datatypes::{DataType as D, TimeUnit};
 
     if col.is_null(row) {
         return proto::SqlValue {
@@ -662,51 +667,118 @@ fn arrow_to_sql_value(col: &arrow::array::ArrayRef, row: usize) -> proto::SqlVal
         };
     }
 
-    let value = if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
-        Some(proto::sql_value::Value::Float64(a.value(row)))
-    } else if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
-        Some(proto::sql_value::Value::Float64(a.value(row) as f64))
-    } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-        Some(proto::sql_value::Value::Int64(a.value(row)))
-    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
-        Some(proto::sql_value::Value::Int64(a.value(row) as i64))
-    } else if let Some(a) = col.as_any().downcast_ref::<Int16Array>() {
-        Some(proto::sql_value::Value::Int64(a.value(row) as i64))
-    } else if let Some(a) = col.as_any().downcast_ref::<Int8Array>() {
-        Some(proto::sql_value::Value::Int64(a.value(row) as i64))
-    } else if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-        Some(proto::sql_value::Value::Uint64(a.value(row)))
-    } else if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
-        Some(proto::sql_value::Value::Uint64(a.value(row) as u64))
-    } else if let Some(a) = col.as_any().downcast_ref::<UInt16Array>() {
-        Some(proto::sql_value::Value::Uint64(a.value(row) as u64))
-    } else if let Some(a) = col.as_any().downcast_ref::<UInt8Array>() {
-        Some(proto::sql_value::Value::Uint64(a.value(row) as u64))
-    } else if let Some(a) = col.as_any().downcast_ref::<BooleanArray>() {
-        Some(proto::sql_value::Value::Boolean(a.value(row)))
-    } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-        Some(proto::sql_value::Value::String(a.value(row).to_string()))
-    } else if let Some(a) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        Some(proto::sql_value::Value::Int64(a.value(row)))
-    } else if let Some(a) = col.as_any().downcast_ref::<Decimal128Array>() {
-        // Digits, not a double: this branch has to come before nothing and
-        // after nothing in particular, but it must exist — without it a
-        // decimal cell fell through to the `<unsupported>` string below.
-        crate::util::decimal_cell_to_string(a, row).map(proto::sql_value::Value::Decimal)
-    } else {
-        // Fallback: render the data type rather than the entire array so we
-        // don't accidentally Debug-print all N values for every single row,
-        // which would allocate O(N²) memory and can OOM the server.
-        Some(proto::sql_value::Value::String(format!(
-            "<unsupported: {}>",
-            col.data_type()
-        )))
-    };
+    // A downcast that disagrees with `data_type()` is an Arrow invariant
+    // violation. Falling through to the JSON encoder keeps the cell
+    // *reported* either way — it reaches the same conclusion by a slower
+    // road, and never silently vanishes.
+    macro_rules! scalar {
+        ($ty:ty, $wrap:path, $conv:expr) => {
+            match col.as_any().downcast_ref::<$ty>() {
+                #[allow(clippy::redundant_closure_call)]
+                Some(a) => Some($wrap($conv(a.value(row)))),
+                None => None,
+            }
+        };
+    }
+
+    let value = match col.data_type() {
+        D::Boolean => scalar!(BooleanArray, proto::sql_value::Value::Boolean, |v| v),
+
+        D::Int8 => scalar!(Int8Array, proto::sql_value::Value::Int64, i64::from),
+        D::Int16 => scalar!(Int16Array, proto::sql_value::Value::Int64, i64::from),
+        D::Int32 => scalar!(Int32Array, proto::sql_value::Value::Int64, i64::from),
+        D::Int64 => scalar!(Int64Array, proto::sql_value::Value::Int64, |v| v),
+
+        D::UInt8 => scalar!(UInt8Array, proto::sql_value::Value::Uint64, u64::from),
+        D::UInt16 => scalar!(UInt16Array, proto::sql_value::Value::Uint64, u64::from),
+        D::UInt32 => scalar!(UInt32Array, proto::sql_value::Value::Uint64, u64::from),
+        D::UInt64 => scalar!(UInt64Array, proto::sql_value::Value::Uint64, |v| v),
+
+        D::Float16 => scalar!(Float16Array, proto::sql_value::Value::Float64, f64::from),
+        D::Float32 => scalar!(Float32Array, proto::sql_value::Value::Float64, f64::from),
+        D::Float64 => scalar!(Float64Array, proto::sql_value::Value::Float64, |v| v),
+
+        D::Utf8 => scalar!(StringArray, proto::sql_value::Value::String, str::to_owned),
+        D::LargeUtf8 => scalar!(
+            LargeStringArray,
+            proto::sql_value::Value::String,
+            str::to_owned
+        ),
+        D::Utf8View => scalar!(
+            StringViewArray,
+            proto::sql_value::Value::String,
+            str::to_owned
+        ),
+
+        // Temporal values travel as the integer in the unit `data_type`
+        // names, exactly as they do over JSON.
+        D::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => {
+                scalar!(TimestampSecondArray, proto::sql_value::Value::Int64, |v| v)
+            }
+            TimeUnit::Millisecond => {
+                scalar!(
+                    TimestampMillisecondArray,
+                    proto::sql_value::Value::Int64,
+                    |v| v
+                )
+            }
+            TimeUnit::Microsecond => {
+                scalar!(
+                    TimestampMicrosecondArray,
+                    proto::sql_value::Value::Int64,
+                    |v| v
+                )
+            }
+            TimeUnit::Nanosecond => {
+                scalar!(
+                    TimestampNanosecondArray,
+                    proto::sql_value::Value::Int64,
+                    |v| v
+                )
+            }
+        },
+        D::Date32 => scalar!(Date32Array, proto::sql_value::Value::Int64, i64::from),
+        D::Date64 => scalar!(Date64Array, proto::sql_value::Value::Int64, |v| v),
+
+        // Digits, not a double — there is no 128-bit proto scalar to carry a
+        // mantissa in, and `double` would lose the value outright.
+        D::Decimal32(..) => decimal_digits::<arrow::datatypes::Decimal32Type>(col, row),
+        D::Decimal64(..) => decimal_digits::<arrow::datatypes::Decimal64Type>(col, row),
+        D::Decimal128(..) => decimal_digits::<arrow::datatypes::Decimal128Type>(col, row),
+        D::Decimal256(..) => decimal_digits::<arrow::datatypes::Decimal256Type>(col, row),
+
+        // No scalar home: a list, struct, map, union, interval, duration,
+        // time-of-day, or binary cell. The shared encoder is total, so this
+        // arm is a delegation rather than a decision to drop anything.
+        _ => None,
+    }
+    .or_else(|| {
+        let json = crate::wire::value::to_json(col.as_ref(), row);
+        // The shared encoder answers `null` for a non-finite float, which
+        // cannot reach here (floats are handled above), and for an Arrow
+        // invariant violation, where `is_null: true` is the honest report.
+        if json.is_null() {
+            None
+        } else {
+            Some(proto::sql_value::Value::Json(json.to_string()))
+        }
+    });
 
     proto::SqlValue {
+        is_null: value.is_none(),
         value,
-        is_null: false,
     }
+}
+
+/// A decimal cell of any width, as exact digits.
+fn decimal_digits<T>(col: &arrow::array::ArrayRef, row: usize) -> Option<proto::sql_value::Value>
+where
+    T: arrow::datatypes::DecimalType + arrow::datatypes::ArrowPrimitiveType,
+{
+    col.as_any()
+        .downcast_ref::<arrow::array::PrimitiveArray<T>>()
+        .map(|a| proto::sql_value::Value::Decimal(a.value_as_string(row)))
 }
 
 /// Record the dedup keys of a batch that has just been written.
@@ -789,6 +861,11 @@ fn proto_field_to_field_value(v: proto::field_value::Value) -> Result<FieldValue
             .parse::<chronix_core::Decimal>()
             .map(FieldValue::Decimal)
             .map_err(|e| ServerError::BadRequest(format!("invalid decimal \"{d}\": {e}"))),
+        // Read-only: `json` carries a query result that has no storage type,
+        // so it is not something a point can be written from.
+        proto::field_value::Value::Json(j) => Err(ServerError::BadRequest(format!(
+            "`json` is a query-result encoding and cannot be written as a field value: {j}"
+        ))),
     }
 }
 
@@ -948,12 +1025,19 @@ fn record_batch_to_proto_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<p
                         }
                     }
                 }
+                // Anything the storage layer does not produce today. It used
+                // to be dropped from the row with only a debug line to say
+                // so; the shared encoder is total, so it is reported instead.
                 _ => {
-                    tracing::debug!(
-                        column = name,
-                        dtype = ?field.data_type(),
-                        "skipping unsupported column type in gRPC response"
-                    );
+                    let json = crate::wire::value::to_json(col.as_ref(), row_idx);
+                    if !json.is_null() {
+                        fields.push(proto::Field {
+                            key: name,
+                            value: Some(proto::FieldValue {
+                                value: Some(proto::field_value::Value::Json(json.to_string())),
+                            }),
+                        });
+                    }
                 }
             }
         }

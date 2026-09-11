@@ -12,9 +12,7 @@ use chronix::prelude::*;
 use crate::error::ServerError;
 use crate::namespace::NamespaceContext;
 
-use super::types::{
-    arrow_value_to_json, resolve_namespace, AppState, TimeRangeRequest, NAMESPACE_TAG,
-};
+use super::types::{arrow_value_to_json, AppState, TimeRangeRequest, NAMESPACE_TAG};
 
 // ── Request / response types ───────────────────────────────────────────
 
@@ -94,6 +92,41 @@ pub struct SqlResponse {
     pub truncated: bool,
 }
 
+/// The scan plan a `/api/v1/chronix/query` body describes.
+///
+/// **`query` and `explain` call this and nothing else.** They built the plan
+/// separately, with one difference nobody had compared: `explain` scoped it
+/// to `"default"` whatever the deployment did, while `query` scoped it with
+/// [`crate::namespace::scope`], which is `None` unless `multi_tenancy` is on.
+/// So on the ordinary single-tenant server `explain` described a plan
+/// carrying a `__namespace__` filter that no point carries — a plan that
+/// would have returned nothing — for a query that returned everything. An
+/// `EXPLAIN` exists to be trusted about the query beside it.
+fn scan_plan(
+    db: &chronix::Chronix,
+    scope: Option<&str>,
+    body: &QueryRequest,
+) -> Result<QueryPlan, chronix::DbError> {
+    let mut builder = db
+        .query()
+        .measurement(&body.measurement)
+        .namespace_scope(scope);
+
+    if let Some(ref range) = body.range {
+        builder = builder.range(range.start, range.end);
+    }
+    for (key, value) in &body.tags {
+        builder = builder.tag(key, value);
+    }
+    for f in &body.fields {
+        builder = builder.field(f);
+    }
+
+    builder
+        .build()
+        .map_err(|e| chronix::DbError::Internal(format!("query build error: {e}")))
+}
+
 // ── Handlers ───────────────────────────────────────────────────────────
 
 /// `POST /api/v1/chronix/query` — query time-series data.
@@ -132,28 +165,7 @@ pub async fn query_handler(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut builder = db
-            .query()
-            .measurement(&body.measurement)
-            .namespace_scope(scope.as_deref());
-
-        if let Some(ref range) = body.range {
-            builder = builder.range(range.start, range.end);
-        }
-
-        for (key, value) in &body.tags {
-            builder = builder.tag(key, value);
-        }
-
-        if !body.fields.is_empty() {
-            for f in &body.fields {
-                builder = builder.field(f);
-            }
-        }
-
-        let plan = builder
-            .build()
-            .map_err(|e| chronix::DbError::Internal(format!("query build error: {e}")))?;
+        let plan = scan_plan(&db, scope.as_deref(), &body)?;
 
         // Apply offset + limit incrementally: skip `offset` rows without
         // converting them to QueryRow, then convert only `limit` rows.
@@ -214,30 +226,116 @@ pub async fn query_handler(
     Ok(Json(result))
 }
 
-/// Map a DataFusion execution error to the right status.
+/// Map a DataFusion error to the right status.
 ///
-/// A query that fails *while running* is not automatically the server's fault:
-/// an aggregate can reject its own arguments only once it has seen them, and
-/// `forecast(v, _time, 2000000)` — over the configured
-/// `analytics.max_forecast_horizon` — did exactly that. Mapping every
-/// execution error to `Internal` made it a `500` whose body is redacted to
-/// "an internal error occurred", so the message naming the setting to change
-/// never reached the caller.
-fn sql_execution_error(e: &datafusion::error::DataFusionError) -> ServerError {
+/// A query that fails *while running* is not automatically the server's
+/// fault: an aggregate can reject its own arguments only once it has seen
+/// them, and a `500` redacts its body to "an internal error occurred", so
+/// the message naming the problem never reaches the caller.
+///
+/// Two steps, so that one decision is written once:
+///
+/// 1. Recover a chronix error, which DataFusion carries as `External`
+///    (`chronix::sql::exec::to_df_error`). It already has a classification
+///    that tells back-pressure from a bug — a full memtable is a `503`, a
+///    query deadline a `504` — so it keeps it.
+/// 2. Otherwise ask [`is_caller_error`], whose match has **no catch-all**, so
+///    a DataFusion release that adds a variant breaks this build rather than
+///    quietly answering `500`.
+fn sql_execution_error(e: datafusion::error::DataFusionError) -> ServerError {
+    match recover_db_error(e) {
+        Ok(db) => ServerError::Db(db),
+        Err(e) if is_caller_error(&e) => ServerError::BadRequest(format!("SQL error: {e}")),
+        Err(e) => ServerError::Internal(format!("SQL execution error: {e}")),
+    }
+}
+
+/// Unwrap the layers DataFusion adds and take back a chronix error, if the
+/// root is one.
+///
+/// Returns the error unchanged when it is not — nothing is lost either way.
+fn recover_db_error(
+    e: datafusion::error::DataFusionError,
+) -> Result<chronix::DbError, datafusion::error::DataFusionError> {
+    use datafusion::error::DataFusionError as E;
     match e {
-        // The caller's query is wrong: planning, resolution, or an argument a
-        // function refuses.
-        datafusion::error::DataFusionError::Plan(_)
-        | datafusion::error::DataFusionError::SchemaError(..)
-        | datafusion::error::DataFusionError::SQL(..)
-        | datafusion::error::DataFusionError::NotImplemented(_) => {
-            ServerError::BadRequest(format!("SQL error: {e}"))
+        E::External(inner) => inner
+            .downcast::<chronix::DbError>()
+            .map_or_else(|other| Err(E::External(other)), |db| Ok(*db)),
+        E::Context(ctx, inner) => {
+            recover_db_error(*inner).map_err(|e| E::Context(ctx, Box::new(e)))
         }
+        E::Diagnostic(d, inner) => {
+            recover_db_error(*inner).map_err(|e| E::Diagnostic(d, Box::new(e)))
+        }
+        // Only recoverable while this is the last reference; otherwise the
+        // verdict below still classifies it correctly, it just cannot carry
+        // the chronix error's own status.
+        E::Shared(arc) => match std::sync::Arc::try_unwrap(arc) {
+            Ok(inner) => recover_db_error(inner),
+            Err(arc) => Err(E::Shared(arc)),
+        },
+        other => Err(other),
+    }
+}
+
+/// Whether this error is the caller's to fix.
+///
+/// DataFusion draws the line for us: its own docs say `Execution` is raised
+/// "due to a malformed input … the user passed malformed arguments to a SQL
+/// method … or tried to divide an integer by zero", while `Internal` is
+/// reserved for an invariant the compiler could not check.
+///
+/// **No catch-all**, deliberately — see [`sql_execution_error`].
+fn is_caller_error(e: &datafusion::error::DataFusionError) -> bool {
+    use datafusion::error::DataFusionError as E;
+    match e {
+        // The caller's query is wrong: parsing, planning, resolution, or an
+        // argument a function refuses once it can see it.
+        E::Plan(_)
+        | E::SchemaError(..)
+        | E::SQL(..)
+        | E::NotImplemented(_)
+        | E::Execution(_)
+        | E::Substrait(_)
+        // `SET` with a value this server will not take.
+        | E::Configuration(_)
         // The query asked for more than this server will give it.
-        datafusion::error::DataFusionError::ResourcesExhausted(_) => {
-            ServerError::BadRequest(format!("SQL error: {e}"))
+        | E::ResourcesExhausted(_) => true,
+
+        // An invariant DataFusion could not check, a task that panicked, or a
+        // foreign-function boundary failing.
+        E::Internal(_) | E::ExecutionJoin(_) | E::Ffi(_) => false,
+
+        // Reading failed underneath the query. Nothing the caller can fix.
+        E::IoError(_) | E::ParquetError(_) | E::ObjectStore(_) => false,
+
+        // A chronix error that `recover_db_error` could not take ownership
+        // of, or a foreign error. Neither is the caller's.
+        E::External(_) => false,
+
+        // Arrow computes the values, so most of its errors are the caller's
+        // arithmetic — but a few are ours.
+        E::ArrowError(inner, _) => {
+            use arrow::error::ArrowError as A;
+            matches!(
+                inner.as_ref(),
+                A::DivideByZero
+                    | A::ArithmeticOverflow(_)
+                    | A::CastError(_)
+                    | A::ParseError(_)
+                    | A::InvalidArgumentError(_)
+                    | A::ComputeError(_)
+                    | A::NotYetImplemented(_)
+            )
         }
-        _ => ServerError::Internal(format!("SQL execution error: {e}")),
+
+        // Wrappers: the verdict belongs to what they wrap.
+        E::Context(_, inner) | E::Diagnostic(_, inner) => is_caller_error(inner),
+        E::Shared(inner) => is_caller_error(inner),
+        // One violated invariant in the set is still a bug, whatever else it
+        // is reported beside.
+        E::Collection(errs) => errs.iter().all(is_caller_error),
     }
 }
 
@@ -334,9 +432,9 @@ pub async fn sql_handler(
                 timeout: std::time::Duration::from_secs(timeout_secs),
                 setting: "server.sql_query_timeout_secs",
             })?
-            .map_err(|e| sql_execution_error(&e))?
+            .map_err(sql_execution_error)?
     } else {
-        stream_future.await.map_err(|e| sql_execution_error(&e))?
+        stream_future.await.map_err(sql_execution_error)?
     };
 
     let mut columns = Vec::new();
@@ -382,7 +480,7 @@ pub async fn sql_handler(
             stream.next().await
         }
     } {
-        let batch = batch_result.map_err(|e| sql_execution_error(&e))?;
+        let batch = batch_result.map_err(sql_execution_error)?;
         for row_idx in 0..batch.num_rows() {
             if row_count >= max_rows {
                 tracing::warn!(max_rows, "SQL result truncated to max_rows limit");
@@ -421,37 +519,19 @@ pub async fn query_explain_handler(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let db = state.db.clone();
     let measurement = body.measurement.clone();
-    let namespace = resolve_namespace(ns_ctx.as_ref().map(|e| &e.0)).to_string();
+    // The same scope `query_handler` uses, so the plan described is the plan
+    // that would run.
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
 
     // Check measurement exists
     if db.schema(&measurement).is_none() {
         return Err(ServerError::NotFound(measurement));
     }
 
-    let plan = tokio::task::spawn_blocking(move || {
-        let mut builder = db.query().measurement(&body.measurement);
-        // Structural namespace isolation.
-        builder = builder.namespace(&namespace);
-
-        if let Some(ref range) = body.range {
-            builder = builder.range(range.start, range.end);
-        }
-        for (key, value) in &body.tags {
-            builder = builder.tag(key, value);
-        }
-        if !body.fields.is_empty() {
-            for f in &body.fields {
-                builder = builder.field(f);
-            }
-        }
-
-        builder
-            .build()
-            .map_err(|e| chronix::DbError::Internal(format!("query build error: {e}")))
-    })
-    .await
-    .map_err(|e| ServerError::Internal(e.to_string()))?
-    .map_err(ServerError::Db)?;
+    let plan = tokio::task::spawn_blocking(move || scan_plan(&db, scope.as_deref(), &body))
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .map_err(ServerError::Db)?;
 
     let plan_json = query_plan_to_json(&plan);
 
@@ -464,6 +544,13 @@ pub async fn query_explain_handler(
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// Convert an Arrow `RecordBatch` to JSON-serializable rows.
+///
+/// The storage path produces a known, small set of Arrow types, and those get
+/// a pre-resolved fast path so a cell costs no downcast. Anything else — a
+/// type this path does not produce today, or one a future plan node
+/// introduces — goes through [`crate::wire::value::to_json`], the encoding
+/// every surface shares. It used to be *dropped*, silently, leaving the field
+/// simply absent from the row with nothing in the response to say so.
 pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<QueryRow> {
     use arrow::array::*;
     use arrow::datatypes::DataType;
@@ -482,6 +569,8 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
         FieldU64(&'a UInt64Array, String),
         FieldBool(&'a BooleanArray, String),
         FieldDecimal(&'a arrow::array::Decimal128Array, String),
+        /// Any other Arrow type, encoded by the shared converter.
+        FieldOther(&'a dyn Array, String),
         Skip,
     }
 
@@ -494,15 +583,21 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
             let name = field.name();
 
             if name == chronix_core::TIME_COLUMN {
-                return col
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .map_or(TypedCol::Skip, TypedCol::Timestamp);
+                // The storage path always emits the timestamp as `Int64`
+                // (`chronix_query::convert`). If that ever stops being true
+                // the row's timestamp would silently read 0, so fall through
+                // to the generic encoder rather than dropping it.
+                return col.as_any().downcast_ref::<Int64Array>().map_or_else(
+                    || TypedCol::FieldOther(col.as_ref(), name.clone()),
+                    TypedCol::Timestamp,
+                );
             }
 
             if name == NAMESPACE_TAG {
                 return TypedCol::Skip;
             }
+
+            let generic = || TypedCol::FieldOther(col.as_ref(), name.clone());
 
             match field.data_type() {
                 DataType::Utf8 => {
@@ -522,39 +617,30 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
                             TypedCol::FieldString(arr, name.clone())
                         }
                     } else {
-                        TypedCol::Skip
+                        generic()
                     }
                 }
                 DataType::Float64 => col
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .map_or(TypedCol::Skip, |arr| TypedCol::FieldF64(arr, name.clone())),
+                    .map_or_else(generic, |arr| TypedCol::FieldF64(arr, name.clone())),
                 DataType::Int64 => col
                     .as_any()
                     .downcast_ref::<Int64Array>()
-                    .map_or(TypedCol::Skip, |arr| TypedCol::FieldI64(arr, name.clone())),
+                    .map_or_else(generic, |arr| TypedCol::FieldI64(arr, name.clone())),
                 DataType::UInt64 => col
                     .as_any()
                     .downcast_ref::<UInt64Array>()
-                    .map_or(TypedCol::Skip, |arr| TypedCol::FieldU64(arr, name.clone())),
+                    .map_or_else(generic, |arr| TypedCol::FieldU64(arr, name.clone())),
                 DataType::Boolean => col
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .map_or(TypedCol::Skip, |arr| TypedCol::FieldBool(arr, name.clone())),
+                    .map_or_else(generic, |arr| TypedCol::FieldBool(arr, name.clone())),
                 DataType::Decimal128(_, _) => col
                     .as_any()
                     .downcast_ref::<arrow::array::Decimal128Array>()
-                    .map_or(TypedCol::Skip, |arr| {
-                        TypedCol::FieldDecimal(arr, name.clone())
-                    }),
-                _ => {
-                    tracing::debug!(
-                        column = name,
-                        dtype = ?field.data_type(),
-                        "skipping unsupported column type in HTTP response"
-                    );
-                    TypedCol::Skip
-                }
+                    .map_or_else(generic, |arr| TypedCol::FieldDecimal(arr, name.clone())),
+                _ => generic(),
             }
         })
         .collect();
@@ -609,6 +695,14 @@ pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> 
                             name.clone(),
                             serde_json::json!({ crate::util::DECIMAL_JSON_KEY: digits }),
                         );
+                    }
+                }
+                TypedCol::FieldOther(arr, name) => {
+                    // A null field is absent from the row, as it is for
+                    // every other type above.
+                    let v = crate::wire::value::to_json(*arr, row_idx);
+                    if !v.is_null() {
+                        fields.insert(name.clone(), v);
                     }
                 }
                 TypedCol::Skip => {}
@@ -668,12 +762,18 @@ fn query_plan_to_json(plan: &QueryPlan) -> serde_json::Value {
         }
         QueryPlan::Downsample {
             source,
-            interval,
+            bucket,
             function,
         } => {
+            // The width's own spelling, not a millisecond count: a calendar
+            // bucket has no fixed length to report, and `interval_ms` would
+            // have had to invent one — 30 days for a month, 24 hours for a
+            // day that is 23. `EXPLAIN` has to describe the plan that runs.
             serde_json::json!({
                 "node": "Downsample",
-                "interval_ms": interval.as_millis() as u64,
+                "bucket": bucket.width().to_string(),
+                "timezone": bucket.timezone(),
+                "calendar": bucket.is_calendar(),
                 "function": format!("{function:?}"),
                 "source": query_plan_to_json(source),
             })

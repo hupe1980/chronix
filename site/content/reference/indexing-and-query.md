@@ -8,21 +8,6 @@ weight = 40
 
 The index crate provides metadata structures for efficient segment pruning.
 
-### Time Index
-
-`TimeIndex` is a sorted vector of `TimeIndexEntry` records:
-
-| Field        | Type        | Description                    |
-|--------------|-------------|--------------------------------|
-| `segment_id` | `u64`       | References a catalog segment   |
-| `min_ts`     | `Timestamp` | Earliest timestamp in segment  |
-| `max_ts`     | `Timestamp` | Latest timestamp in segment    |
-
-- Binary search via `segments_in_range(min, max)` returns all segments whose
-  time range overlaps the query window
-- `add_segment()` inserts and re-sorts; `remove_segment()` returns a
-  `#[must_use]` boolean indicating whether the segment was found
-
 ### Bloom Filters
 
 `SeriesBloomFilter` uses **Kirsch-Mitzenmacker double hashing** (two base hashes
@@ -77,9 +62,17 @@ catalog/
 
 ### Inverted Tag Index
 
-`TagInvertedIndex` maps `"key=value"` → `HashSet<SegmentId>`. Updated on
-segment creation/deletion. `segments_for_tags()` intersects per-tag results
-for multi-tag queries. Thread-safe via `parking_lot::RwLock`.
+`TagInvertedIndex` maps `"key=value"` → `HashSet<SegmentId>`, with a reverse
+map from each segment to its tag pairs. Updated on segment creation and
+retirement; thread-safe via `parking_lot::RwLock`.
+
+`pruner(filters)` borrows it for one query and answers, per candidate segment,
+whether the index can **prove** the segment does not carry every filtered
+pair. It is deliberately the negative question: the index is derived state
+updated after the catalog, so a segment can be queryable and not yet indexed,
+and a segment the index has never seen is scanned rather than pruned. A
+pruning structure may only ever fail towards more work — the same rule the
+zone maps follow.
 
 ### Zone Maps (Column Statistics)
 
@@ -176,11 +169,13 @@ larger than its RAM.
 
 Multi-level pruning eliminates segments before reading:
 
-1. **Tag index pruning** — `TagInvertedIndex::segments_for_tags()` pre-filters
-   segments that contain the queried tag values, reducing the candidate set
-   before any per-segment work is done
-2. **Time pruning** — `TimeIndex::segments_in_range()` eliminates segments
-   outside the query time window
+1. **Tag index pruning** — `TagInvertedIndex::pruner()` eliminates segments
+   the index can prove do not carry every queried tag pair, reducing the
+   candidate set before any per-segment work is done. A segment the index has
+   not indexed is kept
+2. **Time pruning** — the catalog entry's `[min_timestamp, max_timestamp]`
+   eliminates segments outside the query time window, in the same pass that
+   scopes the candidate set to one measurement
 3. **Bloom pruning** — `SeriesBloomFilter::might_contain()` eliminates segments
    that definitely don't contain the target series key
 4. **Column stats pruning** — `CatalogColumnStats` for each candidate segment
@@ -197,14 +192,15 @@ Multi-level pruning eliminates segments before reading:
    evaluated via `ZoneMapPredicate` to skip row groups that provably cannot
    match. See [Zone Maps](#zone-maps-column-statistics) for details.
 
-The core implementation is `prune_entries()`, which accepts pre-filtered catalog
-entries and a bloom lookup closure. Both `execute()` and `execute_stream()` call
-this single function, ensuring all pruning levels are always applied
-consistently. `prune_segments()` (used by the standalone query API) delegates to
-`prune_entries()` internally after time-index filtering.
+The core implementation is `chronix_query::pruning::prune_entries()`, which
+accepts pre-filtered catalog entries and a bloom lookup closure. Both
+`execute()` and `execute_stream()` reach it through `Chronix::prune_segments()`,
+which scopes the candidates to one measurement and its time range first, and
+returns a **lease** on the result so a retirement pass cannot unlink a segment
+the scan has not opened yet.
 
-`PruningStats` tracks `total`, `time_pruned`, `bloom_pruned`, `pruned_by_stats`,
-and `remaining` counts for observability. `execute_with_stats()` returns
+`PruningStats` tracks `segments_total`, `pruned_by_time`, `pruned_by_bloom`,
+`pruned_by_stats` and `segments_remaining`. `execute_with_stats()` returns
 `(RecordBatch, PruningStats)` so callers can inspect pruning effectiveness.
 
 ### Vectorized Filtering
@@ -301,16 +297,16 @@ conflated — only true duplicates (same series + same timestamp) are collapsed.
 
 ### Downsampling
 
-`downsample()` aggregates data into fixed time buckets:
+`downsample()` aggregates data into time buckets:
 
-- Bucket assignment: `bucket = ts - ts.rem_euclid(interval)` —
-  uses Euclidean remainder for correct alignment with negative timestamps,
-  avoiding the `div_euclid * interval` multiplication overflow for large timestamps.
-  All call sites validate that `interval > 0` to prevent `rem_euclid(0)` panics
+- Bucket assignment is `TimeBucket::start_of(ts)` — the same type
+  `time_bucket()` in SQL and a rollup tier use, so all three agree about
+  where a day begins. A fixed width aligns on the epoch; `d`/`w`/`mo`/`y`
+  follow the calendar of the bucket's zone
 - Groups by bucket, applies the chosen `AggFn` per bucket
 - Returns a `RecordBatch` with `(timestamp, value)` columns
-- **Multi-type support:** Supports Float64, Int64, and UInt64 value columns via
-  `extract_f64()` helper; unsupported types return a descriptive error
+- **Multi-type support:** Supports Float64, Int64, UInt64 and Decimal128
+  value columns; unsupported types return a descriptive error
 ## Encoded-Domain Pushdown (`chronix-query`)
 
 `EncodedDomainEvaluator` evaluates column predicates against row-group stats
@@ -396,7 +392,7 @@ Registered as DataFusion UDFs/UDAFs:
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `time_bucket(width, timestamp [, timezone])` | UDF | Bucket timestamps. Sub-day widths are a fixed span; `d`/`w`/`mo`/`y` follow the calendar of `timezone` |
+| `time_bucket(width, timestamp [, timezone [, origin]])` | UDF | Bucket timestamps. Sub-day widths are a fixed span; `d`/`w`/`mo`/`y` follow the calendar of `timezone`. `origin` moves the boundary — a day that starts at 06:00, a month that starts on the 15th |
 | `first(field, timestamp)` | UDAF | First value ordered by timestamp |
 | `last(field, timestamp)` | UDAF | Last value ordered by timestamp |
 | `rate(field, timestamp)` | UDAF | Per-second rate of change |

@@ -164,32 +164,20 @@ impl TagInvertedIndex {
         result
     }
 
-    /// Find segments matching ALL tag filters (intersection).
+    /// Borrow the index for one query's worth of pruning decisions.
     ///
-    /// Returns the intersection of segments across all tag filters.
-    /// If filters is empty, returns an empty Vec.
+    /// The lock is taken once and held for the whole candidate sweep, so a
+    /// pass over N segments costs one acquisition rather than N.
+    ///
+    /// # Panics
+    ///
+    /// Never: the returned [`TagPruner`] only reads.
     #[must_use]
-    pub fn segments_for_tags(&self, filters: &[(&str, &str)]) -> Vec<SegmentId> {
-        if filters.is_empty() {
-            return Vec::new();
+    pub fn pruner<'a>(&'a self, filters: &[(&str, &str)]) -> TagPruner<'a> {
+        TagPruner {
+            keys: filters.iter().map(|&(k, v)| make_tag_key(k, v)).collect(),
+            state: self.state.read(),
         }
-
-        let s = self.state.read();
-        let mut result: Option<HashSet<SegmentId>> = None;
-
-        for &(key, value) in filters {
-            let entry_key = make_tag_key(key, value);
-            let matching = s.index.get(&entry_key).cloned().unwrap_or_default();
-
-            result = Some(match result {
-                Some(existing) => existing.intersection(&matching).copied().collect(),
-                None => matching,
-            });
-        }
-
-        let mut out: Vec<SegmentId> = result.map_or_else(Vec::new, |s| s.into_iter().collect());
-        out.sort();
-        out
     }
 
     /// Atomically replace multiple old segments with a single new segment.
@@ -298,6 +286,46 @@ impl Default for TagInvertedIndex {
     }
 }
 
+/// One query's view of the index, used to eliminate segments that cannot
+/// match its tag filters.
+///
+/// # Why this answers "excluded" rather than "matching"
+///
+/// The index is *derived* state: it is updated after the catalog, from a
+/// segment's series sidecar, and a segment can be in the catalog while the
+/// index has never heard of it — for the window between a compaction's
+/// catalog swap and its index swap, and for as long as a sidecar cannot be
+/// read. A lookup that returns "the segments that match" cannot express that
+/// gap: everything it does not return is pruned, so a segment the index has
+/// not *seen* is indistinguishable from one it has seen and rejected.
+///
+/// Asking the opposite question makes the gap safe. Pruning happens only when
+/// the index holds the segment's tag set and that set is missing a filtered
+/// pair, so an unindexed segment is scanned — slower, never wrong. This is
+/// the same rule the zone maps follow: a pruning structure may only ever fail
+/// towards more work.
+pub struct TagPruner<'a> {
+    state: parking_lot::RwLockReadGuard<'a, InvertedState>,
+    keys: Vec<String>,
+}
+
+impl TagPruner<'_> {
+    /// Whether the index can *prove* that `segment_id` does not carry every
+    /// filtered tag pair.
+    ///
+    /// `false` whenever there are no filters, or the segment is not indexed.
+    #[must_use]
+    pub fn excludes(&self, segment_id: SegmentId) -> bool {
+        if self.keys.is_empty() {
+            return false;
+        }
+        let Some(have) = self.state.reverse.get(&segment_id) else {
+            return false;
+        };
+        !self.keys.iter().all(|k| have.contains(k))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,15 +344,41 @@ mod tests {
     }
 
     #[test]
-    fn intersection_multi_tag() {
+    fn a_segment_missing_any_filtered_pair_is_excluded() {
         let idx = TagInvertedIndex::new();
         idx.add_segment(SegmentId(1), &[("host", "srv1"), ("region", "us-east")]);
         idx.add_segment(SegmentId(2), &[("host", "srv1"), ("region", "eu-west")]);
         idx.add_segment(SegmentId(3), &[("host", "srv2"), ("region", "us-east")]);
 
-        let segs = idx.segments_for_tags(&[("host", "srv1"), ("region", "us-east")]);
-        assert_eq!(segs.len(), 1);
-        assert!(segs.contains(&SegmentId(1)));
+        let pruner = idx.pruner(&[("host", "srv1"), ("region", "us-east")]);
+        assert!(!pruner.excludes(SegmentId(1)));
+        assert!(pruner.excludes(SegmentId(2)));
+        assert!(pruner.excludes(SegmentId(3)));
+    }
+
+    /// The index is updated after the catalog, so a segment can be queryable
+    /// and unindexed — the window between a compaction's catalog swap and its
+    /// index swap. Answering "matching segments" made that window prune
+    /// *everything*: a tag-filtered query returned no rows at all.
+    #[test]
+    fn a_segment_the_index_has_never_seen_is_never_excluded() {
+        let idx = TagInvertedIndex::new();
+        idx.add_segment(SegmentId(1), &[("host", "srv1")]);
+
+        let pruner = idx.pruner(&[("host", "srv1")]);
+        assert!(
+            !pruner.excludes(SegmentId(99)),
+            "an unindexed segment must be scanned, not pruned"
+        );
+    }
+
+    #[test]
+    fn no_filters_excludes_nothing() {
+        let idx = TagInvertedIndex::new();
+        idx.add_segment(SegmentId(1), &[("host", "srv1")]);
+        let pruner = idx.pruner(&[]);
+        assert!(!pruner.excludes(SegmentId(1)));
+        assert!(!pruner.excludes(SegmentId(2)));
     }
 
     #[test]
@@ -353,13 +407,6 @@ mod tests {
         idx.add_segment(SegmentId(1), &[("host", "srv1")]);
         idx.clear();
         assert_eq!(idx.entry_count(), 0);
-    }
-
-    #[test]
-    fn empty_filters_returns_empty() {
-        let idx = TagInvertedIndex::new();
-        idx.add_segment(SegmentId(1), &[("host", "srv1")]);
-        assert!(idx.segments_for_tags(&[]).is_empty());
     }
 
     #[test]

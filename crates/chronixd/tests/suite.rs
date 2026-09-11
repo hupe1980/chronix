@@ -13,6 +13,9 @@ mod decimal_wire;
 #[path = "suite/errors_test.rs"]
 mod errors_test;
 
+#[path = "suite/explain_agreement.rs"]
+mod explain_agreement;
+
 #[path = "suite/flight_test.rs"]
 mod flight_test;
 #[path = "suite/grpc_test.rs"]
@@ -29,6 +32,11 @@ mod tenancy_test;
 mod tls_test;
 #[path = "suite/triggers_test.rs"]
 mod triggers_test;
+
+/// Every Arrow type a query can produce reaches the client as data,
+/// and a mistake in a query says what it was.
+#[path = "suite/value_fidelity.rs"]
+mod value_fidelity;
 
 #[path = "suite/soft_delete.rs"]
 mod soft_delete;

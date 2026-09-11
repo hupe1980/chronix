@@ -167,7 +167,12 @@ impl Chronix {
         let cutoff =
             now_ns.saturating_sub(i64::try_from(config.cold_after.as_nanos()).unwrap_or(i64::MAX));
 
-        let groups = self.cold_groups(cutoff, config.max_objects_per_run);
+        // Leased across encode and upload, because both read these files and
+        // the upload can take minutes. Released before `drop_archived`: the
+        // pass retires the very segments it leased, and one holding its own
+        // lease would defer its own reclamation for ever.
+        // See `db::leases`.
+        let (groups, read_lease) = self.cold_groups(cutoff, config.max_objects_per_run);
         let more_pending = groups.len() >= config.max_objects_per_run;
         if groups.is_empty() {
             return Ok(ArchiveOutcome::default());
@@ -270,6 +275,7 @@ impl Chronix {
             archived.push(group);
         }
 
+        drop(read_lease);
         if !archived.is_empty() {
             self.drop_archived(&archived, &mut outcome);
         }
@@ -288,17 +294,26 @@ impl Chronix {
 
     /// Group the catalog into complete, cold `(measurement, shard)` units.
     ///
-    /// Holds the catalog read lock for the grouping only; the encode and
-    /// upload that follow take it again per group.
-    fn cold_groups(&self, cutoff: i64, max_groups: usize) -> Vec<Group> {
-        let all: Vec<SegmentCatalogEntry> = {
+    /// Holds the catalog read lock for the grouping only, and returns a lease
+    /// on every segment it looked at so the encode and upload that follow
+    /// cannot have their files unlinked underneath them.
+    fn cold_groups(
+        &self,
+        cutoff: i64,
+        max_groups: usize,
+    ) -> (Vec<Group>, crate::db::leases::SegmentLease<'_>) {
+        let (all, lease) = {
             let catalog = self.catalog.read();
-            catalog
+            let all: Vec<SegmentCatalogEntry> = catalog
                 .all_segments()
                 .into_iter()
                 .filter(|e| e.state == SegmentState::Active)
                 .cloned()
-                .collect()
+                .collect();
+            let lease = self
+                .segment_leases
+                .acquire(all.iter().map(|e| e.segment_id));
+            (all, lease)
         };
 
         let mut by_group: BTreeMap<(String, i64), Vec<SegmentCatalogEntry>> = BTreeMap::new();
@@ -390,7 +405,7 @@ impl Chronix {
             });
         }
 
-        groups
+        (groups, lease)
     }
 
     /// Read one group through the read path and encode it as a Parquet object.
@@ -453,56 +468,19 @@ impl Chronix {
 
     /// Drop every archived group's segments from the hot database.
     ///
-    /// Done in one pass, taking the catalog, time index and bloom locks in
-    /// their documented order. Doing it per group inside the upload loop would
+    /// Through `retire_segments`, the one path every pass that removes a
+    /// segment takes. Doing it per group inside the upload loop would
     /// interleave lock acquisition with network I/O for no benefit.
     fn drop_archived(&self, archived: &[Group], outcome: &mut ArchiveOutcome) {
-        let mut catalog = self.catalog.write();
-        let mut time_idx = self.time_index.write();
-        let mut blooms = self.blooms.write();
-
+        // One retirement per archived group, through the same path retention
+        // and compaction take: the rows leave the local database now, the
+        // bytes leave once no running scan still holds them.
         for group in archived {
-            for entry in &group.segments {
-                // Catalog first, then the file — a crash between them loses a
-                // segment that is already in the archive, never one that is
-                // not.
-                if let Err(e) = catalog.remove_segment(entry.segment_id) {
-                    warn!(
-                        segment_id = entry.segment_id.0,
-                        error = %e,
-                        "cold archive: failed to remove catalog entry"
-                    );
-                    outcome.failed += 1;
-                    continue;
-                }
-                blooms.remove(&entry.segment_id.0);
-                if let Some(idx) = time_idx.get_mut(&entry.shard_id) {
-                    // The segment may predate this index's rebuild; either way
-                    // it is gone now.
-                    let _ = idx.remove_segment(entry.segment_id);
-                }
-                self.tag_index.remove_segment(entry.segment_id);
-                self.metadata_cache.remove(entry.segment_id);
-                self.segment_cache.invalidate_segment(entry.segment_id);
-
-                for path in [
-                    entry.path.clone(),
-                    chronix_engine::index::series_index::sidecar_path(&entry.path),
-                ] {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            warn!(path = %path.display(), error = %e, "cold archive: failed to remove local file");
-                        }
-                    }
-                }
-
-                outcome.segments += 1;
-                outcome.bytes += entry.byte_size;
-            }
+            let retired = self.retire_segments(&group.segments);
+            outcome.failed += group.segments.len() - retired.total();
+            outcome.segments += retired.total();
+            outcome.bytes += retired.bytes_freed;
         }
-        drop(blooms);
-        drop(time_idx);
-        drop(catalog);
 
         // Archiving is a delete from the hot database, so the values derived
         // from what it holds — the cardinality budget, the namespace index,

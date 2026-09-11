@@ -68,7 +68,10 @@ fn downsample_emits_one_row_per_interval_across_chunk_boundaries() {
         .query()
         .measurement("m")
         .range(0, i64::MAX)
-        .downsample(std::time::Duration::from_secs(60), AggFn::Sum)
+        .downsample(
+            TimeBucket::fixed(std::time::Duration::from_secs(60)),
+            AggFn::Sum,
+        )
         .build()
         .unwrap();
 
@@ -134,7 +137,10 @@ fn downsample_is_correct_across_segment_buckets() {
         .query()
         .measurement("m")
         .range(0, i64::MAX)
-        .downsample(std::time::Duration::from_secs(60), AggFn::Sum)
+        .downsample(
+            TimeBucket::fixed(std::time::Duration::from_secs(60)),
+            AggFn::Sum,
+        )
         .build()
         .unwrap();
 
@@ -150,4 +156,111 @@ fn downsample_is_correct_across_segment_buckets() {
             "bucket at {ts} summed to {v}, expected 60"
         );
     }
+}
+
+// ── The native plan and SQL must mean the same thing by a bucket ────────
+
+/// Both surfaces bucket a DST transition day identically.
+///
+/// `downsample()` used to take a `Duration`, so `1d` on the native API was
+/// 86 400 seconds of UTC while `1d` in SQL was the zone's day. On the spring
+/// transition Europe/Berlin has a **23-hour** day, so the two answers
+/// disagreed for every series that crossed it — silently, because both
+/// produced plausible buckets.
+#[cfg(feature = "sql")]
+#[test]
+fn the_native_plan_and_sql_agree_about_a_transition_day() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+
+    // 2025-03-30 is the spring-forward day in Europe/Berlin: local 02:00
+    // jumps to 03:00, so the local day is 23 hours long.
+    // 2025-03-29T00:00:00Z .. 2025-03-31T00:00:00Z, hourly.
+    let start = 1_743_206_400_i64 * SEC; // 2025-03-29T00:00:00Z
+    let key = SeriesKey::new("dst", tags! { "host" => "a" }).unwrap();
+    for h in 0..48 {
+        let ts = start + h * 3600 * SEC;
+        db.insert(&Point::new(key.clone(), fields! { "v" => 1.0_f64 }, ts).unwrap())
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let bucket = TimeBucket::parse("1d", Some("Europe/Berlin")).unwrap();
+
+    // The native plan.
+    let plan = db
+        .query()
+        .measurement("dst")
+        .downsample(bucket, AggFn::Count)
+        .build()
+        .unwrap();
+    let native = buckets(&[db.execute(&plan).unwrap()]);
+
+    // The same question in SQL.
+    let sql = db
+        .sql(
+            "SELECT time_bucket('1d', _time, 'Europe/Berlin') AS b, COUNT(v) AS c \
+             FROM dst GROUP BY b ORDER BY b",
+        )
+        .unwrap();
+    let mut from_sql: Vec<(i64, f64)> = Vec::new();
+    for batch in &sql {
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .unwrap();
+        let c = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            #[allow(clippy::cast_precision_loss)]
+            from_sql.push((ts.value(i), c.value(i) as f64));
+        }
+    }
+
+    assert_eq!(
+        native, from_sql,
+        "the native downsample and time_bucket() must bucket identically"
+    );
+
+    // And the transition day really is short — otherwise this test would
+    // pass on two implementations that are wrong in the same way.
+    let counts: Vec<f64> = native.iter().map(|(_, c)| *c).collect();
+    assert!(
+        counts.contains(&23.0),
+        "the Berlin day of the spring transition holds 23 hourly points, got {counts:?}"
+    );
+}
+
+/// A calendar month is not thirty days, on either surface.
+#[test]
+fn a_native_monthly_bucket_follows_the_calendar() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+
+    // One point per day through February and March 2025 (28 + 31).
+    let feb1 = 1_738_368_000_i64 * SEC; // 2025-02-01T00:00:00Z
+    let key = SeriesKey::new("cal", tags! { "host" => "a" }).unwrap();
+    for d in 0..59 {
+        let ts = feb1 + d * 86_400 * SEC;
+        db.insert(&Point::new(key.clone(), fields! { "v" => 1.0_f64 }, ts).unwrap())
+            .unwrap();
+    }
+    db.flush().unwrap();
+
+    let plan = db
+        .query()
+        .measurement("cal")
+        .downsample(TimeBucket::parse("1mo", None).unwrap(), AggFn::Count)
+        .build()
+        .unwrap();
+    let got = buckets(&[db.execute(&plan).unwrap()]);
+    let counts: Vec<f64> = got.iter().map(|(_, c)| *c).collect();
+
+    // February is 28 days in 2025 and March is 31 — a fixed width cannot
+    // produce this pair at all.
+    assert_eq!(counts, vec![28.0, 31.0], "got {got:?}");
 }

@@ -97,79 +97,13 @@ ChangeEvent {
 Chronix defaults to **at-least-once** with idempotent consumers
 (deduplication by sequence number).
 
-### Window Finalization Optimization
-
-`finalize_all_series()` avoids cloning all bucket keys by pre-filtering
-to only series that have at least one expired window (i.e. a bucket whose
-start + interval <= watermark). This reduces allocation overhead under
-high-cardinality workloads where most series' windows are still open.
-
-## Windowing
-
-Streaming computations operate over **windows** — finite slices of an
-unbounded stream:
-
-### Tumbling Windows
-
-Non-overlapping, fixed-size windows:
-
-```text
-time ──▸
-├──── W1 ────┤├──── W2 ────┤├──── W3 ────┤
-```
-
-### Sliding Windows
-
-Overlapping windows with a slide interval:
-
-```text
-time ──▸
-├──── W1 ────┤
-    ├──── W2 ────┤
-        ├──── W3 ────┤
-```
-
-### Session Windows
-
-Dynamic windows that close after a gap of inactivity:
-
-```text
-time ──▸
-├── W1 ──┤    gap    ├── W2 ──────┤  gap  ├ W3 ┤
-```
-
-## Watermarks
-
-In distributed systems, events can arrive **out of order**. A
-**watermark** $W(t)$ declares that no events with timestamp $< W(t)$
-will arrive in the future:
-
-$$
-W(t) = \max(\text{observed timestamps}) - \text{allowed\_lateness}
-$$
-
-When the watermark advances past a window's end, that window is
-**closed** and its result is emitted.
-
-### Late Events
-
-Events arriving after their window has closed are handled by:
-1. **Drop** — discard (default for dashboards)
-2. **Update** — re-emit corrected result
-3. **Side-output** — route to a separate late-event stream
-
 ## Backpressure
 
-When consumers cannot keep up with the ingestion rate:
-
-| Strategy | Behavior |
-|----------|----------|
-| Buffer | Queue events in memory (bounded) |
-| Drop oldest | Discard old events to make room |
-| Block producer | Slow down ingestion (last resort) |
-
-Chronix implements bounded buffering with configurable queue depth,
-falling back to dropping oldest events under sustained overload.
+Each delivery channel owns a **bounded queue and a worker thread**. A queue
+that fills **drops the oldest waiting event**, counts it in
+`chronix_signal_delivery_dropped_total` and keeps accepting — a slow webhook
+must not block ingestion, and the newest signal is the one worth delivering.
+Depth is `chronix_signal_delivery_queue_depth`; capacity is per channel.
 
 ## Integration with Signal Triggers
 

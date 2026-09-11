@@ -486,7 +486,7 @@ fn a_write_after_a_delete_is_visible_inside_the_deleted_interval() {
     db.flush().unwrap();
     assert_eq!(visible_timestamps(&db), vec![1000, 2000, 3000]);
     db.compact().unwrap();
-    db.gc_with_grace(0).unwrap();
+    db.gc().unwrap();
     assert_eq!(visible_timestamps(&db), vec![1000, 2000, 3000]);
     db.close().unwrap();
 }

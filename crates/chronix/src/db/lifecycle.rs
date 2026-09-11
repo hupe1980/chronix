@@ -7,8 +7,7 @@ use metrics::{counter, gauge, histogram};
 use tracing::{debug, info, warn};
 
 use chronix_core::{SegmentState, ShardId};
-use chronix_engine::cache::metadata::CachedSegmentMeta;
-use chronix_engine::index::{CatalogColumnStats, SegmentCatalogEntry, TimeIndexEntry};
+use chronix_engine::index::{CatalogColumnStats, SegmentCatalogEntry};
 use chronix_engine::memtable::FlushResult;
 use chronix_engine::segment::reader::SegmentReader;
 use chronix_query::plan::QueryPlan;
@@ -399,18 +398,7 @@ impl super::Chronix {
         // shard's *start* is used rather than its end, which is the
         // conservative direction: it can only hold data back.
         let now_ns = Self::now_ns();
-        let newest_data_ns = {
-            let on_disk = shard_bounds.values().map(|b| b.1).max();
-            let shard_ns = i64::try_from(self.config.shard_duration.as_nanos()).unwrap_or(i64::MAX);
-            let in_memory = self
-                .shards
-                .active_shard()
-                .map(|s| s.0.saturating_mul(shard_ns));
-            match (on_disk, in_memory) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            }
-        };
+        let newest_data_ns = self.newest_data_ns(shard_bounds.values().map(|b| b.1).max());
         let reference_ns = retention::retention_reference(now_ns, newest_data_ns);
 
         // Without a global rule nothing expires by age alone; the
@@ -454,6 +442,7 @@ impl super::Chronix {
         // always the same.
         let mut shards_dropped: usize = 0;
         let mut segments_preserved: usize = 0;
+        let mut segments_awaiting_readers: usize = 0;
 
         for &shard_id in &expired {
             // From the same snapshot the bounds came from.
@@ -492,48 +481,21 @@ impl super::Chronix {
                 }
             }
 
-            let mut catalog = self.catalog.write();
-            let mut time_idx = self.time_index.write();
-            let mut blooms = self.blooms.write();
+            let doomed: Vec<SegmentCatalogEntry> = entries
+                .iter()
+                .filter(|e| !protected.contains(&e.segment_id))
+                .cloned()
+                .collect();
+            let retired = self.retire_segments(&doomed);
+            total_segments += retired.total();
+            total_bytes += retired.bytes_freed;
+            segments_awaiting_readers += retired.deferred;
 
-            for entry in &entries {
-                if protected.contains(&entry.segment_id) {
-                    continue;
-                }
-                total_bytes += entry.byte_size;
-                total_segments += 1;
-
-                // Remove catalog entry FIRST so queries stop referencing
-                // this segment before its files are deleted (crash-safe order).
-                if let Err(e) = catalog.remove_segment(entry.segment_id) {
-                    warn!(segment_id = ?entry.segment_id, error = %e, "retention: failed to remove catalog entry");
-                }
-                blooms.remove(&entry.segment_id.0);
-                self.tag_index.remove_segment(entry.segment_id);
-                self.metadata_cache.remove(entry.segment_id);
-                self.segment_cache.invalidate_segment(entry.segment_id);
-
-                // Remove files after catalog is updated
-                if let Err(e) = std::fs::remove_file(&entry.path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!(path = %entry.path.display(), error = %e, "retention: failed to remove segment file");
-                    }
-                }
-                if let Err(e) = chronix_engine::index::series_index::remove(&entry.path) {
-                    warn!(path = %entry.path.display(), error = %e, "retention: failed to remove series index");
-                }
-            }
-
-            // The shard's time index goes only when nothing in it survived.
-            if protected.is_empty() {
+            // A shard counts as dropped only when nothing in it survived —
+            // and only when the retirement actually took, so a manifest that
+            // could not be written does not report a shard as dropped.
+            if protected.is_empty() && retired.total() == doomed.len() {
                 shards_dropped += 1;
-                time_idx.remove(&shard_id);
-            } else if let Some(ti) = time_idx.get_mut(&shard_id) {
-                for entry in &entries {
-                    if !protected.contains(&entry.segment_id) {
-                        let _ = ti.remove_segment(entry.segment_id);
-                    }
-                }
             }
         }
 
@@ -580,40 +542,10 @@ impl super::Chronix {
                 })
                 .collect();
 
-            if !seg_to_drop.is_empty() {
-                let mut catalog = self.catalog.write();
-                let mut time_idx = self.time_index.write();
-                let mut blooms = self.blooms.write();
-
-                for entry in &seg_to_drop {
-                    total_bytes += entry.byte_size;
-                    total_segments += 1;
-
-                    // Remove catalog/index entries FIRST (crash-safe order)
-                    if let Err(e) = catalog.remove_segment(entry.segment_id) {
-                        warn!(segment_id = ?entry.segment_id, error = %e, "retention: failed to remove catalog entry");
-                    }
-                    blooms.remove(&entry.segment_id.0);
-                    self.tag_index.remove_segment(entry.segment_id);
-                    self.metadata_cache.remove(entry.segment_id);
-                    self.segment_cache.invalidate_segment(entry.segment_id);
-                    if let Some(ti) = time_idx.get_mut(&entry.shard_id) {
-                        if !ti.remove_segment(entry.segment_id) {
-                            warn!(segment_id = ?entry.segment_id, "retention: time-index entry not found");
-                        }
-                    }
-
-                    // Remove files after catalog is updated
-                    if let Err(e) = std::fs::remove_file(&entry.path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            warn!(path = %entry.path.display(), error = %e, "retention: failed to remove segment file");
-                        }
-                    }
-                    if let Err(e) = chronix_engine::index::series_index::remove(&entry.path) {
-                        warn!(path = %entry.path.display(), error = %e, "retention: failed to remove series index");
-                    }
-                }
-            }
+            let retired = self.retire_segments(&seg_to_drop);
+            total_segments += retired.total();
+            total_bytes += retired.bytes_freed;
+            segments_awaiting_readers += retired.deferred;
         }
 
         // A pass that removed segments changed what the database holds, so
@@ -627,6 +559,7 @@ impl super::Chronix {
             shards_dropped,
             segments_deleted: total_segments,
             segments_preserved,
+            segments_awaiting_readers,
             bytes_freed: total_bytes,
         };
 
@@ -637,6 +570,7 @@ impl super::Chronix {
                 shards = result.shards_dropped,
                 segments = result.segments_deleted,
                 preserved = result.segments_preserved,
+                awaiting_readers = result.segments_awaiting_readers,
                 bytes = result.bytes_freed,
                 "Retention enforced"
             );
@@ -677,7 +611,26 @@ impl super::Chronix {
         // flushed out of the memtable and its segment had not yet been read,
         // and the repair would release a series whose data is on disk.
         let in_memory = self.shards.live_series();
-        let on_disk = Self::series_on_disk(&self.catalog.read());
+        // The sidecars are read *outside* the catalog lock, under a lease.
+        // Holding the read lock across that I/O blocked every `catalog.write()`
+        // — which is where a flush registers its segment — for the whole pass,
+        // and the pass is measured in seconds on a large instance. The lease
+        // gives the same guarantee the lock did, that these files are still
+        // there, without stopping the write path (see `db::leases`).
+        let (entries, _lease) = {
+            let catalog = self.catalog.read();
+            let entries: Vec<SegmentCatalogEntry> = catalog
+                .all_segments()
+                .into_iter()
+                .filter(|e| e.state == SegmentState::Active)
+                .cloned()
+                .collect();
+            let lease = self
+                .segment_leases
+                .acquire(entries.iter().map(|e| e.segment_id));
+            (entries, lease)
+        };
+        let on_disk = Self::series_on_disk(&entries);
         let before = self.known_series.len();
         self.known_series
             .retain(|k| on_disk.contains(k.as_str()) || in_memory.contains(k.as_str()));
@@ -719,14 +672,9 @@ impl super::Chronix {
 
     /// The canonical form of every series the active segments hold, read from
     /// the per-segment series sidecars — no segment is decoded.
-    fn series_on_disk(
-        catalog: &chronix_engine::index::SegmentCatalog,
-    ) -> std::collections::HashSet<String> {
+    fn series_on_disk(entries: &[SegmentCatalogEntry]) -> std::collections::HashSet<String> {
         let mut known = std::collections::HashSet::new();
-        for entry in catalog.all_segments() {
-            if entry.state != SegmentState::Active {
-                continue;
-            }
+        for entry in entries {
             for key in Self::series_keys_of(&entry.path, &entry.measurement) {
                 known.insert(key.canonical_form().to_string());
             }
@@ -781,14 +729,24 @@ impl super::Chronix {
             warn!(error = %e, "Rollup materialisation failed");
         }
 
-        let segments: Vec<SegmentCatalogEntry> = {
+        // Leased for the merge: a task opens its inputs on a worker thread,
+        // minutes after this snapshot on a large shard, and retention or a
+        // drop running beside it would otherwise unlink one and fail the
+        // task. Released before the results are processed, because this pass
+        // *retires* those same inputs and a pass holding its own lease would
+        // defer its own reclamation. See `db::leases`.
+        let (segments, input_lease) = {
             let catalog = self.catalog.read();
-            catalog
+            let segs: Vec<SegmentCatalogEntry> = catalog
                 .all_segments()
                 .into_iter()
                 .filter(|e| e.state == SegmentState::Active)
                 .cloned()
-                .collect()
+                .collect();
+            let lease = self
+                .segment_leases
+                .acquire(segs.iter().map(|e| e.segment_id));
+            (segs, lease)
         };
 
         let segments_dir = self.config.data_dir.join("segments");
@@ -845,6 +803,8 @@ impl super::Chronix {
             }
             all_results
         });
+        // Every input has been read; from here the pass only opens outputs.
+        drop(input_lease);
 
         // Process results sequentially — catalog/index updates require
         // write locks and must not race.
@@ -852,37 +812,8 @@ impl super::Chronix {
             match result {
                 Ok(meta) if meta.row_count == 0 => {
                     // All rows tombstoned — no output segment to register,
-                    // but clean up old input segments from indexes.
-                    {
-                        let mut time_idx = self.time_index.write();
-                        let mut blooms = self.blooms.write();
-
-                        for input in &task.input_segments {
-                            if let Some(idx) = time_idx.get_mut(&input.shard_id) {
-                                if !idx.remove_segment(input.segment_id) {
-                                    warn!(segment_id = ?input.segment_id, "compact: stale time-index entry already removed");
-                                }
-                            }
-                            blooms.remove(&input.segment_id.0);
-                            self.tag_index.remove_segment(input.segment_id);
-                            self.metadata_cache.remove(input.segment_id);
-                            self.segment_cache.invalidate_segment(input.segment_id);
-                        }
-                    }
-
-                    // Soft-delete the input segments so GC picks them up
-                    {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let mut catalog = self.catalog.write();
-                        for input in &task.input_segments {
-                            if let Err(e) = catalog.soft_delete_segment(input.segment_id, now_ms) {
-                                warn!(segment_id = ?input.segment_id, error = %e, "compact: failed to soft-delete input segment");
-                            }
-                        }
-                    }
+                    // so the inputs are simply retired.
+                    self.retire_segments(&task.input_segments);
 
                     info!(
                         shard = %task.shard_id,
@@ -897,31 +828,26 @@ impl super::Chronix {
                         let mut catalog = self.catalog.write();
                         let seg_id = catalog.next_segment_id();
 
-                        let (col_stats, seg_header, col_metas) =
+                        let col_stats: Vec<CatalogColumnStats> =
                             match SegmentReader::open(&meta.path) {
-                                Ok(reader) => {
-                                    let stats = reader
-                                        .column_metadata()
-                                        .iter()
-                                        .map(|cm| CatalogColumnStats {
-                                            name: cm.name.clone(),
-                                            data_type: cm.data_type,
-                                            role: cm.role,
-                                            decimal_scale: cm.decimal_scale,
-                                            stats: cm.stats.clone(),
-                                        })
-                                        .collect();
-                                    let header = reader.header().clone();
-                                    let cols = reader.column_metadata().to_vec();
-                                    (stats, Some(header), cols)
-                                }
+                                Ok(reader) => reader
+                                    .column_metadata()
+                                    .iter()
+                                    .map(|cm| CatalogColumnStats {
+                                        name: cm.name.clone(),
+                                        data_type: cm.data_type,
+                                        role: cm.role,
+                                        decimal_scale: cm.decimal_scale,
+                                        stats: cm.stats.clone(),
+                                    })
+                                    .collect(),
                                 Err(e) => {
                                     warn!(
                                         segment = %meta.path.display(),
                                         error = %e,
                                         "Could not read column stats for compacted segment"
                                     );
-                                    (Vec::new(), None, Vec::new())
+                                    Vec::new()
                                 }
                             };
 
@@ -956,15 +882,6 @@ impl super::Chronix {
                             seg_id.0,
                         );
 
-                        // Populate metadata cache for new segment
-                        if let Some(header) = seg_header {
-                            self.metadata_cache.insert(CachedSegmentMeta {
-                                segment_id: seg_id,
-                                header,
-                                columns: col_metas,
-                            });
-                        }
-
                         seg_id
                     };
 
@@ -984,30 +901,14 @@ impl super::Chronix {
                         );
                     }
 
-                    // Clean up old segment files and indexes
+                    // Clean up the inputs' derived index entries. Their
+                    // files are kept until the reclamation below.
                     {
-                        let mut time_idx = self.time_index.write();
                         let mut blooms = self.blooms.write();
-
                         for input in &task.input_segments {
-                            // Remove old index entries (files are kept until GC)
-                            if let Some(idx) = time_idx.get_mut(&input.shard_id) {
-                                if !idx.remove_segment(input.segment_id) {
-                                    warn!(segment_id = ?input.segment_id, "compact: stale time-index entry already removed");
-                                }
-                            }
                             blooms.remove(&input.segment_id.0);
-                            self.metadata_cache.remove(input.segment_id);
                             self.segment_cache.invalidate_segment(input.segment_id);
                         }
-
-                        // Add new time index entry
-                        let idx = time_idx.entry(task.shard_id).or_default();
-                        idx.add_segment(TimeIndexEntry {
-                            segment_id,
-                            min_ts: meta.min_timestamp,
-                            max_ts: meta.max_timestamp,
-                        });
                     }
 
                     // Atomically swap old tag index entries with new ones —
@@ -1025,6 +926,14 @@ impl super::Chronix {
                     {
                         self.blooms.write().insert(segment_id.0, bloom);
                     }
+
+                    // The inputs are already out of every query — the catalog
+                    // swap above retired them in one transaction with the
+                    // output, which is what keeps a delete issued mid-merge
+                    // masking the rows the merge carried over. Their bytes go
+                    // now unless a scan snapshotted them first, in which case
+                    // the next `gc()` finishes the job.
+                    self.reclaim_retired(&task.input_segments);
 
                     info!(
                         shard = %task.shard_id,
@@ -1083,96 +992,204 @@ impl super::Chronix {
         Ok(completed)
     }
 
-    /// Garbage-collect segments that have been soft-deleted past the grace
-    /// period.
+    /// Retire a set of segments.
     ///
-    /// Returns the number of segments hard-deleted.
+    /// **Their rows leave the database now; their files leave when the last
+    /// reader that could open them is gone.** Every pass that removes a
+    /// segment goes through here — retention, a measurement drop, cold-tier
+    /// archiving, the inputs of a compaction — so the four of them cannot
+    /// disagree about the order of the catalog write, the index cleanup and
+    /// the unlink, and none of them can pull a file out from under a scan
+    /// that has already snapshotted its path (see `db::leases`).
     ///
-    /// The default grace period is 5 minutes (300 000 ms). Callers can
-    /// invoke this after `compact()` or on a periodic schedule.
-    pub fn gc(&self) -> Result<usize> {
-        self.gc_with_grace(300_000)
+    /// A segment a reader still holds is marked
+    /// [`SegmentState::SoftDeleted`] — invisible to every query from this
+    /// moment — and its file is unlinked by the next [`gc`](Self::gc).
+    ///
+    /// The caller must hold no catalog or bloom lock.
+    pub(crate) fn retire_segments(&self, entries: &[SegmentCatalogEntry]) -> Retired {
+        let mut out = Retired::default();
+        if entries.is_empty() {
+            return out;
+        }
+        let now_ms = super::chrono_timestamp_ms();
+        let mut to_unlink: Vec<std::path::PathBuf> = Vec::with_capacity(entries.len());
+
+        {
+            let mut catalog = self.catalog.write();
+            let mut blooms = self.blooms.write();
+
+            // The derived indexes go unconditionally and first: a retired
+            // segment is invisible to queries whether or not its bytes can go
+            // yet.
+            for entry in entries {
+                blooms.remove(&entry.segment_id.0);
+                self.tag_index.remove_segment(entry.segment_id);
+                self.segment_cache.invalidate_segment(entry.segment_id);
+            }
+
+            // One fsync for the whole retirement rather than one per segment:
+            // on flash-backed storage the fsync rate is the wear rate, and a
+            // retention pass expiring a day of shards is dozens of them.
+            let synced = catalog.in_one_sync(|cat| {
+                for entry in entries {
+                    // Asked while the catalog write lock is held, so no reader
+                    // can take a lease between the answer and the unlink it
+                    // decides.
+                    if self.segment_leases.is_leased(entry.segment_id) {
+                        match cat.soft_delete_segment(entry.segment_id, now_ms) {
+                            // Not in the catalog any more: another pass took
+                            // it between this one's snapshot and its write
+                            // lock, so it is not this pass's to report.
+                            Ok(false) => {}
+                            Ok(true) => out.deferred += 1,
+                            Err(e) => {
+                                warn!(segment_id = ?entry.segment_id, error = %e, "retire: failed to mark a segment a reader still holds");
+                            }
+                        }
+                        continue;
+                    }
+                    match cat.remove_segment(entry.segment_id) {
+                        // Already gone: another pass retired it between this
+                        // one's snapshot and its write lock. Not this pass's
+                        // segment to count, and not its file to unlink.
+                        Ok(None) => continue,
+                        Ok(Some(_)) => {}
+                        Err(e) => {
+                            warn!(segment_id = ?entry.segment_id, error = %e, "retire: failed to remove catalog entry");
+                            continue;
+                        }
+                    }
+                    to_unlink.push(entry.path.clone());
+                    out.removed += 1;
+                    out.bytes_freed += entry.byte_size;
+                }
+                Ok(())
+            });
+            if let Err(e) = synced {
+                warn!(error = %e, "retire: manifest sync failed — the files stay until the next pass");
+                return Retired::default();
+            }
+        }
+
+        // Only now: the catalog no longer names these paths, durably, so a
+        // crash here leaves a file nothing points at, which `open()` removes.
+        for path in &to_unlink {
+            Self::unlink_segment_files(path);
+        }
+
+        if out.deferred > 0 {
+            debug!(
+                segments = out.deferred,
+                "retire: segments held by a running scan — their files go on the next GC"
+            );
+            counter!("chronix_segments_retired_awaiting_readers_total")
+                .increment(out.deferred as u64);
+        }
+        out
     }
 
-    /// Garbage-collect with a custom grace period (in milliseconds).
-    pub fn gc_with_grace(&self, grace_period_ms: u64) -> Result<usize> {
+    /// Remove a segment's file and its series sidecar, tolerating a file that
+    /// is already gone.
+    fn unlink_segment_files(path: &std::path::Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %path.display(), error = %e, "failed to remove segment file");
+            }
+        }
+        if let Err(e) = chronix_engine::index::series_index::remove(path) {
+            warn!(path = %path.display(), error = %e, "failed to remove series index");
+        }
+    }
+
+    /// Unlink the files of segments the catalog has already retired, skipping
+    /// any a reader still holds.
+    ///
+    /// Returns the number of files removed.
+    fn reclaim_retired(&self, entries: &[SegmentCatalogEntry]) -> usize {
+        if entries.is_empty() {
+            return 0;
+        }
+        let mut to_unlink: Vec<std::path::PathBuf> = Vec::with_capacity(entries.len());
+        {
+            let mut catalog = self.catalog.write();
+            let synced = catalog.in_one_sync(|cat| {
+                for entry in entries {
+                    if self.segment_leases.is_leased(entry.segment_id) {
+                        continue;
+                    }
+                    match cat.remove_segment(entry.segment_id) {
+                        Ok(None) => continue,
+                        Ok(Some(_)) => {}
+                        Err(e) => {
+                            warn!(segment_id = ?entry.segment_id, error = %e, "gc: failed to remove catalog entry");
+                            continue;
+                        }
+                    }
+                    to_unlink.push(entry.path.clone());
+                }
+                Ok(())
+            });
+            if let Err(e) = synced {
+                warn!(error = %e, "gc: manifest sync failed — the files stay until the next pass");
+                return 0;
+            }
+        }
+        for path in &to_unlink {
+            Self::unlink_segment_files(path);
+        }
+        to_unlink.len()
+    }
+
+    /// Unlink the files of segments that were retired while a reader still
+    /// held them.
+    ///
+    /// Returns the number of segment files removed.
+    ///
+    /// A retirement pass — retention, a drop, archiving, a compaction's
+    /// inputs — takes a segment out of the catalog and unlinks it in one
+    /// step, unless a running scan has leased the path; then the entry is
+    /// marked [`SegmentState::SoftDeleted`], the rows are gone from every
+    /// query, and the bytes wait here for the reader to finish. This is a
+    /// step of every maintenance pass, so the wait is bounded by the
+    /// maintenance interval rather than by anything the reader does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is closed.
+    pub fn gc(&self) -> Result<usize> {
         self.check_open()?;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        let expired: Vec<(
-            chronix_core::SegmentId,
-            chronix_core::ShardId,
-            std::path::PathBuf,
-        )> = {
+        let retired: Vec<SegmentCatalogEntry> = {
             let catalog = self.catalog.read();
-            catalog
-                .expired_soft_deleted(now_ms, grace_period_ms)
-                .into_iter()
-                .map(|e| (e.segment_id, e.shard_id, e.path.clone()))
-                .collect()
+            catalog.retired_segments().into_iter().cloned().collect()
         };
 
-        if expired.is_empty() {
-            return Ok(0);
-        }
-
-        // Lock order: catalog → time_index → blooms (consistent with
-        // execute_retention, compact, drop_measurement).
-        let mut catalog = self.catalog.write();
-        let mut time_idx = self.time_index.write();
-        let mut blooms = self.blooms.write();
-        let mut removed = 0usize;
-        for (seg_id, shard_id, path) in &expired {
-            // Remove files from disk
-            if let Err(e) = std::fs::remove_file(path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!(path = %path.display(), error = %e, "gc: failed to remove segment file");
-                }
-            }
-            if let Err(e) = chronix_engine::index::series_index::remove(path) {
-                warn!(path = %path.display(), error = %e, "gc: failed to remove series index");
-            }
-            // Remove from catalog (manifest entry recorded)
-            if let Err(e) = catalog.remove_segment(*seg_id) {
-                warn!(segment_id = ?seg_id, error = %e, "gc: failed to remove catalog entry");
-            }
-            // Clean up all in-memory indexes to prevent stale entries
-            if let Some(ti) = time_idx.get_mut(shard_id) {
-                if !ti.remove_segment(*seg_id) {
-                    warn!(segment_id = ?seg_id, "gc: stale time-index entry already removed");
-                }
-            }
-            blooms.remove(&seg_id.0);
-            self.tag_index.remove_segment(*seg_id);
-            self.metadata_cache.remove(*seg_id);
-            self.segment_cache.invalidate_segment(*seg_id);
-            removed += 1;
-        }
-
+        let removed = self.reclaim_retired(&retired);
         if removed > 0 {
             counter!("chronix_gc_segments_deleted_total").increment(removed as u64);
-            info!(segments = removed, "GC: hard-deleted expired segments");
-
-            // Same repair retention runs, for the same reason: hard-deleting
-            // a segment can be the moment a series stops existing.
-            drop(blooms);
-            drop(time_idx);
-            drop(catalog);
+            info!(
+                segments = removed,
+                "GC: removed the files of segments a reader had been holding"
+            );
+            // Removing the last segment a series had is the moment it stops
+            // existing, and the cardinality budget is an admission limit.
             self.repair_live_series();
+        }
 
-            // After GC removes segments, garbage-collect tombstones
-            // whose target segments no longer exist in any active segment.
-            let tombstones_removed = self.gc_tombstones();
-            if tombstones_removed > 0 {
-                info!(
-                    tombstones = tombstones_removed,
-                    "GC: cleaned up stale tombstones"
-                );
-            }
+        // Unconditionally, because this is the only caller: a tombstone is
+        // reclaimable once every segment it was issued against has left the
+        // catalog, and segments now leave through `retire_segments` without
+        // passing through here at all. Gating it on `removed > 0` — which it
+        // was, when every retirement was a soft delete this pass collected —
+        // would leave the set growing for ever on a database whose reads
+        // never collide with its retirements, which is most of them.
+        let tombstones_removed = self.gc_tombstones();
+        if tombstones_removed > 0 {
+            info!(
+                tombstones = tombstones_removed,
+                "GC: cleaned up stale tombstones"
+            );
         }
 
         // Hard-delete measurements whose soft-delete TTL has elapsed.
@@ -1187,6 +1204,29 @@ impl super::Chronix {
         Ok(removed)
     }
 
+    /// The newest timestamp this database holds, on disk or in memory.
+    ///
+    /// `on_disk` is the maximum over active segments, which the caller
+    /// supplies from whatever catalog snapshot it already holds — retention
+    /// derives its shard bounds from the same one, and taking a second read
+    /// would let a flush land between them.
+    ///
+    /// The in-memory term matters: a database whose newest data is still
+    /// unflushed must not read as one that stopped writing. The active
+    /// shard's *start* is used rather than its end, which can only hold the
+    /// reference back — the conservative direction.
+    fn newest_data_ns(&self, on_disk: Option<i64>) -> Option<i64> {
+        let shard_ns = i64::try_from(self.config.shard_duration.as_nanos()).unwrap_or(i64::MAX);
+        let in_memory = self
+            .shards
+            .active_shard()
+            .map(|s| s.0.saturating_mul(shard_ns));
+        match (on_disk, in_memory) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Hard-delete measurements whose soft-delete TTL has elapsed.
     ///
     /// Scans the catalog's pending-drop set and hard-deletes any entry whose
@@ -1196,15 +1236,42 @@ impl super::Chronix {
     /// pass to retry rather than forgetting it.
     ///
     /// Returns the number of measurements hard-deleted.
+    ///
+    /// The deadline is measured against the same reference retention uses,
+    /// not the raw wall clock: see the comment in the body.
     pub fn gc_pending_measurement_drops(&self) -> Result<usize> {
-        let now_ms = super::chrono_timestamp_ms();
+        // The same reference retention measures age from, for the same
+        // reason: this pass is irreversible, and a soft delete's whole
+        // purpose is to leave a window in which a mistake can be undone.
+        // Reading `SystemTime::now()` alone means one bad reading — a
+        // gateway with no battery-backed RTC, an NTP server handing out a
+        // date in the next century — closes that window instantly and
+        // destroys the data it existed to protect.
+        //
+        // The cost is retention's, stated the same way: a database that has
+        // stopped receiving data stops reclaiming this disk. That is the
+        // conservative direction for an undo window, and a live server's
+        // newest write is a moment old, so the clock decides in practice.
+        let reference_ns = retention::retention_reference(
+            Self::now_ns(),
+            self.newest_data_ns(
+                self.catalog
+                    .read()
+                    .all_segments()
+                    .into_iter()
+                    .filter(|e| e.state == SegmentState::Active)
+                    .map(|e| e.max_timestamp)
+                    .max(),
+            ),
+        );
+        let reference_ms = u64::try_from(reference_ns / 1_000_000).unwrap_or(0);
 
         let expired: Vec<String> = self
             .catalog
             .read()
             .pending_measurement_drops()
             .iter()
-            .filter(|(_, &deadline)| now_ms >= deadline)
+            .filter(|(_, &deadline)| reference_ms >= deadline)
             .map(|(m, _)| m.clone())
             .collect();
 
@@ -1286,7 +1353,7 @@ impl super::Chronix {
     }
 
     /// Register freshly written segments: catalog entry, metadata cache,
-    /// time index, series sidecar, bloom and tag index.
+    /// series sidecar, bloom and tag index.
     fn register_flushed(&self, shard_id: ShardId, results: &[FlushResult]) -> Result<()> {
         for result in results {
             let meta = &result.segment_meta;
@@ -1344,20 +1411,6 @@ impl super::Chronix {
                 seg_id
             };
 
-            self.metadata_cache.insert(CachedSegmentMeta {
-                segment_id,
-                header: meta.header.clone(),
-                columns: meta.column_metas.clone(),
-            });
-            {
-                let mut indices = self.time_index.write();
-                let idx = indices.entry(shard_id).or_default();
-                idx.add_segment(TimeIndexEntry {
-                    segment_id,
-                    min_ts: meta.min_timestamp,
-                    max_ts: meta.max_timestamp,
-                });
-            }
             {
                 let mut blooms = self.blooms.write();
                 Self::index_series_keys(
@@ -1424,5 +1477,26 @@ impl super::Chronix {
         }
 
         overlap_count
+    }
+}
+
+/// What one call to [`Chronix::retire_segments`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Retired {
+    /// Segments whose catalog entry and file are both gone.
+    pub(crate) removed: usize,
+    /// Segments taken out of every query but whose file a running scan still
+    /// holds. Unlinked by the next [`Chronix::gc`].
+    pub(crate) deferred: usize,
+    /// Bytes actually reclaimed — the deferred segments' bytes are not
+    /// counted, because they are still on the disk.
+    pub(crate) bytes_freed: u64,
+}
+
+impl Retired {
+    /// Segments this pass removed from the database, whether or not their
+    /// bytes have gone yet.
+    pub(crate) const fn total(self) -> usize {
+        self.removed + self.deferred
     }
 }

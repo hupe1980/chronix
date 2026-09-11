@@ -7,7 +7,7 @@ Pre-built Grafana dashboards for monitoring Chronix clusters.
 | File | Description |
 |------|-------------|
 | `cluster-overview.json` | Node status, region count, replication health, leader changes |
-| `query-performance.json` | Query latency percentiles, scatter-gather breakdown, write throughput |
+| `query-performance.json` | Query and write latency percentiles, throughput, plan- and scan-cache hit ratios, segment pruning |
 | `analytics.json` | Forecast/anomaly latency, GPU utilization, compute engine metrics |
 | `storage.json` | Disk usage, object store tiering, cache hit ratios, WAL metrics |
 | `ingestion.json` | Write rate, write latency percentiles, WAL size, memtable flushes, batch distribution |
@@ -27,6 +27,19 @@ Pre-built Grafana dashboards for monitoring Chronix clusters.
 3. **Requirements:**
    - Grafana 10.0+
    - Prometheus data source scraping Chronix metrics endpoint
+
+## Why a panel is empty
+
+A metric that has never been recorded is absent from a scrape, and Grafana
+draws "No data" for it.
+
+- **Write-path counters read `0`** from startup, so an ingestion-error panel
+  shows a number rather than "No data".
+- **Feature-gated panels stay empty until that feature is configured and
+  used**: the object-store panels need a cold tier, `signals.json` needs
+  triggers, the analytics panels need a forecast or a detector to run.
+- **`cluster-overview.json` needs a `--features cluster` build.** The
+  distributed tier is excluded from the default build.
 
 ## Export bundled dashboards
 

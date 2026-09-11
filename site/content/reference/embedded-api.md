@@ -57,7 +57,7 @@ Chronix::open(config)
     │    freeze_and_swap active memtable
     │    write frozen → SegmentWriter → .csx (+ .series sidecar)
     │    register in catalog (including CatalogColumnStats)
-    │    update time index, bloom, tag index from the writer's series keys
+    │    update bloom and tag index from the writer's series keys
     │  after ALL shards flushed: raise the WAL floor, truncate WAL,
     │  retire idle shards below the window
     │
@@ -68,16 +68,15 @@ Chronix::open(config)
     │  CompactionPicker::pick() → CompactionTask list
     │  CompactionExecutor::execute() per task
     │  register compacted segment in catalog (+ .series sidecar)
-    │  populate metadata cache, bloom, tag index
-    │  soft-delete input segments (marked SoftDeleted in catalog)
+    │  populate bloom and tag index
+    │  retire the input segments (one manifest transition with the output)
     │  materialise_rollups(): every rollup up to its final bucket
     │
     ▼
-  gc() / gc_with_grace(ms)
-    │  find soft-deleted segments past grace period (default: 5 min)
-    │  hard-delete segment files (.csx + .series)
-    │  remove catalog entries
-    │  remove from blooms, tag_index, and metadata_cache
+  gc()
+    │  unlink the files of retired segments no reader holds any more
+    │  reclaim tombstones whose segments have all left the catalog
+    │  hard-delete measurements whose soft-delete TTL has elapsed
     │
     ▼
   archive_cold_segments(config)          [feature = "object-store"]
@@ -107,7 +106,7 @@ Chronix::open(config)
 QueryPlan
   ├── 1. Scan memtable (all shards matching measurement + time range)
   ├── 2. Pre-filter segments via tag inverted index (if tag filters present)
-  ├── 3. Prune segments by time index + bloom filter + column stats
+  ├── 3. Prune segments by catalog time range + tag index + bloom + column stats
   ├── 4. Read segments (projection pushdown via compute_scan_columns)
   ├── 5. Filter tombstoned rows from segment data
   ├── 6. Merge memtable + segment batches
@@ -120,9 +119,9 @@ QueryPlan
 `db.execute_with_stats(&plan)` returns `(RecordBatch, PruningStats)` —
 same pipeline but exposes segment pruning statistics for observability.
 
-**Soft-deleted segments** are automatically excluded from all query paths.
-`execute()`, `execute_stream()`, and `last_value()` call
-`active_segments_for_measurement()` which filters out segments in the
+**Retired segments** are automatically excluded from all query paths.
+`execute()`, `execute_stream()`, `execute_iter()` and `last_value()` call
+`active_segments_for_measurement()`, which filters out segments in the
 `SoftDeleted` state.
 
 **Empty-result schema preservation:** When a query matches no data, `execute()`
@@ -265,7 +264,7 @@ tombstone set. Supports both plain `Utf8` and dictionary-encoded
 (`Dictionary<Int32, Utf8>`) tag columns.
 - **`drop_measurement(measurement)`** — removes the measurement schema from the
   `SchemaRegistry`, deletes all catalog entries, segment files (`.csx`), and
-  series sidecar files (`.series`) on disk, and clears time index and bloom filter
+  series sidecar files (`.series`) on disk, and clears the bloom filter
   entries. This is an atomic, irreversible operation.
 
 ### Segment Lifecycle
@@ -276,18 +275,27 @@ Segments progress through three states tracked by `SegmentState`:
 |----------------|--------------------------------------------------|
 | `Active`       | Normal segment, readable by queries              |
 | `Compacting`   | Being processed by the compaction engine          |
-| `SoftDeleted`  | Marked for removal with a `deleted_at_ms` timestamp |
+| `SoftDeleted`  | Retired, and still on disk because a running read holds it |
 
-After compaction, input segments are **soft-deleted** rather than immediately
-removed from disk. The soft-delete operation follows persist-first ordering:
-the manifest entry is written to disk before the in-memory state is mutated,
-ensuring that an I/O failure leaves the segment in its original `Active` state
-rather than creating a transient inconsistency. This allows in-flight queries
-to continue reading data from the old segments during a grace period. `gc()` (default: 5 minute grace) or
-`gc_with_grace(ms)` hard-deletes the segment files, catalog entries, bloom
-filters, tag index entries, and metadata cache entries once the grace period
-expires. All query paths (`execute()`, `execute_stream()`,
-`last_value()`) automatically filter out soft-deleted segments via
+**A segment leaves the catalog when its rows leave the database; its file is
+unlinked when the last reader that could open it is gone.** Retention, a
+measurement drop, cold-tier archiving and a compaction's inputs all retire
+segments through one path, which removes the catalog entry, clears the derived
+indexes and unlinks the file — in one manifest transition, fsynced once, with
+the unlink after the sync so a crash can only ever leave a file nothing points
+at.
+
+A scan is lazy: it snapshots the catalog and opens each segment when it reaches
+it, so it holds a **lease** on that snapshot for its lifetime. A retirement
+that finds a leased segment marks it `SoftDeleted` instead — invisible to every
+query from that moment, its rows gone, its bytes waiting for `gc()`, which runs
+on every maintenance pass. `Chronix::statistics().leased_segments` reports how
+many segments a running read is holding, and
+`RetentionResult::segments_awaiting_readers` how many a pass had to defer;
+`bytes_freed` counts only what was actually unlinked.
+
+All query paths (`execute()`, `execute_stream()`, `execute_iter()`,
+`last_value()`) filter out retired segments via
 `active_segments_for_measurement()`.
 
 ### Cardinality-Based Sort Order
@@ -320,7 +328,7 @@ delete data that is younger than its window *relative to the data itself*.
 ### Concurrency Model
 
 - `Chronix` is `Send + Sync` — safe to share across threads
-- `parking_lot::RwLock` for catalog, time index, and bloom filter maps
+- `parking_lot::RwLock` for the catalog and the bloom filter map
 - `parking_lot::RwLock` for `SchemaRegistry` (no poison errors)
 - `AtomicBool` for the `closed` flag
 - File-level exclusive locking (`fs2::FileExt`) prevents multiple processes from

@@ -225,10 +225,15 @@ curl -X POST 'localhost:8086/api/v1/write?backfill=true' \
 | `POST /api/v1/prom/write` | `?backfill=true` |
 | `POST /v1/metrics`, `/api/v1/otlp/metrics` | `?backfill=true` |
 | gRPC `Write` | `WriteRequest.backfill = true` |
+| Arrow Flight `DoPut` | `FlightData.app_metadata` = `{"backfill": true}` |
 | Python SDK | `client.write(points, backfill=True)` |
 
 Admission, the cardinality budget, the schema and the future-timestamp bound
-are unchanged. Arrow Flight `DoPut` has no field for the flag.
+are unchanged.
+
+Flight SQL has no field for a write mode, so the flag travels in
+`app_metadata`. Put it on any message of the stream; the first non-empty one
+decides. An unrecognised key is **refused**, not ignored.
 
 A backfill below a rollup's watermark marks those buckets for
 re-materialisation ([Data Model](/docs/data-model/)).
@@ -378,6 +383,29 @@ one. Add a `LIMIT`, narrow the range, or raise `server.sql_max_rows`.
 
 Arrow Flight SQL has no field for the flag, so it **refuses** a result over the
 ceiling with `RESOURCE_EXHAUSTED`.
+
+**How a value is encoded.** Every Arrow type a query can produce has a JSON
+form, and the column's `data_type` says how to read it back:
+
+| Arrow type | JSON |
+|---|---|
+| `Int*`, `UInt*` | number — exact, including past 2⁵³ |
+| `Float*` | number; `NaN` and the infinities become `null` (JSON has no literal) |
+| `Decimal*` | **string of digits** (`"30.10"`) — exact |
+| `Utf8`, `LargeUtf8`, `Utf8View` | string |
+| `Binary`, `FixedSizeBinary` | base64 string |
+| `Timestamp`, `Date32`, `Date64`, `Time32`, `Time64`, `Duration` | integer, in the unit `data_type` names — `Date32` is days, `Timestamp(ns)` is nanoseconds |
+| `Interval` | object: `months`, `days`, `nanoseconds` |
+| `List`, `FixedSizeList` | array |
+| `Struct` | object keyed by field name |
+| `Map` | array of `{"key": …, "value": …}` |
+| `Null` | `null` |
+
+Read over Arrow Flight SQL to keep the Arrow types themselves, `NaN` included.
+
+**When a query fails**, `400` carries the reason for anything the caller can
+fix — a division by zero, an impossible cast, an unknown time zone, an
+unsupported `date_trunc` granularity. `500` means a fault in the server.
 
 **Time predicates.** The timestamp column is `_time`, typed
 `TIMESTAMP(nanosecond)`. Three forms compare against it:
@@ -804,17 +832,6 @@ written; the endpoint still returns `204`.
 
 Prometheus Remote Read endpoint. Accepts snappy-compressed protobuf.
 
-### Prometheus Metric Type Support
-
-`parse_prometheus_text()` fully parses all four Prometheus exposition format
-metric types: **counter**, **gauge**, **histogram**, and **summary**.
-Histogram metrics are returned as `HistogramMetric` structs containing
-per-bucket (`HistogramBucket`) boundary/count pairs plus `_sum` and `_count`.
-Summary metrics are returned as `SummaryMetric` structs containing
-per-quantile (`SummaryQuantile`) φ/value pairs plus `_sum` and `_count`.
-The `ServerMetrics` struct exposes `histograms` and `summaries` fields
-alongside the existing counters and gauges.
-
 ### `POST /api/v1/otlp/metrics`
 
 The same rule applies: an OTLP summary quantile with nothing observed behind
@@ -1064,7 +1081,7 @@ the connector started; for a windowed rate, take `rate()` over the
 ### Rollups
 
 A rollup is declared by a **bucket width** and, optionally, the **time zone**
-its calendar is read against:
+its calendar is read against and an **origin** that moves the boundary:
 
 ```bash
 curl -X POST http://localhost:8086/api/v1/rollups \
@@ -1095,6 +1112,20 @@ worth of somebody else's day, and the two halves of the year do not agree with
 each other. Set the zone whenever the buckets are meant to line up with what a
 person calls a day.
 
+**`origin`** moves the boundary off midnight on the 1st, for a period that
+does not start there — `"origin": "2024-01-15"` is a billing month that runs
+from the 15th, `"origin": "2024-01-01 06:00:00"` a shift day that starts at
+six. Write it as a date, a local date and time (read in `timezone`), or an
+RFC 3339 instant. What matters is where it falls in the cycle, not how far
+away it is: for a one-unit width that is its time of day or day of month, and
+for a multi-unit width it also picks which unit opens a bucket — `3mo`
+anchored on a January gives calendar quarters. A monthly tier must start on
+day 1–28: a boundary on the 29th, 30th or 31st is missing from some months,
+so it is refused rather than clamped.
+
+The same `origin` is the fourth argument to `time_bucket()` in SQL, and
+`TimeBucket::with_origin` on the native query API.
+
 A rollup's listing reports where it has got to and whether it is behind:
 
 ```bash
@@ -1110,6 +1141,7 @@ curl http://localhost:8086/api/v1/rollups
       "target_measurement": "energy_15m",
       "every": "15m",
       "timezone": null,
+      "origin": null,
       "aggregations": ["Avg", "Max"],
       "materialised_until": 1700000000000000000,
       "pending_repairs": [[1699900000000000000, 1699903600000000000]]
@@ -1121,7 +1153,8 @@ curl http://localhost:8086/api/v1/rollups
 
 `every` is the width, spelled the way it was written, so what this endpoint
 reports can be typed straight back into a create request. `timezone` is the
-calendar it is read against, or `null` for UTC. `materialised_until` is the
+calendar it is read against, or `null` for UTC, and `origin` the instant the
+boundaries are aligned to, or `null` for midnight on the 1st. `materialised_until` is the
 exclusive end of the newest bucket aggregated so far. `pending_repairs` are bucket ranges *below* that watermark whose input
 changed afterwards — a `backfill`, an import, or a delete — and which the
 next maintenance pass will recompute. **A non-empty list is why retention is
@@ -1637,6 +1670,13 @@ query answer nothing for it — while its data is untouched, so a restore
 before the deadline is instant and loses nothing. The pending state survives
 a restart, so a restart between the drop and the restore neither un-drops it
 nor forgets the deadline.
+
+The deadline is measured from the wall clock **capped by the newest timestamp
+the database holds** — the same reference retention uses — so a clock that
+jumps forward cannot close the window and destroy the data it was protecting.
+The trade is the same one retention makes: a database that has stopped
+receiving data stops reclaiming this disk, and a `DELETE` without
+`soft_delete_ttl_secs` is how to reclaim it immediately.
 
 ```bash
 curl -X DELETE http://localhost:8086/api/v1/measurements/power   # 204

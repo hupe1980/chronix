@@ -44,7 +44,7 @@ use arrow::array::{Array, Int64Array, RecordBatch};
 use chronix_engine::index::SegmentCatalogEntry;
 use chronix_engine::segment::FieldPredicate;
 use chronix_query::plan::{
-    extract_field_predicates, extract_namespace, extract_scan, QueryPlan, TagFilter, TimeRange,
+    extract_field_predicates, extract_scan, QueryPlan, TagFilter, TimeRange,
 };
 
 use crate::error::{DbError, Result};
@@ -118,6 +118,10 @@ pub struct BatchStream<'a> {
     deadline: Option<(std::time::Instant, std::time::Duration)>,
     /// What segment pruning did for this scan.
     pruning_stats: chronix_query::pruning::PruningStats,
+    /// Keeps the snapshot's segment files on disk until the stream is done
+    /// with them — see `db::leases`. Never read; released on drop,
+    /// including when a `LIMIT` abandons the remaining buckets.
+    _segment_lease: super::leases::SegmentLease<'a>,
 }
 
 impl BatchStream<'_> {
@@ -413,12 +417,16 @@ impl Chronix {
         let (measurement, tag_filters, projection, time_range) = extract_scan(plan)
             .ok_or_else(|| DbError::Internal("invalid query plan: no scan node found".into()))?;
 
-        if extract_namespace(plan).is_none() {
-            tracing::warn!(
-                measurement,
-                "query plan has no namespace_id — tenant isolation relies solely on tag filters"
-            );
-        }
+        // No warning here about a plan without a namespace, and that is
+        // deliberate: the embedded API and every single-tenant server produce
+        // one on **every** read, so the warning fired once per query in the
+        // ordinary configuration — 400 identical `WARN` lines for 400 reads,
+        // on a gateway logging to an SD card. A warning that cannot
+        // distinguish "tenancy is off" from "a handler forgot to scope this"
+        // is not evidence of either, and only the server knows which. It is
+        // asked there, where the answer exists: `chronixd`'s read handlers
+        // scope through one function, proved by a test that drives both of
+        // them.
 
         // The memtable is bounded by its flush budget, so materialising it is
         // safe; it is the *segment* side that is unbounded.
@@ -435,7 +443,7 @@ impl Chronix {
         let memtable_batch = chronix_query::points_to_record_batch(&memtable_points)?;
         drop(memtable_points);
 
-        let (matching_entries, pruning_stats) =
+        let (matching_entries, pruning_stats, segment_lease) =
             self.prune_segments(measurement, tag_filters, time_range);
 
         tracing::debug!(
@@ -474,6 +482,7 @@ impl Chronix {
                 (!budget.is_zero()).then(|| (std::time::Instant::now() + budget, budget))
             },
             pruning_stats,
+            _segment_lease: segment_lease,
         })
     }
 }

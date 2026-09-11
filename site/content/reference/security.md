@@ -84,7 +84,7 @@ Request → AuthMiddleware → [mTLS → JWT → API Key] → AuthContext
 - Per-entry nonce for WAL encryption.
 - HMAC-SHA256 manifest integrity verification.
 - Key rotation: new segments use latest key; old segments readable with previous keys.
-- Pluggable `KeyProvider` trait: `FileKeyProvider`, `EnvKeyProvider`, `KmsKeyProvider`.
+- Pluggable `KeyProvider` trait: `FileKeyProvider`, `EnvKeyProvider`, `RotatingKeyProvider`.
 - **Key usage counter:** `EncryptionService` tracks invocations via `AtomicU64`. Logs `tracing::warn!` at NIST's 2³² threshold, signalling time for key rotation.
 
 The `EncryptingBackend` wraps any `StorageBackend` with transparent AES-256-GCM authenticated encryption. Each stored object receives a unique random 96-bit nonce. Wire format: `[12-byte nonce][ciphertext][16-byte GCM tag]`. Keys are derived from `EncryptionService` in `chronix-security::auth`.

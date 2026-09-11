@@ -66,6 +66,32 @@ impl BackfillParam {
     }
 }
 
+/// The reasons a write can be refused, and the label values
+/// `chronix_write_errors_total` carries.
+///
+/// Listed once so [`register_write_metrics`] can publish each at zero: a
+/// counter that has never fired is **absent** from a scrape, and absent reads
+/// on a dashboard as "No data" — the same thing an operator sees when a
+/// metric does not exist at all. Prometheus's own guidance is to initialise
+/// every label value known in advance.
+pub const WRITE_ERROR_REASONS: [&str; 4] = ["timeout", "panic", "rejected", "storage_full"];
+
+/// Publish the write path's counters at zero, at startup.
+///
+/// Only the write path: every `chronixd` has one, so these series are true on
+/// every deployment. Counters belonging to a subsystem that may not be
+/// running — the object-store cache, the signal channels — are deliberately
+/// **not** pre-registered, because "0 cache hits" on a server with no cold
+/// tier claims a subsystem that is not there. Absent is the honest answer for
+/// those; zero is the honest answer for these.
+pub fn register_write_metrics() {
+    for reason in WRITE_ERROR_REASONS {
+        metrics::counter!("chronix_write_errors_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("chronix_points_written_total").increment(0);
+    metrics::counter!("chronix_backfill_points_total").increment(0);
+}
+
 /// Stamp `namespace` on every point and insert the batch under a deadline.
 ///
 /// **The server's only write path.** Every ingestion surface — REST JSON,

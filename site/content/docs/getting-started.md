@@ -139,6 +139,30 @@ varies, while `'1d'`, `'1w'`, `'1mo'` and `'1y'` follow that zone's calendar —
 so a transition day is 23 or 25 hours and February is February. The month is
 `'mo'`; `'m'` is always the minute.
 
+A fourth argument moves the boundary, for a period that does not start at
+midnight on the 1st:
+
+```sql
+-- A billing month that runs from the 15th to the 15th.
+SELECT time_bucket('1mo', _time, '', '2024-01-15') AS period,
+       max(reading) - min(reading)                 AS kwh
+FROM meter GROUP BY period ORDER BY period;
+
+-- A shift day that starts at 06:00 in Berlin.
+SELECT time_bucket('1d', _time, 'Europe/Berlin', '2024-01-01 06:00:00') AS shift,
+       avg(usage_idle)                                                  AS avg_idle
+FROM cpu GROUP BY shift ORDER BY shift;
+```
+
+What matters is where the origin falls in the cycle, not how far away it is.
+For a width of one unit — `1d`, `1mo` — that is just its time of day or day
+of month, so any date with the right shape will do. For a multi-unit width it
+also picks which unit opens a bucket: `3mo` anchored on a January gives
+calendar quarters, anchored on a February gives February–April.
+
+A monthly bucket must start on day 1–28: a boundary on the 29th, 30th or 31st
+does not exist in every month, and is refused rather than clamped.
+
 The long spellings work too, with or without the space: `'1 hour'`,
 `'15 minutes'`, `'3 months'`. A bare `'M'` is refused rather than guessed at.
 

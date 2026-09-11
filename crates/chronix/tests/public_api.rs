@@ -29,9 +29,6 @@ const SURFACE: &[&str] = &[
     "mod promql",
     "mod retention",
     "mod rollup",
-    // The one answer to "what is a day?", shared by `time_bucket()` in SQL
-    // and by every rollup tier.
-    "mod timebucket",
     // ── Re-exported engine crates (tier 3) ─────────────────────────
     "mod chronix_analytics",
     "mod chronix_core",
@@ -213,6 +210,8 @@ fn feature_gated_items_are_declared_under_their_feature() {
 fn the_prelude_is_the_one_that_was_reviewed() {
     const PRELUDE: &[&str] = &[
         "AggFn",
+        // The width of a calendar bucket, beside `TimeBucket` below.
+        "BucketWidth",
         "ChronixConfig",
         "ChronixConfigBuilder",
         "ChronixError",
@@ -240,6 +239,12 @@ fn the_prelude_is_the_one_that_was_reviewed() {
         "RollupAggFn",
         "RollupBuilder",
         "SeriesKey",
+        // The one answer to "what is a day". In the prelude for the same
+        // reason `Decimal` is: `RollupBuilder::bucket()` and
+        // `QueryBuilder::downsample()` both take one, and a `1d` that meant
+        // "86400 seconds" because the calendar type was one import away is
+        // exactly the defect it exists to prevent.
+        "TimeBucket",
         "Timestamp",
         "fields",
         "tags",

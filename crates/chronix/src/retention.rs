@@ -26,7 +26,20 @@ pub struct RetentionResult {
     /// retention rule can appear not to work, so it is reported rather than
     /// left to a log line.
     pub segments_preserved: usize,
-    /// Total bytes freed.
+    /// Segments whose rows this pass removed but whose files it could not
+    /// unlink yet, because a running scan had already been handed the path.
+    ///
+    /// Reported for the same reason `segments_preserved` is: it is the
+    /// difference between "the disk is not shrinking because there was
+    /// nothing to drop" and "…because somebody is reading it". The next
+    /// garbage collection removes them.
+    pub segments_awaiting_readers: usize,
+    /// Bytes actually reclaimed from the disk.
+    ///
+    /// Not the size of what was dropped: a segment counted in
+    /// `segments_awaiting_readers` is out of the database and still on the
+    /// disk, so its bytes are reported by the garbage collection that
+    /// unlinks it.
     pub bytes_freed: u64,
 }
 

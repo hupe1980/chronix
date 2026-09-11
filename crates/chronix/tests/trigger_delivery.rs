@@ -520,7 +520,7 @@ fn a_trigger_can_watch_a_rollup_tier() {
             .name("r")
             .source("raw")
             .target("raw_1m")
-            .bucket(chronix::timebucket::TimeBucket::fixed_ns(MIN))
+            .bucket(TimeBucket::fixed_ns(MIN))
             .aggregation(RollupAggFn::Avg)
             .group_by("h")
             .build()

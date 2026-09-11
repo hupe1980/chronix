@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tag("host", "db-01")
         .field("count")
         .range(base_ts, base_ts + 60_000_000_000)
-        .downsample(Duration::from_secs(10), AggFn::Avg)
+        .downsample(TimeBucket::fixed(Duration::from_secs(10)), AggFn::Avg)
         .build()?;
 
     let batch = db.execute(&plan)?;

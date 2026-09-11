@@ -70,6 +70,93 @@ pub fn column_type_to_arrow(ct: chronix_core::ColumnType) -> arrow::datatypes::D
     }
 }
 
+/// The inverse of [`column_type_to_arrow`], for one cell.
+///
+/// `Ok(None)` means the cell is null. `Err` means the column's Arrow type is
+/// not one the storage layer can hold — which is a *schema* mistake by the
+/// caller, not a value, and must not be mistaken for "no data".
+///
+/// Callers *store* what this produces — a distributed read, and a Raft region
+/// snapshot — so it is one total conversion rather than a `match` at each
+/// site. A quiet arm there drops a field from a point with nothing to say so.
+///
+/// # Errors
+///
+/// Returns [`QueryError::Validation`] when the Arrow type has no
+/// [`ColumnType`](chronix_core::ColumnType), or when a decimal carries a
+/// negative scale — legal in Arrow, unrepresentable in storage.
+pub fn arrow_cell_to_field_value(
+    col: &dyn arrow::array::Array,
+    index: usize,
+) -> error::Result<Option<chronix_core::FieldValue>> {
+    use arrow::array::{
+        BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+    };
+    use arrow::datatypes::DataType;
+    use chronix_core::FieldValue;
+
+    if col.is_null(index) {
+        return Ok(None);
+    }
+
+    let bad = |what: &str| {
+        QueryError::Validation(format!(
+            "column has {what}, which no Chronix column type can hold"
+        ))
+    };
+    let mismatch = || bad("an array that disagrees with its own Arrow type");
+
+    // The six storage types, and nothing else. `Timestamp` shares `Int64`
+    // with `I64`; a timestamp *field* is an `I64` value here, which is what
+    // the schema layer stores it as.
+    let v = match col.data_type() {
+        DataType::Float64 => FieldValue::F64(
+            col.as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(mismatch)?
+                .value(index),
+        ),
+        DataType::Int64 => FieldValue::I64(
+            col.as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(mismatch)?
+                .value(index),
+        ),
+        DataType::UInt64 => FieldValue::U64(
+            col.as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(mismatch)?
+                .value(index),
+        ),
+        DataType::Boolean => FieldValue::Bool(
+            col.as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(mismatch)?
+                .value(index),
+        ),
+        DataType::Utf8 => FieldValue::String(
+            col.as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(mismatch)?
+                .value(index)
+                .to_owned(),
+        ),
+        DataType::Decimal128(_, scale) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(mismatch)?;
+            let scale = u8::try_from(*scale).map_err(|_| bad("a decimal with a negative scale"))?;
+            FieldValue::Decimal(
+                chronix_core::Decimal::new(arr.value(index), scale)
+                    .map_err(|e| QueryError::Validation(format!("decimal cell: {e}")))?,
+            )
+        }
+        other => return Err(bad(&format!("Arrow type {other}"))),
+    };
+    Ok(Some(v))
+}
+
 /// Consolidated Arrow column → `f64` extraction.
 ///
 /// Supports `Float64Array`, `Int64Array`, `UInt64Array` and
@@ -112,4 +199,99 @@ pub fn extract_f64(col: &dyn arrow::array::Array, index: usize) -> Option<f64> {
                 a.value(index) as f64 / chronix_core::pow10(scale).unwrap_or(1) as f64
             })
         })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod cell_tests {
+    use super::{arrow_cell_to_field_value, column_type_to_arrow};
+    use arrow::array::{
+        BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+    };
+    use chronix_core::{ColumnType, FieldValue};
+
+    #[test]
+    fn every_storage_type_survives_the_round_trip() {
+        // The property that matters: whatever `column_type_to_arrow` can
+        // produce, this can read back. A type missing here is a field that
+        // disappears from a replicated region.
+        let cases: Vec<(ColumnType, arrow::array::ArrayRef, FieldValue)> = vec![
+            (
+                ColumnType::F64,
+                std::sync::Arc::new(Float64Array::from(vec![1.5])),
+                FieldValue::F64(1.5),
+            ),
+            (
+                ColumnType::I64,
+                std::sync::Arc::new(Int64Array::from(vec![i64::MIN])),
+                FieldValue::I64(i64::MIN),
+            ),
+            (
+                ColumnType::U64,
+                std::sync::Arc::new(UInt64Array::from(vec![u64::MAX])),
+                FieldValue::U64(u64::MAX),
+            ),
+            (
+                ColumnType::Bool,
+                std::sync::Arc::new(BooleanArray::from(vec![true])),
+                FieldValue::Bool(true),
+            ),
+            (
+                ColumnType::String,
+                std::sync::Arc::new(StringArray::from(vec!["s"])),
+                FieldValue::String("s".to_string()),
+            ),
+            (
+                ColumnType::Decimal { scale: 4 },
+                std::sync::Arc::new(
+                    Decimal128Array::from(vec![12_345_i128])
+                        .with_precision_and_scale(chronix_core::DECIMAL_PRECISION, 4)
+                        .unwrap(),
+                ),
+                FieldValue::Decimal(chronix_core::Decimal::new(12_345, 4).unwrap()),
+            ),
+        ];
+
+        for (ct, arr, want) in cases {
+            assert_eq!(
+                arr.data_type(),
+                &column_type_to_arrow(ct),
+                "test array does not match {ct:?}"
+            );
+            let got = arrow_cell_to_field_value(arr.as_ref(), 0).unwrap();
+            assert_eq!(got, Some(want), "round trip failed for {ct:?}");
+        }
+    }
+
+    #[test]
+    fn a_null_cell_is_absent_not_an_error() {
+        let arr = Float64Array::from(vec![None::<f64>]);
+        assert_eq!(arrow_cell_to_field_value(&arr, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_type_storage_cannot_hold_is_an_error_not_a_silent_drop() {
+        // The defect this exists for: `_ => None` read as "no value here"
+        // for a column that in fact held one.
+        let arr = arrow::array::Int32Array::from(vec![1]);
+        let err = arrow_cell_to_field_value(&arr, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("Int32"),
+            "the error should name the type: {err}"
+        );
+    }
+
+    #[test]
+    fn a_negative_scale_is_an_error_not_a_dropped_column() {
+        // Legal in Arrow, unrepresentable in storage. It used to be read
+        // into a `u8`, fail, and take the whole cell with it.
+        let arr = Decimal128Array::from(vec![123_i128])
+            .with_precision_and_scale(10, -2)
+            .unwrap();
+        let err = arrow_cell_to_field_value(&arr, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("negative scale"),
+            "the error should say why: {err}"
+        );
+    }
 }

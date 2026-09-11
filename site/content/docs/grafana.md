@@ -119,10 +119,23 @@ Chronix ships with 6 production-ready Grafana dashboards in the `dashboards/` di
 |-----------|------|-------------|
 | **Cluster Overview** | `cluster-overview.json` | Node health, Raft state, replication lag |
 | **Ingestion** | `ingestion.json` | Write throughput, batch sizes, WAL depth |
-| **Query Performance** | `query-performance.json` | Latency histograms, cache hit rates, scan stats |
+| **Query Performance** | `query-performance.json` | Query and write latency percentiles, throughput, plan- and scan-cache hit ratios, segment pruning |
 | **Storage** | `storage.json` | Segment counts, compaction stats, disk usage |
 | **Analytics** | `analytics.json` | Forecasting models, anomaly detections |
 | **Signals** | `signals.json` | Signal triggers, alert firings |
+
+These dashboards read Chronix's **own** metrics, so they need a Prometheus
+server scraping `http://<host>:8086/metrics` — not the Chronix data source
+from section 1, which serves the series you wrote. Use both in one Grafana:
+section 1's data source for your data, a second one for these.
+
+**Cluster Overview needs a `--features cluster` build**, which the default
+build excludes.
+
+A metric that has never been recorded is absent from a scrape, so Grafana
+draws "No data". Write-path counters read `0` from startup; feature-gated
+panels — object-store tiering, signal channels, analytics latencies — stay
+empty until that feature is configured and used.
 
 ### Manual Import
 

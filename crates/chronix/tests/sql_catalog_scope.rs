@@ -118,6 +118,71 @@ fn another_tenants_measurement_does_not_resolve() {
     );
 }
 
+/// A measurement pending a drop exists for nobody — including a tenant.
+///
+/// The pending filter was applied to the unscoped branch of
+/// `measurement_names_in` only, and to neither branch of
+/// `has_measurement_in`. So a drop with a grace period configured took a
+/// measurement off a single-tenant server's table list and left it on a
+/// tenanted one, and under tenancy `SELECT * FROM dropped` still planned and
+/// answered zero rows where a name that does not exist is an error — which is
+/// the oracle this file exists to close, from the other side.
+#[test]
+fn a_measurement_pending_a_drop_is_gone_from_a_tenants_catalog_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ChronixConfig::builder()
+        .data_dir(dir.path())
+        .soft_delete_ttl(Some(std::time::Duration::from_secs(3600)))
+        .build()
+        .unwrap();
+    let db = Arc::new(Chronix::open(config).unwrap());
+    db.insert(&point("payroll", "tenant-a", NOW)).unwrap();
+    db.insert(&point("metrics", "tenant-a", NOW)).unwrap();
+
+    assert_eq!(
+        db.measurement_names_in(Some("tenant-a")),
+        vec!["metrics".to_string(), "payroll".to_string()]
+    );
+
+    db.drop_measurement("payroll").unwrap();
+    assert!(
+        db.is_measurement_pending_drop("payroll"),
+        "the grace period is configured, so this is a pending drop"
+    );
+
+    assert_eq!(
+        db.measurement_names_in(Some("tenant-a")),
+        vec!["metrics".to_string()],
+        "a tenant's table list must not carry a measurement that is being dropped"
+    );
+    assert!(!db.has_measurement_in(Some("tenant-a"), "payroll"));
+    assert!(!db.has_measurement_in(None, "payroll"));
+
+    let scoped = query(&db, "tenant-a", "SELECT * FROM payroll");
+    let missing = query(&db, "tenant-a", "SELECT * FROM never_written");
+    assert!(
+        scoped.is_err(),
+        "a dropped table must not plan, whatever the namespace"
+    );
+    let normalise = |e: String| e.replace("payroll", "X").replace("never_written", "X");
+    assert_eq!(
+        normalise(scoped.unwrap_err()),
+        normalise(missing.unwrap_err())
+    );
+
+    // And the drop is still undoable, which is the whole point of the grace.
+    db.restore_measurement("payroll").unwrap();
+    assert!(db.has_measurement_in(Some("tenant-a"), "payroll"));
+    assert_eq!(
+        query(&db, "tenant-a", "SELECT * FROM payroll")
+            .expect("restored")
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+}
+
 #[test]
 fn show_tables_lists_only_the_sessions_own_measurements() {
     let dir = tempfile::tempdir().unwrap();

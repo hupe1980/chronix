@@ -43,7 +43,7 @@ let config = ChronixConfig::builder()
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `wal.fsync_policy` | `FsyncPolicy` | `PerBatch` | When to fsync: `None`, `PerBatch`, `PerEntry` |
+| `wal.fsync_policy` | `FsyncPolicy` | `PerBatch` | `FsyncPolicy::PerWrite`, `PerBatch`, or `Periodic(Duration)` |
 | `wal.fsync_interval` | `Option<Duration>` | `None` | Periodic background fsync interval (e.g. `100ms`). Enables `start_periodic_sync()` |
 | `wal.max_file_size` | `usize` | 32 MB | Maximum WAL file size before rotation |
 | `wal.max_unflushed_wals` | `usize` | 4 | Backpressure: max WAL files before blocking writes |
@@ -131,7 +131,7 @@ second default is written here.
 | `future_write_tolerance_secs` | `u64` | engine default (1 h) | How far ahead of the wall clock a timestamp may be, on every write path including backfill |
 | `cdc_capacity` | `usize` | engine default (65 536) | Change events buffered for a slow subscriber. The ring is allocated on the first subscription, so a deployment that never reads the change stream pays nothing |
 | `wal_max_unflushed` | `usize` | engine default | Unflushed WAL files tolerated before writes are held back |
-| `soft_delete_ttl_secs` | `u64` | unset — drops are immediate | Grace period before a dropped measurement is hard-deleted. With it set, `DELETE /api/v1/measurements/{name}` is recoverable until the deadline passes; without it the drop is irreversible |
+| `soft_delete_ttl_secs` | `u64` | unset — drops are immediate | Grace period before a dropped measurement is hard-deleted. With it set, `DELETE /api/v1/measurements/{name}` is recoverable until the deadline passes; without it the drop is irreversible. Measured from the wall clock capped by the newest timestamp held, as retention is, so a clock jump cannot close the window early |
 | `lvc_measurements` | `[String]` | empty — all measurements | Measurements the last-value cache covers, when `enable_last_value_cache` is on |
 
 ### Server Settings
@@ -139,8 +139,8 @@ second default is written here.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `http_addr` | `SocketAddr` | `0.0.0.0:8086` | HTTP API listen address |
-| `grpc_addr` | `SocketAddr` | `0.0.0.0:8087` | gRPC API listen address |
-| `flight_addr` | `SocketAddr` | `0.0.0.0:8817` | Arrow Flight SQL listen address |
+| `grpc_addr` | `SocketAddr` | unset — port `8087` on `http_addr`'s host | gRPC API listen address. Leave it unset and gRPC listens wherever HTTP does, so `--bind 127.0.0.1:8086` keeps every listener on loopback; set it to put gRPC somewhere else |
+| `flight_addr` | `SocketAddr` | unset — port `8817` on `http_addr`'s host | Arrow Flight SQL listen address, with the same rule as `grpc_addr` |
 | `authz_policy_dir` | `Option<PathBuf>` | `None` | Directory of Cedar `.cedar` policies; absent = open mode |
 | `backup_root` | `Option<PathBuf>` | `<data_dir>/backups` | Root every admin backup/restore path is resolved inside |
 | `multi_tenancy` | `bool` | `false` | Namespace isolation on every read and write |

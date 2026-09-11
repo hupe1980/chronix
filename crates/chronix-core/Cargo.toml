@@ -34,6 +34,10 @@ rust_decimal = ["dep:rust_decimal"]
 
 [dependencies]
 postcard = { workspace = true }
+# For `TimeBucket`: every surface that buckets time shares it — SQL's
+# `time_bucket()`, a rollup tier, and the native `downsample()` plan.
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 rust_decimal = { workspace = true, optional = true }
 dashmap = { workspace = true }
 serde = { workspace = true }
