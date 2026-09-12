@@ -185,7 +185,12 @@ jobs:
       # pass. Every feature flag gets a job, or it is a feature nobody builds.
       - run: cargo clippy -p chronixd --features object-store --all-targets -- -D warnings
       - run: cargo test -p chronixd --features object-store
-      - run: cargo check -p chronix-streaming --features flight --all-targets
+      - run: cargo check -p chronix-streaming --features arrow --all-targets
+      # `rust_decimal` is off by default and was named by no workflow, so its
+      # three conversion tests had never run — only `cargo doc --all-features`
+      # ever touched the module, and that does not build test code.
+      - run: cargo test -p chronix-core --features rust_decimal
+      - run: cargo test -p chronix --features rust_decimal --lib
       - run: cargo check -p chronix-security --no-default-features --all-targets
       # `security`, `streaming` and `pipeline` are off by default in the
       # facade (D225), so the default build compiles none of the code behind

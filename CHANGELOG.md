@@ -52,6 +52,14 @@ and no migration tooling for the on-disk format.
   arrives — a JWT library, Argon2, Cedar and a TLS stack for `security`; an
   HTTP client and a TLS stack for `streaming` — and point at
   `cargo tree -e normal` for anyone wanting a figure for their own build.
+- **`scripts/check-features.sh` now reads the workflows too**, in both
+  directions: a workflow may not name a feature its crate does not declare
+  (renaming `flight` to `arrow` left one such step behind, and it failed only
+  minutes into CI when that job ran), and a crate may not declare an optional
+  feature no workflow names. The second found `rust_decimal`, whose three
+  conversion tests had never run in CI — only `cargo doc --all-features`
+  reached the module, and that does not build test code. Both crates now have
+  a `--features rust_decimal` test step.
 - **`scripts/check-features.sh` checks every feature dependency against the
   code it unlocks**, and runs in CI. `cargo machete` cannot read the
   `[features]` table and `cargo udeps` needs nightly and a full build, so a
