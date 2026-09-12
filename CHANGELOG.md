@@ -39,11 +39,13 @@ and no migration tooling for the on-disk format.
   rustdoc, the guards and both the default and feature test builds
   (`--quick`), plus the examples and the frozen tier without it. CONTRIBUTING
   points at it.
-- **`scripts/check-package-counts.sh` keeps the documented "+N packages"
-  figures honest**, within ±20%. The figures are the argument for the feature
-  gates and nothing read arithmetic, so they had drifted. They are documented
-  rounded on purpose: a count is not a property of the code alone — the
-  `streaming` feature resolves 63 packages on macOS and 62 on x86_64-linux.
+- **Feature documentation names the dependencies a feature pulls in rather
+  than counting them.** A package count is not a property of the code: the
+  same tree resolves 63 packages for `chronix --features streaming` on macOS,
+  62 in a Linux container and 88 on GitHub's runners. The docs now name what
+  arrives — a JWT library, Argon2, Cedar and a TLS stack for `security`; an
+  HTTP client and a TLS stack for `streaming` — and point at
+  `cargo tree -e normal` for anyone wanting a figure for their own build.
 - **`scripts/check-features.sh` checks every feature dependency against the
   code it unlocks**, and runs in CI. `cargo machete` cannot read the
   `[features]` table and `cargo udeps` needs nightly and a full build, so a

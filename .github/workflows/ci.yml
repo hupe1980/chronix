@@ -263,12 +263,6 @@ jobs:
       - name: Check feature dependencies against the code
         run: ./scripts/check-features.sh
 
-      # The "+N packages" figures are the whole argument for the feature
-      # gates, and nothing else in the tree reads arithmetic: removing three
-      # unused dependencies moved two of them and no check noticed.
-      - name: Check documented package counts
-        run: ./scripts/check-package-counts.sh
-
   python-sdk:
     # The SDK shipped with a test suite and no job that ran it, which is the
     # same shape as the `otlp` feature that did not compile (D29, R6). It cost

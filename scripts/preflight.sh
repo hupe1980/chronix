@@ -7,7 +7,7 @@
 # broken rustdoc link (nothing ran `cargo doc`), an example whose
 # `required-features` had grown (nothing ran the examples), a `#[cfg(test)]`
 # assertion true only with a feature on (nothing ran the default build), and
-# a guard asserting a dependency count that varies by platform.
+# and a guard asserting a dependency count that is not portable.
 #
 # Each of those is "I verified this in the one configuration I was in".
 # The fix is not a guard — it is having one command that covers the matrix.
@@ -36,7 +36,6 @@ step() {
 # Prose and manifests — seconds, and the commonest thing to forget.
 step "documentation vs the tree"   ./scripts/check-docs.sh
 step "feature dependencies"        ./scripts/check-features.sh
-step "package counts"              ./scripts/check-package-counts.sh
 step "D/R references"              ./scripts/check-references.sh
 step "unused dependencies"         cargo machete
 
