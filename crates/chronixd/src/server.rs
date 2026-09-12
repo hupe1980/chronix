@@ -58,10 +58,17 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     );
 
     // ── Cluster mode (optional) ────────────────────────────────────
+    // `Config`, not `Internal`: a section this build cannot honour is the
+    // operator's input, and every sibling refusal classifies it that way.
     #[cfg(not(feature = "cluster"))]
     if config.cluster.is_some() {
-        return Err(ServerError::Internal(
-            "this chronixd build has no cluster support — rebuild with `--features cluster`".into(),
+        return Err(ServerError::Config(
+            crate::config::ServerConfigError::Invalid(
+                "[cluster] is configured but this binary was built without the \
+                 `cluster` feature: rebuild with `--features cluster`, or \
+                 remove the section"
+                    .into(),
+            ),
         ));
     }
     #[cfg(feature = "cluster")]
