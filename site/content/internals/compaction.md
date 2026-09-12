@@ -92,7 +92,7 @@ Call `policy.validated()` to clamp thresholds to safe ranges:
 
 `WriteAmpTracker` uses atomic counters to track cumulative bytes flushed
 vs. bytes rewritten by compaction. When the ratio exceeds
-`max_write_amplification_ratio` (default: 10×), low-priority merges are
+`max_write_amplification` (default: 10×), low-priority merges are
 deferred to the next cycle.
 
 ## Write Amplification Analysis

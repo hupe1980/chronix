@@ -9,7 +9,7 @@ Pre-built Grafana dashboards for monitoring Chronix clusters.
 | `cluster-overview.json` | Node status, region count, replication health, leader changes |
 | `query-performance.json` | Query and write latency percentiles, throughput, plan- and scan-cache hit ratios, segment pruning |
 | `analytics.json` | Forecast/anomaly latency, GPU utilization, compute engine metrics |
-| `storage.json` | Disk usage, object store tiering, cache hit ratios, WAL metrics |
+| `storage.json` | Disk usage, object store tiering, cache hit ratios, WAL metrics, checkpoint rate and duration |
 | `ingestion.json` | Write rate, write latency percentiles, WAL size, memtable flushes, batch distribution |
 | `signals.json` | Active signals, signal fire rate, delivery latency, anomaly detections, channel health |
 
@@ -34,7 +34,9 @@ A metric that has never been recorded is absent from a scrape, and Grafana
 draws "No data" for it.
 
 - **Write-path counters read `0`** from startup, so an ingestion-error panel
-  shows a number rather than "No data".
+  shows a number rather than "No data". The checkpoint counters
+  (`chronix_backups_total`, `chronix_backup_failures_total`) likewise — a flat
+  zero on *Checkpoints → taken* means the schedule has stopped running.
 - **Feature-gated panels stay empty until that feature is configured and
   used**: the object-store panels need a cold tier, `signals.json` needs
   triggers, the analytics panels need a forecast or a detector to run.

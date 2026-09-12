@@ -81,3 +81,95 @@ fn segment_only_series_reads_back() {
 
     value(&db, 2 * HOUR_NS);
 }
+
+/// A pre-1970 timestamp is a legal timestamp.
+///
+/// `Timestamp` is a signed nanosecond epoch and `ShardId::from_timestamp`
+/// uses `div_euclid` so that negative values shard correctly — a deliberate
+/// choice, made once and then contradicted by the one read path that scanned
+/// the memtable from `0`. The result was `last_value()` answering `None` for
+/// a series whose rows a query returns.
+#[test]
+fn last_value_finds_a_pre_epoch_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = chronix::Chronix::open(
+        chronix::prelude::ChronixConfig::builder()
+            .data_dir(dir.path())
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let key = chronix::prelude::SeriesKey::new("cpu", chronix::tags! { "host" => "a" }).unwrap();
+    let ts = -3_600_000_000_000; // one hour before the epoch
+    db.insert(
+        &chronix::prelude::Point::new(key.clone(), chronix::fields! { "v" => 7.0 }, ts).unwrap(),
+    )
+    .unwrap();
+
+    let plan = db
+        .query()
+        .measurement("cpu")
+        .range(i64::MIN, i64::MAX)
+        .build()
+        .unwrap();
+    assert_eq!(
+        db.execute(&plan).unwrap().num_rows(),
+        1,
+        "a query sees the row"
+    );
+
+    let last = db
+        .last_value(
+            "cpu",
+            &std::collections::BTreeMap::from([("host".to_owned(), "a".to_owned())]),
+        )
+        .unwrap()
+        .expect("last_value must see it too");
+    assert_eq!(last.timestamp(), ts);
+    db.close().unwrap();
+}
+
+/// Label discovery answers from the memtable as well as from the segments.
+///
+/// `tag_keys()` and `tag_values()` read the inverted tag index, which is
+/// built at **flush**. A freshly started database therefore reported no
+/// labels at all, and a tag that only appears in recent data was invisible
+/// for as long as it stayed unflushed. The one test that covered these
+/// flushed five times first, so it never saw it.
+#[test]
+fn tag_discovery_sees_unflushed_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = chronix::Chronix::open(
+        chronix::prelude::ChronixConfig::builder()
+            .data_dir(dir.path())
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let key =
+        chronix::prelude::SeriesKey::new("cpu", chronix::tags! { "host" => "a", "region" => "eu" })
+            .unwrap();
+    db.insert(&chronix::prelude::Point::new(key, chronix::fields! { "v" => 1.0 }, 1_000).unwrap())
+        .unwrap();
+
+    // Nothing has been flushed.
+    assert!(db.tag_keys().contains(&"host".to_owned()));
+    assert!(db.tag_keys().contains(&"region".to_owned()));
+    assert_eq!(db.tag_values("host"), vec!["a".to_owned()]);
+
+    // And the answer does not change when the data moves to a segment.
+    db.flush().unwrap();
+    assert!(db.tag_keys().contains(&"host".to_owned()));
+    assert_eq!(db.tag_values("region"), vec!["eu".to_owned()]);
+
+    // A second series only in memory joins the answer.
+    let key2 =
+        chronix::prelude::SeriesKey::new("cpu", chronix::tags! { "host" => "b", "region" => "us" })
+            .unwrap();
+    db.insert(&chronix::prelude::Point::new(key2, chronix::fields! { "v" => 2.0 }, 2_000).unwrap())
+        .unwrap();
+    assert_eq!(db.tag_values("host"), vec!["a".to_owned(), "b".to_owned()]);
+    db.close().unwrap();
+}

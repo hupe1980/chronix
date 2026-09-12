@@ -59,6 +59,7 @@ cargo run -p chronix --features object-store --example cold_tier
 |---------|-------------|
 | [gateway_footprint](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/gateway_footprint.rs) | The small preset under the design partner's workload, printing the process's resident set at each step |
 | [storage_lifecycle](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/storage_lifecycle.rs) | Manual flush, compaction, rollup materialisation, and retention enforcement |
+| [backup_and_restore](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/backup_and_restore.rs) | Take a checkpoint, verify it without restoring it, delete the original, and restore onto a fresh directory |
 | [delete_operations](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/delete_operations.rs) | Tombstone-based deletes, predicate deletes, and measurement drops |
 | [encoding](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/encoding.rs) | Compression codecs, adaptive encoding, and compression ratio comparison |
 | [compute_engine](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/compute_engine.rs) | SIMD-accelerated computation, hardware tier detection, and buffer pool |
@@ -67,7 +68,8 @@ cargo run -p chronix --features object-store --example cold_tier
 
 | Example | Description |
 |---------|-------------|
-| [encryption](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/encryption.rs) | AES-256-GCM encryption at rest with key rotation |
+| [field_encryption](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/field_encryption.rs) | Per-column AES-256-GCM: declaring a column and its key variable, the ciphertext on disk, and the paths that refuse to write it out |
+| [encryption](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/encryption.rs) | The standalone `EncryptionService`: key providers, round trip, and key rotation |
 | [authz](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/authz.rs) | Cedar-based RBAC authorization: policies, principals, and allow/deny decisions |
 | [audit_logging](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/audit_logging.rs) | Structured audit logging with multi-sink support and queryable audit trail |
 | [tenant_isolation](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/tenant_isolation.rs) | Namespace management, quota enforcement, and resource usage tracking |

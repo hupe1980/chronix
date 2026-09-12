@@ -61,11 +61,16 @@ Ristretto (Go).
 
 ### Implementation
 
-The cache is implemented as a `LinkedHashMap` guarded by a `RwLock`. Reads
-acquire a read lock (allowing concurrent access), while inserts and evictions
-acquire a write lock. Cache entries are keyed by `(segment_id, column_name)`
-and hold `Arc<dyn arrow::Array>`, enabling zero-copy sharing across
-concurrent readers.
+`SegmentCache` is a `HashMap` with a doubly-linked LRU list threaded through
+it, so eviction is O(1), guarded by one `RwLock`; the TinyLFU frequency sketch
+sits behind its own `Mutex` so a hit on the read-lock fast path can still
+record frequency. Entries are keyed by `SegmentCacheKey { segment_id,
+row_group, column }` and hold an Arrow `ArrayRef`, so a cached column is
+shared zero-copy across concurrent readers.
+
+**Singleflight:** when several threads miss on the same key at once, one loads
+and the rest wait on a `tokio::sync::Notify` — chosen over a `Condvar` so a
+waiter yields its tokio worker instead of blocking it.
 
 ## Cache Coherence
 

@@ -357,15 +357,17 @@ required: a window function without an `OVER` clause fails to plan.
 The other detectors (MAD, IQR, CUSUM, forecast-residual, dynamic threshold)
 are Rust-API types, because each carries its own configuration.
 
-### Sub-batching
+### Parallel chunking
 
-When input exceeds `max_batch_size` (default: 65,536), operations are
-automatically split into sub-batches:
+A vector at or above `PARALLEL_THRESHOLD` (8 192) elements is split across
+the rayon pool. The chunk size is `(len / threads).max(1024)` — sized by the
+pool rather than by a fixed batch:
 
-- **dot_product**: Chunks summed independently, partial results accumulated
-- **difference**: Overlapping chunks (last element shared between adjacent chunks)
-- **z_score**: Independent chunks (mean/std computed globally on CPU)
-
+- **dot_product** — chunks reduced independently into a running sum
+- **difference** — overlapping chunks, the last element shared between
+  adjacent ones
+- **z_score** — independent chunks; mean and standard deviation are computed
+  over the whole input first
 
 ### Rolling Correlation Conventions
 
@@ -422,15 +424,13 @@ aarch64) and Kahan compensated summation:
 | `batch_matrix_solve` | LU decomposition with partial pivoting (pure Rust) |
 | `batch_least_squares` | QR decomposition |
 
-## Tracing Integration
+## Instrumentation
 
-All analytics operations emit `tracing` spans:
-
-- `forecast_fit` — model fitting phase
-- `anomaly_detect` — anomaly detection phase
-
-These integrate with the OpenTelemetry pipeline for end-to-end distributed
-tracing when `chronixd::otel` is configured with OTLP export.
+Each fit and each detection records its duration as a histogram, labelled by
+model or method — `chronix_forecast_fit_duration_seconds{model_type="arima"}`,
+`chronix_anomaly_detect_duration_seconds{method="cusum"}` — so the cost of a
+model is visible per model rather than as one aggregate. The full list is in
+the [operations guide](@/docs/operations.md).
 
 ### Continuous Forecast Re-fit Threshold
 

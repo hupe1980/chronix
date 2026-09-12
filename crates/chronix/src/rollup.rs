@@ -764,14 +764,35 @@ pub struct RollupAccumulator<'a> {
     /// When set, `push` emits nothing and every bucket is held until
     /// `finish` — for callers whose input is complete but unordered.
     hold_everything: bool,
+    /// Field columns the aggregation cannot take, in the order they were
+    /// first seen.
+    ///
+    /// A rollup aggregates numbers; a string field has no `avg` and no
+    /// `sum`, so it is skipped. Recorded because **skipping silently is the
+    /// failure this code has already been bitten by twice** — integer
+    /// columns, then decimal ones, each omitted from the type list, each
+    /// producing no rollup, no error, and then a retention pass that dropped
+    /// the raw rows anyway. The caller reports these once per pass.
+    skipped_columns: std::collections::BTreeSet<String>,
 }
 
 impl<'a> RollupAccumulator<'a> {
+    /// Field columns this pass could not aggregate, sorted.
+    ///
+    /// Empty for the ordinary case. A non-empty list means the rollup's
+    /// target is missing those columns, and the caller says so — because the
+    /// alternative is a target that is quietly narrower than its source.
+    #[must_use]
+    pub fn skipped_columns(&self) -> Vec<&str> {
+        self.skipped_columns.iter().map(String::as_str).collect()
+    }
+
     /// Create an accumulator for `config`.
     #[must_use]
     pub fn new(config: &'a RollupConfig) -> Self {
         Self {
             config,
+            skipped_columns: std::collections::BTreeSet::new(),
             open: BTreeMap::new(),
             closed_through: None,
             unordered: false,
@@ -817,6 +838,22 @@ impl<'a> RollupAccumulator<'a> {
         // is exactly the thing a rollup exists for, and skipping it used to
         // produce no rollup, no error, and then a retention pass that
         // dropped the raw data anyway.
+        for f in schema.fields() {
+            let is_candidate = f.name() != chronix_core::TIME_COLUMN
+                && f.name() != "series_key_hash"
+                && !self.config.group_by_tags.contains(f.name())
+                && f.metadata().get("role").map(String::as_str) != Some("tag");
+            let is_numeric = matches!(
+                f.data_type(),
+                arrow::datatypes::DataType::Float64
+                    | arrow::datatypes::DataType::Int64
+                    | arrow::datatypes::DataType::UInt64
+                    | arrow::datatypes::DataType::Decimal128(_, _)
+            );
+            if is_candidate && !is_numeric {
+                self.skipped_columns.insert(f.name().clone());
+            }
+        }
         let field_indices: Vec<(usize, String)> = schema
             .fields()
             .iter()

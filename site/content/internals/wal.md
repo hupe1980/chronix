@@ -64,11 +64,11 @@ Each WAL record is self-describing with integrity protection.
   CRC is verified *after* the payload is read, so a corrupt length field is
   trusted for the allocation, and 256 MB is a quarter of the RAM on the
   gateways this engine targets.
-- **Tombstones are not durable here.** The WAL logs them so that a
-  point-in-time restore replays a delete, but the WAL is truncated once the
-  memtable it covers has been flushed — so the durable copy lives in the
-  catalog manifest instead. See the delete lifecycle in the architecture
-  guide.
+- **A delete has no WAL record.** Tombstones are catalog state: the WAL is
+  truncated once the memtable it covers has been flushed, which is sooner
+  than a tombstone has to live. Nothing is lost — `execute_delete` flushes
+  first, so every point a tombstone covers is already in a segment and below
+  the WAL floor, which replay never reads. Discriminant `0x01` is reserved.
 - **PayloadVersion** enables per-type schema evolution (currently `1`).
 - The CRC covers `length + sequence_no + record_type + payload_version + payload`.
 
@@ -89,8 +89,8 @@ The functions `wal_encode()` and `wal_decode()` are exported from
 serialises a single point directly into the WAL buffer without cloning,
 avoiding the allocation overhead of the general-purpose `wal_encode()` path.
 The codec is defined by the `WalCodecError` error type.
-Only binary v1 records are accepted — legacy JSON records are rejected
-with `CodecError::UnknownVersion`.
+Only version `0x01` is accepted; anything else — a JSON document included,
+since `{` is `0x7B` — is refused as `CodecError::UnknownVersion`.
 
 ### CRC32c Checksumming
 
@@ -124,18 +124,23 @@ version field enables forward-compatible format evolution.
 
 ## Fsync Policies
 
-The `FsyncPolicy` controls the trade-off between durability and write latency:
+`FsyncPolicy` controls the trade-off between durability and write latency:
 
-| Policy | Behaviour | Durability | Latency |
-|--------|-----------|------------|---------|
-| `EveryWrite` | fsync after each record | Full | ~1 ms |
-| `EveryN(n)` | fsync every *n* records | Bounded loss | ~100 μs |
-| `Interval(ms)` | fsync on a timer | Bounded loss | ~10 μs |
-| `Never` | rely on OS page cache | Best-effort | ~1 μs |
+| Policy | Behaviour | Durability |
+|--------|-----------|------------|
+| `PerWrite` | `fsync` before every append returns | Every acknowledged write is on the device |
+| `PerBatch` | `fsync` once per group-commit batch (**default**) | Every acknowledged write is on the device |
+| `Periodic(d)` | `fsync` on a timer | Up to `d` of the most recent writes can be lost on power failure |
 
-For time-series workloads, `EveryN(1000)` or `Interval(100)` provides a
-practical balance: at most 1 000 points (or 100 ms of data) can be lost on
-an unclean shutdown, but write throughput is 10–100× higher than `EveryWrite`.
+In TOML, `Periodic` is written `periodic_<ms>` — `wal_fsync_policy =
+"periodic_5000"`. The small-footprint preset uses `Periodic(5s)`, because
+coalescing syncs is what keeps write amplification off eMMC and SD cards.
+
+`PerWrite` and `PerBatch` both sync **before returning**, which is what makes
+the rejection contract hold: a write the caller was told succeeded is durable,
+and a write it was told failed is not recovered. `Periodic` states the
+opposite explicitly, and that is why an `ENOSPC` rewind discards the bytes
+past the last successful sync rather than keeping them.
 
 ### Bounded Condvar Wait
 

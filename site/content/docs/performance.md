@@ -319,40 +319,40 @@ from a newer format.
 
 ### Benchmark Commands
 
+Every number in this page is produced by a Criterion bench in the tree:
+
 ```bash
-# CPU dot-product benchmark
-cargo bench -p chronix-analytics::compute -- dot_product
-
-
-# Cluster write throughput
-chronixd bench write --threads 8 --batch-size 10000 --duration 60s
-
-# Query latency
-chronixd bench query --concurrent 16 --queries queries.sql --duration 60s
+cargo bench -p chronix-encoding          # codec ratios and throughput
+cargo bench -p chronix-analytics         # compute kernels
+cargo bench -p chronix                   # write, query, PromQL, SQL
 ```
+
+`chronixd` is a server and takes no subcommands; there is no `chronixd bench`.
 
 ## Troubleshooting Performance
 
 ### High Write Latency
 
-1. Check WAL sync mode — `async` is faster but less durable
-2. Increase `memtable_size` to reduce flush frequency
+1. Check `wal_fsync_policy` — `periodic_<ms>` coalesces syncs, at the cost
+   of losing up to that window on power failure
+2. Increase `memtable_flush_threshold` to flush less often
 3. Flushes run on the database's own maintenance thread as soon as a
-   memtable crosses `memtable_flush_threshold` — writes are never blocked
-   by flush I/O, and nothing has to be started
-4. Monitor compaction backlog — increase `max_concurrent` compaction workers
-5. Check `chronix_cluster_write_latency_seconds` histogram for outliers
-6. Zero-copy WAL encoding via `encode_write_point(&Point)` serialises
-   points directly into the WAL buffer without cloning, reducing allocation
-   overhead on the hot write path
+   memtable crosses that threshold — writes are never blocked by flush I/O,
+   and nothing has to be started
+4. Monitor compaction backlog — raise `compaction_concurrency`
+5. Read `chronix_write_duration_seconds` for the latency distribution and
+   `chronix_batch_size` for how much each write carries
 
 ### High Query Latency
 
-1. Increase `block_cache_size` to reduce disk reads
-3. Check `chronix_cluster_query_latency_seconds` breakdown
-4. Optimize query selectivity — use tag filters to narrow scan scope
-5. Use narrow time ranges — row-group predicate pushdown automatically skips
-   row groups outside the query window, greatly reducing I/O for large segments
+1. Increase `segment_cache_size` to reduce disk reads
+2. Read `chronix_query_duration_seconds` for the distribution, and
+   `chronix_segments_pruned_by_time_and_index_total` for how much of the
+   catalog each query is skipping
+3. Narrow the selectivity — tag filters cut the segment set through the
+   inverted index before anything is opened
+4. Use narrow time ranges — row-group predicate pushdown skips row groups
+   outside the query window, which is most of a large segment
 
 ### Compaction Overhead
 

@@ -656,3 +656,71 @@ fn a_pending_repair_survives_a_restart_and_then_runs() {
     );
     db.close().unwrap();
 }
+
+/// A string field is skipped, and the accumulator says which.
+///
+/// A rollup aggregates numbers — a string has no `avg` and no `sum` — so the
+/// column is left out and the target is narrower than its source. That is
+/// the right behaviour and the wrong way to *deliver* it silently: this code
+/// has been wrong in exactly this shape twice, once for integer columns and
+/// once for decimals, and both times the symptom was a rollup that produced
+/// nothing, reported nothing, and was then followed by a retention pass that
+/// dropped the raw rows anyway.
+///
+/// So the accumulator records what it skipped and the materialiser logs it
+/// once per pass. This pins the record; the log line is what an operator
+/// sees.
+#[test]
+fn a_rollup_reports_the_field_columns_it_cannot_aggregate() {
+    use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let config = RollupBuilder::new()
+        .name("hourly")
+        .source("device")
+        .target("device_hourly")
+        .bucket(TimeBucket::fixed_ns(HOUR))
+        .aggregation(RollupAggFn::Avg)
+        .group_by("h")
+        .build()
+        .unwrap();
+
+    // One of each: a tag, a numeric field, and a string field.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(chronix_core::TIME_COLUMN, DataType::Int64, false),
+        Field::new("h", DataType::Utf8, true),
+        Field::new("watts", DataType::Float64, true),
+        Field::new("firmware", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![0i64, MINUTE])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "a"])),
+            Arc::new(Float64Array::from(vec![1.0, 3.0])),
+            Arc::new(StringArray::from(vec!["v1.2", "v1.2"])),
+        ],
+    )
+    .unwrap();
+
+    let mut acc = chronix::rollup::RollupAccumulator::new(&config);
+    let _ = acc.push(&batch);
+    assert_eq!(
+        acc.skipped_columns(),
+        vec!["firmware"],
+        "the string field is skipped, and the group-by tag is not a skip"
+    );
+
+    // And the numeric field is still aggregated — otherwise the assertion
+    // above would pass on a rollup that produced nothing at all.
+    let points = acc.finish();
+    assert!(
+        points
+            .iter()
+            .any(|p| p.field_keys().any(|k| k == "watts_avg")),
+        "the numeric field must still be rolled up: {:?}",
+        points.first().map(|p| p.field_keys().collect::<Vec<_>>())
+    );
+}

@@ -38,14 +38,15 @@ Each record uses WAL format version 1:
 ### Payload Codec
 
 WAL payloads are serialized using a **binary v1 codec** (`wal_codec` module in
-`chronix-core`) backed by `bincode`:
+`chronix-core`) backed by postcard:
 
 ```text
-[version: 0x01][discriminant][bincode payload]
+[version: 0x01][discriminant][postcard payload]
 ```
 
 `wal_encode()` / `wal_decode()` and the `WalCodecError` type are exported from
-`chronix_core`. Only binary v1 records are accepted; legacy JSON is rejected.
+`chronix_core`. Only version `0x01` is accepted; anything else — a JSON document included —
+is refused as `CodecError::UnknownVersion`.
 `wal_encode_write_point(&Point)` encodes a write directly from a borrow rather
 than cloning the `Point` into a `WalEntry::Write`, keeping `String` and `Vec`
 allocations off the hot write path. Batch inserts benefit most.
@@ -223,10 +224,10 @@ column even if the two orders were ever to drift apart again.
 
 ### Column Statistics
 
-Per-column `ColumnStats` track min, max, null count, sum (f64 + i128), and
-distinct count. Integer columns accumulate `sum_i128: i128` alongside the
-legacy `sum: f64` for full precision above 2^53. Binary format is 76 bytes per
-column (`COLUMN_STATS_SIZE`).
+Per-column `ColumnStats` track min, max, null count, sum and distinct count.
+Integer columns carry `sum_i128: i128` beside `sum: f64`, so a total stays
+exact above 2^53. Encoded width is 76 bytes per column
+(`COLUMN_STATS_SIZE`).
 
 Float statistics use a total-ordering scheme (`f64_to_ordered_i64`) that maps
 IEEE 754 sign-magnitude representation to two's-complement for correct
@@ -367,47 +368,59 @@ The `ShardRouter` manages per-shard memtables:
   full field enumeration for diagnostic logging
 - `entry_to_point()` failures (point reconstruction from skip-list entries)
   are logged at `warn` level via `tracing`, preventing silent data loss
+## Where a segment lives
+
+A segment file is named **relative to the `segments/` directory** and the
+catalog stores it that way, as a `SegmentFile`:
+
+```text
+<data_dir>/segments/shard_{id}/seg_{nanos}_{counter}.csx
+                    └──────────── SegmentFile ────────────┘
+```
+
+Relative by construction, which is what makes a data directory relocatable:
+a backup restored anywhere reads its own files.
+`SegmentFile::resolve(segments_dir)` is the only way to an openable path, and
+the type rejects a path separator or a `..` component, so a catalog read off
+disk cannot name a file outside the database.
+
+Each segment has a **series sidecar** beside it — the same name with `.csx`
+replaced by `.series` — holding the series keys it contains. It is derived
+data, rebuilt from the segment if it is missing.
+
 ## Storage Backend (`chronix-engine::storage`)
 
-The storage crate provides a pluggable, async I/O abstraction layer.
-
-### `StorageBackend` Trait
+`StorageBackend` is the async abstraction the **cold tier** is written
+against. It has one implementation, `ObjectStoreBackend`; the hot path does
+not go through it, because a flush hands an absolute path to `SegmentWriter`
+and a read `mmap`s the file.
 
 ```rust
 pub trait StorageBackend: Send + Sync {
-    async fn put(&self, path: &SegmentPath, data: &[u8]) -> Result<()>;
-    async fn get(&self, path: &SegmentPath) -> Result<Vec<u8>>;
-    async fn get_range(&self, path: &SegmentPath, offset: u64, length: u64) -> Result<Vec<u8>>;
-    async fn delete(&self, path: &SegmentPath) -> Result<()>;
+    async fn put_segment(&self, path: &SegmentPath, data: &[u8]) -> Result<()>;
+    async fn get_segment(&self, path: &SegmentPath) -> Result<Vec<u8>>;
+    async fn get_segment_range(&self, path: &SegmentPath, offset: u64, length: u64) -> Result<Vec<u8>>;
+    async fn delete_segment(&self, path: &SegmentPath) -> Result<()>;
     async fn list_segments(&self, namespace: &NamespaceId) -> Result<Vec<SegmentPath>>;
     async fn exists(&self, path: &SegmentPath) -> Result<bool>;
 }
 ```
 
-### `LocalFsBackend`
-
-The default implementation for local disk I/O:
-
-- **Atomic writes** — data is written to a `.tmp` file and renamed to the final
-  path, preventing partial reads
-- **`pread`-based range reads** — `get_range()` uses OS-level `FileExt::read_at`
-  for efficient partial reads without seeking
-- **Case-sensitive extension validation** via `SegmentPath`
-
 ### `SegmentPath`
 
-A typed path wrapper that enforces `.csx` extension and provides namespace-scoped
-storage isolation (SEC-03). Each `SegmentPath` contains:
+The cold tier's object key, namespace-scoped for defence-in-depth tenant
+isolation:
 
-- **`namespace: NamespaceId`** — tenant namespace for cross-tenant isolation
+- **`namespace: NamespaceId`** — the tenant
 - **`shard_id: ShardId`** — shard assignment
-- **`name: String`** — segment filename (must end in `.csx`)
+- **`segment_name: String`** — the file name, rejected if it is empty or
+  carries a path separator or a `..` component
 
-On-disk layout: `data_dir/ns_{namespace}/shard_{id}/{name}`
-Object store layout: `ns_{namespace}/shard_{id}/{name}`
+Object key: `ns_{namespace}/shard_{id}/{segment_name}`.
 
-This ensures that different tenants' segments are physically separated at the
-storage layer, providing defense-in-depth beyond policy-level access control.
+Different tenants' cold segments are therefore separated by key prefix,
+beyond policy-level access control.
+
 ## Compaction (`chronix-engine::compaction`)
 
 Chronix uses **Time-Window Compaction Strategy (TWCS)** — segments are grouped
@@ -442,10 +455,9 @@ Input Segments (L0)
   └─ Write directly via SegmentWriter::finalize_batches() (streaming I/O)
 ```
 
-The **streaming compaction** pipeline avoids the legacy `concat_batches` +
-`take` round-trip. Instead, per-batch hash and canonical computation keeps
-peak memory proportional to the largest single batch rather than the sum
-of all inputs. `arrow::compute::interleave()` materializes only the selected
+The **streaming compaction** pipeline computes hashes and canonical forms
+per batch, so peak memory is proportional to the largest single input batch
+rather than to the sum of them. `arrow::compute::interleave()` materializes only the selected
 rows from the original arrays, and `finalize_batch()` writes the output
 using streaming I/O with incremental CRC32c.
 
@@ -532,9 +544,10 @@ and deletion. Used by the query planner for pruning without reading segment file
 3. **Resolves** one tombstone per matching series: `[start, end]` from the
    request, with the upper bound falling back to that series' newest stored
    timestamp rather than to "forever".
-4. **Persists** — a `WalEntry::Delete` carrying the resolved tombstones (for
-   point-in-time restore), then a fsynced catalog-manifest append (the durable
-   record), then the in-memory set.
+4. **Persists** — an fsynced catalog-manifest append, which is the only
+   durable record a tombstone has, then the in-memory set. There is no WAL
+   record: the flush in step 1 puts every point the tombstone could cover into
+   a segment and below the WAL floor, which replay never reads.
 5. **Evicts** the last-value cache for every tombstoned series, and releases the
    series from the cardinality budget only when the delete covered all of it.
 

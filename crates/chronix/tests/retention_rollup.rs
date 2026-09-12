@@ -93,7 +93,7 @@ fn unreadable_segment_is_not_dropped_by_rollup_aware_retention() {
         let cat = db.catalog().read();
         cat.active_segments_for_measurement("raw")
             .iter()
-            .map(|e| e.path.clone())
+            .map(|e| e.file.resolve(&db.data_dir().join("segments")))
             .collect()
     };
     assert_eq!(segs.len(), 1, "expected exactly one segment");

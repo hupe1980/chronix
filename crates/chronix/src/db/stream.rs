@@ -222,6 +222,7 @@ impl BatchStream<'_> {
         // Held only for this bucket, not for the life of the stream.
         let tombs = self.db.tombstones.read();
 
+        let segments_dir = self.db.segments_dir();
         let ctx = SegmentFilterCtx {
             scan_columns: self.scan_columns.as_ref(),
             time_range: &self.time_range,
@@ -232,6 +233,13 @@ impl BatchStream<'_> {
             plan: &self.plan,
             tombstones: &tombs,
             tag_col_names: tag_refs.as_deref(),
+            segments_dir: &segments_dir,
+            #[cfg(feature = "field-encryption")]
+            key_provider: self
+                .db
+                .field_encryption
+                .as_ref()
+                .map(|e| std::sync::Arc::clone(&e.reader)),
         };
 
         // Segments first (oldest → newest), so the memtable can overwrite them.

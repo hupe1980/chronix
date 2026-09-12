@@ -90,6 +90,12 @@ pub fn register_write_metrics() {
     }
     metrics::counter!("chronix_points_written_total").increment(0);
     metrics::counter!("chronix_backfill_points_total").increment(0);
+    // Backup is not a subsystem that may be absent — every `chronixd` has
+    // the endpoint — and a nightly checkpoint that starts failing is exactly
+    // the thing an alert has to be able to fire on from the first scrape.
+    metrics::counter!("chronix_backups_total").increment(0);
+    metrics::counter!("chronix_backup_failures_total").increment(0);
+    metrics::counter!("chronix_backup_bytes_total").increment(0);
 }
 
 /// Stamp `namespace` on every point and insert the batch under a deadline.

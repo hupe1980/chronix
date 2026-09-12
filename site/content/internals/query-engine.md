@@ -45,15 +45,25 @@ SQL Query
 
 Chronix extends standard SQL with time-series-specific syntax:
 
-| Extension | Purpose | Example |
-|-----------|---------|---------|
-| `FORECAST()` | Point forecasting | `SELECT FORECAST(value, 24)` |
-| `ANOMALY_SCORE()` | Anomaly detection | `SELECT ANOMALY_SCORE(value)` |
-| `FILL()` | Missing value imputation | `SELECT FILL(value, 'locf')` |
-| `RESAMPLE()` | Time-grid alignment | `SELECT RESAMPLE(value, '1m', 'avg')` |
-| `SMOOTH()` | Noise removal | `SELECT SMOOTH(value, 'ema', 0.3)` |
-| `CORRELATE()` | Cross-correlation | `SELECT CORRELATE(a, b, 10)` |
-| `COOLDOWN INTERVAL` | Alert suppression | `COOLDOWN INTERVAL '120s'` |
+| Function | Purpose | Example |
+|----------|---------|---------|
+| `forecast()` | Point forecast, aggregate | `SELECT forecast(v, _time, 24) FROM cpu` |
+| `auto_forecast()` | Forecast with cross-validated model selection | `SELECT auto_forecast(v, _time, 24) FROM cpu` |
+| `anomaly_score()` | Modified Z-score against the window | `SELECT anomaly_score(v, 3.0) FROM cpu` |
+| `multivariate_forecast()` / `multivariate_anomaly()` | VAR and Mahalanobis across series | |
+| `time_bucket()` | Calendar-aware bucketing, with zone and origin | `time_bucket('1d', _time, 'Europe/Berlin')` |
+| `rate()` / `irate()` | Counter rates, PromQL semantics including resets | `SELECT rate(counter, _time) FROM http` |
+| `diff()` / `pct_change()` | First difference and relative change | |
+| `rolling_mean()` / `rolling_std()` / `rolling_corr()` / `ewm()` | Rolling windows | |
+| `zscore()` | Standardise a column | |
+| `stl_decompose()` and `stl_trend/seasonal/residual()` | Seasonal-trend decomposition | |
+| `cross_correlation()` / `correlation()` | Lagged and plain correlation | |
+| `first()` / `last()` / `last_value()` / `last_time()` | Ordered aggregates, including second-to-last | |
+
+Everything else is DataFusion's own SQL, unchanged — including the window
+functions, which is why an analytics function used as a window function needs
+an explicit `OVER`.
+
 ### Aggregation Semantics
 
 Seven aggregation functions are supported: `Sum`, `Min`, `Max`, `Mean`,
@@ -234,7 +244,6 @@ The degree of parallelism is bounded by:
 
 1. Number of CPU cores (rayon thread pool)
 2. Number of segments matching the query
-3. Configured `max_concurrent_scans` limit
 
 Results are merged via a **merge-sort** operator that preserves time order.
 
@@ -249,13 +258,16 @@ enabling:
 
 ## Query Metrics
 
-Each query execution records:
+`execute_with_stats()` returns the `PruningStats` beside the result — how much
+of the catalog each pruning level eliminated:
 
-| Metric | Description |
-|--------|-------------|
-| `segments_scanned` | Number of segments opened |
-| `segments_pruned` | Number of segments skipped |
-| `rows_scanned` | Total rows read |
-| `rows_returned` | Rows in final result |
-| `elapsed_ms` | Wall-clock time |
-| `cpu_ms` | CPU time across all threads |
+| Field | Description |
+|-------|-------------|
+| `segments_total` | Segments the catalog held for the measurement |
+| `pruned_by_time` | Eliminated by the time range and the tag index |
+| `pruned_by_bloom` | Eliminated by a segment's series bloom filter |
+| `pruned_by_stats` | Eliminated by a column's zone-map statistics |
+| `segments_remaining` | Opened and read |
+
+`total_pruned()` sums the three. On the server the same figures are exported
+as `chronix_segments_pruned_by_time_and_index_total`.

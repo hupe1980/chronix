@@ -26,6 +26,26 @@ to help you get started.
    cargo test --workspace  # additionally the frozen cluster tier
    ```
 
+5. **If you use an editor with rust-analyzer**, let it keep its own build
+   directory. `.vscode/settings.json` sets
+   `rust-analyzer.cargo.targetDir` for VS Code; other editors need the
+   equivalent. rust-analyzer runs `cargo check --workspace` continuously, and
+   sharing `target/` with the terminal means the two invalidate each other's
+   fingerprints and rebuild constantly — and, less obviously, a `cargo test`
+   can find one of its own test binaries deleted between building and running
+   it:
+
+   ```text
+   error: test failed, to rerun pass `-p chronix --test sql_forecast_types`
+   Caused by:
+     could not execute process `…/deps/sql_forecast_types-6f489…` (never executed)
+   Caused by:
+     No such file or directory (os error 2)
+   ```
+
+   That reads like a broken test and is not one. `CARGO_TARGET_DIR` set to
+   something else for the terminal works just as well.
+
 ## Documentation
 
 The site at <https://hupe1980.github.io/chronix> is built from `site/` with

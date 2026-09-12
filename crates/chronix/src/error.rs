@@ -80,6 +80,19 @@ pub enum DbError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// The caller asked for something that cannot be done, and retrying will
+    /// not change that: a restore target that already exists, a backup
+    /// directory with no manifest or with a segment missing, a checkpoint
+    /// aimed at the database's own segment directory.
+    ///
+    /// Distinct from [`Internal`](Self::Internal) because the two reach a
+    /// client differently and must: an internal error is a redacted `500`,
+    /// and redacting *these* leaves an operator staring at
+    /// `an internal error occurred` while trying to restore a backup. The
+    /// message names the caller's own paths and nothing else.
+    #[error("{0}")]
+    InvalidRequest(String),
+
     /// Series cardinality limit exceeded.
     #[error(
         "Series cardinality limit exceeded: {current} unique series \

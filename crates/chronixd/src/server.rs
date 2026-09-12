@@ -1083,12 +1083,12 @@ pub fn build_router(
                     post(crate::admin::backup_handler),
                 )
                 .route(
-                    "/restore",
-                    post(crate::admin::restore_handler),
+                    "/backup/verify",
+                    post(crate::admin::verify_backup_handler),
                 )
                 .route(
-                    "/restore/pitr",
-                    post(crate::admin::pitr_restore_handler),
+                    "/restore",
+                    post(crate::admin::restore_handler),
                 )
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
@@ -1502,14 +1502,21 @@ fn build_trigger_pipeline(
         return Ok(None);
     };
 
-    let secret = match cfg.webhook_signing_secret.as_deref() {
-        None => None,
-        Some(raw) => Some(crate::config::resolve_env_reference(raw).map_err(|var| {
-            ServerError::Config(crate::config::ServerConfigError::Invalid(format!(
-                "triggers.webhook_signing_secret references ${{{var}}}, which is not set"
-            )))
-        })?),
-    };
+    // Every entry resolved, not just the first: a rotation that leaves one
+    // secret unresolved signs with fewer keys than the operator declared and
+    // the receivers holding that key start failing — silently, one delivery
+    // at a time.
+    let secrets = cfg
+        .webhook_signing_secrets
+        .iter()
+        .map(|raw| {
+            crate::config::resolve_env_reference(raw).map_err(|var| {
+                ServerError::Config(crate::config::ServerConfigError::Invalid(format!(
+                    "triggers.webhook_signing_secrets references ${{{var}}}, which is not set"
+                )))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // A relative catalog path belongs under the data directory, not under
     // whatever directory the process happened to start in.
@@ -1524,7 +1531,7 @@ fn build_trigger_pipeline(
     let pipeline = Arc::new(chronix::Pipeline::with_config(chronix::PipelineConfig {
         trigger_catalog_path: catalog_path,
         signal_store_capacity: cfg.signal_store_capacity,
-        webhook_signing_secret: secret,
+        webhook_signing_secrets: secrets,
         webhook_timeout: std::time::Duration::from_secs(cfg.webhook_timeout_secs),
         webhook_allow_private_targets: cfg.webhook_allow_private_targets,
         ..chronix::PipelineConfig::default()

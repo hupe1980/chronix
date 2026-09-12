@@ -1,6 +1,6 @@
 +++
 title = "Security"
-description = "Authenticate with API keys, JWT/OIDC or mTLS; authorise with Cedar policies; encrypt segments and the WAL at rest; and keep a tamper-evident audit trail."
+description = "Authenticate with API keys, JWT/OIDC or mTLS; authorise with Cedar policies; scope every request to a namespace by credential; and keep a tamper-evident audit trail."
 weight = 60
 +++
 
@@ -761,65 +761,76 @@ filename component of the requested path is used — any directory traversal
 attempts (e.g., `../`) are stripped. This prevents attackers from writing
 arbitrary files outside the designated export directory.
 
-**Admin API path validation**: The backup, restore, and point-in-time-restore
-admin endpoints (`POST /api/v1/admin/backup`, `/restore`, `/pitr_restore`)
-validate paths via `validate_admin_path()`, which rejects paths containing
-`..` components and enforces absolute paths. This prevents directory traversal
-attacks from authenticated administrators.
+**Admin API path validation**: the backup and restore endpoints
+(`POST /api/v1/admin/backup`, `/api/v1/admin/restore`) resolve every
+caller-supplied path inside `backup_root` — a canonicalised directory,
+`<data_dir>/backups` unless configured otherwise. Canonicalising the root is
+what makes it confinement: rejecting a `..` in the string accepts any
+absolute path, and it also misses a symlink planted inside the root, which
+contains no `..` at all.
 
 ### Encryption at Rest
 
-Chronix provides transparent encryption at rest via the `EncryptingBackend` storage layer, wrapping any `StorageBackend` implementation with AES-256-GCM authenticated encryption.
+Chronix does not encrypt its data directory wholesale, and no setting makes
+it. Use full-disk or filesystem encryption (LUKS, dm-crypt, FileVault, an
+encrypted ZFS dataset) for the data directory, and the bucket's own
+server-side encryption for the cold tier. That covers segments, WAL, catalog,
+temporary files, core dumps and swap.
 
-**Architecture:**
-- **Algorithm:** AES-256-GCM with random 96-bit nonces
-- **Scope:** Per-object encryption — each stored blob gets a unique nonce
-- **Wire format:** `[12-byte nonce][ciphertext][16-byte GCM tag]`
-- **Key source:** Derives from the existing `EncryptionService` in `chronix-security::auth`
-- **Backend agnostic:** Works with local filesystem, S3, GCS, or any custom `StorageBackend`
-
-**Data flow:**
-1. `put(path, data)` → generate random nonce → AES-256-GCM encrypt → store `nonce || ciphertext || tag`
-2. `get(path)` → read blob → split nonce/ciphertext/tag → AES-256-GCM decrypt → return plaintext
-3. `get_range(path, range)` → full-object decrypt then slice (range queries require full decryption)
-
-**Guarantees:**
-- Authenticated encryption prevents both tampering and information disclosure
-- Each object uses a unique random nonce — no nonce reuse across objects
-- `list()`, `exists()`, and `delete()` pass through unmodified (no encryption needed)
-- Zero-copy where possible; encryption/decryption happens in-memory
-
-**Compliance:** Meets HIPAA, SOC 2, and PCI-DSS encryption-at-rest requirements when combined with proper key management.
+**Per-column encryption** (below) is what Chronix adds on top: a named column
+encrypted with a key that is not on the machine, so a stolen disk or backup
+is unreadable while ordinary queries keep working.
 
 ### Field-Level Encryption
 
-Beyond full-object encryption, Chronix supports **per-column AES-256-GCM encryption** (`FieldEncryptionConfig`). Individual columns can be encrypted while the rest of the segment remains in plaintext. This allows fine-grained control over which data is protected.
+A named column's data blocks are encrypted with AES-256-GCM in the `.csx`
+segment format; the rest of the segment stays in plaintext.
 
-**How it works:**
-1. During writes, columns listed in `FieldEncryptionConfig` are encrypted per-block with random nonces.
-2. During reads, the `FieldKeyProvider` resolves key IDs to key material for decryption.
-3. Key IDs are stored alongside each encrypted block, enabling seamless key rotation.
-
-**Statistics suppression (security/performance tradeoff):**
-
-Encrypted columns have their zone-map statistics (min, max, sum, distinct count) and bloom filters **deliberately zeroed**. This prevents information leakage — publishing plaintext statistics would reveal data about the encrypted values.
-
-> **⚠️ Performance impact:** Without zone-map statistics, predicate pushdown cannot prune row groups based on encrypted columns. Queries that filter primarily by an encrypted column will scan and decrypt every matching segment, causing read amplification proportional to the selectivity loss.
-
-**Best practices to minimize impact:**
-1. **Filter on plaintext columns first** — time range and non-sensitive tag filters still benefit from pruning
-2. **Encrypt only sensitive fields** — keep frequently-filtered columns in plaintext (e.g. `host`, `region`) and encrypt payload fields (e.g. `patient_id`, `ssn`)
-3. **Partition by sensitive dimension** — if you must filter on an encrypted tag, use it as a partition key so each segment has a single value
-
-**Example configuration:**
-```rust
-use chronix_engine::segment::{FieldEncryptionConfig, FieldEncryptionKey};
-
-let mut config = FieldEncryptionConfig::new();
-config.encrypt_column("patient_id", FieldEncryptionKey::new("key-1", key_bytes));
-config.encrypt_column("diagnosis",  FieldEncryptionKey::new("key-1", key_bytes));
-// host, region, timestamp remain in plaintext for efficient filtering
+```toml
+[database.field_encryption]
+columns = { patient_id = "phi-2026", diagnosis = "phi-2026" }
+keys    = { phi-2026 = "CHRONIX_FIELD_KEY_PHI" }
 ```
+
+`columns` maps a column to a key id. `keys` maps a key id to the **name of an
+environment variable** holding the base64 of 32 bytes — the configuration file
+holds no key material, so inject it from a secrets manager and a stolen disk
+or backup stays unreadable. Column names are global, not per measurement.
+
+**What it covers:**
+
+| | |
+|---|---|
+| `.csx` segments, and every backup taken from them | Encrypted |
+| Compaction output | Encrypted — the merge re-encrypts |
+| The WAL | Plaintext, until the memtable it covers is flushed and it is truncated |
+| The memtable | Plaintext, in memory |
+| Query results | Plaintext — the server holds the key |
+
+It protects the long-lived copy. It is not a substitute for authorisation and
+does not hide data from the running server.
+
+**Only a field can be encrypted.** A tag is part of the series key, which is
+written in plaintext in the segment's `.series` sidecar, the inverted tag
+index and its bloom filter. Declaring a tag — or the time column — is a write
+error naming the column.
+
+**An encrypted column does not leave the segment format.** A Parquet export, a
+cold-tier archive and a rollup over the measurement are each refused, naming
+the column. Project the column away, or drop the declaration.
+
+**Statistics are suppressed** for an encrypted column — min, max, sum,
+distinct count and bloom filters are zeroed. Predicate pushdown cannot prune
+on it, so filter on plaintext columns (time range, `host`, `region`).
+
+**Rotation** is a second key id: declare both, and segments written under the
+old one stay readable. Every declared key must resolve at startup, including
+one no column names. A missing variable, a value that is not base64, or one
+that is not 32 bytes stops the server with the variable named and the value
+never printed.
+
+Each block carries a random 96-bit nonce, with the column name and the
+segment's creation timestamp bound in as associated data.
 
 ### Automated Secret Rotation
 
@@ -974,20 +985,30 @@ This prevents misconfigured detectors from entering the model catalog.
 
 ### Production Checklist
 
-- [ ] Enable authentication (`auth.enabled = true`)
-- [ ] Enable Cedar authorization (`authz.enabled = true`)
-- [ ] Enable mTLS for client connections (`tls.require_client_cert = true`)
-- [ ] Enable inter-node TLS (`cluster.tls.enabled = true`)
-- [ ] Enable audit logging (`audit.enabled = true`)
-- [ ] Use dedicated CA for Chronix certificates
-- [ ] Configure `allowed_cns` for mTLS to restrict accepted client certificates
-- [ ] Rotate certificates before expiry
-- [ ] Set `default_decision = "deny"` for authorization
+There is no `enabled` flag on any of these: a section is configured or it is
+absent, and absent means off. Naming a phantom flag is how a checklist gets
+ticked without the control being on.
+
+- [ ] Enable authentication — set `[auth] api_keys` and/or `[auth] jwt`
+- [ ] Enable Cedar authorization — point `authz_policy_dir` at a directory of
+      `.cedar` files. With it unset, every authenticated request is permitted
+- [ ] Enable TLS — set `[tls] cert` and `[tls] key`
+- [ ] Enable mTLS for client connections — set `[tls] client_ca`
+- [ ] Enable inter-node TLS (cluster builds) — set `[cluster.tls] ca_cert`,
+      `cert` and `key`
+- [ ] Enable audit logging — set `[audit] path`, and `hmac_key_env` so the
+      chain is keyed rather than a recomputable hash
+- [ ] Use a dedicated CA for Chronix certificates
+- [ ] Rotate certificates before expiry — `[tls] reload_interval_secs` picks
+      up a new pair without a restart
+- [ ] Write least-privilege Cedar policies per team or service; a request
+      matching no policy is denied
 - [ ] Define least-privilege Cedar policies per team/service
 - [ ] Monitor `chronix_auth_failures_total` for brute-force attempts
 - [ ] Separate admin credentials from application credentials
 - [ ] Use environment variables or secrets manager for sensitive config
-- [ ] Enable encryption at rest (`storage.encryption.enabled = true`) with proper key management
+- [ ] Encrypt the data directory at the filesystem or volume layer, and the cold-tier bucket with its own server-side encryption
+- [ ] Declare `[database.field_encryption]` for columns whose key must not live on the machine, and inject the key from a secrets manager
 - [ ] Verify JWT `jti` replay protection is active if tokens include `jti` claims
 - [ ] Confirm webhook URLs use HTTPS (enforced; the SSRF address rule is on by default and `triggers.webhook_allow_private_targets` is the named way off)
 - [ ] Use `$VAR` syntax for connector credentials, and `CHRONIX_WEBHOOK_SIGNING_SECRET` for the webhook signing key — never embed literal secrets in config
@@ -1064,9 +1085,8 @@ reg.register_model_with_info(info, factory)?;
 
 Every webhook delivery is a [CloudEvents](https://cloudevents.io) 1.0
 structured-mode JSON envelope, signed per the
-[Standard Webhooks](https://www.standardwebhooks.com) `v1` scheme. The
-`signing_secret` is a mandatory parameter — unsigned webhooks are not
-permitted.
+[Standard Webhooks](https://www.standardwebhooks.com) `v1` scheme. At least
+one signing secret is mandatory — unsigned webhooks are not permitted.
 
 ```rust
 use chronix_streaming::signal::WebhookConfig;
@@ -1074,6 +1094,12 @@ use chronix_streaming::signal::WebhookConfig;
 let config = WebhookConfig::new(
     "https://alerts.example.com/webhook",
     "my-signing-secret",  // required
+);
+
+// During a rotation, sign with both — newest first.
+let rotating = WebhookConfig::with_secrets(
+    "https://alerts.example.com/webhook",
+    vec!["new-secret".into(), "old-secret".into()],
 );
 ```
 
@@ -1106,6 +1132,24 @@ webhook-signature: v1,base64(HMAC-SHA256(secret, "{webhook-id}.{webhook-timestam
 
 Any [Standard Webhooks reference library](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries)
 verifies this without any code specific to chronix.
+
+### Rotating a signing secret
+
+A delivery is signed with every configured secret and carries one `v1,<sig>`
+per secret in the space-delimited `webhook-signature` header, so a receiver
+holding any one of them verifies.
+
+```toml
+[triggers]
+# Newest first. Both are sent; either verifies.
+webhook_signing_secrets = ["$CHRONIX_WEBHOOK_KEY_NEW", "$CHRONIX_WEBHOOK_KEY_OLD"]
+```
+
+1. add the new secret at the front and restart;
+2. roll it out to the receivers;
+3. drop the old one.
+
+`CHRONIX_WEBHOOK_SIGNING_SECRET` sets the whole list, comma-separated.
 
 ### Webhook Auth Header — Environment Variable Expansion
 

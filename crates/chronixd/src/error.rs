@@ -354,6 +354,21 @@ fn classify_db(err: &chronix::DbError) -> Outcome {
         // variant is a decision somebody makes here.
         E::Wal(_) => Outcome::internal("DATABASE_ERROR"),
         E::Encoding(_) => Outcome::internal("DATABASE_ERROR"),
+        // A missing encryption key is a *deployment* condition, not a
+        // chronix bug, so it is not a redacted 500 — the same argument the
+        // full-disk case makes above. The message names the column and the
+        // key id and discloses nothing an authorised reader of the schema
+        // does not already have, and it is the only thing that distinguishes
+        // "set the environment variable" from "restore from a backup". The
+        // commonest way to reach it is restoring an encrypted backup onto a
+        // machine the key was never given to.
+        E::Segment(chronix::chronix_engine::segment::SegmentError::MissingEncryptionKey {
+            ..
+        }) => Outcome::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ENCRYPTION_KEY_UNAVAILABLE",
+            tonic::Code::FailedPrecondition,
+        ),
         E::Segment(_) => Outcome::internal("DATABASE_ERROR"),
         E::Memtable(_) => Outcome::internal("DATABASE_ERROR"),
         E::Storage(_) => Outcome::internal("DATABASE_ERROR"),
@@ -363,6 +378,17 @@ fn classify_db(err: &chronix::DbError) -> Outcome {
         E::Config(_) => Outcome::internal("CONFIG_ERROR"),
         E::LockFailed { .. } => Outcome::internal("DATABASE_ERROR"),
         E::Internal(_) => Outcome::internal("DATABASE_ERROR"),
+
+        // The caller's fault, and the message is the caller's own request —
+        // a path they supplied, or what is missing from a directory they
+        // named. Redacting it was how a refused restore reached an operator
+        // as `DATABASE_ERROR: an internal error occurred`, which says
+        // nothing about which of four reasons it was.
+        E::InvalidRequest(_) => Outcome::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            tonic::Code::InvalidArgument,
+        ),
     }
 }
 
@@ -541,6 +567,32 @@ mod tests {
         let err = ServerError::NotFound("cpu".into());
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A missing encryption key reaches the client with its reason intact.
+    ///
+    /// It used to be a `SegmentError::CorruptFile`, which classifies as a
+    /// redacted `DATABASE_ERROR` — so an operator who restored an encrypted
+    /// backup onto a machine without the key was told "an internal error
+    /// occurred" and had every reason to think the backup was damaged. The
+    /// two have completely different next steps.
+    #[test]
+    fn a_missing_encryption_key_is_not_redacted() {
+        let err = ServerError::Db(chronix::DbError::Segment(
+            chronix::chronix_engine::segment::SegmentError::MissingEncryptionKey {
+                column: "patient_id".into(),
+                key_id: "phi-2026".into(),
+            },
+        ));
+        let text = err.to_string();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(text.contains("patient_id"), "{text}");
+        assert!(text.contains("phi-2026"), "{text}");
+        assert!(
+            !text.contains("corrupt"),
+            "a missing key is not corruption: {text}"
+        );
     }
 
     #[test]

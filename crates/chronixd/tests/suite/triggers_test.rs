@@ -205,7 +205,7 @@ async fn an_unsignable_webhook_trigger_is_refused() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body: Value = resp.json().await.unwrap();
     assert!(
-        body.to_string().contains("webhook_signing_secret"),
+        body.to_string().contains("webhook_signing_secrets"),
         "the error must name what is missing, got {body}"
     );
 }

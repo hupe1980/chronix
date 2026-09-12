@@ -1,0 +1,15 @@
+{
+  // rust-analyzer runs `cargo check --workspace` continuously. Without this
+  // it uses the same `target/` directory as the terminal, and the two fight:
+  // each invalidates the other's fingerprints, a `cargo test` can find a
+  // test binary deleted between building and running it ("could not execute
+  // process … No such file or directory"), and both rebuild constantly.
+  //
+  // `true` puts rust-analyzer's artifacts in `target/rust-analyzer`.
+  "rust-analyzer.cargo.targetDir": true,
+
+  // The workspace is large and DataFusion is most of it; checking all
+  // targets keeps test and example code analysed, which is where the
+  // `cfg(test)` breakage that `cargo check` alone misses shows up.
+  "rust-analyzer.check.allTargets": true
+}

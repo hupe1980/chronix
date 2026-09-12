@@ -411,6 +411,35 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub lvc_measurements: Vec<String>,
 
+    /// Per-column encryption in the segment format.
+    ///
+    /// ```toml
+    /// [database.field_encryption]
+    /// columns = { patient_id = "phi-2026" }
+    /// keys    = { phi-2026 = "CHRONIX_FIELD_KEY_PHI" }
+    /// ```
+    ///
+    /// The `keys` values are **environment variable names**, never key
+    /// material: a key in the configuration file sits beside the data it
+    /// protects, which is the one place it is worth nothing. Every declared
+    /// key must resolve at startup.
+    #[serde(default)]
+    pub field_encryption: chronix_core::FieldEncryption,
+
+    /// Take a checkpoint on a schedule, and keep the last few.
+    ///
+    /// ```toml
+    /// [database.checkpoints]
+    /// interval_secs = 21600
+    /// directory     = "/mnt/backup/chronix"
+    /// keep          = 4
+    /// ```
+    ///
+    /// Off by default. The server has an admin endpoint for taking one on
+    /// demand; this is for the deployment that has no scheduler to call it.
+    #[serde(default)]
+    pub checkpoints: chronix_core::Checkpoints,
+
     /// Zstd compression level (1–22). Only used when `compression = "zstd"`.
     #[serde(default = "default_zstd_level")]
     pub zstd_level: i32,
@@ -573,8 +602,14 @@ pub struct TriggersConfig {
     /// written in SQL so it stays out of the trigger catalog on disk and out
     /// of `SHOW TRIGGERS`. `${VAR}` or `$VAR` resolves against the
     /// environment at startup, so it need not be in the file either.
+    /// A **list**, newest first. Rotating a single secret is an outage:
+    /// every in-flight delivery fails the moment either side changes.
+    /// Signing with all of them produces the space-delimited
+    /// `webhook-signature` the Standard Webhooks spec defines for exactly
+    /// this, so the sender and its receivers can be updated in either order.
+    /// The ordinary case is one entry.
     #[serde(default)]
-    pub webhook_signing_secret: Option<String>,
+    pub webhook_signing_secrets: Vec<String>,
 
     /// Timeout for one webhook request, in seconds.
     #[serde(default = "default_webhook_timeout_secs")]
@@ -599,7 +634,7 @@ impl Default for TriggersConfig {
     fn default() -> Self {
         Self {
             catalog_path: None,
-            webhook_signing_secret: None,
+            webhook_signing_secrets: Vec::new(),
             webhook_timeout_secs: default_webhook_timeout_secs(),
             webhook_allow_private_targets: false,
             signal_store_capacity: default_signal_store_capacity(),
@@ -940,6 +975,8 @@ impl Default for DatabaseConfig {
             cdc_capacity: None,
             wal_max_unflushed: None,
             soft_delete_ttl_secs: None,
+            field_encryption: chronix_core::FieldEncryption::default(),
+            checkpoints: chronix_core::Checkpoints::default(),
             lvc_measurements: Vec::new(),
             compression: default_compression(),
             float_encoding: default_float_encoding(),
@@ -1207,10 +1244,17 @@ impl ServerConfig {
                 })?;
             jwt.secret = secret;
         }
-        if let Some(secret) = get("CHRONIX_WEBHOOK_SIGNING_SECRET") {
+        // Comma-separated, newest first, so a rotation can be driven entirely
+        // from the environment without touching the file.
+        if let Some(secrets) = get("CHRONIX_WEBHOOK_SIGNING_SECRET") {
             self.triggers
                 .get_or_insert_with(TriggersConfig::default)
-                .webhook_signing_secret = Some(secret);
+                .webhook_signing_secrets = secrets
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
         }
         Ok(())
     }
@@ -1315,6 +1359,14 @@ impl ServerConfig {
         if !self.database.lvc_measurements.is_empty() {
             builder =
                 builder.lvc_measurements(self.database.lvc_measurements.iter().cloned().collect());
+        }
+        if !self.database.field_encryption.columns.is_empty()
+            || !self.database.field_encryption.keys.is_empty()
+        {
+            builder = builder.field_encryption(self.database.field_encryption.clone());
+        }
+        if self.database.checkpoints.interval_secs.is_some() {
+            builder = builder.checkpoints(self.database.checkpoints.clone());
         }
 
         builder

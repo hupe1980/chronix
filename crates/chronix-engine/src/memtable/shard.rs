@@ -316,6 +316,22 @@ impl ShardRouter {
         out
     }
 
+    /// Every `(tag key, tag value)` pair held in memory, across every shard.
+    ///
+    /// The memtable half of label discovery — see
+    /// [`Memtable::visit_tags`](crate::memtable::memtable::Memtable::visit_tags).
+    #[must_use]
+    pub fn live_tag_pairs(&self) -> std::collections::BTreeSet<(String, String)> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut visit = |key: &str, value: &str| {
+            out.insert((key.to_owned(), value.to_owned()));
+        };
+        for entry in self.shards.read().values() {
+            entry.controller.visit_tags(&mut visit);
+        }
+        out
+    }
+
     /// Returns the total memory usage across all shards.
     #[must_use]
     pub fn total_memory(&self) -> usize {

@@ -133,7 +133,7 @@ fn a_webhook_trigger_needs_a_configured_signing_secret() {
         )
         .expect_err("an unsignable webhook must be refused, not accepted and dropped");
     assert!(
-        err.to_string().contains("webhook_signing_secret"),
+        err.to_string().contains("webhook_signing_secrets"),
         "the error must name what is missing, got: {err}"
     );
 }
@@ -143,7 +143,7 @@ fn a_webhook_trigger_needs_a_configured_signing_secret() {
 #[test]
 fn a_webhook_trigger_registers_a_channel_named_by_its_url() {
     let pipeline = Pipeline::with_config(PipelineConfig {
-        webhook_signing_secret: Some("s3cret".into()),
+        webhook_signing_secrets: vec!["s3cret".into()],
         ..PipelineConfig::default()
     });
 
@@ -414,7 +414,7 @@ fn a_restored_trigger_keeps_its_delivery_channel() {
 
     let config = || PipelineConfig {
         trigger_catalog_path: Some(catalog.clone()),
-        webhook_signing_secret: Some("s3cret".into()),
+        webhook_signing_secrets: vec!["s3cret".into()],
         enable_log_delivery: false,
         enable_metric_delivery: false,
         ..PipelineConfig::default()

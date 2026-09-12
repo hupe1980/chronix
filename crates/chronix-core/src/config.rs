@@ -3,7 +3,7 @@
 //! All configuration is loadable from TOML files, environment variables, and
 //! programmatic builders. The builder validates constraints before construction.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -207,6 +207,168 @@ const fn default_zstd_level() -> i32 {
     3
 }
 
+/// Taking a checkpoint on a schedule, and keeping the last few.
+///
+/// Run by the maintenance thread, beside the flush, compaction, rollup and
+/// retention passes — the deployments this is for have no scheduler of their
+/// own. Off unless `interval_secs` is set.
+///
+/// ```toml
+/// [database.checkpoints]
+/// interval_secs = 21600      # every six hours
+/// directory     = "/mnt/backup/chronix"
+/// keep          = 4          # a day of history
+/// ```
+///
+/// Each run writes `<directory>/<timestamp>`; the oldest are removed once
+/// more than `keep` remain, and a run with no manifest is removed on sight.
+/// A failed run leaves the existing checkpoints alone and increments
+/// `chronix_backup_failures_total`.
+///
+/// `directory` must be outside the data directory's `segments/` tree. On the
+/// same filesystem the segments are hard-linked, so the checkpoint is not a
+/// second copy of the bytes — point it at a different volume if surviving
+/// that volume is the aim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Checkpoints {
+    /// How often to take one. `None` — the default — is off.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    /// Where they go. Required when `interval_secs` is set.
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
+    /// How many to keep. Default 3; `0` keeps only the newest.
+    #[serde(default = "default_checkpoints_keep")]
+    pub keep: usize,
+}
+
+/// Three, so a corrupt or half-finished one is never the only copy.
+const fn default_checkpoints_keep() -> usize {
+    3
+}
+
+impl Checkpoints {
+    /// The interval, when scheduled checkpoints are on.
+    #[must_use]
+    pub fn interval(&self) -> Option<Duration> {
+        self.interval_secs
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+    }
+
+    /// Check the declaration is usable.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] if an interval is set without a
+    /// directory — the one combination that reads as "on" and does nothing.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.interval().is_some() && self.directory.is_none() {
+            return Err(ConfigError::Validation {
+                message: "checkpoints.interval_secs is set but checkpoints.directory is not — \
+                          a schedule with nowhere to write is a backup that silently never \
+                          happens"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Which columns are encrypted in the `.csx` format, and where their keys
+/// come from.
+///
+/// **The keys are named, never written here.** A `keys` entry is the name of
+/// an environment variable holding the base64 of 32 bytes, so the
+/// configuration file carries no secret — which is what makes this worth
+/// having over full-disk encryption, whose key is on the machine too.
+///
+/// ```toml
+/// [database.field_encryption]
+/// columns = { patient_id = "phi-2026", diagnosis = "phi-2026" }
+/// keys    = { phi-2026 = "CHRONIX_FIELD_KEY_PHI" }
+/// ```
+///
+/// Column names are **global**, not per measurement. Only a field may be
+/// encrypted: a tag is part of the series key, which is stored in plaintext
+/// beside the segment, and every scan ranges on the time column.
+///
+/// Declaring several key ids at once is a rotation — segments written under
+/// the old one stay readable. Every declared key must resolve at startup,
+/// including one no column currently names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldEncryption {
+    /// Column name → the id of the key that encrypts it.
+    #[serde(default)]
+    pub columns: BTreeMap<String, String>,
+    /// Key id → the environment variable holding its base64-encoded 32 bytes.
+    #[serde(default)]
+    pub keys: BTreeMap<String, String>,
+}
+
+impl FieldEncryption {
+    /// Whether anything is encrypted at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Whether `column` is declared encrypted.
+    #[must_use]
+    pub fn covers(&self, column: &str) -> bool {
+        self.columns.contains_key(column)
+    }
+
+    /// Check the declaration is self-consistent.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] if a column names a key that is not
+    /// declared, if a name is empty, or if the time column is named — a
+    /// timestamp cannot be encrypted, because every scan ranges on it and
+    /// every retention decision reads it.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (column, key_id) in &self.columns {
+            if column.is_empty() || key_id.is_empty() {
+                return Err(ConfigError::Validation {
+                    message: "field_encryption.columns: column names and key ids must not be empty"
+                        .into(),
+                });
+            }
+            if crate::types::RESERVED_COLUMN_NAMES.contains(&column.as_str()) {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "field_encryption.columns: '{column}' is the time column and cannot be \
+                         encrypted — every scan ranges on it and every retention decision \
+                         reads it"
+                    ),
+                });
+            }
+            if !self.keys.contains_key(key_id) {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "field_encryption: column '{column}' names key '{key_id}', which is \
+                         not declared under [field_encryption.keys]"
+                    ),
+                });
+            }
+        }
+        for (key_id, var) in &self.keys {
+            if key_id.is_empty() || var.is_empty() {
+                return Err(ConfigError::Validation {
+                    message:
+                        "field_encryption.keys: key ids and environment variable names must not \
+                         be empty"
+                            .into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Top-level database configuration.
 ///
 /// Constructed via the builder pattern: `ChronixConfig::builder()`.
@@ -340,6 +502,19 @@ pub struct ChronixConfig {
     /// the next restart.
     #[serde(default = "default_future_write_tolerance")]
     pub future_write_tolerance: Duration,
+    /// Per-column encryption in the segment format — see [`FieldEncryption`].
+    ///
+    /// Empty by default: nothing is encrypted, and the data directory is the
+    /// filesystem's job.
+    #[serde(default)]
+    pub field_encryption: FieldEncryption,
+    /// Take a checkpoint on a schedule — see [`Checkpoints`].
+    ///
+    /// Off by default. A backup is a policy decision, and a database that
+    /// starts writing copies of itself somewhere the operator did not ask
+    /// for is worse than one that does nothing.
+    #[serde(default)]
+    pub checkpoints: Checkpoints,
 }
 
 impl Default for ChronixConfig {
@@ -418,6 +593,8 @@ impl ChronixConfig {
     /// Returns [`ConfigError`] when any field is out of range or
     /// internally inconsistent (see the individual checks).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.field_encryption.validate()?;
+        self.checkpoints.validate()?;
         if self.memtable_flush_threshold == 0 {
             return Err(ConfigError::Validation {
                 message: "memtable_flush_threshold must be > 0".into(),
@@ -509,6 +686,8 @@ pub struct ChronixConfigBuilder {
     lvc_measurements: Option<HashSet<String>>,
     compaction_concurrency: usize,
     maintenance_interval: Duration,
+    field_encryption: FieldEncryption,
+    checkpoints: Checkpoints,
     max_series_cardinality: usize,
     max_query_result_bytes: usize,
     per_query_memory_limit: usize,
@@ -539,6 +718,8 @@ impl Default for ChronixConfigBuilder {
             lvc_measurements: None,
             compaction_concurrency: 2,
             maintenance_interval: default_maintenance_interval(),
+            field_encryption: FieldEncryption::default(),
+            checkpoints: Checkpoints::default(),
             max_series_cardinality: 1_000_000,
             max_query_result_bytes: default_max_query_result_bytes(),
             per_query_memory_limit: default_per_query_memory_limit(),
@@ -658,6 +839,25 @@ impl ChronixConfigBuilder {
     #[must_use]
     pub fn compaction_concurrency(mut self, concurrency: usize) -> Self {
         self.compaction_concurrency = concurrency;
+        self
+    }
+
+    /// Declare which columns are encrypted and where their keys live.
+    ///
+    /// See [`FieldEncryption`]. The declaration is checked at
+    /// [`build`](Self::build); the keys themselves are resolved from the
+    /// environment when the database is opened, so a missing variable is a
+    /// startup error rather than a column that silently writes plaintext.
+    #[must_use]
+    pub fn field_encryption(mut self, settings: FieldEncryption) -> Self {
+        self.field_encryption = settings;
+        self
+    }
+
+    /// Take a checkpoint on a schedule — see [`Checkpoints`].
+    #[must_use]
+    pub fn checkpoints(mut self, settings: Checkpoints) -> Self {
+        self.checkpoints = settings;
         self
     }
 
@@ -795,6 +995,8 @@ impl ChronixConfigBuilder {
             analytics: self.analytics,
             soft_delete_ttl: self.soft_delete_ttl,
             future_write_tolerance: self.future_write_tolerance,
+            field_encryption: self.field_encryption,
+            checkpoints: self.checkpoints,
         };
 
         // Shared structural validation (same checks as from_toml path).

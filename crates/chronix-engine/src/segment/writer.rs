@@ -717,9 +717,32 @@ fn encode_row_groups_streaming<W: Write>(
 
     let mut column_metas: Vec<ColumnMeta> = schema
         .iter()
-        .map(|col| {
+        .map(|col| -> Result<ColumnMeta> {
             #[cfg(feature = "field-encryption")]
             let (encrypted, key_id) = if let Some(k) = config.field_encryption.key_for(&col.name) {
+                // Only a **field** can honestly be encrypted. A tag's value
+                // is part of the series key, and the series key is written
+                // in plaintext right beside this segment — in its `.series`
+                // sidecar, in the inverted tag index and in the bloom filter
+                // — so an "encrypted" tag column would publish the value it
+                // claims to hide, a foot away. The timestamp cannot be
+                // encrypted either: every scan ranges on it.
+                if col.role != crate::segment::metadata::roles::FIELD {
+                    return Err(SegmentError::InvalidConfiguration {
+                        detail: format!(
+                            "column '{}' is declared encrypted but is a {} — only a field can \
+                             be encrypted, because a tag's value is also written in plaintext \
+                             to the segment's series sidecar, the inverted tag index and its \
+                             bloom filter, and the time column is what every scan ranges on",
+                            col.name,
+                            if col.role == crate::segment::metadata::roles::TAG {
+                                "tag"
+                            } else {
+                                "timestamp"
+                            }
+                        ),
+                    });
+                }
                 (true, Some(k.key_id.clone()))
             } else {
                 (false, None)
@@ -727,7 +750,7 @@ fn encode_row_groups_streaming<W: Write>(
             #[cfg(not(feature = "field-encryption"))]
             let (encrypted, key_id) = (false, None);
 
-            ColumnMeta {
+            Ok(ColumnMeta {
                 name: col.name.clone(),
                 data_type: col.data_type,
                 role: col.role,
@@ -738,9 +761,9 @@ fn encode_row_groups_streaming<W: Write>(
                 key_id,
                 decimal_scale: col.decimal_scale,
                 row_group_blooms: None,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let mut row_group_blocks: Vec<Vec<ColumnBlockMeta>> = Vec::new();
     let mut total_uncompressed: u64 = 0;
@@ -1497,9 +1520,32 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
 
     let mut column_metas: Vec<ColumnMeta> = schema
         .iter()
-        .map(|col| {
+        .map(|col| -> Result<ColumnMeta> {
             #[cfg(feature = "field-encryption")]
             let (encrypted, key_id) = if let Some(k) = config.field_encryption.key_for(&col.name) {
+                // Only a **field** can honestly be encrypted. A tag's value
+                // is part of the series key, and the series key is written
+                // in plaintext right beside this segment — in its `.series`
+                // sidecar, in the inverted tag index and in the bloom filter
+                // — so an "encrypted" tag column would publish the value it
+                // claims to hide, a foot away. The timestamp cannot be
+                // encrypted either: every scan ranges on it.
+                if col.role != crate::segment::metadata::roles::FIELD {
+                    return Err(SegmentError::InvalidConfiguration {
+                        detail: format!(
+                            "column '{}' is declared encrypted but is a {} — only a field can \
+                             be encrypted, because a tag's value is also written in plaintext \
+                             to the segment's series sidecar, the inverted tag index and its \
+                             bloom filter, and the time column is what every scan ranges on",
+                            col.name,
+                            if col.role == crate::segment::metadata::roles::TAG {
+                                "tag"
+                            } else {
+                                "timestamp"
+                            }
+                        ),
+                    });
+                }
                 (true, Some(k.key_id.clone()))
             } else {
                 (false, None)
@@ -1507,7 +1553,7 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
             #[cfg(not(feature = "field-encryption"))]
             let (encrypted, key_id) = (false, None);
 
-            ColumnMeta {
+            Ok(ColumnMeta {
                 name: col.name.clone(),
                 data_type: col.data_type,
                 role: col.role,
@@ -1518,9 +1564,9 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
                 key_id,
                 decimal_scale: col.decimal_scale,
                 row_group_blooms: None,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let mut row_group_blocks: Vec<Vec<ColumnBlockMeta>> = Vec::new();
     let mut total_uncompressed: u64 = 0;

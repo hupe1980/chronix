@@ -1006,6 +1006,39 @@ pub async fn backup_handler(
     Ok((StatusCode::OK, Json(manifest)))
 }
 
+/// Request body for `POST /api/v1/admin/backup/verify`.
+#[derive(Debug, Deserialize)]
+pub struct VerifyBackupRequest {
+    /// Directory holding the backup to check.
+    pub backup_dir: String,
+}
+
+/// `POST /api/v1/admin/backup/verify` — check a backup without restoring it.
+///
+/// A backup that can only be checked by restoring it is one nobody checks,
+/// and a backup nobody has checked is the one that turns out to be
+/// incomplete on the day it is needed. This runs the same verification a
+/// restore runs — every segment the backup's own catalog names, present and
+/// at its recorded size — and writes nothing.
+pub async fn verify_backup_handler(
+    State(state): State<AppState>,
+    Json(body): Json<VerifyBackupRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    let backup_dir = confine_to_root(&body.backup_dir, &admin_root(&state))?;
+    let manifest =
+        tokio::task::spawn_blocking(move || chronix::Chronix::verify_backup(&backup_dir))
+            .await
+            .map_err(|e| ServerError::Internal(format!("verify task panicked: {e}")))?
+            .map_err(ServerError::Db)?;
+
+    info!(
+        backup_dir = %body.backup_dir,
+        segments = manifest.segments,
+        "audit: backup verified"
+    );
+    Ok((StatusCode::OK, Json(manifest)))
+}
+
 /// `POST /api/v1/admin/restore` — restore a database from backup.
 pub async fn restore_handler(
     State(state): State<AppState>,
@@ -1039,67 +1072,6 @@ pub async fn restore_handler(
     );
 
     Ok((StatusCode::OK, Json(manifest)))
-}
-
-/// Request body for `POST /api/v1/admin/restore/pitr`.
-#[derive(Debug, Deserialize)]
-pub struct PitrRestoreRequest {
-    /// Directory containing the backup.
-    pub backup_dir: String,
-    /// Target directory to restore into (must not exist).
-    pub target_dir: String,
-    /// WAL sequence number to recover to.
-    pub target_sequence: u64,
-    /// Optional WAL archive directory (if WAL files were archived separately).
-    pub wal_archive_dir: Option<String>,
-}
-
-/// Response for PITR restore.
-#[derive(Debug, Serialize)]
-pub struct PitrRestoreResponse {
-    /// The backup manifest.
-    pub manifest: chronix::BackupManifest,
-    /// Number of WAL records replayed.
-    pub records_replayed: usize,
-}
-
-/// `POST /api/v1/admin/restore/pitr` — point-in-time recovery.
-pub async fn pitr_restore_handler(
-    State(state): State<AppState>,
-    Json(body): Json<PitrRestoreRequest>,
-) -> Result<impl IntoResponse, ServerError> {
-    let root = admin_root(&state);
-    let backup_dir = confine_to_root(&body.backup_dir, &root)?;
-    let target_dir = confine_to_root(&body.target_dir, &root)?;
-    let target_seq = body.target_sequence;
-    let archive_dir = body
-        .wal_archive_dir
-        .as_deref()
-        .map(|d| confine_to_root(d, &root))
-        .transpose()?;
-
-    let (manifest, replayed) = tokio::task::spawn_blocking(move || {
-        chronix::Chronix::restore_pitr(&backup_dir, &target_dir, target_seq, archive_dir.as_deref())
-    })
-    .await
-    .map_err(|e| ServerError::Internal(format!("PITR task panicked: {e}")))?
-    .map_err(ServerError::Db)?;
-
-    info!(
-        backup_dir = %body.backup_dir,
-        target_dir = %body.target_dir,
-        target_seq = target_seq,
-        replayed = replayed,
-        "audit: PITR restore completed"
-    );
-
-    Ok((
-        StatusCode::OK,
-        Json(PitrRestoreResponse {
-            manifest,
-            records_replayed: replayed,
-        }),
-    ))
 }
 
 #[cfg(test)]

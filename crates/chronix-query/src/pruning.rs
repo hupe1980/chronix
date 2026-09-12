@@ -14,8 +14,6 @@
 //! structures are derived from a segment's sidecar and can lag the catalog,
 //! and pruning what has not been seen loses rows with no error anywhere.
 
-use std::path::PathBuf;
-
 use chronix_engine::index::{SegmentCatalogEntry, SeriesBloomFilter};
 
 /// Statistics about segment pruning during query execution.
@@ -50,13 +48,15 @@ pub struct PruningResult {
     pub stats: PruningStats,
 }
 
-/// A segment that survived pruning, with its catalog entry and file path.
+/// A segment that survived pruning.
+///
+/// It used to carry a `path` beside the entry as well. Nothing ever read it —
+/// every caller went to `entry` — and it was a second copy of the one fact
+/// the entry already states.
 #[derive(Debug, Clone)]
 pub struct PrunedSegment {
     /// Catalog entry for this segment.
     pub entry: SegmentCatalogEntry,
-    /// Filesystem path to the segment file.
-    pub path: PathBuf,
 }
 
 /// Prune a pre-filtered set of segment entries through bloom and stats levels.
@@ -98,7 +98,6 @@ where
         }
 
         surviving.push(PrunedSegment {
-            path: entry.path.clone(),
             entry: entry.clone(),
         });
     }
@@ -131,14 +130,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronix_core::{SegmentId, SegmentState, ShardId};
+    use chronix_core::{SegmentFile, SegmentId, SegmentState, ShardId};
 
     fn make_entry(id: u64, shard: i64, min_ts: i64, max_ts: i64) -> SegmentCatalogEntry {
         SegmentCatalogEntry {
             segment_id: SegmentId(id),
             shard_id: ShardId(shard),
             measurement: "cpu".to_string(),
-            path: PathBuf::from(format!("shard_{shard}/seg_{id}.csx")),
+            file: SegmentFile::new(ShardId(shard), &format!("seg_{id}.csx")).unwrap(),
             min_timestamp: min_ts,
             max_timestamp: max_ts,
             row_count: 1000,

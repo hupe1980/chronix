@@ -145,6 +145,25 @@ impl Chronix {
             ));
         }
 
+        // The archive writes plaintext Parquet into a bucket, so an
+        // encrypted column cannot go: the whole point of encrypting it is
+        // that the bytes at rest are ciphertext, and a background pass that
+        // copies the same values out in the clear — hours later, to a
+        // different system — is the opposite. Refused for the database
+        // rather than per measurement, because the pass runs unattended and
+        // a partial archive is worse than none.
+        #[cfg(feature = "field-encryption")]
+        if !self.config.field_encryption.is_empty() {
+            let declared: Vec<&str> = self
+                .config
+                .field_encryption
+                .columns
+                .keys()
+                .map(String::as_str)
+                .collect();
+            self.refuse_encrypted_columns(declared, "the cold archive")?;
+        }
+
         // The wall clock, deliberately uncapped — unlike retention, which
         // measures age from `min(clock, newest timestamp held)` so that one
         // bad reading of the clock cannot empty the database.

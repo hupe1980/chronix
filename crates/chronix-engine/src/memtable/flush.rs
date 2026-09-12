@@ -435,6 +435,14 @@ impl FlushController {
         out
     }
 
+    /// Hand every tag pair this shard holds in memory to `f`.
+    pub fn visit_tags(&self, f: &mut impl FnMut(&str, &str)) {
+        self.active.read().visit_tags(&mut *f);
+        for frozen in self.frozen.read().iter() {
+            frozen.visit_tags(&mut *f);
+        }
+    }
+
     /// Returns the total estimated memory across active and all frozen memtables.
     #[must_use]
     pub fn total_memory(&self) -> usize {

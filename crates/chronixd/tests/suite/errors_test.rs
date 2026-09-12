@@ -329,3 +329,64 @@ async fn a_successful_non_json_body_is_untouched() {
         .unwrap();
     assert!(body.starts_with('#') || body.is_empty(), "{body:.120}");
 }
+
+/// A refused backup or restore says *why*, with the status a caller can act
+/// on.
+///
+/// Every one of these was a redacted `500 DATABASE_ERROR: an internal error
+/// occurred`, because they were raised as `DbError::Internal` and an internal
+/// error is deliberately opaque on the wire. They are not internal: the
+/// target already exists, the directory is not a backup, a segment is
+/// missing. An operator restoring a backup is the last person who should be
+/// told "an internal error occurred" — found by running the finished server
+/// and reading what it said, not by a test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_restore_names_its_reason() {
+    let (base, tmp) = server().await;
+    let client = super::integration::client();
+
+    // Not a backup directory at all.
+    let resp = client
+        .post(format!("{base}/api/v1/admin/restore"))
+        .json(&serde_json::json!({ "backup_dir": "nope", "target_dir": "t" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["code"], "INVALID_REQUEST");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("backup_manifest.json"),
+        "the reason has to survive to the client: {body}"
+    );
+
+    // A real backup, then a restore onto a directory that exists.
+    let resp = client
+        .post(format!("{base}/api/v1/admin/backup"))
+        .json(&serde_json::json!({ "target_dir": "b1" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200);
+    let manifest: Value = resp.json().await.expect("json");
+    assert!(manifest["segments"].is_number(), "manifest: {manifest}");
+
+    let resp = client
+        .post(format!("{base}/api/v1/admin/restore"))
+        .json(&serde_json::json!({ "backup_dir": "b1", "target_dir": "b1" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["code"], "INVALID_REQUEST");
+    assert!(
+        body["error"].as_str().unwrap().contains("already exists"),
+        "{body}"
+    );
+
+    drop(tmp);
+}

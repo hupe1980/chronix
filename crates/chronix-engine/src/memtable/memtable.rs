@@ -450,6 +450,22 @@ impl Memtable {
             .collect()
     }
 
+    /// Hand every `(tag key, tag value)` pair this memtable holds to `f`.
+    ///
+    /// Label discovery has to answer from the memtable as well as from the
+    /// segments: the tag inverted index is built at flush, so a series
+    /// written a second ago is in no segment and therefore in no index, and
+    /// an answer drawn from the index alone omits exactly the labels a fresh
+    /// database has. A visitor rather than a `Vec`, because the caller is
+    /// building a set and the pairs repeat once per series.
+    pub fn visit_tags(&self, mut f: impl FnMut(&str, &str)) {
+        for entry in &self.series_tags {
+            for (key, value) in entry.value().iter() {
+                f(key, value);
+            }
+        }
+    }
+
     /// Returns the number of entries in the memtable.
     #[must_use]
     pub fn len(&self) -> usize {

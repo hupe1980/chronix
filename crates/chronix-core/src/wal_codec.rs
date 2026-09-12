@@ -13,7 +13,7 @@
 //!
 //! Discriminants:
 //! - `0x00` → `WalEntry::Write { point }`
-//! - `0x01` → `WalEntry::Delete { tombstones }`
+//! - `0x01` → retired (was `Delete`; tombstones are catalog state)
 //!
 //! Schema changes are not WAL entries: the catalog manifest is their
 //! durable record, and it is written before the data that needs them.
@@ -26,7 +26,11 @@ const WAL_BINARY_V1: u8 = 0x01;
 
 // Variant discriminants.
 const DISC_WRITE: u8 = 0x00;
-const DISC_DELETE: u8 = 0x01;
+/// Retired. A `Delete` record carried the tombstones a delete resolved to,
+/// and nothing depended on it: the catalog manifest is the durable record and
+/// is fsynced first. The number is not reused, so an old log decodes as an
+/// unknown discriminant rather than as something else.
+const _RETIRED_DISC_DELETE: u8 = 0x01;
 
 /// Errors produced by the WAL codec.
 #[derive(Debug)]
@@ -85,11 +89,6 @@ pub fn encode(entry: &WalEntry) -> Result<Vec<u8>, CodecError> {
             let data = postcard::to_stdvec(point)?;
             buf.extend_from_slice(&data);
         }
-        WalEntry::Delete { tombstones } => {
-            buf.push(DISC_DELETE);
-            let data = postcard::to_stdvec(tombstones)?;
-            buf.extend_from_slice(&data);
-        }
     }
 
     Ok(buf)
@@ -142,10 +141,6 @@ pub fn decode(data: &[u8]) -> Result<WalEntry, CodecError> {
             let point: Point = postcard::from_bytes(payload)?;
             Ok(WalEntry::Write { point })
         }
-        DISC_DELETE => {
-            let tombstones: Vec<crate::types::Tombstone> = postcard::from_bytes(payload)?;
-            Ok(WalEntry::Delete { tombstones })
-        }
         d => Err(CodecError::UnknownDiscriminant(d)),
     }
 }
@@ -153,7 +148,7 @@ pub fn decode(data: &[u8]) -> Result<WalEntry, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FieldValue, SeriesKey, Tombstone};
+    use crate::types::{FieldValue, SeriesKey};
     use std::collections::BTreeMap;
 
     fn sample_point() -> Point {
@@ -189,9 +184,7 @@ mod tests {
         let decoded = decode(&encode(&entry).unwrap()).unwrap();
         assert_eq!(entry, decoded);
 
-        let WalEntry::Write { point } = decoded else {
-            panic!("a write record");
-        };
+        let WalEntry::Write { point } = decoded;
         // Equality alone would pass if both sides had lost the same digits.
         match point.field("z1nb") {
             Some(FieldValue::Decimal(d)) => {
@@ -218,21 +211,18 @@ mod tests {
         assert_eq!(entry, decoded);
     }
 
+    /// The retired `Delete` discriminant decodes as unknown, rather than as
+    /// something else.
+    ///
+    /// A number that is reused is how an old log becomes a wrong answer
+    /// instead of an error.
     #[test]
-    fn delete_roundtrip_preserves_the_time_range() {
-        // The range is the point: the previous encoding stored the *request*
-        // and rebuilt unranged tombstones on replay, so a one-hour delete
-        // became a whole-series delete after a restart.
-        let entry = WalEntry::Delete {
-            tombstones: vec![
-                Tombstone::ranged("cpu\0host=srv-1", 100, 200),
-                Tombstone::ranged("cpu\0host=srv-2", i64::MIN, 5_000).with_segments([1, 2, 3]),
-            ],
-        };
-        let encoded = encode(&entry).unwrap();
-        assert_eq!(encoded[1], DISC_DELETE);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(entry, decoded);
+    fn the_retired_delete_discriminant_is_not_reused() {
+        let old = [WAL_BINARY_V1, 0x01, 0x00];
+        assert!(
+            matches!(decode(&old), Err(CodecError::UnknownDiscriminant(0x01))),
+            "a retired record must fail loudly"
+        );
     }
 
     #[test]

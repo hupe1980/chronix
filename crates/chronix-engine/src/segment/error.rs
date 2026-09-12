@@ -58,6 +58,38 @@ pub enum SegmentError {
     },
 
     /// Column not found.
+    /// An encrypted column cannot be read because its key is not available.
+    ///
+    /// **Not** [`CorruptFile`](Self::CorruptFile), which is what this used to
+    /// be: nothing is wrong with the bytes. The deployment is missing a key,
+    /// and the two have completely different next steps — one is "restore
+    /// from a backup", the other is "set the environment variable". The
+    /// commonest way to arrive here is restoring an encrypted backup onto a
+    /// machine the key was never given to.
+    #[error(
+        "column '{column}' is encrypted with key '{key_id}', which this database has no \
+         key for — set it under [database.field_encryption] and restart"
+    )]
+    MissingEncryptionKey {
+        /// The column that cannot be read.
+        column: String,
+        /// The key id its blocks were written under.
+        key_id: String,
+    },
+
+    /// The writer was asked for something the format cannot honestly do.
+    ///
+    /// Distinct from [`CorruptFile`](Self::CorruptFile): nothing is wrong
+    /// with the data, the *configuration* is wrong — declaring a tag column
+    /// encrypted, for instance, which the format would accept and which
+    /// would publish the value in the sidecar beside it.
+    #[error("invalid segment writer configuration: {detail}")]
+    InvalidConfiguration {
+        /// What was asked for, and why it cannot be done.
+        detail: String,
+    },
+
+    /// A requested column is not in the segment.
     #[error("column not found: {name}")]
     ColumnNotFound {
         /// The requested column name.

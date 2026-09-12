@@ -17,7 +17,8 @@ crate.
 - **Embedded-first** — a library, not a deployment. File-locked data
   directory, crash-safe WAL, graceful `close()`, and a database that
   maintains itself: one built-in thread flushes, compacts, materialises
-  rollups and enforces retention, so there is nothing to start and no
+  rollups, enforces retention and, when configured, takes a **checkpoint** on
+  a schedule and prunes the old ones — so there is nothing to start and no
   daemon to run. Runs where a database *server* cannot.
 - **Exact where exactness is the point** — a `Decimal` field type (`i128`
   mantissa × 10⁻ˢᶜᵃˡᵉ), because one class of time series is not a measurement
@@ -60,9 +61,17 @@ crate.
   conformance suite that builds its own requests never posts a form body,
   never gzips, and never uses a route derived from a base URL.
 - **Security depth** — Cedar policies (a formally verified engine),
-  credential-bound namespace isolation, AES-256-GCM encryption at rest, mTLS, Argon2 API keys,
-  JWT/OIDC, and a tamper-evident HMAC-chained audit trail. All feature-gated;
-  embedded builds compile none of it by default.
+  credential-bound namespace isolation, mTLS, Argon2 API keys, JWT/OIDC, and a
+  tamper-evident HMAC-chained audit trail. All feature-gated; embedded builds
+  compile none of it by default.
+
+  > **Per-column encryption.** `[database.field_encryption]` names a column
+  > and an **environment variable** — never a key — so the key is not on the
+  > disk it protects. AES-256-GCM per block, bound to its column and segment;
+  > compaction re-encrypts; and an encrypted column is refused by the Parquet
+  > export, the cold archive and any rollup over it. Fields only, because a
+  > tag is part of the series key and is stored beside the segment in
+  > plaintext. Whole-directory encryption is the filesystem's job.
 
   > **A namespace is a tag**, stamped by the one write function every
   > ingestion surface goes through and enforced on every read. Which
@@ -104,7 +113,7 @@ Nine crates in the default build:
 | `chronix-query` | Query planner, layered segment pruning, vectorized Arrow filtering/aggregation, dedup, downsampling |
 | `chronix-analytics` | Preprocessing, six forecast models, seven anomaly detectors, multivariate analysis (correlation, VAR, Mahalanobis/Isolation Forest/PCA), model lifecycle (versioning, A/B, drift), streaming analytics, 5-tier SIMD compute |
 | `chronix-streaming` | CDC event bus, filtered/resumable subscriptions, trigger engine with webhook delivery |
-| `chronix-security` | API keys, JWT/OIDC, mTLS, AES-256-GCM at-rest encryption, Cedar policies, a durable hash-chained audit trail, namespaces & quotas |
+| `chronix-security` | API keys, JWT/OIDC, mTLS, an AES-256-GCM `EncryptionService` with key rotation, Cedar policies, a durable hash-chained audit trail, namespaces & quotas |
 | `chronix` | Public facade — embedded API, SQL (DataFusion), PromQL |
 | `chronixd` | Server binary — HTTP, gRPC, Flight SQL, connectors, TLS |
 
@@ -358,7 +367,7 @@ cargo +nightly miri test -p chronix-core -- --skip proptests --skip config_toml_
 
 | Crate | Flag | Default | Purpose |
 |-------|------|---------|---------|
-| `chronix-engine` | `field-encryption` | on | AES-256-GCM segment/WAL encryption support |
+| `chronix-engine`, `chronix` | `field-encryption` | on | Per-column AES-256-GCM in the `.csx` format, declared by `[database.field_encryption]` |
 | `chronix-engine` | `object-store` | off | S3/GCS/Azure cold tier, Parquet archive writer |
 | `chronix` | `object-store` | off | `register_cold_tier()` — SQL over the Parquet archive |
 | `chronix-streaming` | `flight` | off | Arrow Flight CDC export |
@@ -409,9 +418,10 @@ each against an in-process embedded database:
 `promql_queries`, `forecast`, `quantile_forecast`, `anomaly_detection`,
 `alerting`, `multivariate_analysis`, `preprocessing`, `model_lifecycle`,
 `continuous_forecast`, `encoding`, `schema_exploration`,
-`storage_lifecycle`, `delete_operations`, `exact_decimals`, `gateway_footprint`,
+`storage_lifecycle`, `backup_and_restore`, `delete_operations`, `exact_decimals`,
+`gateway_footprint`,
 `signal_triggers`, `data_pipeline`, `cold_tier`, `authz`, `encryption`,
-`audit_logging`, `tenant_isolation`, `compute_engine`.
+`audit_logging`, `tenant_isolation`, `compute_engine`, `field_encryption`.
 
 ```bash
 cargo run -p chronix --example basic_usage

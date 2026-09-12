@@ -204,7 +204,7 @@ pub struct WebhookConfig {
     pub url: String,
     /// Timeout for the HTTP request.
     pub timeout: Duration,
-    /// HMAC-SHA256 signing secret (required).
+    /// HMAC-SHA256 signing secrets, newest first. At least one is required.
     ///
     /// Every delivery is signed per the [Standard
     /// Webhooks](https://www.standardwebhooks.com) `v1` scheme and carried in
@@ -212,7 +212,18 @@ pub struct WebhookConfig {
     /// so receivers can verify authenticity — and the request's age — with
     /// any Standard Webhooks-compatible library rather than code specific to
     /// chronix.
-    pub signing_secret: String,
+    ///
+    /// **A list, because rotating one secret is otherwise an outage.** The
+    /// header is space-delimited by design: a delivery signed with every
+    /// active secret verifies against a receiver that holds *any* of them, so
+    /// the two sides can be updated in either order and in their own time.
+    /// With a single secret there is no such window — every in-flight request
+    /// fails from the moment one side changes, which is why a rotation that
+    /// should be routine gets postponed until it is urgent.
+    ///
+    /// The ordinary case is one entry. Add the new secret, deploy, let the
+    /// receivers pick it up, then drop the old one.
+    pub signing_secrets: Vec<String>,
     /// Custom headers to include.
     pub headers: Vec<(String, String)>,
     /// Permit a target that resolves inside the deployment's own network.
@@ -233,17 +244,54 @@ pub struct WebhookConfig {
 impl WebhookConfig {
     /// Create a new webhook config.
     ///
-    /// `signing_secret` is now mandatory — unsigned webhooks
-    /// allow payload forgery and should never be deployed.
+    /// A signing secret is mandatory — unsigned webhooks allow payload
+    /// forgery and should never be deployed.
+    ///
+    /// Use [`with_secrets`](Self::with_secrets) to sign with more than one
+    /// during a rotation.
     #[must_use]
     pub fn new(url: impl Into<String>, signing_secret: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             timeout: Duration::from_secs(10),
-            signing_secret: signing_secret.into(),
+            signing_secrets: vec![signing_secret.into()],
             headers: Vec::new(),
             allow_private_targets: false,
         }
+    }
+
+    /// Sign with every secret in `secrets`, newest first.
+    ///
+    /// The `webhook-signature` header carries one `v1,<sig>` per secret,
+    /// space-delimited, so a receiver holding any one of them verifies.
+    #[must_use]
+    pub fn with_secrets(url: impl Into<String>, secrets: Vec<String>) -> Self {
+        Self {
+            url: url.into(),
+            timeout: Duration::from_secs(10),
+            signing_secrets: secrets,
+            headers: Vec::new(),
+            allow_private_targets: false,
+        }
+    }
+
+    /// The `webhook-signature` header value for one delivery.
+    ///
+    /// One `v1,<base64>` per active secret, space-delimited — the format the
+    /// Standard Webhooks spec defines precisely so that rotation has a
+    /// window.
+    #[must_use]
+    pub fn signature_header(&self, msg_id: &str, timestamp: u64, payload: &[u8]) -> String {
+        self.signing_secrets
+            .iter()
+            .map(|secret| {
+                format!(
+                    "v1,{}",
+                    WebhookChannel::sign(secret, msg_id, timestamp, payload)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Permit a target inside the deployment's own network.
@@ -377,7 +425,7 @@ impl WebhookChannel {
 
         let url = config.url.clone();
         let headers = config.headers.clone();
-        let signing_secret = config.signing_secret.clone();
+        let signing_secrets = config.signing_secrets.clone();
 
         // Single persistent background thread replaces
         // per-delivery scoped threads.  The MPSC channel bounds
@@ -411,9 +459,19 @@ impl WebhookChannel {
                             request = request.header(name, value);
                         }
 
-                        // signing_secret is always present (mandatory).
-                        let sig = Self::sign(&signing_secret, &msg_id, timestamp, &req.payload);
-                        request = request.header("webhook-signature", format!("v1,{sig}"));
+                        // One signature per active secret, space-delimited,
+                        // so a receiver holding any of them verifies and a
+                        // rotation is not an outage.
+                        let sigs: Vec<String> = signing_secrets
+                            .iter()
+                            .map(|secret| {
+                                format!(
+                                    "v1,{}",
+                                    Self::sign(secret, &msg_id, timestamp, &req.payload)
+                                )
+                            })
+                            .collect();
+                        request = request.header("webhook-signature", sigs.join(" "));
 
                         let result = match request.body(req.payload).send().await {
                             Ok(response) => {
@@ -1302,7 +1360,7 @@ mod tests {
             .with_timeout(Duration::from_secs(30))
             .with_header("Authorization", "Bearer token");
         assert_eq!(config.url, "https://example.com");
-        assert_eq!(config.signing_secret, "s3cret");
+        assert_eq!(config.signing_secrets, vec!["s3cret".to_string()]);
         assert_eq!(config.timeout, Duration::from_secs(30));
         assert_eq!(config.headers.len(), 1);
     }
@@ -1678,5 +1736,69 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    /// During a rotation both secrets verify, which is the whole point.
+    ///
+    /// Standard Webhooks makes `webhook-signature` a **space-delimited list**
+    /// for exactly this: a sender signing with the old and the new secret can
+    /// be updated before, after, or at the same time as its receivers. With
+    /// one secret there is no window at all — every in-flight delivery fails
+    /// the moment either side changes — which is how a routine rotation gets
+    /// postponed until it is urgent.
+    #[test]
+    fn a_rotation_signs_with_every_active_secret() {
+        let config = WebhookConfig::with_secrets(
+            "https://example.test/hook",
+            vec!["new-secret".to_string(), "old-secret".to_string()],
+        );
+        let header = config.signature_header("msg_1", 1_700_000_000, b"{}");
+
+        let parts: Vec<&str> = header.split(' ').collect();
+        assert_eq!(parts.len(), 2, "one signature per secret: {header}");
+
+        // Each is the signature a receiver holding that one secret computes.
+        for (part, secret) in parts.iter().zip(["new-secret", "old-secret"]) {
+            let expected = format!(
+                "v1,{}",
+                WebhookChannel::sign(secret, "msg_1", 1_700_000_000, b"{}")
+            );
+            assert_eq!(*part, expected);
+        }
+
+        // A receiver that has only ever seen the old secret still verifies —
+        // it looks for its own signature among the list.
+        let old_only = format!(
+            "v1,{}",
+            WebhookChannel::sign("old-secret", "msg_1", 1_700_000_000, b"{}")
+        );
+        assert!(header.split(' ').any(|p| p == old_only));
+    }
+
+    /// The ordinary case is one secret and one signature.
+    #[test]
+    fn one_secret_produces_one_signature() {
+        let config = WebhookConfig::new("https://example.test/hook", "only");
+        let header = config.signature_header("m", 1, b"body");
+        assert!(
+            !header.contains(' '),
+            "no list for a single secret: {header}"
+        );
+        assert!(header.starts_with("v1,"));
+    }
+
+    /// A signature covers the id and the timestamp, not the body alone.
+    #[test]
+    fn the_signature_binds_the_id_and_the_timestamp() {
+        let config = WebhookConfig::new("https://example.test/hook", "k");
+        let base = config.signature_header("m1", 100, b"body");
+        assert_ne!(base, config.signature_header("m2", 100, b"body"));
+        assert_ne!(base, config.signature_header("m1", 101, b"body"));
+        assert_ne!(base, config.signature_header("m1", 100, b"other"));
     }
 }

@@ -60,6 +60,15 @@ pub struct CompactionExecutor {
     /// task is rejected with `CompactionError::InputTooLarge`.
     /// 0 = unlimited.
     max_input_bytes: u64,
+    /// Per-column encryption: what to write with, and what to read with.
+    ///
+    /// Kept as one field rather than two, so the two cannot be configured
+    /// independently — see [`with_field_encryption`](Self::with_field_encryption).
+    #[cfg(feature = "field-encryption")]
+    field_encryption: Option<(
+        crate::segment::field_encryption::FieldEncryptionConfig,
+        std::sync::Arc<dyn crate::segment::field_encryption::FieldKeyProvider>,
+    )>,
 }
 
 impl Default for CompactionExecutor {
@@ -72,6 +81,8 @@ impl Default for CompactionExecutor {
             zstd_level: 3,
             task_timeout: DEFAULT_TASK_TIMEOUT,
             max_input_bytes: 0,
+            #[cfg(feature = "field-encryption")]
+            field_encryption: None,
         }
     }
 }
@@ -94,7 +105,43 @@ impl CompactionExecutor {
             zstd_level,
             task_timeout: DEFAULT_TASK_TIMEOUT,
             max_input_bytes: 0,
+            #[cfg(feature = "field-encryption")]
+            field_encryption: None,
         }
+    }
+
+    /// Open an input segment with this executor's decryption keys.
+    ///
+    /// Every read of a segment's **data** goes through here; the one place
+    /// that reads only its metadata says so and opens plainly.
+    fn open_input(&self, path: std::path::PathBuf) -> Result<SegmentReader> {
+        #[allow(unused_mut)]
+        let mut reader = SegmentReader::open(path)?;
+        #[cfg(feature = "field-encryption")]
+        if let Some((_, provider)) = &self.field_encryption {
+            reader.set_key_provider(std::sync::Arc::clone(provider));
+        }
+        Ok(reader)
+    }
+
+    /// Give the executor this database's per-column encryption.
+    ///
+    /// **Both halves, or neither.** A compaction reads input segments and
+    /// writes a new one, so a key provider without the writer config
+    /// decrypts on the way in and writes the column back in **plaintext** —
+    /// a compaction pass that silently undoes the encryption, hours after
+    /// the write that asked for it, with no error anywhere. The writer
+    /// config alone is the mirror image: the read fails closed, which is
+    /// merely broken rather than dangerous.
+    #[cfg(feature = "field-encryption")]
+    #[must_use]
+    pub fn with_field_encryption(
+        mut self,
+        writer: crate::segment::field_encryption::FieldEncryptionConfig,
+        reader: std::sync::Arc<dyn crate::segment::field_encryption::FieldKeyProvider>,
+    ) -> Self {
+        self.field_encryption = Some((writer, reader));
+        self
     }
 
     /// Set the maximum wall-clock time for a single compaction task.
@@ -146,7 +193,7 @@ impl CompactionExecutor {
         info!(
             shard = %task.shard_id,
             input_segments = task.input_segments.len(),
-            output = %task.output_path.display(),
+            output = %task.output_path().display(),
             "Starting compaction"
         );
 
@@ -168,10 +215,7 @@ impl CompactionExecutor {
                 return Err(CompactionError::Internal(format!(
                     "segment_id monotonicity violation: segments {} and {} have \
                      non-strictly-increasing IDs ({} >= {})",
-                    w[0].path.display(),
-                    w[1].path.display(),
-                    w[0].segment_id,
-                    w[1].segment_id,
+                    w[0].file, w[1].file, w[0].segment_id, w[1].segment_id,
                 )));
             }
         }
@@ -179,7 +223,7 @@ impl CompactionExecutor {
         let mut all_batches: Vec<RecordBatch> = Vec::new();
         let mut loaded_bytes: u64 = 0;
         for entry in &sorted_entries {
-            let reader = SegmentReader::open(&entry.path)?;
+            let reader = self.open_input(entry.file.resolve(&task.segments_dir))?;
             let batch = reader.read_all()?;
             if batch.num_rows() > 0 {
                 loaded_bytes += batch.get_array_memory_size() as u64;
@@ -353,7 +397,7 @@ impl CompactionExecutor {
                 "Compaction: all rows tombstoned — no output segment"
             );
             return Ok(SegmentMeta {
-                path: task.output_path.clone(),
+                path: task.output_path(),
                 min_timestamp: 0,
                 max_timestamp: 0,
                 row_count: 0,
@@ -395,10 +439,19 @@ impl CompactionExecutor {
             compression_codec: self.compression_codec,
             zstd_level: self.zstd_level,
             column_codec_overrides: std::collections::HashMap::new(),
+            // Re-encrypt on the way out. Without this the merge decrypts its
+            // inputs and writes the column back in plaintext — an
+            // encryption that a background pass quietly undoes.
+            #[cfg(feature = "field-encryption")]
+            field_encryption: self
+                .field_encryption
+                .as_ref()
+                .map(|(w, _)| w.clone())
+                .unwrap_or_default(),
             ..Default::default()
         };
 
-        let mut writer = SegmentWriter::new(&task.output_path, config)?;
+        let mut writer = SegmentWriter::new(task.output_path(), config)?;
         let meta: std::result::Result<_, CompactionError> =
             (|| Ok(writer.finalize_batches(&output_chunks, measurement, &tag_columns)?))();
 
@@ -416,10 +469,10 @@ impl CompactionExecutor {
             }
             Err(e) => {
                 // Clean up partial output file to prevent orphaned/corrupt segments.
-                if task.output_path.exists() {
-                    if let Err(rm_err) = std::fs::remove_file(&task.output_path) {
+                if task.output_path().exists() {
+                    if let Err(rm_err) = std::fs::remove_file(task.output_path()) {
                         tracing::warn!(
-                            path = %task.output_path.display(),
+                            path = %task.output_path().display(),
                             error = %rm_err,
                             "failed to clean up partial compaction output"
                         );
@@ -541,7 +594,9 @@ fn make_null_array(dt: &DataType, len: usize) -> ArrayRef {
 fn find_tag_columns_from_segments(task: &CompactionTask) -> Vec<String> {
     let mut all_tags = std::collections::BTreeSet::new();
     for entry in &task.input_segments {
-        if let Ok(reader) = SegmentReader::open(&entry.path) {
+        // No key provider: this reads **column metadata** only — names and
+        // roles — and metadata is never encrypted.
+        if let Ok(reader) = SegmentReader::open(entry.file.resolve(&task.segments_dir)) {
             for c in reader.column_metadata() {
                 if c.role == roles::TAG {
                     all_tags.insert(c.name.clone());
@@ -826,7 +881,9 @@ mod tests {
     use super::*;
     use crate::compaction::picker::CompactionTask;
     use crate::index::SegmentCatalogEntry;
-    use chronix_core::{FieldValue, Point, SegmentId, SegmentState, SeriesKey, ShardId};
+    use chronix_core::{
+        FieldValue, Point, SegmentFile, SegmentId, SegmentState, SeriesKey, ShardId,
+    };
     use std::path::{Path, PathBuf};
 
     fn make_point(host: &str, value: f64, ts: i64) -> Point {
@@ -836,8 +893,12 @@ mod tests {
         Point::new(key, fields, ts).unwrap()
     }
 
-    fn write_segment(dir: &Path, name: &str, points: &[Point]) -> (PathBuf, SegmentMeta) {
-        let path = dir.join(name);
+    /// Write a segment where a real flush would put it — `<root>/shard_0/` —
+    /// and return the catalog's view of it, which is relative to `root`.
+    fn write_segment(root: &Path, name: &str, points: &[Point]) -> (SegmentFile, SegmentMeta) {
+        let file = SegmentFile::new(ShardId(0), name).unwrap();
+        let path = file.resolve(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let config = SegmentWriterConfig {
             row_group_size: 1000,
             compress: false,
@@ -850,15 +911,20 @@ mod tests {
         let mut writer = SegmentWriter::new(&path, config).unwrap();
         writer.write_rows(points).unwrap();
         let meta = writer.finalize().unwrap();
-        (path, meta)
+        (file, meta)
     }
 
-    fn make_entry(id: u64, shard: i64, path: PathBuf, meta: &SegmentMeta) -> SegmentCatalogEntry {
+    fn make_entry(
+        id: u64,
+        shard: i64,
+        file: SegmentFile,
+        meta: &SegmentMeta,
+    ) -> SegmentCatalogEntry {
         SegmentCatalogEntry {
             segment_id: SegmentId(id),
             shard_id: ShardId(shard),
             measurement: "cpu_usage".to_string(),
-            path,
+            file,
             min_timestamp: meta.min_timestamp,
             max_timestamp: meta.max_timestamp,
             row_count: meta.row_count,
@@ -874,8 +940,6 @@ mod tests {
     #[test]
     fn compact_three_overlapping_segments() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         // Segment 1: host=srv1 timestamps 100, 200, 300
         let pts1 = vec![
@@ -906,7 +970,8 @@ mod tests {
             ],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("compacted.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "compacted.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(
@@ -924,7 +989,7 @@ mod tests {
         assert_eq!(meta.series_count, 2);
 
         // Read back and verify
-        let reader = SegmentReader::open(&task.output_path).unwrap();
+        let reader = SegmentReader::open(task.output_path()).unwrap();
         let batch = reader.read_all().unwrap();
         assert_eq!(batch.num_rows(), 6);
 
@@ -951,8 +1016,6 @@ mod tests {
     #[test]
     fn compact_with_tombstone_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts = vec![
             make_point("srv1", 1.0, 100),
@@ -979,7 +1042,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, path, &meta)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("cleaned.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "cleaned.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::default();
@@ -988,7 +1052,7 @@ mod tests {
         // Only srv2 rows should remain
         assert_eq!(result.row_count, 2);
 
-        let reader = SegmentReader::open(&task.output_path).unwrap();
+        let reader = SegmentReader::open(task.output_path()).unwrap();
         let batch = reader.read_all().unwrap();
         let host_col = batch.column_by_name("host").unwrap();
         let host_arr = host_col.as_any().downcast_ref::<StringArray>().unwrap();
@@ -1004,7 +1068,8 @@ mod tests {
             input_segments: vec![],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: PathBuf::from("/tmp/empty.csx"),
+            segments_dir: PathBuf::from("/tmp"),
+            output: SegmentFile::new(ShardId(0), "empty.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::default();
@@ -1015,8 +1080,6 @@ mod tests {
     #[test]
     fn compact_preserves_all_data_when_no_duplicates() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts1 = vec![make_point("srv1", 1.0, 100), make_point("srv1", 2.0, 200)];
         let pts2 = vec![make_point("srv1", 3.0, 300), make_point("srv1", 4.0, 400)];
@@ -1029,7 +1092,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, p1, &m1), make_entry(2, 0, p2, &m2)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("no_dup.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "no_dup.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(
@@ -1048,8 +1112,6 @@ mod tests {
     #[test]
     fn compact_output_sorted_by_series_then_time() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         // Interleave two series across two segments so concatenation
         // order would NOT naturally produce sorted output.
@@ -1072,7 +1134,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, p1, &m1), make_entry(2, 0, p2, &m2)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("sorted.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "sorted.csx").unwrap(),
         };
 
         // Use small row_group_size to exercise multi-RG path.
@@ -1082,7 +1145,7 @@ mod tests {
         assert_eq!(meta.row_count, 6);
 
         // Read back and verify within-series timestamp monotonicity.
-        let reader = SegmentReader::open(&task.output_path).unwrap();
+        let reader = SegmentReader::open(task.output_path()).unwrap();
         let batch = reader.read_all().unwrap();
 
         let host_col = batch.column_by_name("host").unwrap();
@@ -1133,8 +1196,6 @@ mod tests {
     #[test]
     fn compact_stress_many_segments_many_series() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         // Generate 8 segments × 5 series × varying timestamps with overlaps.
         let hosts = ["web1", "web2", "db1", "db2", "cache1"];
@@ -1166,7 +1227,8 @@ mod tests {
             input_segments: segments,
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("stress.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "stress.csx").unwrap(),
         };
 
         let executor =
@@ -1181,7 +1243,7 @@ mod tests {
         );
 
         // Read back and verify every row.
-        let reader = SegmentReader::open(&task.output_path).unwrap();
+        let reader = SegmentReader::open(task.output_path()).unwrap();
         let batch = reader.read_all().unwrap();
         assert_eq!(batch.num_rows(), expected.len());
 
@@ -1231,8 +1293,6 @@ mod tests {
     #[test]
     fn compact_succeeds_within_generous_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts = vec![make_point("srv1", 1.0, 100)];
         let (p1, m1) = write_segment(dir.path(), "seg.csx", &pts);
@@ -1242,7 +1302,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, p1, &m1)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("out.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "out.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(
@@ -1261,8 +1322,6 @@ mod tests {
     #[test]
     fn compact_timeout_zero_triggers_task_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts = vec![make_point("srv1", 1.0, 100)];
         let (p1, m1) = write_segment(dir.path(), "seg.csx", &pts);
@@ -1272,7 +1331,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, p1, &m1)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("out.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "out.csx").unwrap(),
         };
 
         // Zero timeout — should trigger immediately after first segment read
@@ -1297,8 +1357,6 @@ mod tests {
     #[test]
     fn kway_merge_dedup_many_segments_same_key() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         // 10 segments all writing the same (host=srv1, ts=100) with different values.
         let mut segments = Vec::new();
@@ -1314,7 +1372,8 @@ mod tests {
             input_segments: segments,
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("dedup_many.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "dedup_many.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(
@@ -1328,7 +1387,7 @@ mod tests {
 
         assert_eq!(meta.row_count, 1, "should keep exactly one row after dedup");
 
-        let reader = SegmentReader::open(&task.output_path).unwrap();
+        let reader = SegmentReader::open(task.output_path()).unwrap();
         let batch = reader.read_all().unwrap();
         let cpu_col = batch.column_by_name("cpu").unwrap();
         let cpu_arr = cpu_col.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -1343,8 +1402,6 @@ mod tests {
     #[test]
     fn kway_merge_single_segment_passthrough() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts = vec![
             make_point("srv1", 1.0, 100),
@@ -1358,7 +1415,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, path, &meta)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("single_out.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "single_out.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(
@@ -1377,8 +1435,6 @@ mod tests {
     #[test]
     fn kway_merge_tombstone_removes_all_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         // Three segments all writing srv1 data.
         let pts1 = vec![make_point("srv1", 1.0, 100), make_point("srv2", 10.0, 100)];
@@ -1409,7 +1465,8 @@ mod tests {
             ],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("tombstone_all.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "tombstone_all.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(
@@ -1424,7 +1481,7 @@ mod tests {
         // Only srv2 rows should remain (3 rows across 3 segments, no dups).
         assert_eq!(result.row_count, 3);
 
-        let reader = SegmentReader::open(&task.output_path).unwrap();
+        let reader = SegmentReader::open(task.output_path()).unwrap();
         let batch = reader.read_all().unwrap();
         let host_col = batch.column_by_name("host").unwrap();
         let host_arr = host_col.as_any().downcast_ref::<StringArray>().unwrap();
@@ -1441,8 +1498,6 @@ mod tests {
     #[test]
     fn kway_merge_all_tombstoned_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts = vec![make_point("srv1", 1.0, 100)];
         let (path, meta) = write_segment(dir.path(), "all_tomb.csx", &pts);
@@ -1463,7 +1518,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, path, &meta)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("all_tomb_out.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "all_tomb_out.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(
@@ -1482,8 +1538,6 @@ mod tests {
     #[test]
     fn max_input_bytes_rejects_oversized_task() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts = vec![make_point("srv1", 1.0, 100), make_point("srv1", 2.0, 200)];
         let (p1, m1) = write_segment(dir.path(), "big1.csx", &pts);
@@ -1493,7 +1547,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, p1, &m1)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("bounded.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "bounded.csx").unwrap(),
         };
 
         // Set an impossibly small limit (1 byte).
@@ -1518,8 +1573,6 @@ mod tests {
     #[test]
     fn max_input_bytes_zero_is_unlimited() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = dir.path().join("output");
-        std::fs::create_dir_all(&out_dir).unwrap();
 
         let pts = vec![make_point("srv1", 1.0, 100), make_point("srv1", 2.0, 200)];
         let (p1, m1) = write_segment(dir.path(), "unlim.csx", &pts);
@@ -1529,7 +1582,8 @@ mod tests {
             input_segments: vec![make_entry(1, 0, p1, &m1)],
             source_level: crate::compaction::CompactionLevel::L0,
             target_level: crate::compaction::CompactionLevel::L1,
-            output_path: out_dir.join("unlim_out.csx"),
+            segments_dir: dir.path().to_path_buf(),
+            output: SegmentFile::new(ShardId(0), "unlim_out.csx").unwrap(),
         };
 
         let executor = CompactionExecutor::new(

@@ -74,20 +74,32 @@ Request → AuthMiddleware → [mTLS → JWT → API Key] → AuthContext
   `AuthError::InvalidCertificate` immediately and **does not** fall through to
   weaker authentication methods (JWT / API key).
 
-### Encryption at Rest
+### Encryption
 
-- AES-256-GCM authenticated encryption for segment data blocks, with each
-  block's **column name and segment creation timestamp as associated data**.
-  Without that binding, an encrypted block decrypts correctly in any other
-  block's place under the same key and its authentication tag still verifies
-  — GCM proves who wrote a ciphertext, never which ciphertext it is.
-- Per-entry nonce for WAL encryption.
-- HMAC-SHA256 manifest integrity verification.
-- Key rotation: new segments use latest key; old segments readable with previous keys.
-- Pluggable `KeyProvider` trait: `FileKeyProvider`, `EnvKeyProvider`, `RotatingKeyProvider`.
-- **Key usage counter:** `EncryptionService` tracks invocations via `AtomicU64`. Logs `tracing::warn!` at NIST's 2³² threshold, signalling time for key rotation.
+Chronix does not encrypt its data directory wholesale, and no configuration
+makes it: use filesystem or volume encryption for the data directory and the
+bucket's server-side encryption for the cold tier. A named **column** can be
+encrypted (below).
 
-The `EncryptingBackend` wraps any `StorageBackend` with transparent AES-256-GCM authenticated encryption. Each stored object receives a unique random 96-bit nonce. Wire format: `[12-byte nonce][ciphertext][16-byte GCM tag]`. Keys are derived from `EncryptionService` in `chronix-security::auth`.
+- `EncryptionService` — AES-256-GCM with a pluggable `KeyProvider`
+  (`FileKeyProvider`, `EnvKeyProvider`, `RotatingKeyProvider`) and key
+  rotation: new data uses the newest key, previous keys stay available for
+  decryption.
+- **Key usage counter** — `EncryptionService` counts invocations in an
+  `AtomicU64` and warns at NIST's 2³² threshold, which is when a key has to
+  be rotated.
+- **Per-column segment encryption** — AES-256-GCM for a `.csx` column's data
+  blocks, each block's **column name and segment creation timestamp bound in
+  as associated data**, so a block cannot be moved into another's place under
+  the same key. Configured by `[database.field_encryption]`, which names a
+  column and an **environment variable** rather than a key. Only a field may
+  be encrypted; compaction re-encrypts; the export, archive and rollup paths
+  refuse. See the
+  [security guide](@/docs/security.md#field-level-encryption).
+
+The manifest and every WAL record are protected by **CRC-32C**, which detects
+corruption and is not a tamper check. The tamper-evident record is the
+[audit chain](#audit-trail-chronix-security-audit), which is HMAC-keyed.
 
 ---
 ## Cedar Authorization (`chronix-security::authz`)

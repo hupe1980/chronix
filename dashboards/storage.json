@@ -13,7 +13,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -31,10 +34,20 @@
     {
       "title": "Object Store Put Latency",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "s" }
+        "defaults": {
+          "unit": "s"
+        }
       },
       "targets": [
         {
@@ -50,10 +63,20 @@
     {
       "title": "Object Store Get Latency",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "s" }
+        "defaults": {
+          "unit": "s"
+        }
       },
       "targets": [
         {
@@ -69,17 +92,34 @@
     {
       "title": "Cache Hit Ratio",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "max": 1,
           "thresholds": {
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "green", "value": 0.8 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.8
+              }
             ]
           }
         }
@@ -94,10 +134,20 @@
     {
       "title": "Cache Hits & Misses (rate)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "ops" }
+        "defaults": {
+          "unit": "ops"
+        }
       },
       "targets": [
         {
@@ -113,10 +163,20 @@
     {
       "title": "WAL Segment Write Duration",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "s" }
+        "defaults": {
+          "unit": "s"
+        }
       },
       "targets": [
         {
@@ -132,10 +192,20 @@
     {
       "title": "Segment Compaction Duration",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "s" }
+        "defaults": {
+          "unit": "s"
+        }
       },
       "targets": [
         {
@@ -151,8 +221,16 @@
     {
       "title": "Tiering Operations (rate)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "targets": [
         {
           "expr": "rate(chronix_objstore_tiering_objects_total[5m])",
@@ -163,16 +241,33 @@
     {
       "title": "Local Disk Usage",
       "type": "gauge",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
           "thresholds": {
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 50000000000 },
-              { "color": "red", "value": 90000000000 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50000000000
+              },
+              {
+                "color": "red",
+                "value": 90000000000
+              }
             ]
           }
         }
@@ -183,15 +278,126 @@
           "legendFormat": "{{instance}}"
         }
       ]
+    },
+    {
+      "title": "Checkpoints",
+      "type": "gauge",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50000000000
+              },
+              {
+                "color": "red",
+                "value": 90000000000
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(chronix_backups_total[1d])",
+          "legendFormat": "taken",
+          "refId": "A",
+          "datasource": null
+        },
+        {
+          "expr": "increase(chronix_backup_failures_total[1d])",
+          "legendFormat": "failed",
+          "refId": "B",
+          "datasource": null
+        }
+      ],
+      "id": 1,
+      "description": "Checkpoints per day. Both series are published at zero from startup, so a flat zero on \"taken\" is a backup schedule that has stopped running \u2014 not a missing metric."
+    },
+    {
+      "title": "Checkpoint Duration",
+      "type": "gauge",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50000000000
+              },
+              {
+                "color": "red",
+                "value": 90000000000
+              }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chronix_backup_duration_seconds_bucket[1h]))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": null
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chronix_backup_duration_seconds_bucket[1h]))",
+          "legendFormat": "p99",
+          "refId": "B",
+          "datasource": null
+        }
+      ],
+      "id": 2,
+      "description": "How long a checkpoint takes, flush included. Segments are hard-linked when the target shares a filesystem, so this tracks the flush and the catalog write rather than the size of the database."
     }
   ],
   "schemaVersion": 39,
-  "tags": ["chronix", "storage", "tiering"],
-  "templating": { "list": [] },
-  "time": { "from": "now-1h", "to": "now" },
+  "tags": [
+    "chronix",
+    "storage",
+    "tiering"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Chronix — Storage & Tiering",
+  "title": "Chronix \u2014 Storage & Tiering",
   "uid": "chronix-storage",
   "version": 1
 }

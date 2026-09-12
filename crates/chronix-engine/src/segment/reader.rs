@@ -983,23 +983,20 @@ impl SegmentReader {
                         col_meta.name,
                     ),
                 })?;
-            let provider = self
-                .key_provider
-                .as_ref()
-                .ok_or_else(|| SegmentError::CorruptFile {
-                    detail: format!(
-                        "column {} is encrypted but no key provider is configured",
-                        col_meta.name,
-                    ),
-                })?;
-            let key = provider
-                .get_key(key_id)
-                .ok_or_else(|| SegmentError::CorruptFile {
-                    detail: format!(
-                        "key '{}' not found in key provider for encrypted column {}",
-                        key_id, col_meta.name,
-                    ),
-                })?;
+            let provider =
+                self.key_provider
+                    .as_ref()
+                    .ok_or_else(|| SegmentError::MissingEncryptionKey {
+                        column: col_meta.name.clone(),
+                        key_id: key_id.to_owned(),
+                    })?;
+            let key =
+                provider
+                    .get_key(key_id)
+                    .ok_or_else(|| SegmentError::MissingEncryptionKey {
+                        column: col_meta.name.clone(),
+                        key_id: key_id.to_owned(),
+                    })?;
             let decrypted = crate::segment::field_encryption::decrypt_block(
                 raw_data,
                 &key,

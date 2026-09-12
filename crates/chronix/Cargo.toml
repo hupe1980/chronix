@@ -24,7 +24,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 doctest = false
 
 [features]
-default = ["sql"]
+default = ["sql", "field-encryption"]
 
 ## SQL through DataFusion: `db.sql()`, `session_context()`, the analytics
 ## functions, `EXPLAIN`, and the cold tier's read half.
@@ -48,6 +48,16 @@ default = ["sql"]
 ## evaluator never touches DataFusion.
 sql = ["dep:datafusion"]
 
+## Per-column AES-256-GCM in the `.csx` segment format, declared by
+## `ChronixConfig::field_encryption` — or `[database.field_encryption]` in
+## `chronixd`.
+##
+## **On by default.** It costs `aes-gcm` in the dependency graph and nothing
+## at run time: a database that declares no column resolves no key, builds no
+## provider and takes no extra branch in the block path. Without it the
+## configuration is accepted and has no effect.
+field-encryption = ["chronix-engine/field-encryption"]
+
 ## `TryFrom` conversions between `chronix::Decimal` and
 ## `rust_decimal::Decimal` — see `chronix-core`'s feature of the same name.
 rust_decimal = ["chronix-core/rust_decimal"]
@@ -67,6 +77,7 @@ chronix-streaming.workspace = true
 chronix-analytics.workspace = true
 chronix-security.workspace = true
 arrow.workspace = true
+base64.workspace = true
 dashmap.workspace = true
 datafusion = { workspace = true, optional = true }
 fs2.workspace = true

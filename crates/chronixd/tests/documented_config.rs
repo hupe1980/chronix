@@ -60,6 +60,41 @@ const OUR_TABLES: &[&str] = &[
     "tracing",
 ];
 
+/// Table prefixes that belong to something other than `chronixd`.
+///
+/// The documentation quotes other tools' configuration — a Prometheus scrape
+/// job, a Telegraf output, a Grafana datasource — and those settings are not
+/// ours to load. Every entry is a real other program, because the cost of a
+/// wrong entry here is a claim about `chronixd` that nothing checks.
+const FOREIGN_TABLES: &[&str] = &[
+    // Prometheus / Grafana / Telegraf / OpenTelemetry Collector
+    "global",
+    "scrape_configs",
+    "remote_write",
+    "remote_read",
+    "outputs",
+    "inputs",
+    "agent",
+    "exporters",
+    "receivers",
+    "processors",
+    "service",
+    "datasources",
+    "apiVersion",
+    // Cargo, Docker Compose, Kubernetes
+    "package",
+    "dependencies",
+    "dev_dependencies",
+    "workspace",
+    "profile",
+    "features",
+    "services",
+    "spec",
+    "metadata",
+    "resources",
+    "env",
+];
+
 /// Pages whose TOML is a design sketch rather than a file this binary loads,
 /// each with the reason.
 ///
@@ -422,4 +457,160 @@ fn an_unset_engine_setting_keeps_the_engine_default() {
     );
     assert_eq!(engine.soft_delete_ttl, default.soft_delete_ttl);
     assert_eq!(engine.lvc_measurements, default.lvc_measurements);
+}
+
+/// A setting the prose tells an operator to set must be a setting that loads.
+///
+/// `documented_config`'s other halves read **fenced `toml` blocks**, which is
+/// where a configuration example lives — and the claim that cost the most was
+/// not in one. The security guide's hardening checklist read
+///
+/// > - [ ] Enable encryption at rest (`storage.encryption.enabled = true`)
+///
+/// in prose, above a compliance claim, in front of an `EncryptingBackend`
+/// that was correct, tested, and had no caller anywhere. There is no
+/// `storage` table and never has been. A checklist line is exactly where a
+/// false claim does the most damage, because it is the line an auditor ticks
+/// off — so the guard has to reach outside the fences.
+///
+/// It looks for a backticked `a.b = value` or `a = value` where the leading
+/// segment names one of [`OUR_TABLES`], builds the smallest TOML document
+/// that says the same thing, and hands it to the real loader. Anything whose
+/// head is not one of our tables is somebody else's configuration and is
+/// skipped, which is the same rule the block scanner uses.
+#[test]
+fn a_setting_named_in_prose_is_a_setting_that_loads() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let mut failures: Vec<String> = Vec::new();
+
+    for page in markdown_pages(&root.join("site").join("content")) {
+        if exempt(&page).is_some() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&page).unwrap_or_default();
+        for (lineno, line) in text.lines().enumerate() {
+            // Skip the inside of fenced blocks — the other tests own those.
+            for claim in backticked_assignments(line) {
+                let Some(document) = as_toml_document(&claim) else {
+                    continue;
+                };
+                if let Err(e) = toml::from_str::<ServerConfig>(&document) {
+                    let message = e.to_string();
+                    if message.contains("unknown field")
+                        || message.contains("unknown variant")
+                        || message.contains("invalid value")
+                        || message.contains("invalid type")
+                    {
+                        failures.push(format!(
+                            "{}:{}\n  claim: `{}`\n  {}",
+                            page.strip_prefix(root).unwrap_or(&page).display(),
+                            lineno + 1,
+                            claim,
+                            message
+                                .lines()
+                                .find(|l| {
+                                    l.contains("unknown field")
+                                        || l.contains("unknown variant")
+                                        || l.contains("invalid value")
+                                        || l.contains("invalid type")
+                                })
+                                .unwrap_or(&message)
+                                .trim(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} documented setting(s) the server cannot load:\n\n{}",
+        failures.len(),
+        failures.join("\n\n"),
+    );
+}
+
+/// Every `md` file under `dir`.
+fn markdown_pages(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "md") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Backticked `key = value` claims in one line of prose.
+fn backticked_assignments(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find('`') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('`') else { break };
+        let inner = &after[..end];
+        if inner.contains('=') && !inner.contains('\n') {
+            out.push(inner.trim().to_owned());
+        }
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+/// Turn `a.b.c = value` into the TOML document that sets it, or `None` if the
+/// claim is not about one of our tables.
+fn as_toml_document(claim: &str) -> Option<String> {
+    let (path, value) = claim.split_once('=')?;
+    let path = path.trim();
+    let value = value.trim();
+    if value.is_empty() || path.is_empty() {
+        return None;
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    if !segments
+        .iter()
+        .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return None;
+    }
+    // **Not** `if !OUR_TABLES.contains(...) { return None }`, which is the
+    // shape this guard was first written in and the shape that misses the
+    // defect it exists for. A whitelist of tables that exist skips a
+    // documented table that does **not** — `storage.encryption.enabled`, the
+    // key the security checklist told operators to set, has no `[storage]`
+    // section and never had one, so a whitelist reads it as somebody else's
+    // configuration and says nothing. The same narrowing as pass 52's
+    // page-level exemption: the guard's question has to be wider than the
+    // set of things that already work.
+    //
+    // So the default is *ours*, and anything genuinely foreign has to be
+    // declared with a reason below.
+    if FOREIGN_TABLES.contains(&segments[0]) {
+        return None;
+    }
+    // A leading capital is a type, not a table: `WriteRequest.backfill = true`
+    // is a protobuf field. Every configuration table is lower snake case.
+    if segments[0].starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let (key, tables) = segments.split_last()?;
+    Some(format!("[{}]\n{key} = {value}\n", tables.join(".")))
 }

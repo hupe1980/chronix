@@ -81,8 +81,14 @@ Condition breached:  ●────●────●────●───�
 
 ### Implementation
 
-Each trigger maintains a `last_fired_at` timestamp. A new firing is
-suppressed if `now - last_fired_at < cooldown_duration`.
+A firing is suppressed only when **both** clocks agree it is inside the
+window: the data's own timestamps (`current_ts - last_fired_ts` in
+`[0, cooldown)`) and the wall clock since the last fire. Either alone is
+wrong — out-of-order data has a negative delta and a backfill has a huge
+positive one.
+
+State is per `(trigger, series)`, so one noisy device does not silence the
+others.
 
 ## Alert Severity Levels
 

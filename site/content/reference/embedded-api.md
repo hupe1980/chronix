@@ -22,7 +22,7 @@ The `Chronix` struct and its methods are organized into focused submodules:
 | `delete.rs`       | `drop_measurement`, tombstones, hard delete           |
 | `lifecycle.rs`    | `flush`, `close`, `compact`, GC, retention enforcement |
 | `rollup.rs`       | Rollup definitions, materialisation, the real-time view |
-| `backup.rs`       | Online backup and restore                             |
+| `backup.rs`       | Checkpoint and restore                                 |
 | `analytics_api.rs`| Anomaly detection, forecast API surface               |
 
 ### Lifecycle
@@ -242,9 +242,10 @@ deleted series must not come back into the count at the next restart.
 **Durability.** Tombstones are appended to the **catalog manifest** and fsynced
 before `execute_delete` returns. They are *not* kept in the data WAL for
 durability: that WAL is truncated once the memtable it covers has been flushed,
-which is sooner than a tombstone must live. The WAL
-still logs the resolved tombstones so a point-in-time restore replays the
-delete, and the catalog is what a plain restart reads.
+which is sooner than a tombstone must live. The catalog is the only durable
+record, and there is no WAL record for a delete at all — `execute_delete`
+flushes first, so by the time a tombstone exists every point it could cover is
+already in a segment and below the WAL floor, which replay never reads.
 
 **Tombstone lifecycle.** A tombstone is reclaimed only when **every segment in
 its `segments` set has left the catalog** — which happens when compaction

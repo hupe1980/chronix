@@ -1092,6 +1092,7 @@ dependencies = [
  "arrow",
  "async-stream",
  "async-trait",
+ "base64 0.23.1",
  "chronix-analytics",
  "chronix-core",
  "chronix-encoding",

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::index::SegmentCatalogEntry;
-use chronix_core::ShardId;
+use chronix_core::{SegmentFile, ShardId};
 
 // Re-export `SegmentState` from `chronix_core` for backward compatibility.
 pub use chronix_core::SegmentState;
@@ -257,8 +257,13 @@ pub struct CompactionTask {
     pub target_level: CompactionLevel,
     /// Source compaction level of the inputs.
     pub source_level: CompactionLevel,
-    /// Output path for the compacted segment.
-    pub output_path: PathBuf,
+    /// The `segments/` directory the inputs and the output live under.
+    ///
+    /// Carried on the task because every path in `input_segments` is
+    /// relative to it — see [`SegmentFile`].
+    pub segments_dir: PathBuf,
+    /// Where the compacted segment goes, relative to `segments_dir`.
+    pub output: SegmentFile,
 }
 
 impl CompactionTask {
@@ -266,6 +271,12 @@ impl CompactionTask {
     #[must_use]
     pub fn total_input_bytes(&self) -> u64 {
         self.input_segments.iter().map(|s| s.byte_size).sum()
+    }
+
+    /// The output's absolute path.
+    #[must_use]
+    pub fn output_path(&self) -> PathBuf {
+        self.output.resolve(&self.segments_dir)
     }
 }
 
@@ -406,13 +417,14 @@ impl CompactionPicker {
 
         for ((shard_id, measurement), group) in groups {
             if group.len() >= self.policy.count_trigger_threshold {
-                let output_path = Self::output_path(output_dir, *shard_id, measurement, group);
+                let output = Self::output_file(*shard_id, measurement, group);
                 tasks.push(CompactionTask {
                     shard_id: *shard_id,
                     input_segments: group.iter().map(|s| (*s).clone()).collect(),
                     source_level,
                     target_level,
-                    output_path,
+                    segments_dir: output_dir.to_path_buf(),
+                    output,
                 });
                 selected.insert((*shard_id, *measurement));
             }
@@ -440,33 +452,38 @@ impl CompactionPicker {
 
             for tier_segments in tiers.values() {
                 if tier_segments.len() >= self.policy.size_tier_threshold {
-                    let output_path =
-                        Self::output_path(output_dir, *shard_id, measurement, tier_segments);
+                    let output = Self::output_file(*shard_id, measurement, tier_segments);
                     tasks.push(CompactionTask {
                         shard_id: *shard_id,
                         input_segments: tier_segments.iter().map(|s| (*s).clone()).collect(),
                         source_level,
                         target_level,
-                        output_path,
+                        segments_dir: output_dir.to_path_buf(),
+                        output,
                     });
                 }
             }
         }
     }
 
-    /// Build the output path for a compaction task.
-    fn output_path(
-        output_dir: &std::path::Path,
+    /// Build the output file for a compaction task, relative to the
+    /// segments directory.
+    ///
+    /// The name cannot fail validation — it is built here from a measurement
+    /// name, which is already rejected at ingest if it carries a separator —
+    /// but a measurement is user input, so the fallible constructor is the
+    /// one to call and the shard directory alone is the fallback.
+    fn output_file(
         shard_id: ShardId,
         measurement: &str,
         segments: &[&SegmentCatalogEntry],
-    ) -> PathBuf {
-        output_dir
-            .join(format!("shard_{}", shard_id.0))
-            .join(format!(
-                "{measurement}_compacted_{}.csx",
-                segments.iter().map(|s| s.segment_id.0).max().unwrap_or(0)
-            ))
+    ) -> SegmentFile {
+        let max_id = segments.iter().map(|s| s.segment_id.0).max().unwrap_or(0);
+        let name = format!("{measurement}_compacted_{max_id}.csx");
+        SegmentFile::new(shard_id, &name).unwrap_or_else(|_| {
+            SegmentFile::new(shard_id, &format!("compacted_{max_id}.csx"))
+                .expect("a name built from digits is always a valid segment file")
+        })
     }
 
     /// Check if write backpressure should be applied.
@@ -501,7 +518,7 @@ mod tests {
             segment_id: SegmentId(id),
             shard_id: ShardId(shard),
             measurement: measurement.to_string(),
-            path: PathBuf::from(format!("shard_{shard}/seg_{id}.csx")),
+            file: SegmentFile::new(ShardId(shard), &format!("seg_{id}.csx")).unwrap(),
             min_timestamp: id as i64 * 1000,
             max_timestamp: id as i64 * 1000 + 999,
             row_count: 1000,
@@ -801,7 +818,8 @@ mod tests {
             input_segments: segments,
             source_level: CompactionLevel::L0,
             target_level: CompactionLevel::L1,
-            output_path: PathBuf::from("/out"),
+            segments_dir: PathBuf::from("/out"),
+            output: SegmentFile::new(ShardId(0), "out.csx").unwrap(),
         };
         assert_eq!(task.total_input_bytes(), 6000);
     }

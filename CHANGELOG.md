@@ -10,6 +10,60 @@ and no migration tooling for the on-disk format.
 
 ### Added
 
+- **Webhook signing secrets rotate.** `triggers.webhook_signing_secrets` is
+  a list, newest first, and every delivery carries one `v1,<sig>` per secret
+  in the space-delimited `webhook-signature` header Standard Webhooks defines
+  for this. A receiver holding any one of them verifies, so sender and
+  receivers can be updated in either order; with a single secret every
+  in-flight delivery failed the moment either side changed.
+  `CHRONIX_WEBHOOK_SIGNING_SECRET` takes the list comma-separated.
+- **Scheduled checkpoints.** `[database.checkpoints]` — an interval, a
+  directory and a `keep` count — and the maintenance thread takes them,
+  beside the flush, compaction, rollup and retention passes it already runs.
+  Off by default. The first runs at startup rather than one interval later,
+  pruning happens after a successful run, and an unfinished run is removed on
+  sight. A backup was the one maintenance task that still needed a scheduler
+  the embedded deployment does not have.
+- **Per-column encryption is configurable.** `[database.field_encryption]`
+  names a column and an **environment variable** — never a key — so the key
+  is not on the disk it protects and a stolen backup stays unreadable.
+  AES-256-GCM per block, each bound to its column name and the segment's
+  creation timestamp. Compaction re-encrypts rather than decrypting on the
+  way through, and a Parquet export, the cold-tier archive and any rollup
+  over the measurement are **refused**, naming the column, because each
+  would write the plaintext somewhere the segment's protection does not
+  reach. Only a field may be encrypted: a tag is part of the series key and
+  is written in plaintext in the segment's sidecar, tag index and bloom
+  filter, so declaring one is a write error. Rotation is a second key id;
+  every declared key must resolve at startup. The format capability existed
+  and was reachable from nothing — no configuration turned it on, the read
+  paths were not key-aware, and compaction would have silently decrypted.
+- **`backup()` is a checkpoint.** It is driven by the catalog rather than by a
+  directory walk, takes a segment lease so nothing it is copying can be
+  unlinked under it, and **hard-links** segment files when the target shares a
+  filesystem — so a checkpoint of a large database is near instant and costs
+  no space until those segments are compacted away. `BackupManifest` gains
+  `segments`, the number its catalog names.
+- **A restore hard-links the backup's segments** and copies only `catalog/`
+  and `wal/` — linkable if and only if immutable, so restoring a large backup
+  costs a directory entry per segment rather than its bytes.
+- **`Chronix::verify_backup()` and `POST /api/v1/admin/backup/verify`** check
+  a backup without restoring it — the same verification a restore runs, on
+  its own, so the backups you are keeping can be checked before you need them.
+- **`chronix_backups_total`, `chronix_backup_failures_total`,
+  `chronix_backup_bytes_total` and `chronix_backup_duration_seconds`**, with
+  the two counters published at zero so an alert on a nightly checkpoint that
+  stopped running can fire from the first scrape. Panels in
+  `dashboards/storage.json`.
+- **`restore()` verifies before it copies**: every segment the backup's
+  catalog names must be present at its recorded size, and the count must match
+  the manifest. An incomplete backup is refused rather than restored into a
+  database that fails at its first query. `Chronix::open()` asks the same
+  question of any data directory.
+- Backing up repeatedly into one directory is a rolling checkpoint: files the
+  new one does not name are removed, and the previous manifest is deleted
+  first, so a re-checkpoint that fails part-way leaves nothing restorable.
+
 - **`time_bucket()` takes an `origin`**, so a bucket boundary need not be
   midnight on the 1st: `time_bucket('1mo', _time, '', '2024-01-15')` is a
   billing month that runs from the 15th, and
@@ -29,6 +83,24 @@ and no migration tooling for the on-disk format.
 
 ### Changed
 
+- **Breaking:** the catalog records a segment's path **relative** to the
+  `segments/` directory, as a `SegmentFile`. `SegmentCatalogEntry.path:
+  PathBuf` is now `SegmentCatalogEntry.file: SegmentFile`, and
+  `SegmentFile::resolve(segments_dir)` is the only way to an openable path.
+  A data directory is relocatable as a result — see *Fixed*.
+- **Breaking:** `triggers.webhook_signing_secret` is now
+  `triggers.webhook_signing_secrets`, a list;
+  `PipelineConfig::webhook_signing_secret` is now `webhook_signing_secrets`;
+  and `WebhookConfig::signing_secret` is now `signing_secrets`, with
+  `WebhookConfig::with_secrets` beside `new`.
+- **Breaking:** `CompactionTask` carries `segments_dir` and a relative
+  `output`, with `output_path()` resolving the two; `PrunedSegment` loses its
+  `path` field, which nothing read.
+- **Breaking:** point-in-time recovery is removed —
+  `Chronix::restore_pitr`, `POST /api/v1/admin/restore/pitr` and
+  `WalWriter::archive_before`. The endpoint did nothing (see *Removed*).
+- **Breaking:** `chronix_engine::storage::{LocalFsBackend, EncryptingBackend}`
+  are removed. Neither had a caller.
 - **Breaking:** `QueryBuilder::downsample()` takes a `TimeBucket` instead of
   a `Duration`, and `QueryPlan::Downsample` carries one. The native plan can
   now express a calendar day or month, and — more to the point — it now means
@@ -51,6 +123,29 @@ and no migration tooling for the on-disk format.
 
 ### Fixed
 
+- **A restored backup is the database that was backed up.** The catalog stored
+  absolute segment paths, so a restore onto a fresh directory produced an
+  **empty** database — `open()`'s orphan sweep compared the restored files
+  against paths naming the original directory, matched none, and deleted every
+  one — and a restore *beside* the original silently read the original's
+  segments until the copy's first compaction unlinked them. The existing
+  round-trip test never flushed, so it exercised a backup with no segments in
+  it.
+- **A backup taken while the database is working is complete.** `backup()`
+  walked `wal/`, `segments/` and `catalog/` with `read_dir`: a WAL file
+  truncated by the next flush vanished mid-copy and failed the backup with a
+  bare `ENOENT`; a catalog snapshot landing mid-copy could pair the old
+  snapshot with the log that snapshot had truncated, losing every transition
+  between them; and a segment flushed between two directory walks was named by
+  the copied catalog and absent from the copy.
+- **`Chronix::tag_keys()` and `tag_values()` see unflushed series.** They read
+  the inverted tag index, which is built at flush — so a freshly started
+  database reported no labels at all, and a tag appearing only in recent data
+  was invisible. `chronixd`'s `/labels` was always correct, because it scans;
+  the two now agree.
+- **`last_value()` finds a pre-1970 point.** It scanned the memtable from `0`
+  rather than `i64::MIN` and returned `None` for a series a query returns rows
+  for.
 - **Every `histogram!` now reaches a Prometheus scrape as a histogram.** The
   exporter was left unconfigured, and `metrics-exporter-prometheus` renders
   histograms as *summaries* unless buckets are set — so no `_bucket` series
@@ -102,6 +197,36 @@ and no migration tooling for the on-disk format.
   silently discarded every exact-decimal field it held. It is now one shared
   conversion, and a type it cannot represent fails the snapshot rather than
   disappearing from it.
+
+### Removed
+
+- **Point-in-time recovery.** `Chronix::restore_pitr` and
+  `POST /api/v1/admin/restore/pitr` did nothing: the target sequence had to be
+  at or after the backup's own, the backup's WAL ends there, so the replay
+  window was always empty and every target sequence produced a byte-identical
+  database. The other half — `WalWriter::archive_before`, which copies WAL
+  files aside before truncation — had no caller, no configuration and no
+  documentation, so there was no archive to recover from. It was also the one
+  admin endpoint that wrote no audit record.
+- **`WalEntry::Delete`.** A delete wrote and fsynced a WAL record carrying its
+  resolved tombstones, and nothing could read it: `execute_delete` flushes
+  first, so every point a tombstone covers is already in a segment and below
+  the WAL floor, which replay never reads. Its stated purpose was
+  point-in-time restore. What is left is one `fsync` per delete instead of
+  two — the catalog manifest, which was always the durable record. WAL
+  discriminant `0x01` is retired and not reused.
+- **`EncryptingBackend` and `LocalFsBackend`.** Neither had a caller anywhere,
+  and `EncryptingBackend` could only ever have encrypted cold-tier objects,
+  because the cold tier is the only implementor of the trait it wraps.
+  Chronix does not encrypt its own data directory and no setting made it: the
+  security guide's `storage.encryption.enabled` was a key that never parsed,
+  and its claims of WAL encryption and an HMAC manifest check were both
+  phantom (the manifest is CRC-32C). The documentation now says what is
+  actually offered — filesystem or volume encryption for the data directory,
+  the bucket's own for the cold tier, and the `.csx` format's per-column
+  AES-256-GCM, which fails closed and which no configuration enables.
+- `chronixd snapshot` / `chronixd restore` / `chronixd bench` from the docs.
+  `chronixd` takes no subcommands.
 
 ## [0.4.0]
 

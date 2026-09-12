@@ -26,7 +26,8 @@ use tracing::{debug, warn};
 
 use crate::segment::stats::ColumnStats;
 use chronix_core::{
-    MeasurementSchema, SegmentId, SegmentState, ShardId, Timestamp, Tombstone, TombstoneSet,
+    MeasurementSchema, SegmentFile, SegmentId, SegmentState, ShardId, Timestamp, Tombstone,
+    TombstoneSet,
 };
 
 use crate::index::error::{IndexError, Result};
@@ -65,8 +66,11 @@ pub struct SegmentCatalogEntry {
     pub shard_id: ShardId,
     /// Measurement name this segment contains data for.
     pub measurement: String,
-    /// Filesystem path to the `.csx` file.
-    pub path: PathBuf,
+    /// Where the `.csx` file lives, relative to the `segments/` directory.
+    ///
+    /// Relative, so the catalog describes *a* database rather than the
+    /// directory this one happens to sit in — see [`SegmentFile`].
+    pub file: SegmentFile,
     /// Minimum timestamp in the segment (inclusive).
     pub min_timestamp: Timestamp,
     /// Maximum timestamp in the segment (inclusive).
@@ -540,7 +544,7 @@ impl SegmentCatalog {
                     + v.iter()
                         .map(|e| {
                             e.measurement.capacity()
-                                + e.path.as_os_str().len()
+                                + e.file.as_relative().as_os_str().len()
                                 + e.column_stats.capacity()
                                     * std::mem::size_of::<CatalogColumnStats>()
                                 + e.column_stats
@@ -1204,8 +1208,8 @@ impl SegmentCatalog {
         }
     }
 
-    /// Write a full snapshot and truncate the WAL.
-    fn write_snapshot(&mut self) -> Result<()> {
+    /// The whole catalog, encoded — everything a reopen needs.
+    fn snapshot_bytes(&self) -> Result<Vec<u8>> {
         let snapshot = CatalogSnapshot {
             format_version: CATALOG_FORMAT_VERSION,
             segments: self.segments.clone(),
@@ -1217,9 +1221,57 @@ impl SegmentCatalog {
             manifest_seq: self.manifest_seq,
             next_segment_id: self.next_segment_id,
         };
+        postcard::to_stdvec(&snapshot).map_err(|e| IndexError::BinarySerialization(e.to_string()))
+    }
 
-        let data = postcard::to_stdvec(&snapshot)
-            .map_err(|e| IndexError::BinarySerialization(e.to_string()))?;
+    /// Write this catalog, as it stands, as the whole catalog of a database
+    /// rooted at `manifest_dir` — a directory that is *not* this one.
+    ///
+    /// This is what a backup captures instead of copying `catalog/` file by
+    /// file. Copying was the defect: a snapshot landing mid-copy replaces
+    /// `manifest.snapshot.bin` **and truncates `manifest.wal`**, so a reader
+    /// walking the directory can pair the old snapshot with the emptied log
+    /// and lose every transition since — silently, and reported as a
+    /// successful backup. One encode of one consistent in-memory state cannot
+    /// be torn, and the empty log beside it says there is nothing to replay.
+    ///
+    /// The caller must hold the catalog read lock for as long as it needs the
+    /// segments this names to still be there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created or written.
+    pub fn write_snapshot_to(&self, manifest_dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(manifest_dir)?;
+        let data = self.snapshot_bytes()?;
+        let snapshot_path = manifest_dir.join("manifest.snapshot.bin");
+        let tmp_path = manifest_dir.join("manifest.snapshot.bin.tmp");
+        let write_tmp = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(&data)?;
+            file.sync_all()
+        })();
+        if let Err(e) = write_tmp {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &snapshot_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        // An empty log, written rather than left absent: a `manifest.wal`
+        // carried over from an older backup in the same directory would be
+        // replayed on top of this snapshot.
+        let wal = std::fs::File::create(manifest_dir.join("manifest.wal"))?;
+        wal.sync_all()?;
+        let dir = std::fs::File::open(manifest_dir)?;
+        dir.sync_all()?;
+        Ok(())
+    }
+
+    /// Write a full snapshot and truncate the WAL.
+    fn write_snapshot(&mut self) -> Result<()> {
+        let data = self.snapshot_bytes()?;
 
         // Atomic snapshot write: write temp → fsync → rename → fsync parent.
         let snapshot_path = self.manifest_dir.join("manifest.snapshot.bin");
@@ -1326,7 +1378,7 @@ mod tests {
             segment_id: SegmentId(id),
             shard_id: ShardId(shard),
             measurement: "cpu".to_string(),
-            path: PathBuf::from(format!("shard_{shard}/seg_{id}.csx")),
+            file: SegmentFile::new(ShardId(shard), &format!("seg_{id}.csx")).unwrap(),
             min_timestamp: min_ts,
             max_timestamp: max_ts,
             row_count: 1000,

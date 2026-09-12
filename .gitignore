@@ -50,3 +50,7 @@ sdks/python/.venv/
 sdks/python/dist/
 sdks/python/build/
 *.egg-info/
+
+# Isolated build directory for full verification runs, so a running
+# rust-analyzer cannot clobber them (see CONTRIBUTING.md).
+target-ci

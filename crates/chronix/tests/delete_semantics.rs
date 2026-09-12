@@ -490,3 +490,142 @@ fn a_write_after_a_delete_is_visible_inside_the_deleted_interval() {
     assert_eq!(visible_timestamps(&db), vec![1000, 2000, 3000]);
     db.close().unwrap();
 }
+
+/// An unclean restart replays writes *over* a tombstone correctly.
+///
+/// The two halves of a restart meet here, and no other test puts them
+/// together: replay re-inserts every write record above the WAL floor, and
+/// the tombstone that must not mask them comes from the catalog. A series is
+/// deleted, then written to again — which re-creates it, visible at once,
+/// even inside the interval the delete covered — and the process aborts
+/// before any of that reaches a segment.
+///
+/// **There is no WAL record for a delete, and there cannot usefully be one.**
+/// `execute_delete` flushes first, so by the time a tombstone exists every
+/// point it could cover is already in a segment and below the WAL floor —
+/// which is never replayed. A `WalEntry::Delete` used to be written and
+/// fsynced on every delete anyway; writing this test is what showed it had no
+/// reachable consumer, because deleting the replay path that read it left
+/// every assertion green. It is gone, and with it a second `fsync` per
+/// delete.
+///
+/// The child aborts rather than returning, because `Drop` runs `close()` and
+/// a clean close truncates the WAL past everything this needs replayed.
+#[test]
+fn an_unclean_restart_replays_writes_over_a_tombstone() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().to_path_buf();
+
+    let config = |path: &std::path::Path| {
+        ChronixConfig::builder()
+            .data_dir(path)
+            // The maintenance thread must not flush behind this test's back:
+            // the whole point is data that is still only in the WAL.
+            .maintenance_interval(std::time::Duration::from_secs(86_400 * 365))
+            .build()
+            .unwrap()
+    };
+
+    if std::env::var("CHRONIX_TOMBSTONE_REPLAY_CHILD").is_ok() {
+        let dir = std::path::PathBuf::from(std::env::var("CHRONIX_TOMBSTONE_REPLAY_DIR").unwrap());
+        let db = Chronix::open(config(&dir)).unwrap();
+        for ts in 0..20i64 {
+            db.insert(&point("doomed", 1_000 + ts)).unwrap();
+            db.insert(&point("keeper", 1_000 + ts)).unwrap();
+        }
+        // Deletes the whole series — and flushes on the way, which is why a
+        // WAL record for the tombstone could never have been needed.
+        db.delete_series("cpu", &host_tags("doomed")).unwrap();
+        assert_eq!(db.last_value("cpu", &host_tags("doomed")).unwrap(), None);
+
+        // Re-create the deleted series, and add to the survivor. Neither
+        // reaches a segment: this is what replay has to bring back.
+        for ts in 0..20i64 {
+            db.insert(&point("doomed", 5_000 + ts)).unwrap();
+            db.insert(&point("keeper", 5_000 + ts)).unwrap();
+        }
+        std::process::abort();
+    }
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "an_unclean_restart_replays_writes_over_a_tombstone",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("CHRONIX_TOMBSTONE_REPLAY_CHILD", "1")
+        .env("CHRONIX_TOMBSTONE_REPLAY_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "the child must abort, not exit cleanly");
+
+    let db = Chronix::open(config(&dir)).unwrap();
+    assert!(
+        db.wal_replayed_records() > 0,
+        "the point of this test is that there was something to replay"
+    );
+
+    // The re-created series is back, at its new timestamps only.
+    let doomed = db
+        .last_value("cpu", &host_tags("doomed"))
+        .unwrap()
+        .expect("a write after a delete re-creates the series");
+    assert!(
+        doomed.timestamp() >= 5_000,
+        "the replayed write is the newest point, not a resurrected one: {}",
+        doomed.timestamp()
+    );
+    let doomed_seen = visible_timestamps_for(&db, "doomed");
+    assert!(
+        doomed_seen.iter().all(|ts| *ts >= 5_000),
+        "the tombstone still masks the deleted range after replay: {doomed_seen:?}"
+    );
+    assert_eq!(doomed_seen.len(), 20);
+
+    // And the survivor kept both halves.
+    assert_eq!(visible_timestamps_for(&db, "keeper").len(), 40);
+    db.close().unwrap();
+}
+
+/// Every visible timestamp of one host, oldest first — read from an
+/// **unfiltered** scan.
+///
+/// Deliberately not `.tag("host", host)`: a whole-series delete rewrites each
+/// segment's series sidecar, so the segment's bloom filter stops claiming the
+/// deleted series and a tag-filtered query prunes the segment away before any
+/// row is read. That is correct, and it is also a second mechanism that hides
+/// the deleted rows — so a tag-filtered assertion passes whether or not the
+/// tombstone survived, which is not what this file is for. Scanning
+/// everything and splitting on the tag column leaves the tombstone as the
+/// only thing that can mask a row.
+fn visible_timestamps_for(db: &Chronix, host: &str) -> Vec<i64> {
+    let plan = db
+        .query()
+        .measurement("cpu")
+        .range(i64::MIN, i64::MAX)
+        .build()
+        .unwrap();
+    let batch = db.execute(&plan).unwrap();
+    let (Some(time), Some(hosts)) = (
+        batch.column_by_name(chronix_core::TIME_COLUMN),
+        batch.column_by_name("host"),
+    ) else {
+        return Vec::new();
+    };
+    let time = time
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let hosts = hosts
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let mut out: Vec<i64> = (0..time.len())
+        .filter(|i| hosts.value(*i) == host)
+        .map(|i| time.value(i))
+        .collect();
+    out.sort_unstable();
+    out
+}

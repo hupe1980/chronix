@@ -58,6 +58,7 @@ let config = ChronixConfig::builder()
 | `cdc_capacity` | `usize` | 65 536 | CDC events buffered for a slow subscriber. The ring (~112 bytes/event) is allocated on the first subscription, so a deployment that never reads the CDC stream pays nothing. `open_small` sets 4 096 |
 | `enable_last_value_cache` | `bool` | `false` | Enable O(1) last-value lookups |
 | `lvc_measurements` | `Option<HashSet<String>>` | `None` | Measurements to include in LVC (None = all) |
+| `field_encryption` | `FieldEncryption` | empty | Per-column AES-256-GCM in the segment format — see [Security](@/docs/security.md#field-level-encryption) |
 
 ### Encoding & Compression
 
@@ -133,6 +134,11 @@ second default is written here.
 | `wal_max_unflushed` | `usize` | engine default | Unflushed WAL files tolerated before writes are held back |
 | `soft_delete_ttl_secs` | `u64` | unset — drops are immediate | Grace period before a dropped measurement is hard-deleted. With it set, `DELETE /api/v1/measurements/{name}` is recoverable until the deadline passes; without it the drop is irreversible. Measured from the wall clock capped by the newest timestamp held, as retention is, so a clock jump cannot close the window early |
 | `lvc_measurements` | `[String]` | empty — all measurements | Measurements the last-value cache covers, when `enable_last_value_cache` is on |
+| `field_encryption.columns` | `{String: String}` | empty | Column name → key id. Only a **field** may be encrypted; a tag or the time column is a write error. See [Security](@/docs/security.md#field-level-encryption) |
+| `field_encryption.keys` | `{String: String}` | empty | Key id → the name of an **environment variable** holding base64 of 32 bytes. Never the key itself. Every declared key must resolve at startup |
+| `checkpoints.interval_secs` | `u64` | unset — off | Take a checkpoint this often, from the maintenance thread. Requires `checkpoints.directory` |
+| `checkpoints.directory` | `PathBuf` | unset | Where scheduled checkpoints go. Must be outside the data directory's `segments/` tree |
+| `checkpoints.keep` | `usize` | `3` | How many complete checkpoints to keep; older ones are removed after a successful run |
 
 ### Server Settings
 
@@ -268,6 +274,37 @@ backup_root = "/var/lib/chronix/backups"   # defaults to <data_dir>/backups
 Every path the admin backup and restore endpoints accept is resolved inside
 this root, following symlinks. An absolute path outside it is refused.
 
+### Scheduled checkpoints
+
+```toml
+[database.checkpoints]
+interval_secs = 21600                    # every six hours
+directory     = "/mnt/backup/chronix"
+keep          = 4
+```
+
+Off by default; taken by the maintenance thread. An interval without a
+directory is a startup error rather than a schedule that never runs. See
+[Operations](@/docs/operations.md#backup-restore).
+
+### Field encryption
+
+```toml
+[database.field_encryption]
+columns = { patient_id = "phi-2026", diagnosis = "phi-2026" }
+keys    = { phi-2026 = "CHRONIX_FIELD_KEY_PHI" }
+```
+
+`keys` values are **environment variable names**, not keys — the file holds
+no key material. Each variable holds the base64 of 32 bytes, and every
+declared key must resolve at startup; a missing one stops the server with the
+variable named and the value never printed.
+
+Only a **field** can be encrypted: declaring a tag or the time column is a
+write error. An encrypted column is refused by the Parquet export, the
+cold-tier archive and any rollup over its measurement. Full detail in
+[Security](@/docs/security.md#field-level-encryption).
+
 ### Cluster
 
 ```toml
@@ -344,15 +381,21 @@ Absent by default; the trigger endpoints answer `404` until it is present.
 ```toml
 [triggers]
 catalog_path = "triggers.json"          # relative to data_dir; survives restart
-webhook_signing_secret = "$CHRONIX_WEBHOOK_SIGNING_SECRET"
+webhook_signing_secrets = ["$CHRONIX_WEBHOOK_SIGNING_SECRET"]
 webhook_timeout_secs = 10
 webhook_allow_private_targets = false   # see below
 signal_store_capacity = 10000
 ```
 
-`webhook_signing_secret` is configuration rather than part of the `DELIVER`
+`webhook_signing_secrets` is configuration rather than part of the `DELIVER`
 clause: a secret written in SQL lands in the trigger catalog on disk and in
-every `SHOW TRIGGERS`. Without it, `DELIVER webhook(…)` is refused at creation.
+every `SHOW TRIGGERS`. With none set, `DELIVER webhook(…)` is refused at
+creation. Each entry may be a `$VAR` reference, resolved at startup.
+
+It is a list because a delivery is signed with every entry, so a receiver
+holding any one of them verifies — see
+[Rotating a signing secret](@/docs/security.md#rotating-a-signing-secret).
+`CHRONIX_WEBHOOK_SIGNING_SECRET` sets the whole list, comma-separated.
 
 `webhook_allow_private_targets` waives the *resolved-address* rule for an
 alerting endpoint on your own network — `https://alertmanager.corp.example/`
@@ -421,7 +464,7 @@ Precedence is **file, then environment, then CLI flags**.
 | `CHRONIX_LOG_LEVEL` | `server.log_level` |
 | `CHRONIX_HTTP_ADDR` | `server.http_addr` |
 | `CHRONIX_JWT_SECRET` | `auth.jwt.secret` — overrides an existing `[auth.jwt]` section; with no such section the server refuses to start rather than silently ignoring it |
-| `CHRONIX_WEBHOOK_SIGNING_SECRET` | `triggers.webhook_signing_secret` |
+| `CHRONIX_WEBHOOK_SIGNING_SECRET` | `triggers.webhook_signing_secrets` (comma-separated, newest first) |
 
 A value that cannot be parsed is a startup error, not a fall back to the
 default.

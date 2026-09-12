@@ -314,6 +314,10 @@ for installing a recorder (e.g., `metrics-exporter-prometheus`).
 | `chronix_write_errors_total` | Counter | every write path | Writes that failed, labelled `reason` = `storage_full` \| `timeout` \| `rejected` \| `panic`. `storage_full` is the data volume, and the one to alert on |
 | `chronix_sql_results_truncated_total` | Counter | the HTTP, gRPC and Flight SQL query paths | Results the `sql_max_rows` ceiling cut short or refused. A non-zero rate means somebody is reading a prefix and calling it an answer |
 | `chronix_backfill_points_total` | Counter | every write path with `?backfill=true` | Points written **outside** the out-of-order window — importing history rather than ingesting live |
+| `chronix_backups_total` | Counter | `backup()` | Checkpoints taken. Published at zero, so an alert on a nightly backup that stopped running can fire from the first scrape |
+| `chronix_backup_failures_total` | Counter | `backup()` | Checkpoints that failed. **The one to alert on** — a backup that silently stops working is what the whole subsystem exists to prevent |
+| `chronix_backup_bytes_total` | Counter | `backup()` | Bytes the checkpoints placed. Hard-linked segments count their size, so this measures the database rather than the disk the backup consumed |
+| `chronix_backup_duration_seconds` | Histogram | `backup()` | How long a checkpoint takes, flush included |
 | `chronix_compaction_backpressure_active` | Gauge | `apply_backpressure()` | 1.0 when write throttling is active, 0.0 otherwise |
 | `chronix_catalog_fsync_total` | Counter | the catalog manifest | Manifest fsyncs. Beside `chronix_wal_fsync_total`: on flash the fsync rate is the wear rate. A compaction is **one**, whatever it retires, and so is a delete however many tombstones it produces |
 | `chronix_maintenance_running` | Gauge | the maintenance thread, refreshed each tick | `1` while it is alive, `0` once it has ended. Everything a database does for itself happens there, so a `0` — or an absence lasting longer than a tick — means the process will stop accepting writes and only a restart recovers. **The one to alert on** |

@@ -60,7 +60,13 @@ pub struct PipelineConfig {
     /// payload anyone can forge — and the secret is deliberately not part of
     /// the DSL: a secret written in SQL is a secret in the trigger catalog on
     /// disk and in every `SHOW TRIGGERS`.
-    pub webhook_signing_secret: Option<String>,
+    /// A **list**, newest first, because rotating a single secret is an
+    /// outage: every in-flight delivery fails the moment either side
+    /// changes. Signing with all of them produces the space-delimited
+    /// `webhook-signature` the Standard Webhooks spec defines for exactly
+    /// this, so sender and receivers can be updated in either order.
+    /// The ordinary case is one entry.
+    pub webhook_signing_secrets: Vec<String>,
     /// Timeout for a webhook request.
     pub webhook_timeout: std::time::Duration,
     /// Permit a webhook target that resolves inside the deployment's network.
@@ -86,7 +92,7 @@ impl Default for PipelineConfig {
             enable_metric_delivery: true,
             audit_memory_capacity: 50_000,
             forecast_horizon: 10,
-            webhook_signing_secret: None,
+            webhook_signing_secrets: Vec::new(),
             webhook_timeout: std::time::Duration::from_secs(10),
             webhook_allow_private_targets: false,
         }
@@ -632,20 +638,23 @@ impl Pipeline {
                     ));
                 }
                 DeliveryTarget::Webhook(url) => {
-                    let secret = self.config.webhook_signing_secret.as_ref().ok_or_else(|| {
-                        SignalError::InvalidConfig(
-                            "DELIVER webhook(…) requires PipelineConfig::webhook_signing_secret: \
+                    if self.config.webhook_signing_secrets.is_empty() {
+                        return Err(SignalError::InvalidConfig(
+                            "DELIVER webhook(…) requires PipelineConfig::webhook_signing_secrets: \
                              every webhook payload is HMAC-signed, and the secret is configured \
                              rather than written in SQL so it stays out of the trigger catalog"
                                 .into(),
-                        )
-                    })?;
+                        ));
+                    }
                     // Named now, connected on the first signal:
                     // `CREATE TRIGGER` must not resolve a hostname.
                     let channel = DeferredWebhookChannel::new(
-                        WebhookConfig::new(url, secret)
-                            .with_timeout(self.config.webhook_timeout)
-                            .allow_private_targets(self.config.webhook_allow_private_targets),
+                        WebhookConfig::with_secrets(
+                            url,
+                            self.config.webhook_signing_secrets.clone(),
+                        )
+                        .with_timeout(self.config.webhook_timeout)
+                        .allow_private_targets(self.config.webhook_allow_private_targets),
                     );
                     self.delivery_router.add_channel(Box::new(channel));
                     info!(url, "webhook delivery channel registered");

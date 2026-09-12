@@ -87,7 +87,8 @@ WHERE metric_name = 'latency_p99'
   AND _time > now() - INTERVAL '24 hours';
 ```
 
-The `ANOMALY_SCORE` function returns a normalized score (typically a
-Z-score equivalent), and the `HAVING` clause acts as the threshold.
+`anomaly_score(value, threshold)` returns a normalised score — a modified
+Z-score against the window — so the filtering is an ordinary `WHERE` on the
+projected column, or a second query over the result.
 
 Each detection method is detailed in the following sub-sections.

@@ -6,9 +6,8 @@ use metrics::counter;
 use tracing::{info, warn};
 
 use arrow::array::Array;
-use chronix_core::{wal_encode, SeriesKey, Tombstone, WalEntry};
+use chronix_core::{SeriesKey, Tombstone};
 use chronix_engine::index::SegmentCatalogEntry;
-use chronix_engine::segment::reader::SegmentReader;
 use chronix_streaming::cdc::CdcEvent;
 
 use crate::delete::{DeleteBuilder, DeleteOutcome, DeleteRequest};
@@ -307,13 +306,14 @@ impl super::Chronix {
         // instead of receiving a plain success.
         let mut segments_skipped: u64 = 0;
 
+        let segments_dir = self.segments_dir();
         for entry in &entries {
             scanned_segments.push(entry.segment_id.0);
 
-            let reader = match SegmentReader::open(&entry.path) {
+            let reader = match self.open_segment(entry.file.resolve(&segments_dir)) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(segment = %entry.path.display(), error = %e, "Skipping unreadable segment in delete");
+                    warn!(segment = %entry.file, error = %e, "Skipping unreadable segment in delete");
                     segments_skipped += 1;
                     continue;
                 }
@@ -322,7 +322,7 @@ impl super::Chronix {
             let batch = match reader.read_all() {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!(segment = %entry.path.display(), error = %e, "Failed to read segment in delete");
+                    warn!(segment = %entry.file, error = %e, "Failed to read segment in delete");
                     segments_skipped += 1;
                     continue;
                 }
@@ -419,22 +419,19 @@ impl super::Chronix {
             // middle leaves a database that has either applied the delete or
             // not seen it — never one that shows it and forgets it on restart.
             //
-            // The catalog append is the durable record, and it goes first:
-            // the WAL floor is raised by any concurrent flush, and a WAL
-            // record below the floor is never replayed, so nothing may
-            // depend on the WAL entry for recovery. It exists so that a
-            // point-in-time restore from a base backup replays the delete
-            // rather than silently resurrecting the rows.
+            // The catalog manifest is the **only** durable record, and it is
+            // fsynced per append. A `WalEntry::Delete` used to be written and
+            // fsynced here as well, and nothing depended on it: the WAL floor
+            // is raised by any concurrent flush and a record below the floor
+            // is never replayed, so it could not be relied on for recovery
+            // even in principle — which the comment here said, while naming
+            // point-in-time restore as the reason to keep it. That never
+            // worked and is gone, so what was left was a second `fsync` on
+            // every delete, and on flash the fsync rate is the wear rate.
             self.catalog
                 .write()
                 .record_tombstones(&tombstones)
                 .map_err(|e| DbError::Internal(format!("Failed to persist tombstones: {e}")))?;
-
-            let payload = wal_encode(&WalEntry::Delete {
-                tombstones: tombstones.clone(),
-            })
-            .map_err(|e| DbError::Internal(format!("Failed to serialize WAL entry: {e}")))?;
-            self.wal.append_durable(&payload)?;
 
             {
                 let mut live = self.tombstones.write();
@@ -485,10 +482,11 @@ impl super::Chronix {
                 let gone: std::collections::HashSet<&str> =
                     matched.keys().map(String::as_str).collect();
                 for entry in &entries {
-                    if let Err(e) =
-                        chronix_engine::index::series_index::remove_series(&entry.path, &gone)
-                    {
-                        warn!(segment = %entry.path.display(), error = %e, "could not rewrite the series index after a delete");
+                    if let Err(e) = chronix_engine::index::series_index::remove_series(
+                        &entry.file.resolve(&segments_dir),
+                        &gone,
+                    ) {
+                        warn!(segment = %entry.file, error = %e, "could not rewrite the series index after a delete");
                     }
                 }
             }

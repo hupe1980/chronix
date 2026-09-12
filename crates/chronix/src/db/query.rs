@@ -30,6 +30,18 @@ pub(super) struct SegmentFilterCtx<'a> {
     pub(super) plan: &'a QueryPlan,
     pub(super) tombstones: &'a TombstoneSet,
     pub(super) tag_col_names: Option<&'a [&'a str]>,
+    /// Where to resolve each entry's relative [`SegmentFile`] against.
+    pub(super) segments_dir: &'a std::path::Path,
+    /// The database's decryption keys, where any column is encrypted.
+    ///
+    /// Carried on the context because [`read_segment_filtered`] is an
+    /// associated function with no `&self` — and a reader opened without it
+    /// fails closed on an encrypted column, which is right and also
+    /// invisible until a query happens to take this path rather than one of
+    /// the others.
+    #[cfg(feature = "field-encryption")]
+    pub(super) key_provider:
+        Option<std::sync::Arc<dyn chronix_engine::segment::field_encryption::FieldKeyProvider>>,
 }
 
 /// The Arrow field-metadata key that carries a column's role.
@@ -360,7 +372,12 @@ impl super::Chronix {
         // a warning returned a confidently incomplete answer — and let
         // retention roll up a shard from whatever fraction of it was
         // readable and then drop the rest.
-        let reader = SegmentReader::open(&entry.path)?;
+        #[allow(unused_mut)]
+        let mut reader = SegmentReader::open(entry.file.resolve(ctx.segments_dir))?;
+        #[cfg(feature = "field-encryption")]
+        if let Some(provider) = &ctx.key_provider {
+            reader.set_key_provider(std::sync::Arc::clone(provider));
+        }
 
         let time_range_ns = Some((ctx.time_range.start, ctx.time_range.end));
         let batch = if let Some(cols) = ctx.scan_columns {
@@ -425,6 +442,7 @@ impl super::Chronix {
     /// once, and the sidecar rewritten.
     pub(super) fn load_catalog_state(
         catalog: &SegmentCatalog,
+        segments_dir: &std::path::Path,
     ) -> (
         BTreeMap<u64, SeriesBloomFilter>,
         TagInvertedIndex,
@@ -440,7 +458,7 @@ impl super::Chronix {
             if entry.state != SegmentState::Active {
                 continue;
             }
-            let keys = Self::series_keys_of(&entry.path, &entry.measurement);
+            let keys = Self::series_keys_of(&entry.file.resolve(segments_dir), &entry.measurement);
             Self::index_series_keys(&mut blooms, &tag_index, entry.segment_id, &keys);
             for key in &keys {
                 known.insert(key.canonical_form().to_string());
@@ -635,7 +653,18 @@ impl super::Chronix {
         // walks segments newest-first and stops as soon as a segment's
         // `max_timestamp` cannot beat the best so far, so when the memtable
         // point really is the newest, no segment is opened at all.
-        let memtable_best = self.shards.scan(&key, 0, i64::MAX).into_iter().last();
+        //
+        // `i64::MIN`, not `0`: a timestamp is a signed nanosecond epoch and
+        // `ShardId::from_timestamp` uses `div_euclid` precisely so a pre-1970
+        // one shards correctly. Starting the scan at zero made this one
+        // function disagree with every other read path about which points
+        // exist, so `last_value` answered `None` for a series a query
+        // returned rows for.
+        let memtable_best = self
+            .shards
+            .scan(&key, i64::MIN, i64::MAX)
+            .into_iter()
+            .last();
 
         // 2. Check on-disk segments in reverse time order (with bloom pruning)
         //
@@ -689,7 +718,7 @@ impl super::Chronix {
             // only remaining reason is a damaged one, and skipping it would
             // answer a *stale* reading as though it were current — which for
             // a meter is the wrong number rather than a missing one.
-            let reader = SegmentReader::open(&entry.path)?;
+            let reader = self.open_segment(entry.file.resolve(&self.segments_dir()))?;
 
             let tag_refs: Vec<(&str, &str)> =
                 tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();

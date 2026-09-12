@@ -69,6 +69,11 @@ fn run(
     flush_threshold: usize,
 ) {
     let mut last_pass = Instant::now();
+    // Not `Instant::now()`: a scheduled checkpoint is wanted *at* startup as
+    // well as every interval after it, because the commonest reason a
+    // gateway has no recent backup is that it was restarted more often than
+    // the interval.
+    let mut last_checkpoint: Option<Instant> = None;
     let tick = if interval.is_zero() {
         IDLE_TICK
     } else {
@@ -120,7 +125,13 @@ fn run(
         // running; `AliveGuard` still covers the case where the loop leaves
         // for a reason this does not catch.
         let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            one_pass(&db, &mut last_pass, interval, flush_threshold)
+            one_pass(
+                &db,
+                &mut last_pass,
+                &mut last_checkpoint,
+                interval,
+                flush_threshold,
+            )
         }));
         match closed {
             Ok(true) => return,
@@ -144,6 +155,7 @@ fn run(
 fn one_pass(
     db: &Chronix,
     last_pass: &mut Instant,
+    last_checkpoint: &mut Option<Instant>,
     interval: Duration,
     flush_threshold: usize,
 ) -> bool {
@@ -182,6 +194,27 @@ fn one_pass(
                 Ok(_) => {}
                 Err(crate::error::DbError::Closed) => return true,
                 Err(e) => warn!(error = %e, "maintenance: retention failed"),
+            }
+        }
+    }
+
+    // Checkpoints run on their own schedule, not the maintenance interval:
+    // one is seconds and the other is hours, and tying them together would
+    // mean either checkpointing far too often or compacting far too rarely.
+    if let Some(every) = db.config.checkpoints.interval() {
+        let due = last_checkpoint.is_none_or(|t| t.elapsed() >= every);
+        if due {
+            *last_checkpoint = Some(Instant::now());
+            match db.scheduled_checkpoint() {
+                Ok(Some(path)) => {
+                    tracing::info!(path = %path.display(), "maintenance: checkpoint taken");
+                }
+                Ok(None) => {}
+                Err(crate::error::DbError::Closed) => return true,
+                // Not fatal to the thread: a backup target that has gone
+                // away must not stop flushing, compacting and expiring.
+                // `chronix_backup_failures_total` is what an alert reads.
+                Err(e) => warn!(error = %e, "maintenance: checkpoint failed"),
             }
         }
     }

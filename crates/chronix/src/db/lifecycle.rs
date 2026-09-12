@@ -9,7 +9,6 @@ use tracing::{debug, info, warn};
 use chronix_core::{SegmentState, ShardId};
 use chronix_engine::index::{CatalogColumnStats, SegmentCatalogEntry};
 use chronix_engine::memtable::FlushResult;
-use chronix_engine::segment::reader::SegmentReader;
 use chronix_query::plan::QueryPlan;
 
 use chronix_engine::compaction::CompactionExecutor;
@@ -255,6 +254,14 @@ impl super::Chronix {
         parquet_config: &ParquetExportConfig,
     ) -> Result<crate::export::ParquetExportResult> {
         self.check_open()?;
+
+        // An export writes a plaintext Parquet file; an encrypted column
+        // does not leave the segment format.
+        #[cfg(feature = "field-encryption")]
+        {
+            let names = self.column_names_of(&scan_measurement(plan));
+            self.refuse_encrypted_columns(names.iter().map(String::as_str), "a Parquet export")?;
+        }
 
         let result = if matches!(plan, QueryPlan::Scan { .. }) {
             // An export is explicitly for a window larger than RAM, so it is
@@ -630,7 +637,7 @@ impl super::Chronix {
                 .acquire(entries.iter().map(|e| e.segment_id));
             (entries, lease)
         };
-        let on_disk = Self::series_on_disk(&entries);
+        let on_disk = Self::series_on_disk(&entries, &self.segments_dir());
         let before = self.known_series.len();
         self.known_series
             .retain(|k| on_disk.contains(k.as_str()) || in_memory.contains(k.as_str()));
@@ -672,10 +679,13 @@ impl super::Chronix {
 
     /// The canonical form of every series the active segments hold, read from
     /// the per-segment series sidecars — no segment is decoded.
-    fn series_on_disk(entries: &[SegmentCatalogEntry]) -> std::collections::HashSet<String> {
+    fn series_on_disk(
+        entries: &[SegmentCatalogEntry],
+        segments_dir: &std::path::Path,
+    ) -> std::collections::HashSet<String> {
         let mut known = std::collections::HashSet::new();
         for entry in entries {
-            for key in Self::series_keys_of(&entry.path, &entry.measurement) {
+            for key in Self::series_keys_of(&entry.file.resolve(segments_dir), &entry.measurement) {
                 known.insert(key.canonical_form().to_string());
             }
         }
@@ -768,13 +778,22 @@ impl super::Chronix {
             self.config.compression,
             3,
         );
+        // A compaction reads segments and writes a new one, so it has to
+        // carry both halves of the encryption or it decrypts the inputs and
+        // writes the column back in plaintext.
+        #[cfg(feature = "field-encryption")]
+        let executor = match &self.field_encryption {
+            Some(enc) => executor
+                .with_field_encryption(enc.writer.clone(), std::sync::Arc::clone(&enc.reader)),
+            None => executor,
+        };
         let tombstones = self.tombstones.read().clone();
         let mut completed = 0;
         let compaction_start = std::time::Instant::now();
 
         // Ensure output directories exist before spawning threads.
         for task in &tasks {
-            if let Some(parent) = task.output_path.parent() {
+            if let Some(parent) = task.output_path().parent() {
                 std::fs::create_dir_all(parent)?;
             }
         }
@@ -828,34 +847,34 @@ impl super::Chronix {
                         let mut catalog = self.catalog.write();
                         let seg_id = catalog.next_segment_id();
 
-                        let col_stats: Vec<CatalogColumnStats> =
-                            match SegmentReader::open(&meta.path) {
-                                Ok(reader) => reader
-                                    .column_metadata()
-                                    .iter()
-                                    .map(|cm| CatalogColumnStats {
-                                        name: cm.name.clone(),
-                                        data_type: cm.data_type,
-                                        role: cm.role,
-                                        decimal_scale: cm.decimal_scale,
-                                        stats: cm.stats.clone(),
-                                    })
-                                    .collect(),
-                                Err(e) => {
-                                    warn!(
-                                        segment = %meta.path.display(),
-                                        error = %e,
-                                        "Could not read column stats for compacted segment"
-                                    );
-                                    Vec::new()
-                                }
-                            };
+                        let col_stats: Vec<CatalogColumnStats> = match self.open_segment(&meta.path)
+                        {
+                            Ok(reader) => reader
+                                .column_metadata()
+                                .iter()
+                                .map(|cm| CatalogColumnStats {
+                                    name: cm.name.clone(),
+                                    data_type: cm.data_type,
+                                    role: cm.role,
+                                    decimal_scale: cm.decimal_scale,
+                                    stats: cm.stats.clone(),
+                                })
+                                .collect(),
+                            Err(e) => {
+                                warn!(
+                                    segment = %meta.path.display(),
+                                    error = %e,
+                                    "Could not read column stats for compacted segment"
+                                );
+                                Vec::new()
+                            }
+                        };
 
                         let entry = SegmentCatalogEntry {
                             segment_id: seg_id,
                             shard_id: task.shard_id,
                             measurement: task.input_segments[0].measurement.clone(),
-                            path: meta.path.clone(),
+                            file: task.output.clone(),
                             min_timestamp: meta.min_timestamp,
                             max_timestamp: meta.max_timestamp,
                             row_count: meta.row_count,
@@ -1013,6 +1032,7 @@ impl super::Chronix {
             return out;
         }
         let now_ms = super::chrono_timestamp_ms();
+        let segments_dir = self.segments_dir();
         let mut to_unlink: Vec<std::path::PathBuf> = Vec::with_capacity(entries.len());
 
         {
@@ -1060,7 +1080,7 @@ impl super::Chronix {
                             continue;
                         }
                     }
-                    to_unlink.push(entry.path.clone());
+                    to_unlink.push(entry.file.resolve(&segments_dir));
                     out.removed += 1;
                     out.bytes_freed += entry.byte_size;
                 }
@@ -1110,6 +1130,7 @@ impl super::Chronix {
         if entries.is_empty() {
             return 0;
         }
+        let segments_dir = self.segments_dir();
         let mut to_unlink: Vec<std::path::PathBuf> = Vec::with_capacity(entries.len());
         {
             let mut catalog = self.catalog.write();
@@ -1126,7 +1147,7 @@ impl super::Chronix {
                             continue;
                         }
                     }
-                    to_unlink.push(entry.path.clone());
+                    to_unlink.push(entry.file.resolve(&segments_dir));
                 }
                 Ok(())
             });
@@ -1355,8 +1376,19 @@ impl super::Chronix {
     /// Register freshly written segments: catalog entry, metadata cache,
     /// series sidecar, bloom and tag index.
     fn register_flushed(&self, shard_id: ShardId, results: &[FlushResult]) -> Result<()> {
+        let segments_dir = self.segments_dir();
         for result in results {
             let meta = &result.segment_meta;
+            // The writer is handed an absolute path and the catalog stores a
+            // relative one, so this is the one place the two meet. A segment
+            // written outside the segments directory is a bug in the flush
+            // configuration, not a row to record.
+            let segment_file = chronix_core::SegmentFile::from_absolute(&meta.path, &segments_dir)
+                .map_err(|e| {
+                    DbError::Internal(format!(
+                        "flushed segment is not in the segments directory: {e}"
+                    ))
+                })?;
             debug!(
                 shard = %shard_id,
                 measurement = %result.measurement,
@@ -1397,7 +1429,7 @@ impl super::Chronix {
                     segment_id: seg_id,
                     shard_id,
                     measurement: result.measurement.clone(),
-                    path: meta.path.clone(),
+                    file: segment_file,
                     min_timestamp: meta.min_timestamp,
                     max_timestamp: meta.max_timestamp,
                     row_count: meta.row_count,
@@ -1498,5 +1530,21 @@ impl Retired {
     /// bytes have gone yet.
     pub(crate) const fn total(self) -> usize {
         self.removed + self.deferred
+    }
+}
+
+/// The measurement a plan ultimately scans.
+///
+/// `QueryPlan` is a plain enum with no accessors, and every shape wraps a
+/// `Scan` at the bottom, so this walks down to it. An empty name for a plan
+/// that has no scan under it, which no export can produce.
+#[cfg(feature = "field-encryption")]
+fn scan_measurement(plan: &QueryPlan) -> String {
+    match plan {
+        QueryPlan::Scan { measurement, .. } => measurement.clone(),
+        QueryPlan::Limit { source, .. }
+        | QueryPlan::Aggregate { source, .. }
+        | QueryPlan::Downsample { source, .. } => scan_measurement(source),
+        _ => String::new(),
     }
 }

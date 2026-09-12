@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,6 +104,143 @@ pub struct SegmentId(pub u64);
 impl fmt::Display for SegmentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "seg-{}", self.0)
+    }
+}
+
+/// Where a segment's `.csx` file lives, **relative to the `segments/`
+/// directory** — `shard_7/seg_1757…_000003.csx`.
+///
+/// Relative *by construction*, and that is the whole point of the type. The
+/// catalog is the durable record of a database that can be copied — backed
+/// up, restored onto another machine, moved to a bigger disk — and an
+/// absolute path in it names the directory the database was **created** in,
+/// which is the one directory a restored copy is not sitting in.
+///
+/// It used to be a bare `PathBuf` holding the absolute path the flush had
+/// written, and every symptom of that was silent. A restore onto a fresh
+/// directory produced an **empty** database: the open-time sweep that removes
+/// `.csx` files the catalog does not know compared the restored files against
+/// paths naming the original directory, matched none of them, and deleted the
+/// lot. Restoring *beside* a live database was worse — it appeared to work,
+/// because the copy's catalog read the original's files, and then the copy's
+/// first compaction unlinked them.
+///
+/// `resolve()` is the only way back to something openable, so a reader has to
+/// say which database it is reading.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct SegmentFile(PathBuf);
+
+/// Deserialisation validates, which is the whole reason this is a newtype
+/// rather than a convention.
+///
+/// The catalog is `postcard`, which is not self-describing: this field was a
+/// bare `PathBuf` holding an **absolute** path, and the encoding of the two
+/// is byte-identical. So a catalog written before the change would decode
+/// straight back into an absolute `SegmentFile` and reinstate the defect —
+/// silently, and only on the databases that already have one. Rejecting it
+/// here turns that into a refusal to open, which names the file.
+impl<'de> Deserialize<'de> for SegmentFile {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let path = PathBuf::deserialize(d)?;
+        Self::from_relative(path).map_err(serde::de::Error::custom)
+    }
+}
+
+impl SegmentFile {
+    /// The file a shard's segment writer produced.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::InvalidName`] if `name` is empty or carries a path
+    /// separator or a `..` component — a segment name comes from the writer,
+    /// but it also comes back off disk through the manifest, and a catalog
+    /// that can name `../../etc` is a catalog that can be handed a path
+    /// outside the database.
+    pub fn new(shard: ShardId, name: &str) -> Result<Self, SchemaError> {
+        Self::check_component(name)?;
+        Ok(Self(PathBuf::from(format!("shard_{}", shard.0)).join(name)))
+    }
+
+    /// Adopt a path that is already relative to the segments directory.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::InvalidName`] if the path is absolute, empty, or has a
+    /// `..` component.
+    pub fn from_relative(path: impl Into<PathBuf>) -> Result<Self, SchemaError> {
+        let path = path.into();
+        if path.is_absolute() || path.as_os_str().is_empty() {
+            return Err(SchemaError::InvalidName {
+                name: "segment file".to_owned(),
+                reason: format!(
+                    "must be relative to the segments directory: {}",
+                    path.display()
+                ),
+            });
+        }
+        for component in path.components() {
+            match component {
+                std::path::Component::Normal(part) => {
+                    Self::check_component(&part.to_string_lossy())?;
+                }
+                _ => {
+                    return Err(SchemaError::InvalidName {
+                        name: "segment file".to_owned(),
+                        reason: format!("not a plain relative path: {}", path.display()),
+                    })
+                }
+            }
+        }
+        Ok(Self(path))
+    }
+
+    /// Take the path a writer produced and express it under `segments_dir`.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::InvalidName`] if `absolute` is not inside
+    /// `segments_dir`, which would mean the flush wrote outside the database.
+    pub fn from_absolute(absolute: &Path, segments_dir: &Path) -> Result<Self, SchemaError> {
+        let relative =
+            absolute
+                .strip_prefix(segments_dir)
+                .map_err(|_| SchemaError::InvalidName {
+                    name: "segment file".to_owned(),
+                    reason: format!(
+                        "{} is not inside the segments directory {}",
+                        absolute.display(),
+                        segments_dir.display()
+                    ),
+                })?;
+        Self::from_relative(relative)
+    }
+
+    /// The absolute path, for the database rooted at `segments_dir`.
+    #[must_use]
+    pub fn resolve(&self, segments_dir: &Path) -> PathBuf {
+        segments_dir.join(&self.0)
+    }
+
+    /// The path as stored — relative, for logging and for copying.
+    #[must_use]
+    pub fn as_relative(&self) -> &Path {
+        &self.0
+    }
+
+    fn check_component(part: &str) -> Result<(), SchemaError> {
+        if part.is_empty() || part == "." || part == ".." || part.contains(['/', '\\']) {
+            return Err(SchemaError::InvalidName {
+                name: "segment file".to_owned(),
+                reason: format!("invalid path component '{part}'"),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for SegmentFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
     }
 }
 
@@ -1203,9 +1341,20 @@ impl TombstoneSet {
 
 /// A typed WAL record envelope.
 ///
-/// The WAL stores opaque byte payloads. This enum provides a discriminator so
-/// that different record kinds (writes, deletes) can coexist in the same log
-/// and be correctly replayed on crash recovery.
+/// The WAL stores opaque byte payloads; this enum is the discriminator replay
+/// reads them back through.
+///
+/// **There is one variant, and that is the point.** A `Delete` variant used to
+/// sit beside it, carrying the tombstones a delete resolved to — and nothing
+/// depended on it, because the tombstones are written to the **catalog
+/// manifest** first and fsynced there before `execute_delete` returns
+/// (`record_tombstones`), and the manifest is the store a flush never
+/// truncates. Replay folded the WAL copy into a set it had already loaded
+/// from the catalog. Its one documented purpose was to let a point-in-time
+/// restore replay the delete, and point-in-time restore never worked and is
+/// gone; what remained was a second `fsync` on every delete — on flash, the
+/// fsync rate is the wear rate — for a record whose removal no test could
+/// observe.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WalEntry {
@@ -1213,20 +1362,6 @@ pub enum WalEntry {
     Write {
         /// The point to insert.
         point: Point,
-    },
-    /// A delete: the tombstones it produced.
-    ///
-    /// One variant rather than the previous `DeleteSeries` + `DeletePredicate`
-    /// pair. Those carried the *request* — measurement, tag filters, time
-    /// bounds — and replay used none of it except the list of canonical keys,
-    /// which it then reconstructed as unranged tombstones. A ranged delete
-    /// therefore widened into a whole-series delete at the next startup.
-    /// Logging the resolved tombstones instead makes replay exact by
-    /// construction, and there is nothing left for the two shapes to disagree
-    /// about.
-    Delete {
-        /// The tombstones the delete resolved to.
-        tombstones: Vec<Tombstone>,
     },
 }
 
@@ -1988,19 +2123,6 @@ mod proptests {
     }
 
     #[test]
-    fn wal_entry_delete_roundtrip() {
-        let entry = WalEntry::Delete {
-            tombstones: vec![
-                Tombstone::ranged("cpu\0host=srv-1", 100, 200),
-                Tombstone::ranged("cpu\0host=srv-2", i64::MIN, 900).with_segments([7, 8]),
-            ],
-        };
-        let json = serde_json::to_vec(&entry).unwrap();
-        let back: WalEntry = serde_json::from_slice(&json).unwrap();
-        assert_eq!(entry, back);
-    }
-
-    #[test]
     fn a_ranged_tombstone_masks_only_its_range() {
         let t = Tombstone::ranged("cpu\0host=a", 100, 200);
         assert!(!t.matches("cpu\0host=a", 99));
@@ -2081,5 +2203,72 @@ mod proptests {
         );
         // Idempotent: a replayed manifest entry changes nothing.
         assert_eq!(set.extend_to_compaction_output(&[1, 2], 9), 0);
+    }
+}
+
+#[cfg(test)]
+mod segment_file_tests {
+    use super::*;
+
+    #[test]
+    fn a_segment_file_is_relative_to_the_segments_directory() {
+        let f = SegmentFile::new(ShardId(7), "seg_1_000003.csx").unwrap();
+        assert_eq!(f.as_relative(), Path::new("shard_7/seg_1_000003.csx"));
+        assert_eq!(
+            f.resolve(Path::new("/data/segments")),
+            PathBuf::from("/data/segments/shard_7/seg_1_000003.csx")
+        );
+        assert_eq!(f.to_string(), "shard_7/seg_1_000003.csx");
+    }
+
+    #[test]
+    fn a_negative_shard_has_a_name() {
+        // Pre-1970 data shards negative, and `div_euclid` is chosen so that
+        // it does — the file name has to survive it.
+        let f = SegmentFile::new(ShardId(-3), "seg.csx").unwrap();
+        assert_eq!(f.as_relative(), Path::new("shard_-3/seg.csx"));
+    }
+
+    #[test]
+    fn a_name_that_could_escape_the_database_is_refused() {
+        assert!(SegmentFile::new(ShardId(0), "").is_err());
+        assert!(SegmentFile::new(ShardId(0), "..").is_err());
+        assert!(SegmentFile::new(ShardId(0), "a/b.csx").is_err());
+        assert!(SegmentFile::from_relative("../../etc/passwd").is_err());
+        assert!(SegmentFile::from_relative("/etc/passwd").is_err());
+        assert!(SegmentFile::from_relative("").is_err());
+        assert!(SegmentFile::from_relative("shard_1/../../x.csx").is_err());
+    }
+
+    #[test]
+    fn an_absolute_path_from_the_writer_is_made_relative() {
+        let root = Path::new("/data/segments");
+        let f = SegmentFile::from_absolute(Path::new("/data/segments/shard_2/s.csx"), root)
+            .expect("inside the segments directory");
+        assert_eq!(f.as_relative(), Path::new("shard_2/s.csx"));
+        assert!(
+            SegmentFile::from_absolute(Path::new("/elsewhere/s.csx"), root).is_err(),
+            "a flush that wrote outside the database is an error, not a row"
+        );
+    }
+
+    /// The catalog is `postcard`, which is not self-describing, so the old
+    /// absolute `PathBuf` and the new relative one encode identically. A
+    /// catalog carrying an absolute path must fail to load rather than
+    /// decode back into the defect.
+    #[test]
+    fn an_absolute_path_cannot_be_deserialised() {
+        let encoded = postcard::to_stdvec(&PathBuf::from("/data/segments/shard_0/s.csx")).unwrap();
+        assert!(
+            postcard::from_bytes::<SegmentFile>(&encoded).is_err(),
+            "an absolute path must not round-trip into a SegmentFile"
+        );
+
+        let relative = SegmentFile::from_relative("shard_0/s.csx").unwrap();
+        let bytes = postcard::to_stdvec(&relative).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<SegmentFile>(&bytes).unwrap(),
+            relative
+        );
     }
 }

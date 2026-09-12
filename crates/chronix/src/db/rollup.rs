@@ -311,6 +311,22 @@ impl super::Chronix {
 
     /// Aggregate `[from, to)` of a rollup's source into its target.
     fn materialise_range(&self, config: &RollupConfig, from: i64, to: i64) -> Result<usize> {
+        // A rollup reads the source decrypted and writes an aggregate into a
+        // *different* measurement, whose columns are named after the
+        // aggregation (`avg_x`, `last_x`) and are therefore not the declared
+        // encrypted ones — so the aggregate would land in plaintext. Checked
+        // here as well as at `create_rollup`, because a source measurement
+        // can gain an encrypted column after the rollup was created, and
+        // this pass runs unattended.
+        #[cfg(feature = "field-encryption")]
+        {
+            let names = self.column_names_of(&config.source_measurement);
+            self.refuse_encrypted_columns(
+                names.iter().map(String::as_str),
+                &format!("materialising rollup '{}'", config.name),
+            )?;
+        }
+
         /// Rollup points are written in chunks so a long backlog never
         /// sits in memory whole.
         const CHUNK: usize = 8_192;
@@ -355,6 +371,20 @@ impl super::Chronix {
         // is the only safe answer: the watermark then does not advance and
         // retention will not drop the raw data.
         let unordered = acc.saw_unordered_input();
+        // A rollup aggregates numbers, so a string field has no `avg` and is
+        // skipped — which leaves the target quietly narrower than its source.
+        // Said out loud once per pass, because the two times this code was
+        // wrong before (integer columns, then decimal ones) it was wrong in
+        // exactly this way: the column was missing, and nothing said so.
+        let skipped = acc.skipped_columns();
+        if !skipped.is_empty() {
+            warn!(
+                rollup = %config.name,
+                source = %config.source_measurement,
+                columns = %skipped.join(", "),
+                "Rollup skipped non-numeric field column(s): the target has no aggregate for them"
+            );
+        }
         pending.extend(acc.finish());
         if !pending.is_empty() {
             written += self.backfill(&pending)?.into_complete()?;
@@ -494,6 +524,18 @@ impl super::Chronix {
                 "a rollup's source and target must differ".into(),
             ));
         }
+        // Fast feedback: the same rule the materialiser enforces, at the
+        // moment somebody asks for the rollup rather than hours later in a
+        // background pass.
+        #[cfg(feature = "field-encryption")]
+        {
+            let names = self.column_names_of(&config.source_measurement);
+            self.refuse_encrypted_columns(
+                names.iter().map(String::as_str),
+                &format!("a rollup over '{}'", config.source_measurement),
+            )?;
+        }
+
         let name = config.name.clone();
         let bytes = postcard::to_stdvec(&config)
             .map_err(|e| DbError::Internal(format!("encoding rollup: {e}")))?;

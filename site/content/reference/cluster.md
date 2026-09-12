@@ -73,7 +73,7 @@ linearizable metadata replication:
 
 #### Snapshot & Recovery
 
-State snapshots use `bincode` serialization. On restore, the routing table is
+State snapshots use postcard serialization. On restore, the routing table is
 rebuilt from the deserialized state. The snapshot includes all schemas, nodes,
 regions, models, and cluster configuration.
 

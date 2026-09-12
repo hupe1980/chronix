@@ -509,7 +509,7 @@ Two: `log` and `webhook('https://…')`. Anything else — `nats(…)`, `mqtt(�
 Each webhook URL is its own channel, so two triggers can deliver to two
 endpoints. Every delivery is a CloudEvents envelope, signed per the
 [Standard Webhooks](https://www.standardwebhooks.com) `v1` scheme with
-`triggers.webhook_signing_secret`; without it configured, `DELIVER webhook(…)`
+`triggers.webhook_signing_secrets`; with none configured, `DELIVER webhook(…)`
 is refused at creation. The URL must be `https`, carry no userinfo, and name
 neither an internal host nor a non-routable address — see
 [Webhook URL SSRF Protection](/docs/security/#webhook-url-ssrf-protection).
@@ -1387,9 +1387,30 @@ POST /api/v1/admin/backup
 **Request Body:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `target_dir` | string | Absolute path to the backup target directory |
+| `target_dir` | string | Backup target directory, resolved inside `backup_root` |
 
-**Response:** `200 OK` — Returns `BackupManifest` with `version`, `created_at`, `wal_sequence`, `file_count`, `total_bytes`.
+**Response:** `200 OK` — a `BackupManifest` with `version`, `created_at`,
+`wal_sequence`, `segments`, `file_count` and `total_bytes`.
+
+The backup is a checkpoint taken after a flush: every write acknowledged
+before the request is in it, and one accepted while it runs is not. Backing
+up into a directory that already holds a checkpoint replaces it.
+
+#### Verify a Backup
+
+```
+POST /api/v1/admin/backup/verify
+```
+
+**Request Body:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `backup_dir` | string | Backup directory, resolved inside `backup_root` |
+
+**Response:** `200 OK` — the backup's `BackupManifest`.
+
+**Errors:** `400` if the directory is not a backup, the manifest is corrupt,
+or a segment is missing or the wrong size, with the file named. Reads only.
 
 #### Restore from Backup
 
@@ -1400,10 +1421,15 @@ POST /api/v1/admin/restore
 **Request Body:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `backup_dir` | string | Absolute path to the backup source directory |
-| `target_dir` | string | Absolute path to the restore target directory |
+| `backup_dir` | string | Backup source directory, resolved inside `backup_root` |
+| `target_dir` | string | Restore target directory; must not exist |
 
-**Response:** `200 OK` — Returns `BackupManifest`.
+**Response:** `200 OK` — the backup's `BackupManifest`.
+
+**Errors:** `400` if the target exists, the manifest is missing or corrupt,
+or the backup is incomplete — every segment its catalog names is checked for
+presence and size before anything is copied. The restored directory is a
+complete database that can be opened on any machine.
 
 ---
 

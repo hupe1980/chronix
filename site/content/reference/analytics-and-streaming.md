@@ -79,8 +79,9 @@ SQL Query                    Rust API
 | SARIMA | + (P,D,Q,m) seasonal | O(d+D·m) | Seasonal undiff |
 | Linear Regression | slope, intercept, R² | O(1) Welford | SE widening |
 
-All models implement `ForecastModel` trait for uniform dispatch and support
-serialization via `serde` + `bincode`.
+All models implement the `ForecastModel` trait for uniform dispatch and
+derive `serde`, so a caller persists them in whatever format it already uses;
+chronix uses postcard.
 
 **Auto ARIMA order selection** – `auto_arima()` takes the differencing order
 `d` from a KPSS level-stationarity test, then ranks `(p, q)` at that fixed `d`
@@ -318,7 +319,7 @@ slice is the whole population rather than a sample.
 
 **Statistical correctness**: The two-sample KS test uses proper ECDF computation
 (advance pointer, then compute CDFs) for accurate statistic calculation. PSI
-`bin_counts` filters NaN values before binning to prevent silent skew. All
+`bin_counts_by_edges` filters NaN values before binning to prevent silent skew. All
 A/B test promotion criteria (`LowerMape`, `LowerRmse`, `LowerBoth`) guard
 against NaN metrics to avoid permanent block/pass states.
 

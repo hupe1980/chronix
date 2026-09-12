@@ -44,11 +44,10 @@ catalog/
 - **Periodic snapshots** — After every 1000 manifest entries, a full snapshot is
   written atomically (write to `.tmp` then rename). On recovery, the snapshot is
   loaded first, then any manifest entries written after it are replayed.
-- **Binary format** — The manifest WAL uses length-prefixed bincode with CRC32c
-  integrity checksums instead of JSON Lines. Each entry is framed as
-  `[u32 length][bincode payload][u32 CRC32c]`. Snapshots use bincode format
-  (`.bin`), with legacy JSON fallback for migration. Binary format provides
-  ~10× faster serialization and ~3× smaller output vs JSON.
+- **Binary format** — The manifest WAL is length-prefixed postcard with
+  CRC-32C integrity checksums. Each entry is framed as
+  `[u32 length][postcard payload][u32 CRC32c]`; snapshots are postcard in
+  `manifest.snapshot.bin`.
 - **`SegmentMeta`** — Stored per segment: `segment_id`, `shard_id`,
   `measurement`, `min_ts`, `max_ts`, `row_count`, `size_bytes`, `created_at`,
   plus an optional `schema` (`MeasurementSchema`)

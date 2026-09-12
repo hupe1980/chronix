@@ -387,6 +387,82 @@ impl Chronix {
         &self.config.data_dir
     }
 
+    /// Refuse to write an encrypted column's plaintext outside the segment
+    /// format.
+    ///
+    /// Three paths take a decrypted `RecordBatch` and write it elsewhere —
+    /// the Parquet export, the cold archive, and a rollup's materialised
+    /// aggregate — where the segment's protection does not reach. Each calls
+    /// this first.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::InvalidRequest`] naming the first encrypted column found.
+    #[cfg(feature = "field-encryption")]
+    pub(crate) fn refuse_encrypted_columns<'a>(
+        &self,
+        columns: impl IntoIterator<Item = &'a str>,
+        operation: &str,
+    ) -> Result<()> {
+        if self.field_encryption.is_none() {
+            return Ok(());
+        }
+        for column in columns {
+            if self.config.field_encryption.covers(column) {
+                return Err(DbError::InvalidRequest(format!(
+                    "{operation} would write column '{column}' in plaintext, and it is \
+                     declared encrypted. An encrypted column does not leave the segment \
+                     format: project it away, or drop the declaration if this data does not \
+                     need it"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The columns of `measurement`, or an empty list if it is unknown.
+    #[cfg(feature = "field-encryption")]
+    pub(crate) fn column_names_of(&self, measurement: &str) -> Vec<String> {
+        self.schema(measurement)
+            .map(|s| s.columns().iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Open a segment for reading, with this database's decryption keys.
+    ///
+    /// **The only way a read path opens a segment.** A `SegmentReader` with
+    /// no key provider fails loudly on an encrypted column rather than
+    /// returning ciphertext — which is the right default and a bad thing to
+    /// reach by forgetting, because whether it fires depends on which of
+    /// seven call sites a query happened to take. One function, so a reader
+    /// added tomorrow cannot forget.
+    pub(crate) fn open_segment(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<
+        chronix_engine::segment::SegmentReader,
+        chronix_engine::segment::SegmentError,
+    > {
+        #[allow(unused_mut)]
+        let mut reader = chronix_engine::segment::SegmentReader::open(path)?;
+        #[cfg(feature = "field-encryption")]
+        if let Some(enc) = &self.field_encryption {
+            reader.set_key_provider(std::sync::Arc::clone(&enc.reader));
+        }
+        Ok(reader)
+    }
+
+    /// Where this database's segment files live.
+    ///
+    /// Every [`SegmentFile`](chronix_core::SegmentFile) in the catalog is
+    /// relative to this, so a reader that wants to open one resolves it here
+    /// — which is the whole reason the catalog no longer stores an absolute
+    /// path.
+    #[must_use]
+    pub(crate) fn segments_dir(&self) -> std::path::PathBuf {
+        super::segments_dir_of(&self.config.data_dir)
+    }
+
     /// Number of WAL records `open()` replayed into the memtable.
     ///
     /// Zero after a graceful `close()`: everything acknowledged was already
@@ -415,23 +491,42 @@ impl Chronix {
         &self.tag_index
     }
 
-    /// Return all distinct tag key names present in the index.
+    /// Every distinct tag key this database holds.
     ///
-    /// This is an O(n) scan over the inverted index keys, but cheap
-    /// because the index already partitions entries by `"key=value"`.
-    /// Results are sorted alphabetically.
+    /// **Both halves.** The inverted index is built at flush, so it knows
+    /// only the segments on disk; a series written a second ago is in no
+    /// segment and therefore in no index. Answering from the index alone —
+    /// which this did — meant a freshly started gateway reported *no labels
+    /// at all* until its first flush, and a tag that only ever appears in
+    /// recent data was permanently invisible. The server's `/labels` never
+    /// had the bug because it scans; this is the embedded answer to the same
+    /// question, and the two must agree.
+    ///
+    /// Sorted, and deduplicated across the two sources.
     #[must_use]
     pub fn tag_keys(&self) -> Vec<String> {
-        self.tag_index.all_keys()
+        let mut keys: std::collections::BTreeSet<String> =
+            self.tag_index.all_keys().into_iter().collect();
+        for (key, _) in self.shards.live_tag_pairs() {
+            keys.insert(key);
+        }
+        keys.into_iter().collect()
     }
 
-    /// Return all distinct values for a given tag key.
+    /// Every distinct value of `key` this database holds.
     ///
-    /// This scans the inverted index for entries matching `"key="` prefix
-    /// and collects the unique values. Results are sorted alphabetically.
+    /// Segments and memtables both, for the reason in
+    /// [`tag_keys`](Self::tag_keys). Sorted.
     #[must_use]
     pub fn tag_values(&self, key: &str) -> Vec<String> {
-        self.tag_index.values_for_key(key)
+        let mut values: std::collections::BTreeSet<String> =
+            self.tag_index.values_for_key(key).into_iter().collect();
+        for (k, value) in self.shards.live_tag_pairs() {
+            if k == key {
+                values.insert(value);
+            }
+        }
+        values.into_iter().collect()
     }
 
     /// Access the underlying CDC event bus.

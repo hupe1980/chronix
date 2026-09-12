@@ -61,15 +61,27 @@ are stored in contiguous, aligned arrays. The compute kernels in
 
 ## Kernel Catalog
 
-| Kernel | Operation | SIMD? | Complexity |
-|--------|-----------|-------|------------|
-| `sum_f64` | Sum float array | ✓ | O(n/k) |
-| `min_max_f64` | Min and max | ✓ | O(n/k) |
-| `filter_range` | Time range filter | ✓ | O(n/k) |
-| `dot_product` | Correlation helper | ✓ | O(n/k) |
-| `xor_encode` | Gorilla encoding | Partial | O(n) |
-| `delta_encode` | Timestamp encoding | ✓ | O(n/k) |
-| `z_score` | Anomaly score | ✓ | O(n/k) |
+`chronix_analytics::compute::simd`, all over `&[f64]` or `&[i64]` with a
+scalar fallback:
+
+| Kernel | Operation |
+|--------|-----------|
+| `simd_sum` | Sum |
+| `simd_mean` | Arithmetic mean |
+| `simd_variance` | Variance about a supplied mean (sample, `n − 1`) |
+| `simd_population_variance` | Variance about a supplied mean (`n`) |
+| `simd_mean_variance` | Both, in one pass |
+| `simd_std_dev` | Standard deviation |
+| `simd_min_max` | Minimum and maximum, in one pass |
+| `simd_range_filter_i64` | Indices of timestamps inside `[min, max]` |
+| `simd_dot_product` | Dot product — the correlation and regression helper |
+| `simd_tier` | Which instruction set was selected at runtime |
+
+`CpuEngine::batch_z_score` sits above them: one `simd_mean_variance` pass over
+the whole input, then the per-element score.
+
+The column codecs — Gorilla's XOR, delta-of-delta, PFOR — live in
+`chronix-encoding`, not here.
 
 ## Why there is no GPU backend
 

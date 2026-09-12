@@ -674,6 +674,17 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
     paths = paths.path(
+        "/api/v1/admin/backup/verify",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Verify a backup without restoring it"))
+                .response("200", ok_json("Backup manifest", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
         "/api/v1/admin/restore",
         PathItem::new(
             HttpMethod::Post,
@@ -977,7 +988,7 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
 
-    // ── Admin: keys, models, PITR ──────────────────────────────────
+    // ── Admin: keys and models ─────────────────────────────────────
     paths = paths.path(
         "/api/v1/admin/auth/keys",
         PathItem::new(
@@ -1033,18 +1044,6 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 .build(),
         ),
     );
-    paths = paths.path(
-        "/api/v1/admin/restore/pitr",
-        PathItem::new(
-            HttpMethod::Post,
-            OperationBuilder::new()
-                .tag("Admin")
-                .summary(Some("Point-in-time restore"))
-                .response("200", ok_json("Restore result", obj_schema()))
-                .build(),
-        ),
-    );
-
     // ── Aliases ────────────────────────────────────────────────────
     //
     // A client derives these rather than being told them: a Prometheus

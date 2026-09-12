@@ -8,6 +8,8 @@ mod accessors;
 mod analytics_api;
 mod backup;
 mod delete;
+#[cfg(feature = "field-encryption")]
+mod encryption;
 pub(crate) mod leases;
 mod lifecycle;
 mod query;
@@ -46,18 +48,31 @@ use chronix_streaming::cdc::EventBus;
 use crate::error::{DbError, Result};
 use crate::rollup::RollupRegistry;
 
-/// Metadata written to `backup_manifest.json` when a backup completes.
+/// Metadata written to `backup_manifest.json` when a checkpoint completes.
+///
+/// Its presence is what makes a directory a backup: it is written last, so an
+/// interrupted checkpoint produces a directory [`Chronix::restore`] refuses.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupManifest {
     /// Manifest format version.
     pub version: u32,
-    /// Unix-millisecond timestamp when the backup was created.
+    /// Unix-millisecond timestamp when the checkpoint was taken.
     pub created_at: u64,
-    /// WAL sequence at the time of backup.
+    /// The database's WAL sequence at the checkpoint point.
+    ///
+    /// Informational: the checkpoint carries no WAL, because it is taken
+    /// after a flush. It names the moment, for an operator comparing two
+    /// backups of one database.
     pub wal_sequence: u64,
-    /// Number of files copied.
+    /// How many segments the checkpoint's catalog names.
+    ///
+    /// The number a restore verifies against, and the only one of these three
+    /// that describes the *database* rather than the copy: `file_count`
+    /// counts sidecars too, and a sidecar is derived data.
+    pub segments: u64,
+    /// Number of files placed — segments plus the sidecars that existed.
     pub file_count: usize,
-    /// Total bytes copied.
+    /// Total bytes those files hold.
     pub total_bytes: u64,
 }
 
@@ -322,6 +337,13 @@ pub struct DbInner {
     pub(super) compaction_running: AtomicBool,
     /// Number of WAL records replayed by `open()`.
     pub(super) replayed_records: usize,
+    /// Resolved per-column encryption, or `None` where nothing is declared.
+    ///
+    /// Resolved once at `open()` — the keys are read from the environment
+    /// there and nowhere else, so a missing variable is a startup failure
+    /// rather than a column that quietly writes plaintext.
+    #[cfg(feature = "field-encryption")]
+    pub(super) field_encryption: Option<encryption::ResolvedFieldEncryption>,
     /// The DataFusion session behind [`Chronix::sql`], built on first use
     /// and rebuilt when a UDF is registered.
     #[cfg(feature = "sql")]
@@ -338,6 +360,27 @@ impl std::fmt::Debug for Chronix {
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
+}
+
+/// The three directories a chronix data directory is made of.
+///
+/// One definition each, because `backup()` has to name them too and a second
+/// spelling is a second thing to keep in step.
+#[must_use]
+pub(crate) fn wal_dir_of(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("wal")
+}
+
+/// See [`wal_dir_of`].
+#[must_use]
+pub(crate) fn segments_dir_of(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("segments")
+}
+
+/// See [`wal_dir_of`].
+#[must_use]
+pub(crate) fn catalog_dir_of(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("catalog")
 }
 
 impl Chronix {
@@ -388,9 +431,9 @@ impl Chronix {
         info!(data_dir = %data_dir.display(), "Opening Chronix database");
 
         // Ensure sub-directories exist
-        let wal_dir = data_dir.join("wal");
-        let segments_dir = data_dir.join("segments");
-        let catalog_dir = data_dir.join("catalog");
+        let wal_dir = wal_dir_of(data_dir);
+        let segments_dir = segments_dir_of(data_dir);
+        let catalog_dir = catalog_dir_of(data_dir);
         std::fs::create_dir_all(&wal_dir)?;
         std::fs::create_dir_all(&segments_dir)?;
         std::fs::create_dir_all(&catalog_dir)?;
@@ -404,11 +447,13 @@ impl Chronix {
         // has to descend one level: it used to list only the top directory,
         // which holds nothing but those subdirectories, and removed nothing.
         Self::remove_orphaned_segments(&segments_dir, &catalog);
+        Self::refuse_dangling_entries(&segments_dir, &catalog)?;
 
         // Rebuild the indexes and the series set from the catalog and the
         // per-segment series sidecars — no segment is decoded here.
         let namespace_measurements;
-        let (blooms, tag_index, mut known_series) = Self::load_catalog_state(&catalog);
+        let (blooms, tag_index, mut known_series) =
+            Self::load_catalog_state(&catalog, &segments_dir);
 
         // Open WAL
         let wal = WalWriter::open(&wal_dir, config.wal.clone())?;
@@ -437,6 +482,12 @@ impl Chronix {
             }
         }
 
+        // Resolve the field-encryption declaration before anything is
+        // written: a key that cannot be read has to stop the open, not the
+        // first flush.
+        #[cfg(feature = "field-encryption")]
+        let field_encryption = encryption::resolve(&config.field_encryption)?;
+
         // Set up shard router
         let flush_cfg = FlushConfig {
             flush_threshold: config.memtable_flush_threshold,
@@ -450,6 +501,11 @@ impl Chronix {
                 zstd_level: config.zstd_level,
                 zstd_dict_training: config.zstd_dict_training,
                 column_codec_overrides: std::collections::HashMap::new(),
+                #[cfg(feature = "field-encryption")]
+                field_encryption: field_encryption
+                    .as_ref()
+                    .map(|e| e.writer.clone())
+                    .unwrap_or_default(),
                 ..Default::default()
             },
             ..Default::default()
@@ -471,9 +527,13 @@ impl Chronix {
         let replayed_count = wal_records.len();
         let mut replay_series: HashSet<String> = HashSet::new();
 
-        // Tombstones come from the catalog, not from the WAL: the manifest is
-        // their durable record and is written before the WAL entry.
-        let mut replay_tombstones = catalog.tombstones().clone();
+        // Tombstones come from the catalog, which is their only durable
+        // record — and the only place they have ever needed to come from.
+        // A delete used to write a WAL record too; it could not be reached,
+        // because `execute_delete` flushes first, so every point a tombstone
+        // covers is already in a segment and below the floor this replay
+        // starts after.
+        let replay_tombstones = catalog.tombstones().clone();
         for record in wal_records {
             // A record may contain a single WAL entry OR an atomic batch.
             // Decode batch framing first; if absent, treat as single entry.
@@ -489,11 +549,6 @@ impl Chronix {
                         replay_series.insert(point.series_key().canonical_form().to_string());
                         if let Err(e) = shards.insert_replay(&point, record.sequence_no) {
                             warn!(seq = record.sequence_no, error = %e, "Skipping WAL record during replay");
-                        }
-                    }
-                    Ok(WalEntry::Delete { tombstones }) => {
-                        for tombstone in tombstones {
-                            replay_tombstones.insert(tombstone);
                         }
                     }
                     Err(e) => {
@@ -616,6 +671,8 @@ impl Chronix {
                 custom_udafs: Arc::new(parking_lot::RwLock::new(Vec::new())),
                 compaction_running: AtomicBool::new(false),
                 replayed_records: replayed_count,
+                #[cfg(feature = "field-encryption")]
+                field_encryption,
                 #[cfg(feature = "sql")]
                 sql_ctx: parking_lot::RwLock::new(None),
                 #[cfg(feature = "sql")]
@@ -632,13 +689,43 @@ impl Chronix {
         Ok(db)
     }
 
+    /// Refuse to open a catalog that names a segment file which is not there.
+    ///
+    /// The reverse of [`remove_orphaned_segments`](Self::remove_orphaned_segments),
+    /// and it cannot happen to a database that was only ever written to: a
+    /// retirement removes the catalog entry **durably first** and unlinks the
+    /// file afterwards, so a crash leaves an orphan file, never a dangling
+    /// entry. It happens to a database that was *copied* — a backup that
+    /// missed a segment, an `rsync` of a live directory, a half-finished
+    /// restore — which is exactly when nobody has a second copy and the
+    /// symptom would otherwise be a query failing days later with
+    /// `No such file or directory`.
+    fn refuse_dangling_entries(segments_dir: &Path, catalog: &SegmentCatalog) -> Result<()> {
+        let missing: Vec<String> = catalog
+            .all_segments()
+            .iter()
+            .filter(|e| !e.file.resolve(segments_dir).exists())
+            .map(|e| e.file.to_string())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(DbError::Internal(format!(
+            "the catalog names {} segment file(s) that are not in {}: {} — \
+             this data directory is incomplete, not merely stale",
+            missing.len(),
+            segments_dir.display(),
+            missing.join(", "),
+        )))
+    }
+
     /// Remove `.csx` files (and their sidecars) under `segments_dir` that
     /// the catalog does not know, one shard directory deep.
     fn remove_orphaned_segments(segments_dir: &Path, catalog: &SegmentCatalog) {
         let known_paths: std::collections::HashSet<std::path::PathBuf> = catalog
             .all_segments()
             .iter()
-            .map(|e| e.path.clone())
+            .map(|e| e.file.resolve(segments_dir))
             .collect();
         let Ok(shards) = std::fs::read_dir(segments_dir) else {
             return;
@@ -2153,7 +2240,7 @@ mod tests {
             cat.segments_for_measurement("cpu")
                 .iter()
                 .filter(|e| e.state != SegmentState::Active)
-                .map(|e| e.path.clone())
+                .map(|e| e.file.resolve(&db.segments_dir()))
                 .collect()
         };
         for path in &soft_deleted_paths {

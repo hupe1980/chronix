@@ -1802,31 +1802,6 @@ fn restore_rejects_existing_target() {
     assert!(result.is_err(), "restore should reject existing target dir");
 }
 
-// ── PITR (Point-in-Time Recovery) ──────────────────────────────────
-
-#[test]
-fn pitr_restore_at_backup_sequence() {
-    let tmp = TempDir::new().unwrap();
-    let data_dir = tmp.path().join("data");
-    let backup_dir = tmp.path().join("backup");
-    let restore_dir = tmp.path().join("restored");
-
-    let db = Chronix::open(default_config(&data_dir)).unwrap();
-    for i in 0..20 {
-        db.insert(&cpu_point("h", i * 1000, i as f64)).unwrap();
-    }
-    db.flush().unwrap();
-
-    let manifest = db.backup(&backup_dir).unwrap();
-    db.close().unwrap();
-
-    // PITR at exact backup sequence = no WAL replay needed
-    let (restored, replayed) =
-        Chronix::restore_pitr(&backup_dir, &restore_dir, manifest.wal_sequence, None).unwrap();
-    assert_eq!(replayed, 0, "no WAL replay needed at exact backup sequence");
-    assert_eq!(restored.wal_sequence, manifest.wal_sequence);
-}
-
 // ── Parquet Export ──────────────────────────────────────────────────
 
 #[test]
@@ -2174,38 +2149,6 @@ fn predicate_delete_removes_matching_series() {
         30,
         "unrelated measurement should be intact"
     );
-
-    db.close().unwrap();
-}
-
-// ── WAL Archiving ──────────────────────────────────────────────────
-
-#[test]
-fn wal_archive_copies_files() {
-    let tmp = TempDir::new().unwrap();
-    let archive_dir = tmp.path().join("wal_archive");
-
-    let db = Chronix::open(default_config(tmp.path())).unwrap();
-
-    // Write some data so the WAL has entries
-    for i in 0..50 {
-        db.insert(&cpu_point("h", i * 1000, i as f64)).unwrap();
-    }
-    // Flush to advance the WAL sequence and allow archiving of older files
-    db.flush().unwrap();
-
-    let current_seq = db.wal_sequence();
-    assert!(current_seq > 0, "WAL sequence should advance after writes");
-
-    // Archive WAL files before the current sequence.
-    // With default WAL settings there may be only one WAL file, so
-    // `archive_before` may return 0 (it never archives the active file).
-    let archived = db.wal().archive_before(current_seq, &archive_dir).unwrap();
-
-    // If any files were archived, verify the archive dir was created
-    if archived > 0 {
-        assert!(archive_dir.exists(), "archive directory should exist");
-    }
 
     db.close().unwrap();
 }
