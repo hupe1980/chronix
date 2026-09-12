@@ -87,8 +87,9 @@ on and false in the default build.
 
 ## Code Style
 
-- Run `cargo fmt --all` before committing. CI enforces `rustfmt` with the
-  project's [rustfmt.toml](rustfmt.toml).
+- Run `cargo fmt --all` before committing, and `cargo fmt --all --check` to
+  confirm — `--all` alone reformats and succeeds, so it says nothing about
+  the edit you made after it. CI runs `--check`, and so does preflight.
 - Run `cargo clippy --all-targets -- -D warnings` and fix all
   warnings. CI treats Clippy warnings as errors.
 - Follow the existing naming conventions in the crate you're modifying.
