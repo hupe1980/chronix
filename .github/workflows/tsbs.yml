@@ -1,0 +1,183 @@
+# TSBS — the Time Series Benchmark Suite, run by hand.
+#
+# The throughput figures in the README are measured against this project's
+# own benches, which is not evidence a reader can weigh against another
+# database. This runs the industry's load benchmark instead, and — the part
+# that makes the number mean something — loads the *same generated dataset*
+# into InfluxDB on the *same runner* in the same job.
+#
+# **The ratio is the result, not the absolute.** A GitHub runner is shared,
+# virtualised and noisy; run-to-run variance is large, and published TSBS
+# figures come from dedicated instances. Quoting points/sec from here beside
+# a vendor's number would be the same category error the README is trying to
+# fix. Quote "N times InfluxDB on identical hardware, re-runnable by pressing
+# this button" instead.
+#
+# Load only. `tsbs_run_queries_influx` speaks InfluxQL against `/query`, and
+# chronix speaks PromQL and SQL — there is no query half until someone writes
+# a chronix query runner.
+name: TSBS
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Hosts to simulate (TSBS --scale)"
+        default: "100"
+      days:
+        description: "Days of data to generate"
+        default: "3"
+      log_interval:
+        description: "Reading interval (TSBS --log-interval)"
+        default: "10s"
+      workers:
+        description: "Concurrent loading clients"
+        default: "8"
+      batch_size:
+        description: "Readings per insert"
+        default: "10000"
+      compare_influx:
+        description: "Also load InfluxDB 1.8 for a same-runner ratio"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to a commit: a benchmark whose tool moves under it is not a
+  # series, and the TSBS repository publishes no tags to pin to.
+  # 8323e59, 2026-05-27.
+  TSBS_REF: "8323e59c74027b108f4ad5ec5d3e498b0101a02e"
+
+jobs:
+  tsbs:
+    name: Load benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-disk-space
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build chronixd (release)
+        run: cargo build --release -p chronixd
+
+      - name: Build the TSBS tools
+        run: |
+          set -euo pipefail
+          go install "github.com/timescale/tsbs/cmd/tsbs_generate_data@${TSBS_REF}"
+          go install "github.com/timescale/tsbs/cmd/tsbs_load_influx@${TSBS_REF}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate the dataset
+        run: |
+          set -euo pipefail
+          END=$(date -u -d "2016-01-01T00:00:00Z + ${{ inputs.days }} days" +%Y-%m-%dT%H:%M:%SZ)
+          echo "generating scale=${{ inputs.scale }} through $END"
+          tsbs_generate_data \
+            --use-case="cpu-only" \
+            --seed=123 \
+            --scale="${{ inputs.scale }}" \
+            --timestamp-start="2016-01-01T00:00:00Z" \
+            --timestamp-end="$END" \
+            --log-interval="${{ inputs.log_interval }}" \
+            --format="influx" \
+            | gzip > /tmp/influx-data.gz
+          ls -lh /tmp/influx-data.gz
+
+      # chronix takes the InfluxDB line protocol at the paths Telegraf posts
+      # to and answers 204, which is what this loader checks for. It has no
+      # InfluxQL `/query`, so database creation is skipped — chronix has one
+      # database per process and scopes by namespace.
+      - name: Load chronix
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/chronix-data
+          ./target/release/chronixd --data-dir /tmp/chronix-data --bind 127.0.0.1:8086 \
+            > /tmp/chronixd.log 2>&1 &
+          echo $! > /tmp/chronixd.pid
+          until curl -sf http://127.0.0.1:8086/health >/dev/null; do sleep 1; done
+
+          gunzip -c /tmp/influx-data.gz | tsbs_load_influx \
+            --urls="http://127.0.0.1:8086" \
+            --db-name="benchmark" \
+            --workers="${{ inputs.workers }}" \
+            --batch-size="${{ inputs.batch_size }}" \
+            --do-create-db=false \
+            | tee /tmp/chronix-load.txt
+
+          kill "$(cat /tmp/chronixd.pid)" || true
+          du -sh /tmp/chronix-data
+
+      - name: Load InfluxDB 1.8 on the same runner
+        if: ${{ inputs.compare_influx }}
+        run: |
+          set -euo pipefail
+          docker run -d --name influx -p 8087:8086 \
+            -e INFLUXDB_HTTP_AUTH_ENABLED=false \
+            -e INFLUXDB_REPORTING_DISABLED=true \
+            influxdb:1.8
+          until curl -sf http://127.0.0.1:8087/ping >/dev/null; do sleep 1; done
+
+          gunzip -c /tmp/influx-data.gz | tsbs_load_influx \
+            --urls="http://127.0.0.1:8087" \
+            --db-name="benchmark" \
+            --workers="${{ inputs.workers }}" \
+            --batch-size="${{ inputs.batch_size }}" \
+            | tee /tmp/influx-load.txt
+
+          docker logs influx > /tmp/influx-server.log 2>&1 || true
+          docker rm -f influx || true
+
+      - name: Summarise
+        if: always()
+        run: |
+          set -uo pipefail
+          # TSBS prints thousands separators — "mean rate 201,807.42
+          # metrics/sec" — so the digit class has to include the comma or
+          # the summary quietly reports 807.42. The raw output is included
+          # below whatever this extracts, so a bad parse stays visible.
+          rate() {
+            grep -oE "[0-9][0-9,.]* (metrics|rows|values)/sec" "$1" 2>/dev/null \
+              | tail -1 || true
+          }
+          show() { r=$(rate "$1"); echo "${r:-unparsed — see raw output}"; }
+          {
+            echo "## TSBS load — scale ${{ inputs.scale }}, ${{ inputs.days }} days, ${{ inputs.workers }} workers"
+            echo
+            echo "| Target | Mean load rate |"
+            echo "|---|---|"
+            echo "| chronix | $(show /tmp/chronix-load.txt) |"
+            if [ -f /tmp/influx-load.txt ]; then
+              echo "| InfluxDB 1.8 | $(show /tmp/influx-load.txt) |"
+            fi
+            echo
+            echo "Both loaded the same generated dataset on this runner, in this job."
+            echo "**The ratio is the result.** A shared runner's absolute throughput is"
+            echo "not comparable to figures published from dedicated instances."
+            echo
+            for t in chronix influx; do
+              f="/tmp/${t}-load.txt"
+              [ -f "$f" ] || continue
+              echo "<details><summary>${t} loader output</summary>"
+              echo; echo '```'; cat "$f"; echo '```'
+              echo "</details>"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tsbs-results
+          path: |
+            /tmp/chronix-load.txt
+            /tmp/influx-load.txt
+            /tmp/chronixd.log
+            /tmp/influx-server.log
+          if-no-files-found: warn

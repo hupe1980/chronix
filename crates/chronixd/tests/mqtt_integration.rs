@@ -402,10 +402,16 @@ async fn mqtt_decode_error_resilience() {
         .await
         .expect("publish valid 2");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // **Wait for what is asserted, not for a proxy.** `messages_total` counts
+    // a record when the loop *sees* it; `points_total` counts it when the
+    // batch insert has returned. Breaking on the first and asserting the
+    // second stops the consumer in the window between them — which is how
+    // this failed in CI with `points_total == 0` after the decode error had
+    // already been logged.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let m = subscriber.metrics().await;
-        if m.messages_total >= 3 {
+        if m.points_total >= 2 && m.decode_errors >= 1 {
             break;
         }
         if tokio::time::Instant::now() > deadline {

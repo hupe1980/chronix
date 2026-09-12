@@ -225,7 +225,11 @@ mod consumer_impl {
     const SETUP_BACKOFF_MAX: Duration = Duration::from_secs(30);
     /// Consecutive setup failures after which the status names the error
     /// rather than saying "reconnecting". Retrying continues either way.
-    const SETUP_ATTEMPTS_BEFORE_FAILED: u32 = 5;
+    ///
+    /// Eight is about thirty seconds of continuous failure, given the
+    /// backoff below. Five was under eight, which a broker still
+    /// electing a coordinator can spend without anything being wrong.
+    const SETUP_ATTEMPTS_BEFORE_FAILED: u32 = 8;
     /// Consecutive empty polls after which a connected consumer reports
     /// `Idle` rather than `Running`: connected, and nothing arriving.
     const EMPTY_POLLS_BEFORE_IDLE: u32 = 30;

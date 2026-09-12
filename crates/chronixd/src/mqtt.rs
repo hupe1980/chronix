@@ -254,7 +254,11 @@ mod subscriber_impl {
     const SUBSCRIBE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
     /// Consecutive subscribe failures after which the status names the
     /// error rather than saying "reconnecting". Retrying continues.
-    const SUBSCRIBE_ATTEMPTS_BEFORE_FAILED: u32 = 5;
+    ///
+    /// Eight is about thirty seconds of continuous failure, given the
+    /// backoff below — long enough not to fire while a broker that is
+    /// still starting up refuses.
+    const SUBSCRIBE_ATTEMPTS_BEFORE_FAILED: u32 = 8;
     use rumqttc::{AsyncClient, MqttOptions, QoS};
     use tracing::{debug, error, warn};
 

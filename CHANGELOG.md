@@ -35,6 +35,12 @@ and no migration tooling for the on-disk format.
   each produced to a topic nothing had created, and a KRaft broker resolves
   the metadata request that triggers auto-creation *after* it answers the
   produce. They now create their topics through `AdminClient::create_topics`.
+- **A TSBS load benchmark, run by hand** — `.github/workflows/tsbs.yml`,
+  `workflow_dispatch`. It generates one dataset with the industry's suite and
+  loads it into chronix *and* InfluxDB 1.8 on the same runner in the same
+  job, because a shared runner's absolute throughput is not comparable to
+  figures published from dedicated instances — the ratio is the result. Load
+  only: `tsbs_run_queries_influx` speaks InfluxQL, which chronix does not.
 - **`scripts/preflight.sh` runs what CI gates on in one command** — lints,
   rustdoc, the guards and both the default and feature test builds
   (`--quick`), plus the examples and the frozen tier without it. CONTRIBUTING
