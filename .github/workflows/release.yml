@@ -122,6 +122,19 @@ jobs:
           sys.exit(1 if missing else 0)
           EOF
 
+      # The order below is the contract: cargo resolves each crate's
+      # dependencies against crates.io, not against this tree, so a crate
+      # cannot go up before the ones it depends on. One step per crate rather
+      # than a loop, so the release page shows exactly how far it got.
+      # Every crate is published after the ones it depends on, and none is
+      # missing — the property crates.io actually enforces. This compared the
+      # steps against `publish-order.sh`'s own output until a release failed
+      # for a reshuffle that would have published perfectly: removing the
+      # `chronix-engine -> chronix-security` edge freed those two to swap,
+      # and one of several correct orders is not the correct order.
+      - name: Publish steps can actually publish
+        run: ./scripts/publish-order.sh --check
+
   # A tag push does not run the CI workflow, so the gate runs here too. These
   # are the checks a published version cannot be taken back from.
   # CI already ran every check on this commit, and runs *more* of them than a
@@ -249,25 +262,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-protoc
-      # The order below is the contract: cargo resolves each crate's
-      # dependencies against crates.io, not against this tree, so a crate
-      # cannot go up before the ones it depends on. One step per crate rather
-      # than a loop, so the release page shows exactly how far it got.
-      - name: Publish order matches the manifests
-        run: |
-          set -euo pipefail
-          derived=$(./scripts/publish-order.sh)
-          declared=$(grep -oE 'publish-crate\.sh [a-z-]+' .github/workflows/release.yml \
-                     | awk '{print $2}')
-          if [ "$derived" != "$declared" ]; then
-            echo "::error::the publish steps are stale. Derived order:" >&2
-            printf '%s\n' "$derived" >&2
-            echo "declared in this file:" >&2
-            printf '%s\n' "$declared" >&2
-            exit 1
-          fi
-          echo "publish order is current"
-
       - name: Publish chronix-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -286,12 +280,6 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: ./scripts/publish-crate.sh chronix-encoding
 
-      - name: Publish chronix-security
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
-        run: ./scripts/publish-crate.sh chronix-security
-
       - name: Publish chronix-engine
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -303,6 +291,12 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: ./scripts/publish-crate.sh chronix-query
+
+      - name: Publish chronix-security
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronix-security
 
       - name: Publish chronix-streaming
         env:
@@ -317,12 +311,22 @@ jobs:
         run: ./scripts/publish-crate.sh chronix
 
   # ── Publish the Python SDK to PyPI ───────────────────────────────────
+  # **Last, and only after crates.io.** This ran in parallel with
+  # `crates-io`, so a failure there — a stale publish order, a version
+  # mismatch — landed *after* PyPI had already uploaded. A PyPI version
+  # cannot be re-used or replaced, so that burned the release: the fix was a
+  # version bump, not a re-run.
+  #
+  # Ordering them does not make the two registries atomic, and nothing can.
+  # It makes the *recoverable* failure the likely one: crates.io first means
+  # a failure there publishes nothing, and a failure here leaves the crates
+  # published with the SDK still re-runnable at the same version.
   pypi:
     name: Publish chronix-client to PyPI
     # The same gate as the crates: CI's verdict on this exact commit. The SDK
     # is pure Python, so there is no wheel matrix — one sdist and one
     # universal wheel cover every platform.
-    needs: [ci-passed]
+    needs: [ci-passed, crates-io]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

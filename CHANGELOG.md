@@ -52,6 +52,14 @@ and no migration tooling for the on-disk format.
   arrives — a JWT library, Argon2, Cedar and a TLS stack for `security`; an
   HTTP client and a TLS stack for `streaming` — and point at
   `cargo tree -e normal` for anyone wanting a figure for their own build.
+- **The release's publish-order check validates that the steps *work*, not
+  that they match one particular ordering.** It compared them against
+  `publish-order.sh`'s own output, which is one linearisation of several
+  correct ones, so a release failed when removing the
+  `chronix-engine` → `chronix-security` edge freed those two crates to swap.
+  It now checks what crates.io enforces — every crate published after its
+  dependencies, none missing, none duplicated — and runs on every preflight
+  rather than only on release day.
 - **`scripts/check-features.sh` now reads the workflows too**, in both
   directions: a workflow may not name a feature its crate does not declare
   (renaming `flight` to `arrow` left one such step behind, and it failed only

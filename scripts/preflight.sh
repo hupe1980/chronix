@@ -37,6 +37,9 @@ step() {
 step "documentation vs the tree"   ./scripts/check-docs.sh
 step "feature dependencies"        ./scripts/check-features.sh
 step "D/R references"              ./scripts/check-references.sh
+# A release-day check that only runs on release day finds its problem on
+# release day. This one costs a `cargo metadata`.
+step "publish order"               ./scripts/publish-order.sh --check
 step "unused dependencies"         cargo machete
 
 step "formatting"                  cargo fmt --all --check

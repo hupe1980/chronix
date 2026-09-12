@@ -40,20 +40,15 @@ jobs:
       # Default members = the product (engine, analytics, streaming,
       # security, facade, server). The frozen cluster tier has its own job.
       - run: cargo clippy --all-targets -- -D warnings
-      # `release.yml` publishes in the order this prints. Nothing else runs it,
-      # so without this step a broken derivation surfaces mid-release, with
-      # some crates already uploaded and no way to take them back.
-      - name: Publish order resolves
-        run: |
-          set -euo pipefail
-          order=$(./scripts/publish-order.sh)
-          echo "$order"
-          [ "$(printf '%s\n' "$order" | wc -l)" -eq 8 ] || {
-            echo "::error::expected 8 publishable crates" >&2; exit 1; }
-          [ "$(printf '%s\n' "$order" | head -1)" = "chronix-core" ] || {
-            echo "::error::chronix-core must publish first" >&2; exit 1; }
-          [ "$(printf '%s\n' "$order" | tail -1)" = "chronix" ] || {
-            echo "::error::chronix must publish last" >&2; exit 1; }
+      # `release.yml` publishes crates bottom-up, and whether its steps can
+      # do that is a property of the manifests — knowable on every commit,
+      # not on release day. This checked the *derivation* only (that the
+      # script emits 8 crates, core first, chronix last) and never that
+      # `release.yml` declares them, which is the half that went stale and
+      # failed a release. `--check` reads the workflow, and carries no
+      # hard-coded count to rot when a crate is added.
+      - name: Publish steps can actually publish
+        run: ./scripts/publish-order.sh --check
 
   test:
     name: Test
