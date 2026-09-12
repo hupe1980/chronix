@@ -1820,11 +1820,13 @@ mod unbuildable_section_tests {
         } else {
             let err = verdict.expect_err("a build without the feature must refuse");
             let msg = err.to_string();
-            assert!(msg.contains("--features kafka"), "must name the flag: {msg}");
+            assert!(
+                msg.contains("--features kafka"),
+                "must name the flag: {msg}"
+            );
         }
     }
 }
-
 
 #[cfg(test)]
 mod shutdown_tests {
