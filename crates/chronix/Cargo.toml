@@ -61,7 +61,7 @@ field-encryption = ["chronix-engine/field-encryption"]
 ## Change-data-capture: `Chronix::subscribe`, the event bus every write
 ## publishes to, and the signal/trigger engine.
 ##
-## **Off by default.** It is 63 packages beyond the engine — an HTTP client
+## **Off by default.** It is ~60 packages beyond the engine — an HTTP client
 ## and a TLS stack among them, for webhook delivery — and an embedded
 ## consumer that opens a database and writes to it subscribes to nothing.
 streaming = ["dep:chronix-streaming"]
@@ -69,7 +69,7 @@ streaming = ["dep:chronix-streaming"]
 ## Authentication, Cedar authorization, the audit trail and the namespace
 ## registry.
 ##
-## **Off by default.** It is 126 packages beyond the engine — a JWT library,
+## **Off by default.** It is ~125 packages beyond the engine — a JWT library,
 ## Argon2, `aes-gcm`, Cedar and a whole TLS stack — none of which an embedded
 ## `Chronix::open` touches.
 ##

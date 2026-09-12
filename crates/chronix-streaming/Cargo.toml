@@ -29,7 +29,7 @@ default = []
 ## Arrow — a Flight service, an IPC stream, a Parquet writer.
 ##
 ## An encoding, not a transport: nothing here serves the batches over a
-## network. Adds `arrow` and its 45 packages.
+## network. Adds `arrow` and its ~45 packages.
 arrow = ["dep:arrow"]
 
 [dependencies]

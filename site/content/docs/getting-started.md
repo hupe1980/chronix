@@ -34,13 +34,14 @@ cargo add chronix --features streaming
 
 | Feature | What it adds | Cost |
 |---|---|---|
-| `streaming` | The CDC bus and `db.subscribe()`, triggers and delivery | +63 packages, including an HTTP client and a TLS stack |
-| `security` | API keys, JWT/OIDC, mTLS, Cedar authorization, the audit chain, namespaces | +126 packages, including a JWT library, Cedar and Argon2 |
+| `streaming` | The CDC bus and `db.subscribe()`, triggers and delivery | ~60 packages, including an HTTP client and a TLS stack |
+| `security` | API keys, JWT/OIDC, mTLS, Cedar authorization, the audit chain, namespaces | ~125 packages, including a JWT library, Cedar and Argon2 |
 | `pipeline` | The real-time pipeline — CDC → triggers → delivery, streaming anomaly detection, continuous forecasting. Implies both | — |
 
-Without them a build resolves **175 packages**; with all three, 304. If you
-are running the server rather than embedding the library, `chronixd` has all
-of it and cannot be built otherwise.
+Without them a build resolves about **175 packages**; with all three, about
+**300**. (Counts vary by a package or two with the host platform.) If you are
+running the server rather than embedding the library, `chronixd` has all of it
+and cannot be built otherwise.
 
 Open a database, write a point, read it back — this is
 [`examples/quickstart.rs`](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/quickstart.rs),

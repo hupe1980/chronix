@@ -106,6 +106,8 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             .with_start_retry_backoff_ms(config.server.connector_start_retry_backoff_ms),
     );
 
+    reject_unbuildable_sections(&config)?;
+
     // Register configured connectors
     if let Some(ref kafka_cfg) = config.kafka {
         let consumer = crate::kafka::KafkaConsumer::new_arc(
@@ -1638,6 +1640,41 @@ fn build_trigger_pipeline(
     Ok(Some(pipeline))
 }
 
+/// Refuse a configuration section this binary cannot honour.
+///
+/// A section that parses and then does nothing is the same defect as a
+/// documented environment variable nothing reads: no failure, and the
+/// operator finds out from a graph that never fills. `[cold_archive]` has
+/// always refused this way; `[kafka]` and `[mqtt]` did not, and instead
+/// registered a connector that logged "enable the feature" and then reported
+/// itself healthy for ever.
+///
+/// # Errors
+///
+/// Returns [`ServerError::Config`] naming the section and the feature flag
+/// to rebuild with.
+pub fn reject_unbuildable_sections(
+    config: &crate::config::ServerConfig,
+) -> Result<(), ServerError> {
+    let refuse = |section: &str, feature: &str| {
+        ServerError::Config(crate::config::ServerConfigError::Invalid(format!(
+            "[{section}] is configured but this binary was built without the \
+             `{feature}` feature: rebuild with `--features {feature}`, or \
+             remove the section"
+        )))
+    };
+    #[cfg(not(feature = "kafka"))]
+    if config.kafka.is_some() {
+        return Err(refuse("kafka", "kafka"));
+    }
+    #[cfg(not(feature = "mqtt"))]
+    if config.mqtt.is_some() {
+        return Err(refuse("mqtt", "mqtt"));
+    }
+    let _ = (&config, &refuse);
+    Ok(())
+}
+
 /// Run a cold-archiving pass periodically, when `[cold_archive]` is configured.
 ///
 /// Archiving was an embedded API call with no trigger anywhere in the server:
@@ -1737,6 +1774,50 @@ fn spawn_cold_archiver(
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod unbuildable_section_tests {
+    use super::reject_unbuildable_sections;
+
+    /// A `[kafka]` section is accepted or refused according to the build,
+    /// and the refusal names the flag.
+    ///
+    /// Asserted in both directions because the whole defect was a state that
+    /// only existed in one of them: without the feature the connector used
+    /// to register, log "enable the feature", and then report itself healthy
+    /// while ingesting nothing.
+    #[test]
+    fn a_connector_section_needs_its_feature() {
+        let mut config = crate::config::ServerConfig::default();
+        assert!(reject_unbuildable_sections(&config).is_ok());
+
+        config.kafka = Some(crate::connector::KafkaConfig {
+            namespace: "default".into(),
+            brokers: "localhost:9092".into(),
+            group_id: "g".into(),
+            topics: vec!["t".into()],
+            format: crate::connector::ConnectorFormat::Json,
+            auto_offset_reset: "latest".into(),
+            topic_measurement_map: Default::default(),
+            sasl_mechanism: None,
+            sasl_username: None,
+            sasl_password: None,
+            security_protocol: None,
+            ca_cert: None,
+            credential_file: None,
+        });
+
+        let verdict = reject_unbuildable_sections(&config);
+        if cfg!(feature = "kafka") {
+            assert!(verdict.is_ok(), "a build with the feature must accept it");
+        } else {
+            let err = verdict.expect_err("a build without the feature must refuse");
+            let msg = err.to_string();
+            assert!(msg.contains("--features kafka"), "must name the flag: {msg}");
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod shutdown_tests {

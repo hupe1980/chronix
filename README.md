@@ -66,7 +66,7 @@ crate.
   namespace isolation, mTLS, Argon2 API keys, JWT/OIDC, and a tamper-evident
   HMAC-chained audit trail. `chronixd` always has all of it; the embedded
   crate compiles **none** of it unless you ask — `security` and `streaming`
-  are off by default, which is 129 packages an embedded build does not
+  are off by default, which is ~130 packages an embedded build does not
   carry.
 
   > **Per-column encryption.** `[database.field_encryption]` names a column
@@ -334,7 +334,7 @@ it, so that difference is 0.34 MiB.
 gateway that calls `Chronix::open` and writes to it does not authenticate
 anyone, evaluate a policy or subscribe to a change feed — and it was carrying
 a JWT library, Cedar, Argon2, `aes-gcm`, an HTTP client and a whole TLS stack
-for the privilege: **304 packages against 175**. `chronixd` takes all three
+for the privilege: **~300 packages against ~175**. `chronixd` takes all three
 features at its dependency and will not compile without them.
 
 **No C toolchain for the connectors.** `krafka` and `rumqttc` are pure Rust.
@@ -381,10 +381,10 @@ cargo +nightly miri test -p chronix-core -- --skip proptests --skip config_toml_
 | `chronix-engine`, `chronix` | `field-encryption` | on | Per-column AES-256-GCM in the `.csx` format, declared by `[database.field_encryption]` |
 | `chronix-engine` | `object-store` | off | S3/GCS/Azure cold tier, Parquet archive writer |
 | `chronix` | `object-store` | off | `register_cold_tier()` — SQL over the Parquet archive |
-| `chronix` | `streaming` | **off** | CDC bus, `db.subscribe()`, triggers and delivery (+63 packages) |
-| `chronix` | `security` | **off** | API keys, JWT, mTLS, Cedar, audit, namespaces (+126 packages) |
+| `chronix` | `streaming` | **off** | CDC bus, `db.subscribe()`, triggers and delivery (~60 packages) |
+| `chronix` | `security` | **off** | API keys, JWT, mTLS, Cedar, audit, namespaces (~125 packages) |
 | `chronix` | `pipeline` | off | The real-time pipeline; implies `streaming` + `security` |
-| `chronix-streaming` | `arrow` | off | CDC events as Arrow `RecordBatch`es (+45 packages) |
+| `chronix-streaming` | `arrow` | off | CDC events as Arrow `RecordBatch`es (~45 packages) |
 | `chronix-security` | `webhook` | on | Audit webhook sink |
 | `chronixd` | `kafka`, `mqtt` | off | Ingestion connectors (`krafka` / `rumqttc`, both pure Rust) |
 | `chronixd` | `object-store` | off | Periodic cold archiving to S3/GCS/Azure (`[cold_archive]`) |

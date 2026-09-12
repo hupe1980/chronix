@@ -227,7 +227,7 @@ impl ApiKeyStore {
 
     /// Authenticate `token` and build the context it grants.
     ///
-    /// **The one place an API key becomes an [`AuthContext`].** `chronixd`
+    /// **The one place an API key becomes an [`AuthContext`](crate::auth::middleware::AuthContext).** `chronixd`
     /// has a second key store for keys minted at run time, and it assembled
     /// the context by hand from three accessors — so when the credential
     /// grew a `roles` list, a key created through `POST /admin/auth/keys`

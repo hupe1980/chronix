@@ -71,6 +71,20 @@ ports, example paths, and subsystems that were removed. It exists because all
 four had drifted — the site documented three different sets of listen ports,
 none of which the server bound.
 
+## Before you push
+
+```bash
+./scripts/preflight.sh --quick   # ~3 min: lints, docs, guards, both test builds
+./scripts/preflight.sh           # ~15 min: adds the examples and the frozen tier
+```
+
+This runs what CI gates on. It exists because the list below used to be a
+strict *subset* of CI, and the gap is where failures landed: a broken
+intra-doc link that only `cargo doc` resolves, an example whose
+`required-features` had grown (`cargo run` **skips** such a target rather
+than failing), and a `#[cfg(test)]` assertion that was true with a feature
+on and false in the default build.
+
 ## Code Style
 
 - Run `cargo fmt --all` before committing. CI enforces `rustfmt` with the
@@ -87,10 +101,10 @@ none of which the server bound.
 - Use `proptest` for property-based testing where appropriate (see existing
   tests in `chronix-encoding` and `chronix-engine`).
 - Integration tests go in the crate's `tests/` directory.
-- Run the full suite before opening a PR:
-  ```bash
-  cargo test
-  ```
+- Run the full suite before opening a PR — `./scripts/preflight.sh`, which
+  covers both the default build and the feature builds. A test in a
+  `#[cfg(test)]` module of a crate with optional features runs in every
+  build, so an assertion can pass in one and fail in another.
 
 ## Commit Messages
 

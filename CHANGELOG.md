@@ -35,11 +35,15 @@ and no migration tooling for the on-disk format.
   each produced to a topic nothing had created, and a KRaft broker resolves
   the metadata request that triggers auto-creation *after* it answers the
   produce. They now create their topics through `AdminClient::create_topics`.
-- **`scripts/check-package-counts.sh` checks the documented "+N packages"
-  figures against `cargo tree`**, and runs in CI. Those numbers are the whole
-  argument for the feature gates and nothing in the tree read arithmetic:
-  removing three unused dependencies moved `streaming` from +74 to +63 and
-  `security` from +139 to +126, and the documentation kept the old figures.
+- **`scripts/preflight.sh` runs what CI gates on in one command** — lints,
+  rustdoc, the guards and both the default and feature test builds
+  (`--quick`), plus the examples and the frozen tier without it. CONTRIBUTING
+  points at it.
+- **`scripts/check-package-counts.sh` keeps the documented "+N packages"
+  figures honest**, within ±20%. The figures are the argument for the feature
+  gates and nothing read arithmetic, so they had drifted. They are documented
+  rounded on purpose: a count is not a property of the code alone — the
+  `streaming` feature resolves 63 packages on macOS and 62 on x86_64-linux.
 - **`scripts/check-features.sh` checks every feature dependency against the
   code it unlocks**, and runs in CI. `cargo machete` cannot read the
   `[features]` table and `cargo udeps` needs nightly and a full build, so a
@@ -301,6 +305,11 @@ and no migration tooling for the on-disk format.
   annotated "Public API types — used by external consumers", kept the
   compiler quiet; removing it produces exactly those three warnings and no
   others.
+- **A `[kafka]` or `[mqtt]` section in a binary built without that feature is
+  now a startup error** naming the flag to rebuild with, as `[cold_archive]`
+  already was. It previously registered a connector that logged "enable the
+  feature", then reported `Idle` — healthy, with `chronix_connector_up 1` —
+  while ingesting nothing.
 - **A connector that could not reach its broker reported `Running` for
   ever.** Three layers, each hiding the one below. (1) Both connectors gave
   up on their first setup error — `error!(…); return;` — and the commonest

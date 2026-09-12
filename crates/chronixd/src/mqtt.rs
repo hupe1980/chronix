@@ -452,8 +452,15 @@ impl IngestionConnector for MqttSubscriber {
             }
         }
 
+        // Without the feature there is no task and this connector can never
+        // ingest. `Idle` would read as healthy and publish
+        // `chronix_connector_up 1`; naming the missing flag is the honest
+        // answer. `run()` refuses a `[mqtt]` section in such a build, so
+        // this is reachable only by constructing the connector directly.
         #[cfg(not(feature = "mqtt"))]
-        self.set_state(ConnectorStatus::Idle);
+        self.set_state(ConnectorStatus::Failed(
+            "built without the `mqtt` feature".into(),
+        ));
         #[cfg(not(feature = "mqtt"))]
         info!(
             name = %self.name,
@@ -687,9 +694,16 @@ mod tests {
         assert_eq!(sub.status().await, ConnectorStatus::Stopped);
 
         sub.start().await.unwrap();
-        // No broker here, so `Running` is the one thing this must not say:
-        // started, trying, not yet connected.
+        // `Running` is the one thing this must not say, in either build: the
+        // status used to come from the flag `start()` had just set, so this
+        // assertion passed with no broker and no task at all.
+        #[cfg(feature = "mqtt")]
         assert_eq!(sub.status().await, ConnectorStatus::Reconnecting);
+        #[cfg(not(feature = "mqtt"))]
+        assert!(matches!(
+            sub.status().await,
+            ConnectorStatus::Failed(ref why) if why.contains("mqtt")
+        ));
         assert!(!sub.is_healthy().await);
 
         sub.stop().await.unwrap();

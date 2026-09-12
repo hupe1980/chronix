@@ -24,7 +24,7 @@
 //! - **Actions:** `Read`, `Write`, `Delete` on a namespace; the capabilities
 //!   in the `Admin` group on the system
 //!
-//! The model is compiled in as a Cedar schema ([`AuthzEngine::SCHEMA_SRC`])
+//! The model is compiled in as a Cedar schema ([`engine::SCHEMA_SRC`])
 //! and **every policy is validated against it**, so a rule naming something
 //! this server never asks about is refused at load rather than accepted and
 //! never consulted.

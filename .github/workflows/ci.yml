@@ -216,17 +216,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run every example
-        # `object-store` is enabled for the whole loop because `cold_tier`
-        # declares it as a required feature; without it `cargo run` refuses that
-        # target and the loop would skip the one example that exercises the
-        # archive path. It is the only feature `chronix` has, so enabling it
-        # costs the other examples nothing but build time.
+        # `--all-features` rather than a list: several examples declare
+        # `required-features`, and `cargo run` *skips* a target whose features
+        # are off rather than failing, so a named list silently stops running
+        # an example as soon as a new feature gates one.
         run: |
           set -euo pipefail
           for f in crates/chronix/examples/*.rs; do
             name=$(basename "$f" .rs)
             echo "── $name"
-            cargo run -q -p chronix --features object-store --example "$name"
+            cargo run -q -p chronix --all-features --example "$name"
           done
 
   site:

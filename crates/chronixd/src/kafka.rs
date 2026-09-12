@@ -548,8 +548,15 @@ impl IngestionConnector for KafkaConsumer {
             }
         }
 
+        // Without the feature there is no task and this connector can never
+        // ingest. `Idle` would read as healthy and publish
+        // `chronix_connector_up 1`; naming the missing flag is the honest
+        // answer. `run()` refuses a `[kafka]` section in such a build, so
+        // this is reachable only by constructing the connector directly.
         #[cfg(not(feature = "kafka"))]
-        self.set_state(ConnectorStatus::Idle);
+        self.set_state(ConnectorStatus::Failed(
+            "built without the `kafka` feature".into(),
+        ));
         #[cfg(not(feature = "kafka"))]
         info!(
             name = %self.name,
@@ -745,9 +752,16 @@ mod tests {
         assert_eq!(consumer.status().await, ConnectorStatus::Stopped);
 
         consumer.start().await.unwrap();
-        // No broker here, so `Running` is the one thing this must not say:
-        // started, trying, not yet connected.
+        // `Running` is the one thing this must not say, in either build: the
+        // status used to come from the flag `start()` had just set, so this
+        // assertion passed with no broker and no task at all.
+        #[cfg(feature = "kafka")]
         assert_eq!(consumer.status().await, ConnectorStatus::Reconnecting);
+        #[cfg(not(feature = "kafka"))]
+        assert!(matches!(
+            consumer.status().await,
+            ConnectorStatus::Failed(ref why) if why.contains("kafka")
+        ));
         assert!(!consumer.is_healthy().await);
 
         consumer.stop().await.unwrap();
