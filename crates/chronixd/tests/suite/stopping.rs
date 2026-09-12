@@ -208,6 +208,19 @@ async fn a_full_memtable_is_a_503_that_says_to_retry() {
 #[tokio::test]
 async fn back_pressure_says_how_long_to_wait() {
     chronixd::tls::ensure_crypto_provider();
+    // **One oversized write, then a small one.** `check_admission` refuses a
+    // request it finds the memtable already full for, so a 503 needs memory
+    // to still be over the cap when the *next* request arrives. Writing 500
+    // points a round — which this test used to do — leaves the flush plenty
+    // of time to drain between rounds, so whether a 503 ever happens is a
+    // race: it passed in 0.3 s alone and failed in CI inside an 89 s suite.
+    //
+    // The thresholds cannot be separated (the config requires
+    // `max_memtable_memory >= memtable_flush_threshold`), so the margin has
+    // to come from volume: 5 000 distinct series is far more than the 128 KiB
+    // cap holds, so the flush that clears it has a real segment to write
+    // before the next request lands. (The harness caps a body at 10 MiB, so
+    // the batch has to stay under that.)
     let h = harness(
         |b| {
             *b = std::mem::take(b)
@@ -220,10 +233,26 @@ async fn back_pressure_says_how_long_to_wait() {
     .await;
 
     let client = reqwest::Client::new();
-    for round in 0..40 {
+    let overrun = client
+        .post(format!("{}/api/v1/write", h.base))
+        .json(&write_body("cpu", 0, 5_000))
+        .send()
+        .await
+        .expect("the first write is admitted — the memtable is empty");
+    let st = overrun.status();
+    let body = overrun.text().await.unwrap_or_default();
+    assert!(
+        st.is_success() || st == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "the overrunning write is either taken or refused, not an error: {st} {body}"
+    );
+
+    // Whatever happened to that one, the memtable is now over its cap, and
+    // the flush has real work to do. Ask repeatedly rather than once so a
+    // machine that flushes unusually fast still gets asked while it is full.
+    for _ in 0..200 {
         let resp = client
             .post(format!("{}/api/v1/write", h.base))
-            .json(&write_body("cpu", round * 500, 500))
+            .json(&write_body("cpu", 5_000, 1))
             .send()
             .await
             .expect("request");
@@ -236,7 +265,7 @@ async fn back_pressure_says_how_long_to_wait() {
             return;
         }
     }
-    panic!("the memtable must fill within 20 000 points");
+    panic!("a memtable capped at 128 KiB never reported itself full after 5 000 series");
 }
 
 /// A query that runs out of time is a `504`, and says which setting bound it.
