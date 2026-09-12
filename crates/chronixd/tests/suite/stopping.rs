@@ -140,6 +140,56 @@ fn write_body(measurement: &str, start_series: usize, count: usize) -> Value {
 
 // ── The engine knows; the client is told ───────────────────────────────
 
+/// Drive a server until it refuses a write, and return that refusal.
+///
+/// **Back-pressure is only observable when a request *finds* the memtable
+/// already at capacity.** `check_admission` reads the memtable it is handed;
+/// if the flush has drained it between requests there is nothing to refuse.
+/// Both tests below used to write 500 points a round and hope, with the
+/// flush threshold set equal to the admission cap so the flush fired at
+/// exactly the point admission would refuse — whichever won the race decided
+/// the result. They passed in a third of a second alone and failed inside
+/// CI's loaded suite.
+///
+/// The thresholds cannot be separated (the config requires
+/// `max_memtable_memory >= memtable_flush_threshold`, so flushing always
+/// begins at or before the cap), so the margin comes from volume: one write
+/// of 5 000 distinct series leaves memory far above a 128 KiB cap and the
+/// flush a real segment to write before the next request lands.
+///
+/// One implementation, because there are two callers and the first fix was
+/// applied to only one of them.
+async fn write_until_refused(
+    h: &Harness,
+) -> Option<(reqwest::StatusCode, reqwest::header::HeaderMap, Value)> {
+    let client = reqwest::Client::new();
+
+    // Admitted while the memtable is empty, and far more than it holds.
+    let _ = client
+        .post(format!("{}/api/v1/write", h.base))
+        .json(&write_body("cpu", 0, 5_000))
+        .send()
+        .await;
+
+    // Ask repeatedly rather than once, so a machine that flushes unusually
+    // fast still gets asked while the memtable is over its cap.
+    for i in 0..200 {
+        let resp = client
+            .post(format!("{}/api/v1/write", h.base))
+            .json(&write_body("cpu", 5_000 + i, 1))
+            .send()
+            .await
+            .expect("request");
+        if resp.status() != reqwest::StatusCode::NO_CONTENT {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+            return Some((status, headers, body));
+        }
+    }
+    None
+}
+
 /// A full memtable is back-pressure, and the client is told to back off.
 ///
 /// This is the ordinary condition on a gateway whose flash is slower than its
@@ -150,8 +200,6 @@ fn write_body(measurement: &str, start_series: usize, count: usize) -> Value {
 #[tokio::test]
 async fn a_full_memtable_is_a_503_that_says_to_retry() {
     chronixd::tls::ensure_crypto_provider();
-    // Small enough that a few hundred series fill it, and equal to the flush
-    // threshold so the flush that resolves it is the one already signalled.
     let h = harness(
         |b| {
             *b = std::mem::take(b)
@@ -163,22 +211,9 @@ async fn a_full_memtable_is_a_503_that_says_to_retry() {
     )
     .await;
 
-    let client = reqwest::Client::new();
-    let mut saw = None;
-    for round in 0..40 {
-        let resp = client
-            .post(format!("{}/api/v1/write", h.base))
-            .json(&write_body("cpu", round * 500, 500))
-            .send()
-            .await
-            .expect("request");
-        if resp.status() != reqwest::StatusCode::NO_CONTENT {
-            saw = Some((resp.status(), resp.json::<Value>().await.expect("json")));
-            break;
-        }
-    }
-
-    let (status, body) = saw.expect("the memtable must fill within 20 000 points");
+    let (status, _headers, body) = write_until_refused(&h)
+        .await
+        .expect("a memtable capped at 128 KiB never reported itself full");
     assert_eq!(
         status,
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -208,19 +243,6 @@ async fn a_full_memtable_is_a_503_that_says_to_retry() {
 #[tokio::test]
 async fn back_pressure_says_how_long_to_wait() {
     chronixd::tls::ensure_crypto_provider();
-    // **One oversized write, then a small one.** `check_admission` refuses a
-    // request it finds the memtable already full for, so a 503 needs memory
-    // to still be over the cap when the *next* request arrives. Writing 500
-    // points a round — which this test used to do — leaves the flush plenty
-    // of time to drain between rounds, so whether a 503 ever happens is a
-    // race: it passed in 0.3 s alone and failed in CI inside an 89 s suite.
-    //
-    // The thresholds cannot be separated (the config requires
-    // `max_memtable_memory >= memtable_flush_threshold`), so the margin has
-    // to come from volume: 5 000 distinct series is far more than the 128 KiB
-    // cap holds, so the flush that clears it has a real segment to write
-    // before the next request lands. (The harness caps a body at 10 MiB, so
-    // the batch has to stay under that.)
     let h = harness(
         |b| {
             *b = std::mem::take(b)
@@ -232,40 +254,18 @@ async fn back_pressure_says_how_long_to_wait() {
     )
     .await;
 
-    let client = reqwest::Client::new();
-    let overrun = client
-        .post(format!("{}/api/v1/write", h.base))
-        .json(&write_body("cpu", 0, 5_000))
-        .send()
+    let (status, headers, body) = write_until_refused(&h)
         .await
-        .expect("the first write is admitted — the memtable is empty");
-    let st = overrun.status();
-    let body = overrun.text().await.unwrap_or_default();
-    assert!(
-        st.is_success() || st == reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "the overrunning write is either taken or refused, not an error: {st} {body}"
+        .expect("a memtable capped at 128 KiB never reported itself full");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "back-pressure, not a server fault: {body}"
     );
-
-    // Whatever happened to that one, the memtable is now over its cap, and
-    // the flush has real work to do. Ask repeatedly rather than once so a
-    // machine that flushes unusually fast still gets asked while it is full.
-    for _ in 0..200 {
-        let resp = client
-            .post(format!("{}/api/v1/write", h.base))
-            .json(&write_body("cpu", 5_000, 1))
-            .send()
-            .await
-            .expect("request");
-        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            assert!(
-                resp.headers().contains_key("retry-after"),
-                "a 503 a client should retry says when: {:?}",
-                resp.headers()
-            );
-            return;
-        }
-    }
-    panic!("a memtable capped at 128 KiB never reported itself full after 5 000 series");
+    assert!(
+        headers.contains_key("retry-after"),
+        "a 503 a client should retry says when: {headers:?}"
+    );
 }
 
 /// A query that runs out of time is a `504`, and says which setting bound it.

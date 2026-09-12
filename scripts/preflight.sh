@@ -51,7 +51,11 @@ step "rustdoc links"               env RUSTDOCFLAGS="-D warnings" \
 # true in one and false in the other, which is how `connector_lifecycle`
 # passed locally and failed in CI.
 step "tests (default build)"       cargo test
-step "tests (connector features)"  cargo test -p chronixd --features kafka,mqtt --lib
+# **Not `--lib`.** CI runs `cargo test -p chronixd --features kafka`, which
+# builds every target — including `--test suite`, where the races that
+# reached CI three times actually live. Restricting this to the library was
+# a hole in exactly the shape of the failures it was meant to catch.
+step "tests (connector features)"  cargo test -p chronixd --features kafka,mqtt
 
 if [ "$QUICK" -eq 0 ]; then
     step "tests (workspace, all features)" \
