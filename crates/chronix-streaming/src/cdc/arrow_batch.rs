@@ -1,8 +1,9 @@
-//! Arrow Flight CDC export — bridge CDC events to Flight `DoExchange` streams.
+//! Arrow encoding for CDC — turn [`CdcEvent`]s into [`RecordBatch`]es.
 //!
-//! This module converts [`CdcEvent`]s into Arrow [`RecordBatch`]es and
-//! provides a [`CdcFlightExporter`] that implements the Arrow Flight
-//! `DoExchange` RPC for real-time CDC streaming to external consumers.
+//! An *encoding*, not a transport: it converts CDC events into Arrow record
+//! batches with a stable schema, and what carries them — Arrow Flight, IPC,
+//! a Parquet file — is the caller's choice. Over the network `chronixd`
+//! streams CDC as JSON over SSE at `/api/v1/cdc/stream`.
 //!
 //! ## Schema
 //!
@@ -14,7 +15,7 @@
 //! | `seq` | `UInt64` | Monotonic sequence number |
 //! | `event_type` | `Utf8` | `"point_written"`, `"series_deleted"`, or `"measurement_dropped"` |
 //! | `measurement` | `Utf8` | Measurement name |
-//! | `timestamp` | `Int64` | Nanosecond timestamp (0 for non-write events) |
+//! | `event_timestamp` | `Int64` | Nanosecond timestamp (0 for non-write events) |
 //! | `tags_json` | `Utf8` | JSON-encoded tag map |
 //! | `fields_json` | `Utf8` | JSON-encoded field map (empty for non-write events) |
 //! | `series_hash` | `UInt64` | FNV-1a series hash (0 for non-delete events) |
@@ -23,14 +24,14 @@
 //!
 //! ```no_run
 //! use chronix_streaming::cdc::EventBus;
-//! use chronix_streaming::cdc::flight::{CdcBatchConverter, CdcFlightExporter};
+//! use chronix_streaming::cdc::arrow_batch::{CdcBatchConverter, CdcBatchExporter};
 //! use chronix_streaming::cdc::SubscriptionFilter;
 //!
 //! let bus = EventBus::with_default_capacity();
 //!
 //! // Create an exporter with a filter
 //! let filter = SubscriptionFilter::all().measurement("cpu");
-//! let exporter = CdcFlightExporter::new(&bus, filter, 1024);
+//! let exporter = CdcBatchExporter::new(&bus, filter, 1024);
 //!
 //! // In a tokio task, consume batches:
 //! // while let Some(batch) = exporter.next_batch().await { ... }
@@ -172,14 +173,14 @@ impl CdcBatchConverter {
 ///
 /// Wraps a [`FilteredSubscription`] and converts received events into
 /// Arrow RecordBatches in configurable batch sizes. Designed to feed
-/// Arrow Flight `DoExchange` or `DoGet` streams.
+/// an Arrow Flight stream, an IPC writer, or Parquet.
 ///
 /// ## Back-pressure
 ///
 /// The exporter respects the bounded buffer of the underlying broadcast
 /// channel. If the consumer is too slow, events will be dropped by the
 /// broadcast layer and reported via [`gap_count`](Self::gap_count).
-pub struct CdcFlightExporter {
+pub struct CdcBatchExporter {
     subscription: FilteredSubscription,
     converter: CdcBatchConverter,
     batch_size: usize,
@@ -189,7 +190,7 @@ pub struct CdcFlightExporter {
     last_known_gaps: u64,
 }
 
-impl CdcFlightExporter {
+impl CdcBatchExporter {
     /// Create a new exporter.
     ///
     /// - `bus` — the CDC event bus to subscribe to
@@ -423,7 +424,7 @@ mod tests {
     async fn exporter_produces_batches() {
         let bus = EventBus::with_default_capacity();
         let filter = SubscriptionFilter::all();
-        let mut exporter = CdcFlightExporter::new(&bus, filter, 10);
+        let mut exporter = CdcBatchExporter::new(&bus, filter, 10);
 
         // Publish events
         for i in 0..5 {
@@ -439,7 +440,7 @@ mod tests {
     async fn exporter_filters_events() {
         let bus = EventBus::with_default_capacity();
         let filter = SubscriptionFilter::all().measurement("cpu");
-        let mut exporter = CdcFlightExporter::new(&bus, filter, 10);
+        let mut exporter = CdcBatchExporter::new(&bus, filter, 10);
 
         // Publish a cpu event and a mem event
         bus.publish(sample_point_written(1)); // cpu
@@ -462,7 +463,7 @@ mod tests {
     #[test]
     fn exporter_default_batch_size() {
         let bus = EventBus::with_default_capacity();
-        let exporter = CdcFlightExporter::new(&bus, SubscriptionFilter::all(), 0);
+        let exporter = CdcBatchExporter::new(&bus, SubscriptionFilter::all(), 0);
         assert_eq!(exporter.batch_size(), DEFAULT_BATCH_SIZE);
     }
 }

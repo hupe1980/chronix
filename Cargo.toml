@@ -34,7 +34,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
@@ -51,14 +51,14 @@ rust-version = "1.94"
 # dependency carries only a `path`, so without it none of the seven crates that
 # depend on a sibling can be released at all. Declared once here, inherited by
 # every member through `chronix-core.workspace = true`.
-chronix = { path = "crates/chronix", version = "0.4.0" }
-chronix-core = { path = "crates/chronix-core", version = "0.4.0" }
-chronix-engine = { path = "crates/chronix-engine", version = "0.4.0" }
-chronix-security = { path = "crates/chronix-security", version = "0.4.0" }
-chronix-streaming = { path = "crates/chronix-streaming", version = "0.4.0" }
-chronix-encoding = { path = "crates/chronix-encoding", version = "0.4.0" }
-chronix-query = { path = "crates/chronix-query", version = "0.4.0" }
-chronix-analytics = { path = "crates/chronix-analytics", version = "0.4.0" }
+chronix = { path = "crates/chronix", version = "0.5.0" }
+chronix-core = { path = "crates/chronix-core", version = "0.5.0" }
+chronix-engine = { path = "crates/chronix-engine", version = "0.5.0" }
+chronix-security = { path = "crates/chronix-security", version = "0.5.0" }
+chronix-streaming = { path = "crates/chronix-streaming", version = "0.5.0" }
+chronix-encoding = { path = "crates/chronix-encoding", version = "0.5.0" }
+chronix-query = { path = "crates/chronix-query", version = "0.5.0" }
+chronix-analytics = { path = "crates/chronix-analytics", version = "0.5.0" }
 # Frozen and dev-only: never published, so a path-only dependency is correct.
 chronix-meta = { path = "crates/chronix-meta" }
 chronix-cluster = { path = "crates/chronix-cluster" }

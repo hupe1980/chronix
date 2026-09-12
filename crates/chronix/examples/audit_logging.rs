@@ -97,41 +97,37 @@ fn main() {
     );
     println!("  Logged: admin ADMIN system → Allow");
 
-    // Forecast action
+    // Something the built-in categories do not name. `Custom` is the escape
+    // hatch, and it is why the enum holds only the categories the server
+    // actually emits: a variant nothing constructs reads as coverage.
     logger.log(
         AuditEvent::new(
             "alice",
-            AuditAction::Forecast,
+            AuditAction::Custom("forecast".into()),
             "cpu_metrics",
             AuditDecision::Allow,
         )
         .with_request_id("req-004")
         .with_metadata("model", "ARIMA"),
     );
-    println!("  Logged: alice FORECAST cpu_metrics → Allow");
+    println!("  Logged: alice forecast cpu_metrics → Allow");
 
-    // Anomaly detection
+    // A schema change — permanent, because schema-on-write is additive-only.
     logger.log(
         AuditEvent::new(
             "bob",
-            AuditAction::DetectAnomalies,
+            AuditAction::SchemaChange,
             "temperature",
             AuditDecision::Allow,
         )
-        .with_request_id("req-005"),
+        .with_request_id("req-005")
+        .with_metadata("column", "celsius"),
     );
-    println!("  Logged: bob DETECT_ANOMALIES temperature → Allow");
+    println!("  Logged: bob SCHEMA_CHANGE temperature → Allow");
 
-    // Login events
-    logger.log(
-        AuditEvent::new(
-            "dave",
-            AuditAction::LoginSuccess,
-            "auth",
-            AuditDecision::Allow,
-        )
-        .with_source_ip("172.16.0.100"),
-    );
+    // A refused credential. There is deliberately no `LoginSuccess`: a
+    // database authenticates every request, so recording the successes would
+    // make the trail a second request log.
     logger.log(
         AuditEvent::new(
             "eve",
@@ -142,27 +138,27 @@ fn main() {
         .with_source_ip("203.0.113.50")
         .with_metadata("reason", "invalid_credentials"),
     );
-    println!("  Logged: dave LOGIN_SUCCESS → Allow");
     println!("  Logged: eve LOGIN_FAILURE → Deny");
 
-    // Key rotation
+    // A minted key, recorded against the caller who minted it.
     logger.log(
         AuditEvent::new(
             "admin",
-            AuditAction::KeyRotation,
-            "encryption_keys",
+            AuditAction::ApiKeyCreate,
+            "api_key:ingest",
             AuditDecision::Allow,
         )
-        .with_metadata("old_key_id", "key-001")
-        .with_metadata("new_key_id", "key-002"),
+        .with_metadata("namespaces", "tenant-a"),
     );
-    println!("  Logged: admin KEY_ROTATION encryption_keys → Allow");
+    println!("  Logged: admin API_KEY_CREATE api_key:ingest → Allow");
 
-    // Custom action
+    // Data leaving the database. `DataExport` is a built-in category, and
+    // this said `Custom("DataExport")` beside it — the tell that the built-in
+    // one had no producer and nobody had noticed it was there.
     logger.log(
         AuditEvent::new(
             "system",
-            AuditAction::Custom("DataExport".to_string()),
+            AuditAction::DataExport,
             "all_metrics",
             AuditDecision::Allow,
         )

@@ -13,7 +13,7 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
-# Not published to crates.io for v0.4.0; distributed as a binary through
+# Not published to crates.io for v0.5.0; distributed as a binary through
 # GitHub Releases instead.
 #
 # The reason is a manifest fact with a product cause: the `cluster`
@@ -22,7 +22,7 @@ readme.workspace = true
 # requires a version for every dependency it packages, optional ones included.
 # The three options were to publish the frozen crates (inviting use of a tier
 # that is explicitly not developed), to strip the two features from `chronixd`
-# (76 `cfg` gates and a 547-line module, for a mode v0.4.0 cannot run anyway),
+# (76 `cfg` gates and a 547-line module, for a mode v0.5.0 cannot run anyway),
 # or this. The library — which is the product — publishes normally.
 #
 # What would change it: splitting the cluster server integration into
@@ -49,7 +49,14 @@ path = "src/main.rs"
 tonic-prost.workspace = true
 prost-types.workspace = true
 # Internal
-chronix.workspace = true
+# `security`, `streaming` and `pipeline` are optional in the embedded facade
+# and **not** optional here. A server build without authentication, Cedar
+# authorization and the audit trail is not something anybody should be able
+# to produce by accident, so it is named at the dependency rather than left
+# to a feature flag somebody might clear. `chronix-security` is also taken
+# directly, because the auth middleware, the key store and the audit sinks
+# are `chronixd`'s own, not the facade's.
+chronix = { workspace = true, features = ["security", "streaming", "pipeline"] }
 chronix-core.workspace = true
 chronix-query.workspace = true
 chronix-security.workspace = true

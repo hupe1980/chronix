@@ -8,15 +8,19 @@
 
 use chronix_security::audit::{AuditAction, AuditDecision, AuditEvent};
 
-use crate::http::AppState;
+use crate::http::SharedState;
 
 /// Record one event, if an audit logger is configured.
 ///
 /// Takes the principal, what was attempted, what it was attempted on, and
 /// how it was decided. Metadata is free-form and goes into the sealed
 /// payload, so it is covered by the hash chain like everything else.
+///
+/// `&SharedState` rather than `&AppState`: a caller holding either can pass
+/// it, because `AppState` is an `Arc` and derefs — and the gates that need to
+/// record a *refusal* hold the inner reference.
 pub fn record(
-    state: &AppState,
+    state: &SharedState,
     principal: &str,
     action: AuditAction,
     resource: impl Into<String>,

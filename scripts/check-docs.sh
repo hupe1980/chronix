@@ -16,6 +16,22 @@ cd "$(dirname "$0")/.."
 fail=0
 note() { printf '  %s\n' "$1"; fail=1; }
 
+# ── Scope: everything a reader can reach ────────────────────────────────
+# Every check below used to scan `site/content` and the top-level README,
+# which is not the same set as "the documentation". `sdks/python/README.md`
+# is on PyPI, is the first page a Python user sees, and sat outside all of
+# it — so it went on showing `localhost:5555` and Flight SQL `5557` long
+# after check 2 was written *for that exact drift*, and the ports were
+# corrected on the site alone. A guard's question is as narrow as its scope.
+#
+# `CHANGELOG.md` is deliberately not here: a changelog's job is to name the
+# ports, crates and subsystems that were removed. `specs/` holds third-party
+# protocol documents, which are not ours to keep current.
+PUBLISHED="site/content README.md CONTRIBUTING.md dashboards/README.md sdks/python/README.md"
+for f in $PUBLISHED; do
+  [ -e "$f" ] || note "published document '$f' is missing"
+done
+
 # ── 1. Crates named in the docs must exist ──────────────────────────────
 # The tree went from 33 crates to 9; the docs kept citing the old ones, so a
 # reader following them would depend on packages that were never published.
@@ -26,7 +42,7 @@ allow_extra=$'chronix-client'
 # `chronix-*` also appears as certificate CNs, Kafka group ids, MQTT client ids,
 # hostnames and bucket paths. Those are sample *values*, not package names, so
 # the lines that carry them are excluded before the names are collected.
-cited=$(grep -rhE '\bchronix-[a-z]+\b' site/content README.md 2>/dev/null \
+cited=$(grep -rhE '\bchronix-[a-z]+\b' $PUBLISHED 2>/dev/null \
         | grep -vE 'CN=|allowed_cns|group_id|client_id|://|<chronix-|chronix-data' \
         | grep -oE '\bchronix-[a-z]+\b' \
         | sort -u \
@@ -43,7 +59,7 @@ done
 # it matches the hyphenated package name, and a Rust path is underscored.
 echo "checking crate paths in code samples…"
 existing_paths=$(ls crates | tr '-' '_' | sort -u)
-for path in $(grep -rhoE '\buse chronix_[a-z_]+' site/content README.md 2>/dev/null \
+for path in $(grep -rhoE '\buse chronix_[a-z_]+' $PUBLISHED 2>/dev/null \
               | sed 's/^use //' | sort -u); do
   if ! grep -qx "$path" <<<"$existing_paths"; then
     note "a code sample imports '$path', which is not a crate in crates/"
@@ -64,9 +80,27 @@ for pair in "default_http_addr:HTTP" "default_grpc_addr:gRPC" "default_flight_ad
   fi
 done
 # Ports the docs used to claim, none of which the server has ever bound.
-if grep -rnE '\b(4242|5555|5556|5557)\b' site/content README.md dashboards 2>/dev/null; then
+if grep -rnE '\b(4242|5555|5556|5557)\b' $PUBLISHED 2>/dev/null; then
   note "documentation references a port the server does not listen on"
 fi
+
+# ── 2b. The published crate must point at the changelog ─────────────────
+# `cargo package` includes nothing from outside a package directory, so the
+# root `CHANGELOG.md` is invisible on crates.io and docs.rs — which is what
+# the design partner reported: they had to diff the repository to discover
+# that `default = ["sql"]` was new in 0.3. There is exactly one changelog and
+# it stays at the root; what travels with the crate is the README (cargo
+# resolves `readme.workspace` against the workspace root and embeds it), so
+# the README has to carry the link.
+echo "checking the changelog is reachable from the crate…"
+[ -f CHANGELOG.md ] || note "CHANGELOG.md is missing"
+grep -qF 'blob/main/CHANGELOG.md' README.md \
+  || note "README.md must link to CHANGELOG.md by absolute URL — a relative \
+link resolves on GitHub and 404s on crates.io and docs.rs, which is where a \
+consumer of the published crate reads it"
+for extra in $(find crates -name CHANGELOG.md 2>/dev/null); do
+  note "$extra: there is one changelog, at the repository root"
+done
 
 # ── 3. Every linked example must exist ──────────────────────────────────
 echo "checking example links…"
@@ -91,11 +125,49 @@ for f in README.md CONTRIBUTING.md; do
   [ -f "$f" ] || note "$f is missing"
 done
 
+echo "checking the README feature table…"
+# Each row names a crate and one or more flags; the crate's manifest must
+# declare them. Renaming `chronix-streaming`'s `flight` to `arrow` left the
+# row behind, and nothing else in this file reads a feature name.
+# `while` after a pipe runs in a subshell, where `note`'s `fail=1` would be
+# lost — the check would print the problem and still exit 0. Feed it from a
+# here-string so the loop stays in this shell.
+rows=$(sed -n '/^| Crate | Flag |/,/^$/p' README.md | grep -E '^\| `')
+while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    crates=$(printf '%s' "$row" | cut -d'|' -f2 | grep -oE '`[a-z0-9-]+`' | tr -d '`')
+    flags=$(printf '%s' "$row" | cut -d'|' -f3 | grep -oE '`[a-z0-9-]+`' | tr -d '`')
+    for crate in $crates; do
+        manifest="crates/$crate/Cargo.toml"
+        if [ ! -f "$manifest" ]; then
+            note "README feature table names unknown crate '$crate'"
+            continue
+        fi
+        for flag in $flags; do
+            if ! sed -n '/^\[features\]/,/^\[[a-z]/p' "$manifest" | grep -qE "^$flag *="; then
+                note "README says '$crate' has flag '$flag'; $manifest does not declare it"
+            fi
+        done
+    done
+done <<EOF
+$rows
+EOF
+
 echo "checking for internal references…"
 if grep -rn 'concepts/' \
      site/content README.md CONTRIBUTING.md \
      Cargo.toml crates .github 2>/dev/null; then
   note "a published artifact references the internal architecture notes"
+fi
+# The same reference without the directory. `See ROADMAP.md` in a file that
+# ships inside the crate sends a reader to a document that is not in it, and
+# the check above cannot see it because the path is absent. Found in a
+# `.cedarschema` — which is also why this one is not limited to `*.rs`: a
+# guard's scope is part of its question, and the last scope that was too
+# narrow was this script's own.
+if grep -rnE '\b(ROADMAP|QUALITY|DECISIONS|RISKS|STORAGE|QUERY|SERVER|ARCHITECTURE|DATA_MODEL|OVERVIEW|SECURITY|ANALYTICS|STREAMING|ENCODING|CLUSTER|DESIGN_PARTNER|MARKET_LANDSCAPE)\.md\b' \
+     crates 2>/dev/null; then
+  note "a file inside a published crate names an architecture note, which is not published with it"
 fi
 if grep -rnE '\b[DR][0-9]{1,3}\b' --include='*.rs' crates 2>/dev/null; then
   note "a doc comment cites a D/R identifier, which resolves only in concepts/"
@@ -113,7 +185,7 @@ fi
 # The GPU backend, the WASM plugin runtime and the in-house dashboards were
 # all built and then removed; each lingered in the docs afterwards.
 echo "checking for removed subsystems…"
-if grep -rniE '\b(wgpu|WGSL|wasmtime|GPU acceleration|GPU compute)\b' site/content 2>/dev/null \
+if grep -rniE '\b(wgpu|WGSL|wasmtime|GPU acceleration|GPU compute)\b' $PUBLISHED 2>/dev/null \
      | grep -viE 'no GPU backend|why there is no|was built and then|deleted'; then
   note "documentation describes a subsystem that was removed"
 fi
@@ -121,7 +193,7 @@ fi
 # The warm tier was cut (D77). The pages may explain that it is gone; they may
 # not describe it as something an operator can configure or call.
 if grep -rniE 'warm_tier_migrate|WarmTierConfig|warm_after|shards_to_warm' \
-     site/content 2>/dev/null; then
+     $PUBLISHED 2>/dev/null; then
   note "documentation describes the warm tier, which was removed"
 fi
 
@@ -134,7 +206,7 @@ facade_methods=$(
   grep -rhoE '^\s*pub (async )?fn [a-z_0-9]+' crates/chronix/src/db/*.rs crates/chronix/src/*.rs \
     | sed -E 's/.*fn //' | sort -u
 )
-for m in $(grep -rhoE 'db\.[a-z_0-9]+\(' site/content concepts README.md 2>/dev/null \
+for m in $(grep -rhoE 'db\.[a-z_0-9]+\(' $PUBLISHED concepts 2>/dev/null \
              | sed -E 's/^db\.//; s/\($//' | sort -u); do
   case "$m" in
     # Builder and iterator chains, not facade methods.

@@ -58,6 +58,31 @@ sql = ["dep:datafusion"]
 ## configuration is accepted and has no effect.
 field-encryption = ["chronix-engine/field-encryption"]
 
+## Change-data-capture: `Chronix::subscribe`, the event bus every write
+## publishes to, and the signal/trigger engine.
+##
+## **Off by default.** It is 63 packages beyond the engine — an HTTP client
+## and a TLS stack among them, for webhook delivery — and an embedded
+## consumer that opens a database and writes to it subscribes to nothing.
+streaming = ["dep:chronix-streaming"]
+
+## Authentication, Cedar authorization, the audit trail and the namespace
+## registry.
+##
+## **Off by default.** It is 126 packages beyond the engine — a JWT library,
+## Argon2, `aes-gcm`, Cedar and a whole TLS stack — none of which an embedded
+## `Chronix::open` touches.
+##
+## `chronixd` enables it unconditionally: a server without authentication,
+## authorization and an audit trail is not a build anybody should be able to
+## produce by accident.
+security = ["dep:chronix-security"]
+
+## The real-time pipeline: CDC → triggers → delivery, streaming anomaly
+## detection and continuous forecasting, with audit and authorization wired
+## through. Needs both halves above, plus webhook delivery.
+pipeline = ["streaming", "security"]
+
 ## `TryFrom` conversions between `chronix::Decimal` and
 ## `rust_decimal::Decimal` — see `chronix-core`'s feature of the same name.
 rust_decimal = ["chronix-core/rust_decimal"]
@@ -73,9 +98,9 @@ chronix-core.workspace = true
 chronix-encoding.workspace = true
 chronix-query.workspace = true
 chronix-engine.workspace = true
-chronix-streaming.workspace = true
 chronix-analytics.workspace = true
-chronix-security.workspace = true
+chronix-streaming = { workspace = true, optional = true }
+chronix-security = { workspace = true, optional = true }
 arrow.workspace = true
 base64.workspace = true
 dashmap.workspace = true
@@ -96,7 +121,6 @@ metrics.workspace = true
 uuid.workspace = true
 rayon.workspace = true
 regex.workspace = true
-chrono-tz.workspace = true
 
 # Cold tier (feature-gated)
 object_store = { workspace = true, optional = true }
@@ -105,6 +129,10 @@ chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The catalog's own framing, so a test can build a record the replay scanner
+# will accept — which is what makes "a fragment with a valid record after it"
+# reproducible without reaching into the engine.
+crc32c.workspace = true
 proptest.workspace = true
 criterion = { workspace = true }
 
@@ -114,10 +142,9 @@ harness = false
 required-features = ["sql"]
 
 # Examples are auto-discovered from `examples/`; only the feature-gated ones
-# need a declaration. They used to live at the workspace root and be wired up
-# with 27 `path = "../../examples/..."` entries — which `cargo package` cannot
-# include, so the published crate declared 27 example targets whose sources
-# were absent and the verification build failed.
+# need a declaration. They must live inside the crate: `cargo package` cannot
+# include a `path = "../../examples/..."` target, so the published crate would
+# declare sources it does not ship.
 [[example]]
 name = "cold_tier"
 required-features = ["object-store"]
@@ -183,7 +210,7 @@ required-features = ["sql"]
 
 [[test]]
 name = "documented_sql"
-required-features = ["sql"]
+required-features = ["sql", "streaming"]
 
 [[test]]
 name = "sql_decimal_semantics"
@@ -226,3 +253,47 @@ required-features = ["sql"]
 [[test]]
 name = "analytics_limits"
 required-features = ["sql"]
+
+# Targets that exercise the streaming, security and pipeline surfaces, which
+# are off by default so an embedded build does not carry a JWT library and a
+# TLS stack. Same idiom as `sql` above: cargo skips the target rather than
+# compiling an empty binary that reports success.
+[[example]]
+name = "audit_logging"
+required-features = ["security"]
+
+[[example]]
+name = "authz"
+required-features = ["security"]
+
+[[example]]
+name = "encryption"
+required-features = ["security"]
+
+[[example]]
+name = "tenant_isolation"
+required-features = ["security"]
+
+[[example]]
+name = "signal_triggers"
+required-features = ["streaming"]
+
+[[example]]
+name = "data_pipeline"
+required-features = ["pipeline", "sql"]
+
+[[test]]
+name = "decimal_lifecycle"
+required-features = ["streaming"]
+
+[[test]]
+name = "resident_memory"
+required-features = ["streaming"]
+
+[[test]]
+name = "trigger_delivery"
+required-features = ["pipeline"]
+
+[[test]]
+name = "public_api"
+required-features = ["pipeline", "sql"]

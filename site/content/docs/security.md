@@ -118,8 +118,13 @@ For service-to-service communication:
 name = "ingest"
 key = "$CHRONIX_INGEST_KEY"   # env-var reference, Argon2 PHC string, or plain text
 namespaces = ["tenant-a"]     # tenants this key may act in
-admin = false                 # restore, namespace and key management
+admin = false                 # the administrative *capability*; policies decide which
+roles = ["ingest-service"]    # Chronix::Role memberships, for Cedar policies
 ```
+
+`roles` is what makes a policy written `principal in Chronix::Role::"…"`
+apply to this key. Without it the only way to name the key in a policy is
+`principal == Chronix::User::"ingest"`.
 
 `key` takes three forms: `$VAR` or `${VAR}` reads the value from the
 environment at startup, a string beginning `$argon2` is a pre-hashed PHC
@@ -129,6 +134,23 @@ load. Prefer the first, so a key never sits in a config file.
 Keys can also be minted at runtime through `/api/v1/admin/auth/keys`, which
 requires an administrative credential. Under multi-tenancy the request must
 name the namespaces the new key may act in.
+
+**Runtime key changes are durable.** `[[auth.api_keys]]` is a *declaration*
+and is re-read on every start, so both halves of runtime key management used
+to last exactly as long as the process: a minted key — shown once, in the
+creation response, and unrecoverable — stopped working at the next restart,
+and a **revocation was undone by one**. Chronix keeps the record in
+`<data_dir>/auth/api_keys.json`: Argon2 hashes for keys the API created, and
+names for keys it revoked, applied *after* the config so a revocation wins
+over a declaration. Revoking a configured key therefore takes effect
+immediately and stays, without editing the config and redeploying during an
+incident.
+
+Both operations are written before they are acknowledged, and roll back if
+the write fails — a revocation the caller was told succeeded and the disk did
+not take is the failure the record exists to remove. Remove the key from
+`[[auth.api_keys]]` as well when convenient; the entry in the record is what
+keeps it revoked until you do.
 
 **`namespaces` and `admin` both fail open when omitted**, which is why each
 has a guard. A key naming no namespaces reads every tenant, so a server with
@@ -157,255 +179,173 @@ laptop and wrong for anything reachable by anyone else.
 
 ## Authorization (Cedar)
 
-Chronix uses [Cedar](https://www.cedarpolicy.com/) for fine-grained,
-formally verified authorization policies.
+Chronix authorizes with [Cedar](https://www.cedarpolicy.com/), a formally
+verified policy language. Two decisions are put to it, and the model contains
+exactly those two:
 
-**Error safety**: All Cedar entity construction (`to_entity()` for principals,
-resources, and namespaces) returns `Result<Entity, AuthzError>`. Construction
-failures are logged and result in `Decision::Deny` — the system never panics
-on authorization and always defaults to deny.
+| Decision | Resource | Actions |
+|---|---|---|
+| May this principal touch this tenant's data? | `Chronix::Namespace` | `Read`, `Write`, `Delete` |
+| May this principal administer the server? | `Chronix::System` | the capabilities in the `Admin` group |
 
-### Principal Model
+**There is no `Measurement` resource.** The unit of authorization is the
+namespace, because that is the unit everything else uses: points carry a
+`__namespace__` tag, SQL sessions are built per namespace, quotas are counted
+per namespace, and a credential is bound to a set of them. A finer unit that
+only the policy layer understood would have to be remembered by each of forty
+routes, and the ones that forgot would read as protected.
+
+### The schema is compiled in, and every policy is validated against it
+
+`chronixd` loads [`chronix.cedarschema`][schema] at startup and validates
+every policy against it. A rule naming an action or an entity type this
+server never asks about is a **startup error**, not a rule that quietly never
+fires — which is the failure this whole mechanism exists to prevent, and the
+one this guide itself shipped for several releases.
+
+[schema]: https://github.com/hupe1980/chronix/blob/main/crates/chronix-security/src/authz/chronix.cedarschema
+
+Read the schema for the authoritative list of entity types and actions. Two
+things to know before writing a policy:
+
+* **Everything is namespaced under `Chronix::`.** `Action::"Read"` is a
+  different type from `Chronix::Action::"Read"` and matches nothing.
+* **Roles are `Chronix::Role`, not groups.** A principal is in a role
+  because its credential says so — `roles = [...]` on an API key, or the
+  JWT claim named by `auth.jwt.role_claim`.
+
+### Principals
 
 ```text
-Principal hierarchy:
-  User("alice")
-  ServiceAccount("ingest-pipeline")
-  Group("platform-team")
-    ├── User("alice")
-    └── User("bob")
+Chronix::User::"alice"                  a JWT subject, an API key name, a cert CN
+  └── in Chronix::Role::"platform-team" from the credential's role list
 ```
 
-### Action Model
+### Policy examples
 
-| Action | Description |
-|--------|-------------|
-| `Action::"Write"` | Write time-series data |
-| `Action::"Query"` | Read/query time-series data |
-| `Action::"CreateMeasurement"` | Create a new measurement schema |
-| `Action::"DeleteMeasurement"` | Delete a measurement |
-| `Action::"Admin"` | Administrative operations |
-| `Action::"ManageNamespace"` | Create/delete/modify namespaces |
-| `Action::"ManageModel"` | Train/delete forecast/anomaly models |
-
-### Resource Model
-
-```text
-Resource hierarchy:
-  Namespace("team-platform")
-    ├── Measurement("cpu")
-    ├── Measurement("memory")
-    └── Model("cpu-forecast")
-```
-
-### Policy Examples
-
-**Allow a team to read/write their namespace:**
+**A team reads and writes its own namespace:**
 
 ```cedar
 permit(
-  principal in Group::"platform-team",
-  action in [Action::"Write", Action::"Query"],
-  resource in Namespace::"team-platform"
+  principal in Chronix::Role::"platform-team",
+  action in [Chronix::Action::"Read", Chronix::Action::"Write"],
+  resource == Chronix::Namespace::"team-platform"
 );
 ```
 
-**Allow admin operations for specific users:**
+**An ingest key writes, and only writes, and only there:**
 
 ```cedar
 permit(
-  principal == User::"alice",
-  action == Action::"Admin",
-  resource
+  principal == Chronix::User::"telegraf",
+  action == Chronix::Action::"Write",
+  resource == Chronix::Namespace::"metrics"
 );
 ```
 
-**Deny cross-namespace queries by default:**
+**Nobody deletes production except the on-call role:**
 
 ```cedar
 forbid(
   principal,
-  action == Action::"Query",
-  resource
+  action == Chronix::Action::"Delete",
+  resource == Chronix::Namespace::"production"
 ) unless {
-  resource in principal.namespace
+  principal in Chronix::Role::"oncall"
 };
 ```
 
-**Rate-limited write access:**
+**Every administrative capability at once** — `Admin` is an action *group*,
+so this is `in`, not `==`:
 
 ```cedar
 permit(
-  principal in Group::"external-ingest",
-  action == Action::"Write",
-  resource in Namespace::"external"
-) when {
-  context.points_per_second <= 10000
-};
+  principal in Chronix::Role::"root",
+  action in Chronix::Action::"Admin",
+  resource
+);
 ```
 
-### Policy Management
+**One capability, which is the point of having twelve:**
 
-```bash
-# Add a Cedar policy
-curl -X POST http://chronix:8086/api/v1/admin/policies \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "platform-team-access",
-    "policy": "permit(principal in Group::\"platform-team\", action in [Action::\"Write\", Action::\"Query\"], resource in Namespace::\"team-platform\");"
-  }'
-
-# List all policies
-curl http://chronix:8086/api/v1/admin/policies
-
-# Delete a policy
-curl -X DELETE http://chronix:8086/api/v1/admin/policies/platform-team-access
+```cedar
+permit(
+  principal == Chronix::User::"backup-runner",
+  action == Chronix::Action::"ManageBackups",
+  resource
+);
 ```
 
-Policy mutations (add, remove, load from directory) emit structured audit logs
-via `tracing::info!` with policy IDs and counts. Metrics counters
-(`chronix_authz_policy_load`) track policy operations by type.
+That credential can take, verify and restore backups. It cannot mint an API
+key, change the log level or delete a namespace — each of those is a separate
+capability asked for by the route group that performs it.
 
-### Policy Versioning and Rollback
+### Two gates, and both have to pass
 
-Every policy mutation (add, remove, load) is automatically versioned.
-The authorization engine maintains a ring buffer of the last 10 policy
-versions, enabling instant rollback if a bad policy causes an outage.
+An administrative request needs **both** the capability on its credential
+(`admin = true` on the key, or `"admin": true` in the token) **and** a policy
+permitting the specific action. Adding policies can therefore only ever
+*narrow* what a credential can do — a permissive file in `authz_policy_dir`
+never widens it.
 
-```rust
-// Get current version number
-let version = engine.current_version();
+Data requests need the credential's namespace binding — which is what keeps
+tenants apart, and is enforced whether or not Cedar is configured — and then
+the policy.
 
-// List recent policy versions
-let versions = engine.policy_versions(); // Vec<PolicyVersion>
+### What the method asks for
 
-// Revert to a previous version
-engine.revert_to_version(3)?;
+The data gate maps the HTTP method, and every gRPC and Flight SQL RPC names
+its action directly:
 
-// Dry-run a policy load without modifying the active set
-engine.dryrun_load_policies("./policies/")?;
-```
+| Method | Action |
+|---|---|
+| `GET`, `HEAD`, `OPTIONS` | `Read` |
+| `POST`, `PUT`, `PATCH` | `Write` |
+| `DELETE` | `Delete` |
 
-Each `PolicyVersion` records the version number, the complete `PolicySet`
-snapshot, a human-readable source label, and a Unix timestamp.
+Health, readiness, the metrics scrape, the OpenAPI document and the
+administrative routes are outside the data gate. The first four carry no
+tenant rows, and a liveness probe that fails because a policy file changed is
+an outage a policy file should not be able to cause. The administrative
+routes are outside it because an administrative request is not a request *in*
+a namespace — it is governed by its capability on `Chronix::System`, and
+applying both would mean a key bound to `tenant-a` also needed `Write` on
+`default` before it could take a backup. Everything else refuses when no
+policy permits it — `every_route_refuses_under_a_deny_all_policy` walks the
+router and checks it.
 
-### Schema validation
-
-Cedar schema validation ensures that policies reference valid entity types,
-actions, and attributes. Typos in policy definitions are caught at load time
-rather than silently failing at authorization time.
-
-```rust
-// Loading a schema automatically enables strict validation
-let mut engine = AuthzEngine::new();
-engine.load_schema(r#"
-    entity User;
-    entity Measurement;
-    action Read appliesTo { principal: User, resource: Measurement };
-"#)?;
-
-// This will now FAIL — "Wrte" is not a valid action
-engine.add_policy("typo-policy",
-    r#"permit(principal, action == Action::"Wrte", resource);"#
-)?; // → Err(PolicyValidation(...))
-```
-
-**Behavior:**
-- `AuthzEngine::new()` starts with `require_schema = false` (built-in
-  policies load without a schema)
-- Calling `with_schema()` or `load_schema()` auto-enables
-  `require_schema = true`
-- All subsequent `add_policy()` and `load_policies()` calls are validated
-  against the schema
-- Use `with_require_schema(false)` to opt out (not recommended)
-
-### Authorization Configuration
+### Turning it on
 
 ```toml
+[server]
 # Cedar authorization is on when a policy directory is set, and off when it
 # is not. There is no `enabled` flag: an empty directory would be
 # default-deny and refuse everything.
 authz_policy_dir = "/etc/chronix/policies/"
 ```
 
-### Namespace-Level Authorization (Rust API)
+Every `.cedar` file in the directory is loaded as one policy set, in filename
+order. An `[auth]` section is required: a policy names a principal, and
+without authentication every request is anonymous.
 
-The `chronix-security::authz` crate provides dedicated namespace authorization via
-`ChronixNamespace` and `AuthzEngine::authorize_namespace()`. The engine
-never panics — all Cedar evaluation errors (malformed entities, invalid
-requests) produce `Decision::Deny` with error logging, ensuring a
-fail-closed security posture. Deny responses return only a generic
-"access denied" message; detailed Cedar diagnostics (policy IDs,
-evaluation errors) are logged server-side at debug level.
+Policies are loaded at startup. There is no API to add, remove or roll them
+back at run time — the files are the source of truth, and a deployment that
+needs a change restarts or reloads with a new directory.
 
-The namespace middleware automatically maps HTTP methods to Cedar actions:
-- `GET`, `HEAD`, `OPTIONS` → `Action::"Read"`
-- `POST`, `PUT`, `PATCH` → `Action::"Write"`
-- `DELETE` → `Action::"Delete"`
+### Cross-tenant isolation is not a policy
 
-### Namespace-Scoped Resource Authorization
+It is a property of the credential. A key or token carries the namespaces it
+may act in, and a request naming any other is refused before Cedar is
+consulted — so an operator cannot forget to deploy the rule that keeps
+tenants apart. `chronixd` refuses to start multi-tenant with an unconfined
+key.
 
-Resources can be scoped to a namespace using `with_namespace()`, enabling
-Cedar policies that restrict access based on namespace membership:
+### Failure behaviour
 
-```rust
-use chronix_security::authz::model::{ChronixResource, ChronixAction, ChronixPrincipal};
-
-// Create a resource scoped to a namespace
-let resource = ChronixResource::new("cpu")
-    .with_namespace("production");
-
-// The Cedar entity hierarchy becomes:
-// Chronix::Measurement::"cpu" in Chronix::Namespace::"production"
-```
-
-This enables Cedar policies like:
-
-```cedar
-// Allow reads only for resources in the "production" namespace
-permit(
-  principal in Group::"ops-team",
-  action == Action::"Query",
-  resource in Namespace::"production"
-);
-
-// Deny writes to staging namespace
-forbid(
-  principal,
-  action == Action::"Write",
-  resource in Namespace::"staging"
-) unless {
-  principal in Group::"staging-deployers"
-};
-```
-
-When `authorize()` is called with a namespace-scoped resource, the namespace
-entity is automatically included in the Cedar entity set, so `resource in
-Namespace::"..."` conditions resolve correctly.
-
-```rust
-use chronix_security::authz::{AuthzEngine, ChronixNamespace};
-use chronix_security::authz::model::{ChronixAction, ChronixPrincipal};
-
-let engine = AuthzEngine::new();
-// ... add policies ...
-
-// Namespace-scoped authorization check
-let principal = ChronixPrincipal::new("alice").with_role("platform-admin");
-let decision = engine.authorize_namespace(
-    &principal,
-    ChronixAction::Read,
-    &ChronixNamespace::new("team-platform"),
-);
-
-if decision.is_allowed() {
-    // Proceed with namespace operation
-}
-```
-
-The `namespace_layer` middleware in `chronixd` automatically performs
-this check on every request when the authz engine is configured,
-using the `X-Namespace` header value as the target namespace.
+Cedar evaluation never panics. Entity-construction failures, malformed
+requests and evaluation errors all produce a denial, logged server-side;
+the caller is told `403` and the action that was refused, never a policy id
+or an evaluation trace.
 
 ## Namespace isolation
 
@@ -667,37 +607,37 @@ sync_each = true
 
 ### Audit Events
 
-The `AuditAction` enum provides **26 built-in action types** covering all
-security-relevant operations:
+Every category below is one `chronixd` **emits**. That is a recent property
+and worth stating plainly: the enum had twenty-five variants and the server
+constructed four, so this table listed `namespace_delete`, `data_export`,
+`policy_load`, `api_key_create` and fifteen others as coverage while nothing
+produced them. An absent event is what an auditor reads as *it did not
+happen*, so a category nothing emits is worse than a missing one.
+`every_audit_action_has_a_producer` walks the enum and fails on the next.
 
-| Event | Logged When |
-|-------|------------|
-| `write` | Data write operation |
-| `read` | Data read / query |
-| `delete` | Data deletion |
-| `admin` | Administrative operation |
-| `create_rollup` | Rollup rule created |
-| `forecast` | Forecast model execution |
-| `detect_anomalies` | Anomaly detection run |
-| `subscribe` | CDC subscription created |
-| `login_success` | Successful authentication |
-| `login_failure` | Failed authentication attempt (HTTP + gRPC/Flight) |
-| `key_rotation` | Encryption key rotated |
-| `token_refresh` | JWT token refreshed |
-| `trigger_create` | Signal trigger created |
-| `trigger_drop` | Signal trigger dropped |
-| `signal_fired` | Composite signal fired |
-| `schema_change` | Schema created/altered/dropped |
-| `drop_rollup` | Rollup rule dropped |
-| `data_export` | Data exported (e.g., Parquet) |
-| `permission_change` | Permission or role change |
-| `policy_load` | Cedar/authz policy loaded or updated |
-| `api_key_create` | API key created |
-| `api_key_revoke` | API key revoked |
-| `namespace_create` | Namespace created |
-| `namespace_delete` | Namespace deleted |
-| `quota_change` | Namespace quota changed |
-| `custom(…)` | User-defined custom action |
+| Event | Logged when | Emitted by |
+|-------|------------|-----------|
+| `write` | A data write | the embedded API — `chronixd` does not log one event per request |
+| `read` | A data read | the embedded API, as above |
+| `delete` | A delete, the one operation nothing can undo | `POST /api/v1/delete`, `delete_batch`, a measurement drop |
+| `schema_change` | A column declared — permanent, and shared between tenants | `POST /api/v1/measurements/{name}/schema/fields` |
+| `data_export` | Data leaving the database | `POST /api/v1/export/parquet` |
+| `login_failure` | A rejected credential | HTTP, gRPC and Flight SQL |
+| `admin` | An administrative operation, **and every administrative refusal** | backup, restore, the log level, and the capability gate |
+| `api_key_create` | A key minted at runtime | `POST /api/v1/admin/auth/keys` |
+| `api_key_revoke` | A key revoked | `DELETE /api/v1/admin/auth/keys/{name}` |
+| `policy_load` | The Cedar policy set the server is enforcing | startup, with every policy id |
+| `namespace_create` | A tenant created | `POST /api/v1/namespaces` |
+| `namespace_delete` | A tenant deleted — every credential's route to its data | `DELETE /api/v1/namespaces/{name}` |
+| `quota_change` | A namespace quota changed | the namespace API |
+| `create_rollup` / `drop_rollup` | A rollup rule created or dropped | `/api/v1/rollups` |
+| `trigger_create` / `trigger_drop` | A trigger created or dropped — a trigger sends data somewhere | `/api/v1/triggers` |
+| `signal_fired` | A signal fired | the pipeline |
+| `custom(…)` | Anything an embedded consumer wants to record | the embedded API |
+
+**There is deliberately no `login_success`.** A database authenticates every
+request; recording the successes would make the trail a second request log
+and bury the events it exists for.
 
 ### Hash Chain Integrity
 
@@ -710,6 +650,24 @@ the `prev_hash` field, forming a tamper-evident chain:
   entry's `prev_hash` matches the computed hash of its predecessor
 - **Tamper detection** — any modification, insertion, or deletion of entries
   breaks the chain, making unauthorized changes immediately detectable
+
+**A broken chain means tampering, and nothing else.** That is the whole value
+of the mechanism, and it is why three benign ways of breaking it were
+removed rather than documented:
+
+- Sealing an event and writing it are **one step**. They were two, so two
+  concurrent requests could seal in one order and write in the other and
+  leave a file that failed its own verification — with no error anywhere.
+- An event that reaches **no durable sink** does not advance the chain. It
+  used to, so a full disk broke every later verification of that file,
+  permanently. The gap is counted by `chronix_audit_chain_gaps_total` and
+  logged at `error`, because a lost audit event is worth an alert of its own.
+- A line is written **whole or not at all**, so a failed write cannot swallow
+  the event after it.
+
+A check that can fail for a benign reason is a check whose failures mean
+nothing; alert on `verify_hash_chain` only once its benign failures are
+gone.
 
 #### HMAC-Keyed Hash Chain (SEC-07)
 
@@ -991,7 +949,9 @@ ticked without the control being on.
 
 - [ ] Enable authentication — set `[auth] api_keys` and/or `[auth] jwt`
 - [ ] Enable Cedar authorization — point `authz_policy_dir` at a directory of
-      `.cedar` files. With it unset, every authenticated request is permitted
+      `.cedar` files. With it unset, every authenticated request is permitted.
+      Policies are validated against the compiled-in schema at startup, so a
+      typo is a refusal to start rather than a rule that never fires
 - [ ] Enable TLS — set `[tls] cert` and `[tls] key`
 - [ ] Enable mTLS for client connections — set `[tls] client_ca`
 - [ ] Enable inter-node TLS (cluster builds) — set `[cluster.tls] ca_cert`,
@@ -1003,8 +963,14 @@ ticked without the control being on.
       up a new pair without a restart
 - [ ] Write least-privilege Cedar policies per team or service; a request
       matching no policy is denied
-- [ ] Define least-privilege Cedar policies per team/service
-- [ ] Monitor `chronix_auth_failures_total` for brute-force attempts
+- [ ] Grant administrative credentials **one capability each** —
+      `action == Chronix::Action::"ManageBackups"` rather than
+      `action in Chronix::Action::"Admin"` — and give each its own key
+- [ ] Monitor `chronix_auth_failures_total` for brute-force attempts, and
+      `chronix_authz_denied_total` and `chronix_namespace_denied_total` for a
+      credential reaching for something it is not allowed. All three are
+      published **at zero** at startup, so an alert on them can be tested
+      before the incident rather than during it
 - [ ] Separate admin credentials from application credentials
 - [ ] Use environment variables or secrets manager for sensitive config
 - [ ] Encrypt the data directory at the filesystem or volume layer, and the cold-tier bucket with its own server-side encryption
@@ -1012,7 +978,7 @@ ticked without the control being on.
 - [ ] Verify JWT `jti` replay protection is active if tokens include `jti` claims
 - [ ] Confirm webhook URLs use HTTPS (enforced; the SSRF address rule is on by default and `triggers.webhook_allow_private_targets` is the named way off)
 - [ ] Use `$VAR` syntax for connector credentials, and `CHRONIX_WEBHOOK_SIGNING_SECRET` for the webhook signing key — never embed literal secrets in config
-- [ ] Review audit event coverage (26 built-in action types)
+- [ ] Review audit event coverage — every category the server declares is one it emits, checked by `every_audit_action_has_a_producer`; the list read "26 built-in action types" while nineteen of them were constructed by nothing
 
 ### Namespace Security
 

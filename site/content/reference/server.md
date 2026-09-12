@@ -126,6 +126,12 @@ pub trait IngestionConnector: Send + Sync {
 }
 ```
 
+`status()` reports what the connector's task is doing: `Running` (receiving),
+`Idle` (connected, nothing arriving), `Reconnecting` (retrying with backoff),
+`Failed(reason)` (retrying, and naming the error), `Stopped`. `is_healthy()`
+is `Running | Idle`. Connection setup retries rather than being attempted
+once, so a broker that is still coming up is not a permanent failure.
+
 #### Connector Format (RQ-05)
 
 The payload format is configured via the `ConnectorFormat` enum:
@@ -226,7 +232,11 @@ When compiled with `--features mqtt`, `MqttSubscriber` spawns a `rumqttc`
   preserves unchanged running connectors
 - **`list_connectors()`** — returns `ConnectorInfo` (name, type, status, metrics)
   for the REST status API at `GET /api/v1/connectors`
-- **`all_healthy()`** — aggregated health check for the `/ready` endpoint
+- **`refresh_gauges()`** — publishes `chronix_connector_up{connector,type}`,
+  called from the metrics scrape. Connector health is not part of `/ready`,
+  which asks only whether the database is writable: a connector that cannot
+  reach its broker does not stop this node answering queries. Alert on the
+  gauge
 
 Connectors are wired into `server.rs`: on startup, `KafkaConsumer` and
 `MqttSubscriber` instances are created from `ServerConfig.kafka` /
@@ -275,6 +285,7 @@ types, and an error for any other Arrow type.
 | `chronix_grpc_points_written_total` | Counter | Points written via gRPC |
 | `chronix_grpc_queries_total` | Counter | Queries executed via gRPC |
 | `chronix_kafka_messages_consumed_total` | Counter | Messages consumed from Kafka topics |
+| `chronix_connector_up` | Gauge | `1` when a connector is ingesting or could be (`Running`, `Idle`), `0` otherwise (`Reconnecting`, `Failed`, `Stopped`). Labelled `connector` and `type`. This is the connector alert to wire — `/ready` does not cover it |
 | `chronix_kafka_consumer_lag` | Gauge | Kafka consumer lag in messages, summed over the connector's assigned partitions and labelled `connector`. Read from the watermarks the last fetch response already carried, so it costs no broker round trip |
 | `chronix_kafka_deserialization_errors_total` | Counter | Kafka payload deserialization failures |
 | `chronix_mqtt_messages_received_total` | Counter | Messages received from MQTT topics |

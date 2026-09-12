@@ -211,7 +211,8 @@ exempt_paths = ["/health", "/ready", "/metrics"]
 name = "ingest"
 key = "$CHRONIX_INGEST_KEY"      # env-var reference, Argon2 PHC string, or plain text
 namespaces = ["tenant-a"]        # namespaces this key may act in; empty = all
-admin = false                    # restore, namespace and key management
+admin = false                    # the administrative capability
+roles = ["ingest-service"]       # Chronix::Role memberships, for Cedar policies
 
 [auth.jwt]
 secret = "your-jwt-secret"       # HS256/HS384/HS512 only
@@ -226,19 +227,25 @@ role_claim = "realm_access.roles"       # optional; defaults to "roles"
 # jwks_url = "https://auth.example.com/.well-known/jwks.json"
 ```
 
-An API key carries a principal name, the namespaces it may act in, and
-whether it is an administrator. Roles come from JWT claims, so Cedar policies
-written against roles apply to JWT principals; an API-key principal matches
-only policies written against its name. A JWT may carry `namespaces` (an
-array, or a single string) and `admin` as claims.
+An API key carries a principal name, the namespaces it may act in, whether
+it is an administrator, and its Cedar roles. A JWT carries the same four:
+`namespaces` (an array, or a single string), `admin`, and roles from the
+claim named by `role_claim`.
+
+**Roles are resolved once, at authentication**, whichever credential was
+used, so the same role means the same thing at the data gate and the
+administrative gate — and `principal in Chronix::Role::"…"` matches on both.
+API keys carry roles as well as tokens.
 
 **`namespaces` is not optional under multi-tenancy.** A key naming none is
 unrestricted and reads every tenant, so `chronixd` refuses to start with
 `multi_tenancy = true` while one exists, naming it in the error.
 
 **`admin` gates the administrative endpoints** — restore, namespace
-management and key management — on any deployment without a Cedar policy
-directory.
+management, key management, the log level — and it is required whether or
+not a policy directory is configured. With one, a policy permitting the
+route group's specific capability is required *as well*, so adding policies
+can only narrow what a credential reaches.
 
 The verification key follows the algorithm's family. `HS*` reads `secret`;
 `RS*`, `PS*`, `ES*` and `EdDSA` read `public_key_pem_file`; `jwks_url`

@@ -41,13 +41,15 @@ chrono-tz = { workspace = true }
 rust_decimal = { workspace = true, optional = true }
 dashmap = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 fnv = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+# Test-only: no public item returns or accepts JSON, so consumers do not
+# inherit it.
+serde_json = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 

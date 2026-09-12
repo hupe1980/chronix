@@ -13,7 +13,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::authz::engine::AuthzEngine;
-    use crate::authz::model::{ChronixAction, ChronixPrincipal, ChronixResource};
+    use crate::authz::model::{ChronixAction, ChronixNamespace, ChronixPrincipal};
 
     /// Generate a Cedar policy using proper entity membership syntax.
     fn make_policy(id: usize) -> String {
@@ -21,7 +21,7 @@ mod tests {
             r#"permit(
   principal in Chronix::Role::"role_{id}",
   action == Chronix::Action::"Read",
-  resource == Chronix::Measurement::"measurement_{id}"
+  resource == Chronix::Namespace::"namespace_{id}"
 );"#
         )
     }
@@ -49,11 +49,11 @@ mod tests {
 
         // Deny path (no matching role → default-deny)
         let principal = ChronixPrincipal::new("user1");
-        let resource = ChronixResource::measurement("measurement_50");
+        let resource = ChronixNamespace::new("namespace_50");
 
         // Warm up
         for _ in 0..50 {
-            let _ = engine.authorize(&principal, ChronixAction::Read, &resource);
+            let _ = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
         }
 
         let iterations = 5_000;
@@ -61,7 +61,7 @@ mod tests {
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let d = engine.authorize(&principal, ChronixAction::Read, &resource);
+            let d = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
             latencies.push(start.elapsed());
             assert!(!d.is_allowed());
         }
@@ -88,11 +88,11 @@ mod tests {
         }
 
         let principal = ChronixPrincipal::new("user1");
-        let resource = ChronixResource::measurement("measurement_500");
+        let resource = ChronixNamespace::new("namespace_500");
 
         // Warm up
         for _ in 0..20 {
-            let _ = engine.authorize(&principal, ChronixAction::Read, &resource);
+            let _ = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
         }
 
         let iterations = 2_000;
@@ -100,7 +100,7 @@ mod tests {
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let _ = engine.authorize(&principal, ChronixAction::Read, &resource);
+            let _ = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
             latencies.push(start.elapsed());
         }
 
@@ -129,10 +129,10 @@ mod tests {
 
         // Principal with matching role → should be allowed
         let principal = ChronixPrincipal::new("alice").with_role("role_50");
-        let resource = ChronixResource::measurement("measurement_50");
+        let resource = ChronixNamespace::new("namespace_50");
 
         // Verify allow path works
-        let decision = engine.authorize(&principal, ChronixAction::Read, &resource);
+        let decision = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
         assert!(
             decision.is_allowed(),
             "Expected allow for principal with matching role"
@@ -144,7 +144,7 @@ mod tests {
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let _ = engine.authorize(&principal, ChronixAction::Read, &resource);
+            let _ = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
             latencies.push(start.elapsed());
         }
 
@@ -175,14 +175,14 @@ mod tests {
 
         // Nothing matches → deny
         let principal = ChronixPrincipal::new("nobody");
-        let resource = ChronixResource::measurement("nonexistent");
+        let resource = ChronixNamespace::new("nonexistent");
 
         let iterations = 5_000;
         let mut latencies = Vec::with_capacity(iterations);
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let decision = engine.authorize(&principal, ChronixAction::Write, &resource);
+            let decision = engine.authorize_namespace(&principal, ChronixAction::Write, &resource);
             latencies.push(start.elapsed());
             assert!(!decision.is_allowed());
         }
@@ -234,17 +234,17 @@ mod tests {
         }
 
         let principal = ChronixPrincipal::new("alice").with_role("role_50");
-        let resource = ChronixResource::measurement("measurement_50");
+        let resource = ChronixNamespace::new("namespace_50");
 
         // Verify authz works
         assert!(engine
-            .authorize(&principal, ChronixAction::Read, &resource)
+            .authorize_namespace(&principal, ChronixAction::Read, &resource)
             .is_allowed());
 
         let iterations = 5_000;
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = engine.authorize(&principal, ChronixAction::Read, &resource);
+            let _ = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
         }
         let authz_total = start.elapsed();
         let authz_per_op = authz_total / iterations as u32;
@@ -267,7 +267,7 @@ mod tests {
     #[ignore = "perf benchmark — run with --ignored"]
     fn authz_scales_sublinearly_with_policy_count() {
         let principal = ChronixPrincipal::new("user1");
-        let resource = ChronixResource::measurement("m_test");
+        let resource = ChronixNamespace::new("m_test");
 
         let mut results = Vec::new();
 
@@ -281,13 +281,13 @@ mod tests {
 
             // Warm up
             for _ in 0..20 {
-                let _ = engine.authorize(&principal, ChronixAction::Read, &resource);
+                let _ = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
             }
 
             let iterations = 1_000;
             let start = Instant::now();
             for _ in 0..iterations {
-                let _ = engine.authorize(&principal, ChronixAction::Read, &resource);
+                let _ = engine.authorize_namespace(&principal, ChronixAction::Read, &resource);
             }
             let avg = start.elapsed() / iterations as u32;
             results.push((count, avg));

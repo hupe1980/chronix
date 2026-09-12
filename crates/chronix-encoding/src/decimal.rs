@@ -353,4 +353,85 @@ mod tests {
             assert_eq!(zigzag_decode_i128(zigzag_encode_i128(value)), value);
         }
     }
+
+    // ── Properties ─────────────────────────────────────────────────────
+    //
+    // This crate's first stated principle is that **every encoder
+    // guarantees bitwise-exact roundtrip**, and every other codec module
+    // here backs that with a `proptest!`. `decimal` and `coding` were the
+    // two that did not, and this is the one whose wide form is a
+    // hand-written 128-bit LEB128 over `wrapping_sub`/`wrapping_add`
+    // deltas — the shape where a chosen example proves least.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The property the module promises, over arbitrary mantissas.
+        ///
+        /// `any::<i128>()` reaches the wide form; the narrow form is the
+        /// separate strategy below, because a random `i128` almost never
+        /// fits an `i64` and the common path would otherwise go untested.
+        #[test]
+        fn roundtrip_arbitrary_mantissas(
+            values in prop::collection::vec(any::<i128>(), 1..200),
+        ) {
+            let encoded = DecimalEncoder::encode(&values).unwrap();
+            let decoded = DecimalDecoder::decode(&encoded).unwrap();
+            prop_assert_eq!(decoded, values);
+        }
+
+        /// The narrow form, which delegates to the whole `i64` stack — so
+        /// this also asserts that RLE, frame-of-reference and pco each
+        /// return the mantissas they were handed.
+        #[test]
+        fn roundtrip_narrow_mantissas(
+            values in prop::collection::vec(any::<i64>(), 1..200),
+        ) {
+            let wide: Vec<i128> = values.iter().map(|&v| i128::from(v)).collect();
+            let encoded = DecimalEncoder::encode(&wide).unwrap();
+            prop_assert_eq!(encoded[0], FORM_NARROW);
+            let decoded = DecimalDecoder::decode(&encoded).unwrap();
+            prop_assert_eq!(decoded, wide);
+        }
+
+        /// A slowly varying wide column is the shape the wide form is for,
+        /// and the one where a delta that wraps `i128` is reachable.
+        #[test]
+        fn roundtrip_wide_deltas_that_may_wrap(
+            base in any::<i128>(),
+            steps in prop::collection::vec(any::<i64>(), 1..200),
+        ) {
+            let mut values = vec![base];
+            for step in steps {
+                let prev = *values.last().unwrap();
+                values.push(prev.wrapping_add(i128::from(step)));
+            }
+            let encoded = DecimalEncoder::encode(&values).unwrap();
+            let decoded = DecimalDecoder::decode(&encoded).unwrap();
+            prop_assert_eq!(decoded, values);
+        }
+
+        /// A decoder must never panic on adversarial bytes, only error.
+        #[test]
+        fn decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let _ = DecimalDecoder::decode(&bytes);
+        }
+
+        /// The varint is the wide form's whole payload; it must round-trip
+        /// every `u128` and consume exactly what it produced.
+        #[test]
+        fn varint_roundtrips_every_u128(value in any::<u128>()) {
+            let mut buf = Vec::new();
+            varint_encode_u128(value, &mut buf);
+            let (decoded, used) = varint_decode_u128(&buf).unwrap();
+            prop_assert_eq!(decoded, value);
+            prop_assert_eq!(used, buf.len());
+        }
+
+        /// `ZigZag` over the full signed range.
+        #[test]
+        fn zigzag_roundtrips_every_i128(value in any::<i128>()) {
+            prop_assert_eq!(zigzag_decode_i128(zigzag_encode_i128(value)), value);
+        }
+    }
 }

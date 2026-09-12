@@ -96,6 +96,17 @@ pub fn register_write_metrics() {
     metrics::counter!("chronix_backups_total").increment(0);
     metrics::counter!("chronix_backup_failures_total").increment(0);
     metrics::counter!("chronix_backup_bytes_total").increment(0);
+    // The catalog is the durable record of what may be deleted, and both of
+    // these are silent by nature: a snapshot that stops succeeding only makes
+    // replay longer until the day it matters, and a skipped tail record is a
+    // crash artefact that is ordinary once and a signal when it repeats.
+    // Every `chronixd` has a catalog, so zero is the honest answer.
+    metrics::counter!("chronix_catalog_snapshot_failures_total").increment(0);
+    metrics::counter!("chronix_catalog_tail_records_skipped_total").increment(0);
+    // A gap in the audit chain is the one failure that makes every *later*
+    // verification meaningless, so an alert on it has to be able to fire from
+    // the first scrape rather than from the first gap.
+    metrics::counter!("chronix_audit_chain_gaps_total").increment(0);
 }
 
 /// Stamp `namespace` on every point and insert the batch under a deadline.

@@ -908,20 +908,53 @@ impl TriggerCatalog {
         self.entries.read().is_empty()
     }
 
-    /// Persist the catalog to disk using atomic write (write to
-    /// temp + rename) for crash safety.
+    /// Persist the catalog: write a temp file, **fsync it**, rename, fsync
+    /// the directory.
+    ///
+    /// This tree has three atomic-file writers — the segment catalog
+    /// snapshot, the namespace registry and this one — and each learned the
+    /// same lessons at a different time. This one was missing two of them.
+    ///
+    /// * **The temp file was never fsynced.** Only the parent directory was,
+    ///   which makes the *rename* durable while the bytes it points at may
+    ///   not be: a crash then leaves a catalog file that is empty or
+    ///   half-written, and every trigger in it is gone. Fsyncing the
+    ///   directory and not the data is the ordering that looks careful and
+    ///   protects the wrong half.
+    /// * **The directory fsync's error was discarded** (`let _ =`), and so
+    ///   was a failure to open it, so the one part that *was* being done
+    ///   could fail in silence.
+    /// * **The temp file was left behind on failure**, consuming the space
+    ///   whose absence is the commonest reason to fail.
     pub fn save_to_disk(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+
         let json = self.to_json()?;
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json.as_bytes())
-            .map_err(|e| SignalError::InvalidConfig(format!("write catalog: {e}")))?;
-        std::fs::rename(&tmp, path)
-            .map_err(|e| SignalError::InvalidConfig(format!("rename catalog: {e}")))?;
-        // fsync the parent directory to ensure the rename is durable.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        let fail = |what: &str, e: &dyn std::fmt::Display| {
+            SignalError::InvalidConfig(format!("{what} trigger catalog: {e}"))
+        };
+
+        let written = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(fail("write", &e));
+        }
+
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(fail("rename", &e));
+        }
+
+        // The rename itself has to reach the disk, or a crash restores the
+        // directory entry that was there before it.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let dir = std::fs::File::open(parent).map_err(|e| fail("open dir for", &e))?;
+            dir.sync_all().map_err(|e| fail("fsync dir for", &e))?;
         }
         Ok(())
     }
@@ -1747,5 +1780,62 @@ mod tests {
             err.to_string().contains("quote it"),
             "the error must say how to fix it: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    /// **A failed save leaves no temp file behind.**
+    ///
+    /// The space a temp file consumes is the space whose absence is the
+    /// commonest reason for the save to fail, so leaking it makes the next
+    /// attempt likelier to fail too. The segment catalog learned this after
+    /// an `ENOSPC` left a partial `.tmp` on the one file the database cannot
+    /// afford to lose; this writer had not.
+    #[test]
+    fn a_failed_save_cleans_up_its_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("triggers.json");
+        let catalog = TriggerCatalog::new();
+
+        // A directory where the rename wants to put the file: the write and
+        // fsync succeed, the rename does not.
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert!(catalog.save_to_disk(&path).is_err(), "the rename must fail");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "a failed save must not leave its temp file behind"
+        );
+    }
+
+    /// A save that cannot write reports it.
+    ///
+    /// Narrower than it looks, and named for what it actually proves: this
+    /// exercises the `File::create` failure, not the parent-directory fsync
+    /// — which used to be `let _ =` and is now propagated, but which no test
+    /// here can make fail on its own without a filesystem that refuses
+    /// `fsync` on a directory it just let us open. Stated rather than
+    /// implied by a name that would claim more.
+    #[test]
+    fn a_save_that_cannot_write_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("triggers.json");
+        let catalog = TriggerCatalog::new();
+        // No parent directory: `File::create` fails, and the error must
+        // reach the caller rather than being dropped on the floor.
+        assert!(catalog.save_to_disk(&path).is_err());
+    }
+
+    /// The round trip still works, which is what the fsyncs are protecting.
+    #[test]
+    fn a_saved_catalog_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("triggers.json");
+        let catalog = TriggerCatalog::new();
+        catalog.save_to_disk(&path).unwrap();
+        assert_eq!(TriggerCatalog::load_from_disk(&path).unwrap().len(), 0);
     }
 }

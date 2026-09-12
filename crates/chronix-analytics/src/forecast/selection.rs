@@ -254,25 +254,20 @@ fn candidates(
                     // well would multiply the fits for a choice that is
                     // nearly always one of these two.
                     //
-                    // `D` is *chosen*, not fixed. It used to be hard-coded
-                    // to 1 in both shapes, so `SARIMA(p,d,q)(P,0,Q)[m]` could
-                    // not be proposed at all — and the series that needs it
-                    // is the one `detect_period` finds a period in while the
-                    // seasonal term explains almost none of the variance.
-                    // Differencing that spends `m` observations, adds a
-                    // moving-average term the data does not support, and
-                    // widens every interval built on the result. It does not
-                    // fail; it just forecasts worse.
-                    //
-                    // The measure is seasonal **strength** over an STL
+                    // `D` comes from seasonal **strength** over an STL
                     // decomposition against a 0.64 threshold — R's
                     // `forecast::nsdiffs` default, whose threshold was fitted
-                    // by minimising MASE on M3/M4 rather than derived. Worth
-                    // being exact about what that does and does not buy:
-                    // strong seasonality is differenced whether or not it has
-                    // a unit root, and a *stochastic* seasonal level scores
-                    // low and is missed. Both are pinned by tests beside the
-                    // function.
+                    // by minimising MASE on M3/M4 rather than derived. Strong
+                    // seasonality is differenced whether or not it has a unit
+                    // root, and a *stochastic* seasonal level scores low and
+                    // is missed. Both are pinned by tests beside the function.
+                    //
+                    // Proposing both orders and letting the folds choose was
+                    // measured and dropped: mean MASE moves by less than 0.01
+                    // across four regimes, it is *worse* on quarterly data,
+                    // and it costs 22% more fits. Holt-Winters already covers
+                    // the blind spot — its seasonal smoothing tracks a
+                    // drifting level. See `examples/seasonal_differencing.rs`.
                     let sd = crate::forecast::select_seasonal_differencing_order(values, m, 1);
                     for (sp, sq) in [(1usize, 0usize), (0, 1)] {
                         let needed = (p.max(q) + sp.max(sq) * m) + 2 * d + 2 * sd * m + 10;

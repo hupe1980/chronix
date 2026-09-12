@@ -464,11 +464,13 @@ the node-local `EventBus`. CDC is designed for cluster-wide consumption:
 This enables downstream consumers (replication agents, materialized views,
 external sinks) to rejoin at their last checkpoint without missing events.
 
-### Arrow Flight CDC Export
+### CDC as Arrow batches
 
-`CdcBatchConverter` + `CdcFlightExporter` (behind the `flight` feature flag)
-convert CDC events to Arrow `RecordBatch` / `FlightData` frames for
-zero-copy gRPC streaming to external systems (Spark, Flink, DataFusion).
+`CdcBatchConverter` + `CdcBatchExporter` (behind the `arrow` feature flag)
+encode CDC events as Arrow `RecordBatch`es for a consumer that already speaks
+Arrow (Spark, Flink, DataFusion). It is an encoding, not a transport — over
+the network `chronixd` streams CDC as JSON over SSE at `/api/v1/cdc/stream`.
+See [the streaming internals](/internals/streaming/).
 
 ## Multi-Tenancy
 

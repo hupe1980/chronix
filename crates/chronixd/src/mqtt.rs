@@ -84,9 +84,21 @@ pub struct MqttSubscriber {
     /// feature is enabled.
     #[cfg_attr(not(feature = "mqtt"), allow(dead_code))]
     reconnections: AtomicU64,
+    /// What the subscriber loop is doing. `running`/`stopped` record only
+    /// the caller's intent, so they cannot tell a connected subscriber from
+    /// one that never reached the broker.
+    #[cfg_attr(not(feature = "mqtt"), allow(dead_code))]
+    state: parking_lot::Mutex<ConnectorStatus>,
 }
 
 impl MqttSubscriber {
+    /// Record what the subscriber loop is doing. `start()`/`stop()` own the
+    /// `Stopped` transitions; everything else is an observation.
+    #[cfg_attr(not(feature = "mqtt"), allow(dead_code))]
+    fn set_state(&self, next: ConnectorStatus) {
+        *self.state.lock() = next;
+    }
+
     /// Namespace this connector writes to.
     ///
     /// A connector carries no request, so its namespace comes from its own
@@ -128,6 +140,7 @@ impl MqttSubscriber {
             points_total: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             started_at: std::time::Instant::now(),
+            state: parking_lot::Mutex::new(ConnectorStatus::Stopped),
             reconnections: AtomicU64::new(0),
         });
         let _ = arc.self_ref.set(Arc::downgrade(&arc));
@@ -152,6 +165,7 @@ impl MqttSubscriber {
             points_total: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             started_at: std::time::Instant::now(),
+            state: parking_lot::Mutex::new(ConnectorStatus::Stopped),
             reconnections: AtomicU64::new(0),
         }
     }
@@ -233,6 +247,14 @@ impl MqttSubscriber {
 #[cfg(feature = "mqtt")]
 mod subscriber_impl {
     use super::*;
+
+    /// How long to wait before the first retry of a failed subscribe.
+    const SUBSCRIBE_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+    /// The ceiling the retry backoff doubles up to.
+    const SUBSCRIBE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Consecutive subscribe failures after which the status names the
+    /// error rather than saying "reconnecting". Retrying continues.
+    const SUBSCRIBE_ATTEMPTS_BEFORE_FAILED: u32 = 5;
     use rumqttc::{AsyncClient, MqttOptions, QoS};
     use tracing::{debug, error, warn};
 
@@ -300,12 +322,38 @@ mod subscriber_impl {
             let topics = self.config.topics.clone();
 
             tokio::spawn(async move {
-                // Subscribe to all configured topics
-                for topic in &topics {
-                    if let Err(e) = client.subscribe(topic, qos).await {
-                        error!(name = %this.name, %e, topic = %topic, "MQTT subscribe failed");
+                // Subscribing is retried: the commonest failure is the
+                // transient one, a broker still coming up beside us.
+                let mut backoff = SUBSCRIBE_BACKOFF_MIN;
+                let mut attempts: u32 = 0;
+                'subscribe: loop {
+                    if this.stopped.load(Ordering::SeqCst) {
                         return;
                     }
+                    let mut failure = None;
+                    for topic in &topics {
+                        if let Err(e) = client.subscribe(topic, qos).await {
+                            failure = Some(format!("subscribe to {topic} failed: {e}"));
+                            break;
+                        }
+                    }
+                    let Some(reason) = failure else {
+                        break 'subscribe;
+                    };
+
+                    attempts += 1;
+                    if attempts >= SUBSCRIBE_ATTEMPTS_BEFORE_FAILED {
+                        error!(name = %this.name, attempts, %reason, "MQTT still cannot subscribe");
+                        this.set_state(ConnectorStatus::Failed(reason));
+                    } else {
+                        warn!(name = %this.name, attempts, %reason, "MQTT subscribe failed, retrying");
+                        this.set_state(ConnectorStatus::Reconnecting);
+                    }
+                    tokio::select! {
+                        () = this.cancel.notified() => return,
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(SUBSCRIBE_BACKOFF_MAX);
                 }
 
                 info!(name = %this.name, "MQTT subscriptions active");
@@ -349,10 +397,12 @@ mod subscriber_impl {
                                 }
                                 Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
                                     info!(name = %this.name, "MQTT connected");
+                                    this.set_state(ConnectorStatus::Running);
                                 }
                                 Err(e) => {
                                     warn!(name = %this.name, %e, "MQTT connection error, reconnecting...");
                                     this.reconnections.fetch_add(1, Ordering::Relaxed);
+                                    this.set_state(ConnectorStatus::Reconnecting);
                                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 }
                                 _ => {}
@@ -384,6 +434,8 @@ impl IngestionConnector for MqttSubscriber {
 
         self.running.store(true, Ordering::SeqCst);
         self.stopped.store(false, Ordering::SeqCst);
+        // Nothing has reached the broker yet; promoted on the first ConnAck.
+        self.set_state(ConnectorStatus::Reconnecting);
 
         #[cfg(feature = "mqtt")]
         {
@@ -392,9 +444,16 @@ impl IngestionConnector for MqttSubscriber {
                     "MqttSubscriber must be created via new_arc() for live subscription".into(),
                 )
             })?;
-            arc_self.spawn_subscriber()?;
+            if let Err(e) = arc_self.spawn_subscriber() {
+                self.running.store(false, Ordering::SeqCst);
+                self.stopped.store(true, Ordering::SeqCst);
+                self.set_state(ConnectorStatus::Failed(e.to_string()));
+                return Err(e);
+            }
         }
 
+        #[cfg(not(feature = "mqtt"))]
+        self.set_state(ConnectorStatus::Idle);
         #[cfg(not(feature = "mqtt"))]
         info!(
             name = %self.name,
@@ -418,19 +477,18 @@ impl IngestionConnector for MqttSubscriber {
         self.cancel.notify_one();
         self.running.store(false, Ordering::SeqCst);
         self.stopped.store(true, Ordering::SeqCst);
+        self.set_state(ConnectorStatus::Stopped);
 
         info!(name = %self.name, "MQTT subscriber stopped");
         Ok(())
     }
 
+    /// What the subscriber loop is doing, not what `start()` intended.
     async fn status(&self) -> ConnectorStatus {
-        if self.stopped.load(Ordering::SeqCst) {
-            ConnectorStatus::Stopped
-        } else if self.running.load(Ordering::SeqCst) {
-            ConnectorStatus::Running
-        } else {
-            ConnectorStatus::Stopped
+        if self.stopped.load(Ordering::SeqCst) || !self.running.load(Ordering::SeqCst) {
+            return ConnectorStatus::Stopped;
         }
+        self.state.lock().clone()
     }
 
     async fn metrics(&self) -> ConnectorMetrics {
@@ -629,7 +687,10 @@ mod tests {
         assert_eq!(sub.status().await, ConnectorStatus::Stopped);
 
         sub.start().await.unwrap();
-        assert_eq!(sub.status().await, ConnectorStatus::Running);
+        // No broker here, so `Running` is the one thing this must not say:
+        // started, trying, not yet connected.
+        assert_eq!(sub.status().await, ConnectorStatus::Reconnecting);
+        assert!(!sub.is_healthy().await);
 
         sub.stop().await.unwrap();
         assert_eq!(sub.status().await, ConnectorStatus::Stopped);

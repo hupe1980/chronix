@@ -6,9 +6,114 @@ per [CONTRIBUTING.md](CONTRIBUTING.md), a breaking change bumps the minor
 version and a fix bumps the patch — there is no stability promise before 1.0,
 and no migration tooling for the on-disk format.
 
-## [Unreleased]
+## [0.5.0] - 2026-09-12
 
 ### Added
+
+- **`chronix-encoding`'s two untested codec modules have property tests.**
+  The crate's first stated principle is that every encoder guarantees a
+  bitwise-exact roundtrip, and every module backed it with a `proptest!`
+  except `decimal` and `coding` — the two that most needed one. `decimal`'s
+  wide form is a hand-written 128-bit LEB128 over `wrapping_sub` /
+  `wrapping_add` deltas, and `coding`'s `pack_bits` / `unpack_bits` — the
+  primitive under RLE, frame-of-reference and delta — accepts 64 bit widths
+  and was pinned at two of them. Eleven new properties: roundtrip at every
+  width, the packed size, the full `u128` varint and `i128` `ZigZag` ranges,
+  `bits_needed` minimality, and two "decode never panics on adversarial
+  bytes". Both modules turned out to be correct; what changed is that the
+  principle is now checked rather than asserted.
+- **CI runs the Kafka and MQTT integration suites against real brokers**, and
+  `ignored_suites_run.rs` keeps it that way. All eleven tests that drive the
+  connectors end to end are `#[ignore]`d because they need Docker, so the two
+  jobs that exist to test the connectors printed `ok. 0 passed; 5 ignored`
+  and `0 passed; 6 ignored` — green, executing nothing. `testcontainers`
+  starts the brokers from inside the test, so the whole gap was a missing
+  `-- --ignored`. The new test refuses any suite under `crates/chronixd/tests`
+  that ignores its tests and is not named by a workflow line passing
+  `--ignored`. Running them for the first time found what never-executed
+  code always has: MQTT passed 6/6, and **4 of the 5 Kafka tests failed** —
+  each produced to a topic nothing had created, and a KRaft broker resolves
+  the metadata request that triggers auto-creation *after* it answers the
+  produce. They now create their topics through `AdminClient::create_topics`.
+- **`scripts/check-package-counts.sh` checks the documented "+N packages"
+  figures against `cargo tree`**, and runs in CI. Those numbers are the whole
+  argument for the feature gates and nothing in the tree read arithmetic:
+  removing three unused dependencies moved `streaming` from +74 to +63 and
+  `security` from +139 to +126, and the documentation kept the old figures.
+- **`scripts/check-features.sh` checks every feature dependency against the
+  code it unlocks**, and runs in CI. `cargo machete` cannot read the
+  `[features]` table and `cargo udeps` needs nightly and a full build, so a
+  `dep:` entry that nothing names is invisible to both on a pull request —
+  which is how the `flight` feature above carried 32 unused packages. It
+  also refuses a `[package.metadata.cargo-machete] ignored` list in a crate
+  with no `build.rs`: generated code is the only thing a source scanner
+  cannot see, and the ignore list that had been written for `flight` gave a
+  reason that was true in general and false about those three crates.
+- **The Cedar authorization model is compiled in as a schema, and every
+  policy is validated against it.**
+  [`chronix.cedarschema`](crates/chronix-security/src/authz/chronix.cedarschema)
+  ships in the binary; `chronixd` refuses to start on a policy naming an
+  action or an entity type it never asks about. Without it Cedar accepts
+  anything well-formed, so a `permit` that permits nothing looks like a
+  lockout and a `forbid` that forbids nothing looks like protection — which
+  is what every policy example in the security guide was.
+- **Granular administrative capabilities are asked for.** Each administrative
+  route group requires its own — `ManageKeys`, `ManageBackups`,
+  `ManageConfig`, `ManageModels`, `ManageNamespaces`, `ManageNodes`,
+  `ManageRegions`, `ManageCluster`, `ViewCluster` — so a backup credential
+  cannot mint API keys. `Admin` is now an action **group**:
+  `action in Chronix::Action::"Admin"` grants all of them at once.
+- **API keys carry Cedar roles.** `roles = [...]` on `[[auth.api_keys]]`, and
+  `roles` in the body of `POST /api/v1/admin/auth/keys`. Roles are resolved
+  once at authentication, from whichever credential was used, and live on
+  `AuthContext`.
+- **`cargo machete` runs in CI**, and found an unused `chrono-tz` in the
+  facade on its first run. An unused dependency is not a warning, so nothing
+  here could see one — which is how `chronix-engine` carried
+  `chronix-security` with no reference to it, and why a consumer found that
+  instead of us.
+- **`every_data_route_resolves_a_namespace`** — the second property asserted
+  of every mounted route, after the deny-all authorization walk. Authorization
+  and scoping are different questions and only the first is a middleware's:
+  the gate says *may you touch this tenant*, the handler decides *which rows
+  come back*. A route added tomorrow is covered the day it is mounted.
+- **`chronix_engine::durable::DurableFile`** — one fault-injection seam for
+  every durable path, so a test can make a write fail where a filesystem will
+  not. The WAL's `WalSink` is now its seekable specialisation, and the
+  catalog uses it too, which is what found the three defects above.
+  `chronix_catalog_snapshot_failures_total` and
+  `chronix_catalog_tail_records_skipped_total`, published at zero.
+- **`ServerConfig::validate_authz`** refuses `authz_policy_dir` without an
+  `[auth]` section: a policy names a principal, and every request would be
+  anonymous.
+- **`PUT /api/v1/namespaces/{name}/quota`.** `NamespaceRegistry::update_quota`
+  existed, validated its bounds and persisted — and no route reached it, so a
+  tenant's quota was whatever it was created with and growing one meant
+  deleting the namespace. The new route applies the change to the live rate
+  limiter as well as to the record.
+- **Every audit category the server declares is one it emits.** `AuditAction`
+  had twenty-five variants and the server constructed **four**;
+  `namespace_delete`, `data_export`, `policy_load`, `api_key_create`,
+  `schema_change`, `trigger_create`/`trigger_drop`, `create_rollup`/
+  `drop_rollup`, `quota_change` and `signal_fired` are all recorded now, the
+  Cedar policy set is sealed into the chain at startup with every policy id,
+  and **every refusal is recorded, on every protocol** — administrative and
+  data-plane, HTTP, gRPC and Flight SQL. That is the event the trail exists
+  for and it was in none of it: a policy denial left a `warn!` in the process
+  log, which does not survive a restart and cannot be shown to be unedited.
+  `chronix_authz_denied_total` counts them. `every_audit_action_has_a_producer`
+  walks the enum. Dropped with no producer and no operation behind them:
+  `login_success` (a database authenticates every request; recording the
+  successes buries what the trail is for), `token_refresh`,
+  `permission_change`, `forecast`, `detect_anomalies`, `subscribe`, and
+  `key_rotation`, which stood in for the two precise key events.
+- **The crate's front page links to this file.** `cargo package` includes
+  nothing from outside a package directory, so a root-level changelog is
+  invisible on crates.io and docs.rs and a consumer had to diff the
+  repository to find a breaking change. There is still exactly one changelog,
+  at the repository root; the README — which *is* the published crate's front
+  page — now carries an absolute link to it, and `check-docs.sh` fails if the
+  link goes or a second changelog appears.
 
 - **Webhook signing secrets rotate.** `triggers.webhook_signing_secrets` is
   a list, newest first, and every delivery carries one `v1,<sig>` per secret
@@ -83,6 +188,69 @@ and no migration tooling for the on-disk format.
 
 ### Changed
 
+- **`chronix-streaming`'s `flight` feature is now `arrow`, and no longer
+  pulls the gRPC stack.** It declared `arrow-flight`, `tonic` and `prost` —
+  **32 packages** — for a module that names none of the three: it converts
+  CDC events to Arrow `RecordBatch`es and stops there, while its own
+  documentation claimed it "implements the Arrow Flight `DoExchange` RPC".
+  The feature *is* the encoding, for an embedded consumer that already
+  speaks Arrow; over the network `chronixd` streams CDC as JSON over SSE at
+  `/api/v1/cdc/stream`. Enabling `arrow`
+  on `chronix-streaming` now resolves **244 packages instead of 276**.
+  `cdc::flight` is now `cdc::arrow_batch` and `CdcFlightExporter` is
+  `CdcBatchExporter`.
+- **`chronix-core` no longer makes its consumers depend on `serde_json`,
+  and `chronix-engine`'s `object-store` feature no longer pulls
+  `tempfile`.** Both were used only under `#[cfg(test)]` and declared as
+  ordinary dependencies, so every consumer inherited them.
+- **`chronix`'s `security` and `streaming` features are off by default**, and
+  `chronix-streaming` / `chronix-security` are optional dependencies. An
+  embedded build resolves **175 packages instead of 304** — no JWT library,
+  no Cedar, no Argon2, no `aes-gcm`, no HTTP client, no TLS stack. If you use
+  `db.subscribe()`, `chronix::chronix_security`, or `Pipeline`, add
+  `features = ["streaming"]`, `["security"]` or `["pipeline"]`. `chronixd`
+  takes all three at its dependency and does not compile without them.
+- **A data request's action comes from the route, not the HTTP method.** The
+  method mapping was wrong in both directions, and a live server found it.
+  `POST /api/v1/chronix/sql`, `POST /api/v1/chronix/query` and
+  `POST /api/v1/query` are **reads** — the last is how Grafana sends PromQL by
+  default — so a read-only policy could not read, and granting a datasource
+  the least privilege it needed meant granting `Write`, which also grants
+  ingest. In the other direction `POST /api/v1/delete` and `/delete_batch`
+  are **deletes**, so `forbid(principal, action == Chronix::Action::"Delete", …)`
+  — the example this guide shows — forbade nothing, because any principal
+  that could write could delete. Every data route is now classified
+  explicitly against its matched route pattern, an unclassified one is
+  refused rather than guessed, and `every_data_route_is_classified` fails on
+  a route nobody has classified.
+- **gRPC and Flight SQL are behind the data-plane authorization gate.** They
+  do not pass through an axum middleware, which is where the gate lived, so
+  they had none: a principal a policy denied `Read` on a namespace could read
+  it by pointing any Flight SQL or gRPC client at the same server. Every RPC
+  now names the action it performs, through one function, the way every write
+  surface already went through one write function.
+- **`SharedState::namespace_registry` is no longer an `Option`.** The gate
+  returned early when it was `None` — a branch `run()` could not produce,
+  because it always opens a registry, and one that **every test and bench in
+  the tree took**, since they all set `None`. So the branch the whole suite
+  exercised was the one that skips the gate. Nothing was wrong in the
+  product; nothing could have caught it if something had been.
+- **An administrative request needs the capability *and* the policy.** A
+  configured policy engine used to replace the credential's `admin` flag
+  rather than join it, so pointing `authz_policy_dir` at a permissive file
+  widened what every ordinary key could reach. Adding policies can now only
+  narrow.
+- **Health, readiness, the metrics scrape, the OpenAPI document and every
+  administrative route are outside the data gate**, so a policy file cannot
+  take a liveness probe down and an administrative request is not also a
+  request *in* a namespace. That last one was a live trap: `validate_tenancy`
+  requires every key to name its namespaces under multi-tenancy,
+  administrative keys included, so a key bound to `tenant-a` was refused on
+  every administrative endpoint unless it also listed `default` — a namespace
+  an administrative request does not have and nothing told anyone to add.
+- `AuthzEngine` has two entry points — `authorize_namespace` and
+  `authorize_system` — replacing `authorize` / `authorize_admin`.
+
 - **Breaking:** the catalog records a segment's path **relative** to the
   `segments/` directory, as a `SegmentFile`. `SegmentCatalogEntry.path:
   PathBuf` is now `SegmentCatalogEntry.file: SegmentFile`, and
@@ -122,6 +290,107 @@ and no migration tooling for the on-disk format.
   no client could tell from a string.
 
 ### Fixed
+
+- **`LogReturnExpr`, `RollingStatExpr` and `RollingStat` are reachable.**
+  All three implement or support `chronix_analytics`'s own
+  `DerivedSeriesExpr` trait and were missing from the `pub use` list that
+  makes the private `derived` module's contents nameable, so a consumer
+  could not construct a log-return or rolling-statistic derived series —
+  while a comment elsewhere in the crate cited `RollingStatExpr` "for
+  consistency across the codebase". A module-level `#![allow(dead_code)]`,
+  annotated "Public API types — used by external consumers", kept the
+  compiler quiet; removing it produces exactly those three warnings and no
+  others.
+- **A connector that could not reach its broker reported `Running` for
+  ever.** Three layers, each hiding the one below. (1) Both connectors gave
+  up on their first setup error — `error!(…); return;` — and the commonest
+  such error is transient: a Kafka broker that has just started has no
+  `__consumer_offsets` topic, so the first `subscribe` gets
+  `CoordinatorNotAvailable`. That is chronixd and its broker coming up
+  together in a compose file or a rollout, and the connector was then dead
+  for the lifetime of the process. Setup now retries with backoff, for ever.
+  (2) `status()` was computed from the `running` flag that `start()` had just
+  set, so it reported the caller's *intent*: `ConnectorStatus` declares five
+  variants and `Idle`, `Reconnecting` and `Failed(String)` were constructed
+  nowhere in the tree. MQTT's loop logged "connection error, reconnecting…"
+  while `status()` answered `Running`. It now reports what the task is
+  doing. (3) `is_healthy()`'s documentation claimed it gated `/ready`; it did
+  not, and `all_healthy()` had no caller outside its own test.
+  `chronix_connector_up{connector,type}` replaces it, refreshed on scrape.
+  Found by running the broker suites for the first time.
+
+- **An API key's creation was audited against the key it created.** The
+  record named the *new* key as the principal rather than the caller, which
+  answers "who did this?" with the thing that was done.
+- **Two concurrent audited requests made the tamper-evident log report
+  tampering.** `AuditLogger::log` sealed the event into the hash chain under a
+  lock and released it *before* writing, so two callers could seal in one
+  order and write in the other — leaving a file in which `B` precedes `A`
+  while `B.prev_hash` names `A`, which is exactly what `verify_hash_chain`
+  reports as tampering. No write failed and nothing was logged. A trail whose
+  purpose is to be checkable cannot have a benign reason to fail its own
+  check, because then no failure of it means anything. Sealing and emitting
+  are now one step.
+- **An audit event that reached no durable sink still advanced the chain**,
+  so a full disk broke every later verification of that file, permanently,
+  and reported it as tampering. The chain now continues from the last event
+  that landed; the gap is counted by `chronix_audit_chain_gaps_total` and
+  logged at `error`.
+- **A half-written audit line swallowed the next event.** `writeln!` that
+  failed part-way left a line with no terminator, and the following event was
+  appended to it — one line holding a fragment and a whole event, parsing as
+  neither. The line is now one `write_all` with a rewind on failure, so a
+  failed write loses only itself.
+- **The trigger catalog fsynced the directory but not the data.** That makes
+  the *rename* durable while the bytes it points at may not be, so a crash
+  could leave the file empty or half-written with every trigger in it gone —
+  the ordering that looks careful and protects the wrong half. It also
+  discarded the directory fsync's error (`let _ =`) and left its temp file
+  behind on failure. Both lessons had been learned by the two sibling atomic
+  writers in this tree, at different times, and not carried across.
+- **Revoking an API key was undone by a restart.** `[[auth.api_keys]]` is a
+  declaration and is re-read on every start, and the revocation lived in an
+  in-memory store — so an operator revoking a leaked credential during an
+  incident was told `204`, and the next restart handed the key back. Nothing
+  said so. The mirror half was the same: a key minted through
+  `POST /api/v1/admin/auth/keys` is shown **once** and cannot be recovered,
+  and it stopped working at the next restart. Both are now recorded in
+  `<data_dir>/auth/api_keys.json` — Argon2 hashes for created keys, names for
+  revoked ones, applied after the config so a revocation wins over a
+  declaration — written before the operation is acknowledged and rolled back
+  if the write fails.
+- **Creating a namespace was acknowledged before it was durable.** The
+  registry snapshotted *best effort* on a background thread and returned
+  `Ok` regardless, so an operator could provision a tenant, be told it
+  exists, hand out a credential bound to it, and find after the next restart
+  that every request from that tenant answers `400 namespace not found`.
+  Deleting one was already synchronous, with a comment saying destructive
+  operations must be durable before returning — the asymmetry was the tell.
+  Creates and quota changes are synchronous now, the in-memory entry is
+  rolled back if the write fails, and the background-snapshot thread (with
+  the rename race it needed serialising against) is gone because nothing
+  used it any more.
+- **Every namespace-registry failure reached the caller as `400`.** A full
+  disk was reported as *invalid namespace config*, which sends an operator to
+  re-read their request body while the problem is the volume. Persistence
+  failures have their own `TenantError::Persist` and map to a server error.
+- **gRPC `GetSchema` leaked another tenant's schema.** It answered from the
+  process-wide schema registry with no namespace scope at all, so one tenant
+  could name another's measurement and be told its column names — while the
+  HTTP sibling `GET /api/v1/measurements/{name}/schema` had scoped since the
+  tenancy pass. The gRPC tenancy suite could not see it: it walks the RPCs
+  that *take* a scope, and this one did not take one.
+- **The Python SDK's defaults and documented calls.** `ChronixClient` used
+  `localhost:5555` and Flight SQL `5557`; the server listens on 8086 and
+  8817. Three files showed `client.query(..., tag_filters={...})`, which
+  raises `TypeError`. The namespace header was `X-Chronix-Namespace`, which
+  `chronixd` does not read — so a client configured for a tenant was served
+  `default`, and on a deployment whose credential is bound to a tenant, every
+  request was refused for a namespace nobody asked for.
+- **`scripts/check-docs.sh` scanned `site/content` and the top-level README
+  only.** It has a check for exactly the port drift above, written after it
+  happened once; `sdks/python/README.md` is on PyPI and was outside its
+  scope. It now covers every published document.
 
 - **A restored backup is the database that was backed up.** The catalog stored
   absolute segment paths, so a restore onto a fresh directory produced an
@@ -199,6 +468,32 @@ and no migration tooling for the on-disk format.
   disappearing from it.
 
 ### Removed
+
+- **`Chronix::Measurement` as an authorization resource, with its tag
+  constraints.** The unit of authorization is the namespace, which is the
+  unit storage, SQL scoping, quotas and credentials all already use. A second
+  finer unit understood only by the policy layer would have to be remembered
+  by each of ~40 routes, and the ones that forgot would read as protected.
+  `ChronixResource` is gone; `ChronixSystem` replaces the synthetic
+  `Measurement::"__system__"` the administrative gate used.
+- **Policy versioning, rollback and dry-run** (`PolicyVersion`,
+  `current_version`, `policy_versions`, `revert_to_version`,
+  `dryrun_load_policies`). Documented with a worked example and reachable
+  from no endpoint; the policy files are the source of truth.
+- **`load_cross_tenant_isolation_policy` and `warn_if_no_namespace_policies`.**
+  Neither had a caller, and the built-in policy compared a
+  `principal.namespace` attribute nothing ever set — an isolation guarantee
+  that existed as a string constant. Cross-tenant isolation is a property of
+  the credential and is enforced before Cedar is consulted.
+- **`ChronixAction::{Forecast, DetectAnomalies, Subscribe, CreateRollup}`**,
+  and `Admin` as a requestable action — no request path asked for any of
+  them. (The identically named `AuditAction::CreateRollup` is unrelated and
+  stays: rollup creation *is* recorded. The two enums answer different
+  questions — what a policy decides about, and what a trail is searched by —
+  and `namespace::audit_action_for` is the one place they meet.)
+- **`chronix-engine`'s dependency on `chronix-security`** — one line in a
+  manifest, referenced from nowhere in the crate, and the edge that made
+  gating the facade alone insufficient (reported by the hems gateway).
 
 - **Point-in-time recovery.** `Chronix::restore_pitr` and
   `POST /api/v1/admin/restore/pitr` did nothing: the target sequence had to be

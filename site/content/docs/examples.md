@@ -70,7 +70,7 @@ cargo run -p chronix --features object-store --example cold_tier
 |---------|-------------|
 | [field_encryption](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/field_encryption.rs) | Per-column AES-256-GCM: declaring a column and its key variable, the ciphertext on disk, and the paths that refuse to write it out |
 | [encryption](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/encryption.rs) | The standalone `EncryptionService`: key providers, round trip, and key rotation |
-| [authz](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/authz.rs) | Cedar-based RBAC authorization: policies, principals, and allow/deny decisions |
+| [authz](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/authz.rs) | Cedar authorization: namespace and system decisions, a schema that refuses a misspelt action, and least-privilege administrative capabilities |
 | [audit_logging](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/audit_logging.rs) | Structured audit logging with multi-sink support and queryable audit trail |
 | [tenant_isolation](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/tenant_isolation.rs) | Namespace management, quota enforcement, and resource usage tracking |
 

@@ -24,6 +24,7 @@ use metrics::{counter, gauge, histogram};
 use tracing::{debug, warn};
 
 use chronix_core::{wal_encode_write_point, Point, SeriesKey, Timestamp};
+#[cfg(feature = "streaming")]
 use chronix_streaming::cdc::CdcEvent;
 
 use crate::error::{DbError, InsertResult, Result};
@@ -282,10 +283,13 @@ impl super::Chronix {
         let wal_seq = self.wal.append_batch(&refs)?;
 
         // ── 4. Memtable: what the WAL holds is inserted ───────────────
+        #[cfg(feature = "streaming")]
         let has_cdc_subscribers = self.cdc_bus.subscriber_count() > 0;
+        #[cfg(feature = "streaming")]
         let mut cdc_events: Vec<CdcEvent> = Vec::new();
         for point in &admitted {
             self.shards.insert_admitted(point, wal_seq)?;
+            #[cfg(feature = "streaming")]
             if has_cdc_subscribers {
                 cdc_events.push(CdcEvent::PointWritten {
                     measurement: point.series_key().measurement().to_string(),
@@ -308,6 +312,7 @@ impl super::Chronix {
                 self.lvc.update(point);
             }
         }
+        #[cfg(feature = "streaming")]
         if !cdc_events.is_empty() {
             self.cdc_bus.publish_batch(&mut cdc_events);
         }

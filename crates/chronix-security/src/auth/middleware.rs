@@ -40,6 +40,15 @@ pub struct AuthContext {
     /// because the policy engine is optional and "no policy" must not mean
     /// "everyone is an admin".
     pub admin: bool,
+    /// Cedar roles this credential carries, as `Chronix::Role` memberships.
+    ///
+    /// Resolved **once**, here, from whichever credential authenticated —
+    /// a key's `roles` list or the JWT claim named by `auth.jwt.role_claim`.
+    /// They used to be re-derived inside the administrative gate alone, so
+    /// the same role granted an admin operation and matched nothing in a
+    /// namespace policy, and an API key had no roles at all: every policy in
+    /// the documentation is written `principal in Chronix::Role::"…"`.
+    pub roles: Vec<String>,
     /// Namespaces this credential may act in; empty means unrestricted.
     ///
     /// Authentication answers *who is calling*; this answers *whose data
@@ -53,6 +62,16 @@ impl AuthContext {
     #[must_use]
     pub fn allows_namespace(&self, namespace: &str) -> bool {
         self.namespaces.is_empty() || self.namespaces.iter().any(|n| n == namespace)
+    }
+
+    /// The Cedar principal for this credential.
+    ///
+    /// **The only producer.** Every gate builds its principal from here, so
+    /// none of them can be looking at a different identity or a different
+    /// role set from the others.
+    #[must_use]
+    pub fn principal(&self) -> crate::authz::ChronixPrincipal {
+        crate::authz::ChronixPrincipal::new(&self.principal).with_roles(self.roles.clone())
     }
 }
 
@@ -196,6 +215,7 @@ impl AuthMiddleware {
                     method: AuthMethod::None,
                     claims: std::collections::HashMap::new(),
                     admin: false,
+                    roles: Vec::new(),
                     namespaces: Vec::new(),
                 });
             }
@@ -225,6 +245,9 @@ impl AuthMiddleware {
                         method: AuthMethod::Mtls,
                         claims: std::collections::HashMap::new(),
                         admin: false,
+                        // A certificate carries no role list. An mTLS
+                        // deployment names the principal in the policy.
+                        roles: Vec::new(),
                         namespaces: Vec::new(),
                     });
                 }
@@ -249,11 +272,13 @@ impl AuthMiddleware {
                         Ok(name) => {
                             let namespaces = store.namespaces_for(&name).to_vec();
                             let admin = store.is_admin(&name);
+                            let roles = store.roles(&name);
                             return Ok(AuthContext {
                                 principal: name,
                                 method: AuthMethod::ApiKey,
                                 claims: std::collections::HashMap::new(),
                                 admin,
+                                roles,
                                 namespaces,
                             });
                         }
@@ -339,11 +364,13 @@ impl AuthMiddleware {
                     .get("admin")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                let roles = jwt.extract_roles(&claims);
                 Some(Ok(AuthContext {
                     principal,
                     method: AuthMethod::Jwt,
                     claims: claims.extra,
                     admin,
+                    roles,
                     namespaces,
                 }))
             }

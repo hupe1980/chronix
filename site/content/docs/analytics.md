@@ -68,6 +68,10 @@ searches an ARIMA order, and scores every eligible candidate by rolling-origin
 cross-validation **at the horizon asked for** — the only comparison that
 transfers across model families. The winner is refitted on the whole window.
 
+The candidate set is deliberately small: a wider search lets a candidate win
+the folds and lose out of sample, which measures worse. See
+[Model Selection](/internals/forecasting-selection/) for the numbers.
+
 ```rust
 use chronix_analytics::forecast::{auto_forecast, AutoForecastOptions};
 

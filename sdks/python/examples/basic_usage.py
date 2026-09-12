@@ -6,7 +6,7 @@ from chronix_client import ChronixClient, Point, TimeRange
 
 
 async def main() -> None:
-    async with ChronixClient("http://localhost:5555") as client:
+    async with ChronixClient("http://localhost:8086") as client:
         # ── Health check ──────────────────────────────────────
         health = await client.health()
         print(f"Server health: {health}")
@@ -43,7 +43,7 @@ async def main() -> None:
                 start=1_699_999_999_000_000_000,
                 end=1_700_000_001_000_000_000,
             ),
-            tag_filters={"region": "us-east"},
+            tags={"region": "us-east"},
             limit=10,
         )
         print(f"Query returned {len(result)} rows:")

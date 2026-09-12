@@ -457,11 +457,34 @@ async fn mqtt_connector_lifecycle_live() {
     assert_eq!(subscriber.status().await, ConnectorStatus::Stopped);
 
     subscriber.start().await.expect("start");
-    assert_eq!(subscriber.status().await, ConnectorStatus::Running);
+
+    // **`start()` returning is not "connected".** This was
+    // `assert_eq!(status(), Running)` on the line after `start()`, and it
+    // passed because `status()` was read off the flag `start()` had just
+    // set — it would have passed with no broker at all, and with the
+    // subscriber task already dead. `Running` now means the loop has seen
+    // its ConnAck, so it is something to wait for.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = subscriber.status().await;
+        if status == ConnectorStatus::Running {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscriber never reached Running; last status: {status:?}"
+        );
+        assert!(
+            matches!(status, ConnectorStatus::Reconnecting),
+            "a subscriber that is still connecting must say so, not {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(subscriber.is_healthy().await);
 
     subscriber.stop().await.expect("stop");
     assert_eq!(subscriber.status().await, ConnectorStatus::Stopped);
+    assert!(!subscriber.is_healthy().await);
 }
 
 /// Verify ingestion across multiple MQTT topics with different

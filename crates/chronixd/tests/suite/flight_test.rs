@@ -807,3 +807,113 @@ async fn put(
     }
     Ok(())
 }
+
+// ══ Authorization ═══════════════════════════════════════════════════════
+
+/// A Flight SQL server with authentication and `policies` in force.
+async fn start_authorized_flight_server(
+    policies: &str,
+    roles: Vec<String>,
+) -> (FlightServiceClient<Channel>, TempDir) {
+    let tmp = TempDir::new().expect("tempdir");
+    let config = ChronixConfigBuilder::default()
+        .data_dir(tmp.path().to_path_buf())
+        .build()
+        .expect("chronix config");
+    let db = Arc::new(Chronix::open(config).expect("open db"));
+
+    let auth_config = chronixd::config::AuthConfig {
+        api_keys: vec![chronixd::config::ApiKeyEntry {
+            name: "tester".to_string(),
+            key: "flight-authz-key".to_string(),
+            namespaces: Vec::new(),
+            admin: false,
+            roles,
+        }],
+        jwt: None,
+        exempt_paths: vec![],
+    };
+    let auth_state = chronixd::auth::AuthState::from_config(&auth_config).expect("auth state");
+
+    let engine = chronix_security::authz::AuthzEngine::new();
+    if !policies.trim().is_empty() {
+        engine.load_policies(policies).expect("policies load");
+    }
+
+    let flight_service = ChronixFlightSqlService::new(db).with_authz(Some(Arc::new(engine)));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let interceptor = auth_state.grpc_interceptor();
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                flight_service.into_server(),
+                interceptor,
+            ))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let channel = Channel::from_shared(endpoint)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    (FlightServiceClient::new(channel), tmp)
+}
+
+/// **The bypass, pinned.** Flight SQL does not pass through the axum
+/// middleware the Cedar gate lived in, so it had no gate at all: a principal
+/// a policy denied `Read` could read by pointing an ADBC client at the same
+/// server. Every RPC that touches data names its action now.
+#[tokio::test]
+async fn flight_refuses_a_query_under_a_deny_all_policy() {
+    let (mut client, _tmp) = start_authorized_flight_server("", Vec::new()).await;
+
+    let cmd = CommandStatementQuery {
+        query: "SELECT 1".to_string(),
+        transaction_id: None,
+    };
+    let mut req = tonic::Request::new(FlightDescriptor::new_cmd(pack_any(&cmd)));
+    req.metadata_mut()
+        .insert("authorization", "Bearer flight-authz-key".parse().unwrap());
+
+    let err = client
+        .get_flight_info(req)
+        .await
+        .expect_err("no policy permits anything");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
+}
+
+/// And it permits what a policy permits, so the test above is not passing
+/// because the harness is broken.
+#[tokio::test]
+async fn flight_permits_a_query_a_policy_allows() {
+    let (mut client, _tmp) = start_authorized_flight_server(
+        r#"permit(principal in Chronix::Role::"reader",
+                  action == Chronix::Action::"Read", resource);"#,
+        vec!["reader".to_string()],
+    )
+    .await;
+
+    let cmd = CommandStatementQuery {
+        query: "SELECT 1".to_string(),
+        transaction_id: None,
+    };
+    let mut req = tonic::Request::new(FlightDescriptor::new_cmd(pack_any(&cmd)));
+    req.metadata_mut()
+        .insert("authorization", "Bearer flight-authz-key".parse().unwrap());
+
+    assert!(
+        client.get_flight_info(req).await.is_ok(),
+        "a Read policy must reach Flight SQL"
+    );
+}

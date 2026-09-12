@@ -69,6 +69,15 @@ pub struct ApiKeyEntry {
     /// engine is optional and its absence used to mean "permit".
     #[serde(default)]
     pub admin: bool,
+    /// Cedar roles this key carries, as `Chronix::Role` memberships.
+    ///
+    /// A key had none, so every policy in the documentation — all of them
+    /// written as `principal in Chronix::Role::"…"` — matched nothing when
+    /// the caller authenticated with the credential `chronixd` is usually
+    /// deployed with. Roles were resolvable from a JWT claim alone, and only
+    /// inside the administrative gate.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 impl ApiKeyEntry {
@@ -177,6 +186,7 @@ impl ApiKeyStore {
             created_at: now,
             namespaces: Vec::new(),
             admin: false,
+            roles: Vec::new(),
         };
 
         self.keys.insert(name.to_string(), entry);
@@ -213,6 +223,63 @@ impl ApiKeyStore {
             }
             None => false,
         }
+    }
+
+    /// Authenticate `token` and build the context it grants.
+    ///
+    /// **The one place an API key becomes an [`AuthContext`].** `chronixd`
+    /// has a second key store for keys minted at run time, and it assembled
+    /// the context by hand from three accessors — so when the credential
+    /// grew a `roles` list, a key created through `POST /admin/auth/keys`
+    /// carried none of it and every role-based policy silently stopped
+    /// matching for exactly those keys. Three accessors are three chances to
+    /// forget the fourth.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`validate`](Self::validate) returns.
+    pub fn authenticate(&self, token: &str) -> Result<crate::auth::AuthContext, AuthError> {
+        let name = self.validate(token)?;
+        Ok(crate::auth::AuthContext {
+            namespaces: self.namespaces_for(&name).to_vec(),
+            admin: self.is_admin(&name),
+            roles: self.roles(&name),
+            principal: name,
+            method: crate::auth::AuthMethod::ApiKey,
+            claims: std::collections::HashMap::new(),
+        })
+    }
+
+    /// The stored entry for `name`, if any.
+    ///
+    /// The whole record, so a caller that must persist a key change writes
+    /// exactly what the store holds rather than reassembling it from four
+    /// accessors — which is the mistake that lost `roles` once already.
+    #[must_use]
+    pub fn entry(&self, name: &str) -> Option<&ApiKeyEntry> {
+        self.keys.get(name)
+    }
+
+    /// Assign the Cedar roles an existing key carries.
+    ///
+    /// Returns `false` when no key of that name is stored.
+    pub fn set_roles(&mut self, name: &str, roles: Vec<String>) -> bool {
+        match self.keys.get_mut(name) {
+            Some(entry) => {
+                entry.roles = roles;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The Cedar roles a key carries.
+    #[must_use]
+    pub fn roles(&self, name: &str) -> Vec<String> {
+        self.keys
+            .get(name)
+            .map(|e| e.roles.clone())
+            .unwrap_or_default()
     }
 
     /// Whether a key carries the administrative capability.
@@ -299,6 +366,7 @@ impl ApiKeyStore {
             created_at: now,
             namespaces: Vec::new(),
             admin: false,
+            roles: Vec::new(),
         };
 
         // Zeroize the local hash copy now that it is stored in the entry.

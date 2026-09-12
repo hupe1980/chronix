@@ -228,6 +228,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     config.validate_tenancy()?;
     // Refuse to start with an [auth] section that authenticates nobody
     config.validate_auth()?;
+    config.validate_authz()?;
     // Refuse a [tracing] section this build cannot honour
     config.validate_tracing()?;
 

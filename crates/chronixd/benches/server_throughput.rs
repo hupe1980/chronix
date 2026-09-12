@@ -93,7 +93,7 @@ fn bench_http_write(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -183,7 +183,7 @@ fn bench_http_query(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -541,7 +541,7 @@ fn bench_scale_http_write_10k(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -615,7 +615,7 @@ fn bench_scale_multi_measurement(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -721,7 +721,7 @@ fn bench_scale_targeted_query(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -797,7 +797,7 @@ fn bench_tsbs_devops_workload(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -884,7 +884,7 @@ fn bench_replicated_write_throughput(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -1010,7 +1010,7 @@ fn bench_multi_tenant_100ns(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: Some(registry.clone()),
+        namespace_registry: registry.clone(),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -1125,7 +1125,7 @@ fn bench_large_scale_targeted_query(c: &mut Criterion) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),

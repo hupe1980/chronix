@@ -480,3 +480,98 @@ fn replay_does_not_drop_records_over_the_memtable_cap() {
     );
     db.close().unwrap();
 }
+
+/// **A damaged catalog refuses to open; it does not open smaller.**
+///
+/// The catalog is the durable record of *what may be deleted*, and `open()`
+/// deletes every `.csx` the catalog does not name. So a replay that stops
+/// early and returns `Ok` does not merely forget segments — it **deletes
+/// them**, on the one pass that is supposed to be recovering the database.
+///
+/// Replay used to decide "this is the tail, stop here" from a byte count:
+/// more than eight bytes left meant corruption, fewer meant a crash artefact.
+/// A fragment followed by a real record could land on either side of that.
+/// Now the question is asked directly — *is there a whole, CRC-valid record
+/// after this?* — and a `yes` is a refusal.
+///
+/// What this pins is the consequence, in the order it matters: the open
+/// fails, **and the segment files are still on disk** when it does.
+#[test]
+fn a_corrupt_catalog_refuses_to_open_and_deletes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let cfg = || {
+        ChronixConfig::builder()
+            .data_dir(dir.path())
+            .maintenance_interval(Duration::ZERO)
+            .build()
+            .unwrap()
+    };
+
+    {
+        let db = Chronix::open(cfg()).unwrap();
+        for i in 0..20 {
+            db.insert(&point("m", "a", i * 1_000_000_000, i as f64))
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    let segments_before = segment_files(dir.path());
+    assert!(
+        !segments_before.is_empty(),
+        "the fixture must have produced a segment, or this proves nothing"
+    );
+
+    // A fragment, then a whole record. `close()` snapshots and empties the
+    // log, so this is exactly the shape a failed append used to leave behind:
+    // bytes that are not a record, with a record after them.
+    {
+        use std::io::Write;
+        let wal = dir.path().join("catalog").join("manifest.wal");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+        f.write_all(&64u32.to_le_bytes()).unwrap();
+        f.write_all(b"fragment").unwrap();
+        // A record the scanner will find: length, payload, matching CRC.
+        let payload = b"a well-framed record".as_slice();
+        f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(payload).unwrap();
+        f.write_all(&crc32c::crc32c(payload).to_le_bytes()).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let err = Chronix::open(cfg()).expect_err("a damaged catalog must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("mid-stream corruption"),
+        "the refusal must say what is wrong: {msg}"
+    );
+
+    assert_eq!(
+        segment_files(dir.path()),
+        segments_before,
+        "a refused open must not have deleted anything — the orphan sweep runs \
+         only on a catalog that loaded"
+    );
+}
+
+/// Every `.csx` under `segments/`, sorted.
+fn segment_files(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![data_dir.join("segments")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "csx") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}

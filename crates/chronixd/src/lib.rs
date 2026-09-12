@@ -18,6 +18,28 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
+// ── The server's security surface is not optional ───────────────────────
+//
+// `chronix`'s `security`, `streaming` and `pipeline` features are off by
+// default, because an embedded consumer that opens a database and writes to
+// it needs none of them and should not carry a JWT library, Cedar and a TLS
+// stack for the privilege. A *server* is the opposite case: a `chronixd`
+// built without authentication, authorization and the audit trail is not
+// something anybody should be able to produce by accident.
+//
+// `Cargo.toml` names the features on the dependency. This is what stops that
+// line being edited away in silence: clearing one breaks the build here,
+// beside this comment, rather than producing a server that cannot
+// authenticate anyone.
+const _: () = {
+    #[allow(unused_imports)]
+    use chronix::chronix_security as _authn_authz_and_audit_are_compiled_in;
+    #[allow(unused_imports)]
+    use chronix::chronix_streaming as _cdc_and_signals_are_compiled_in;
+    #[allow(unused_imports)]
+    use chronix::Pipeline as _the_realtime_pipeline_is_compiled_in;
+};
+
 pub mod admin;
 pub mod audit;
 pub mod auth;

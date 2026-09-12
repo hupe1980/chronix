@@ -133,9 +133,9 @@ then. Sealing the facade API is a pre-1.0 job, not a pre-0.2 one.
 #   [workspace.dependencies] the eight `chronix* = { path = …, version = "…" }`
 $EDITOR Cargo.toml
 cargo update --workspace  # refresh Cargo.lock to match
-git commit -am "Release 0.4.0"
-git tag -a v0.4.0 -m "chronix 0.4.0"
-git push origin v0.4.0
+git commit -am "Release 0.5.0"
+git tag -a v0.5.0 -m "chronix 0.5.0"
+git push origin v0.5.0
 ```
 
 `.github/workflows/release.yml` does the rest: it checks the tag against the

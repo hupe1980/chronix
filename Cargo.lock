@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "chronix"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "async-stream",
@@ -1101,7 +1101,7 @@ dependencies = [
  "chronix-security",
  "chronix-streaming",
  "chrono",
- "chrono-tz",
+ "crc32c",
  "criterion",
  "dashmap",
  "datafusion",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-analytics"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1150,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-cluster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "chronix-analytics",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-dsim"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chronix-meta",
  "openraft",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-encoding"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chronix-core",
  "criterion",
@@ -1225,14 +1225,13 @@ dependencies = [
 
 [[package]]
 name = "chronix-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "arrow",
  "bytes",
  "chronix-core",
  "chronix-encoding",
- "chronix-security",
  "crc32c",
  "criterion",
  "crossbeam-skiplist",
@@ -1260,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-meta"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "futures",
  "metrics",
@@ -1284,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-query"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1297,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-security"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1328,10 +1327,9 @@ dependencies = [
 
 [[package]]
 name = "chronix-streaming"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
- "arrow-flight",
  "base64 0.23.1",
  "chronix-core",
  "chrono",
@@ -1340,7 +1338,6 @@ dependencies = [
  "hmac 0.13.0",
  "metrics",
  "parking_lot",
- "prost",
  "reqwest 0.13.5",
  "rustls",
  "rustls-platform-verifier",
@@ -1351,7 +1348,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
- "tonic",
  "tracing",
  "url",
  "uuid",
@@ -1359,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "chronixd"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "arrow-flight",

@@ -14,7 +14,7 @@
 //!       ├── Subscription (raw)
 //!       ├── FilteredSubscription (measurement / tag / type filters)
 //!       ├── CdcStream (async Stream<Item = CdcEvent>)
-//!       └── CdcFlightExporter (Arrow RecordBatch export — `flight` feature)
+//!       └── CdcBatchExporter (Arrow RecordBatch encoding — `arrow` feature)
 //! ```
 //!
 //! ## Event Types
@@ -48,12 +48,12 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
+#[cfg(feature = "arrow")]
+pub mod arrow_batch;
 mod bus;
 mod error;
 mod event;
 pub mod event_log;
-#[cfg(feature = "flight")]
-pub mod flight;
 #[cfg(test)]
 mod perf;
 mod subscription;

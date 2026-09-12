@@ -91,9 +91,21 @@ pub struct KafkaConsumer {
     lag: std::sync::atomic::AtomicI64,
     /// When the connector was constructed, for the throughput figure.
     started_at: std::time::Instant,
+    /// What the consumer task is doing. `running`/`stopped` record only the
+    /// caller's intent, so they cannot tell a connected consumer from one
+    /// that never reached the broker.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
+    state: parking_lot::Mutex<ConnectorStatus>,
 }
 
 impl KafkaConsumer {
+    /// Record what the consumer task is doing. `start()`/`stop()` own the
+    /// `Stopped` transitions; everything else is an observation.
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
+    fn set_state(&self, next: ConnectorStatus) {
+        *self.state.lock() = next;
+    }
+
     /// Namespace this connector writes to.
     ///
     /// A connector carries no request, so its namespace comes from its own
@@ -136,6 +148,7 @@ impl KafkaConsumer {
             decode_errors: AtomicU64::new(0),
             lag: std::sync::atomic::AtomicI64::new(-1),
             started_at: std::time::Instant::now(),
+            state: parking_lot::Mutex::new(ConnectorStatus::Stopped),
         });
         let _ = arc.self_ref.set(Arc::downgrade(&arc));
         arc
@@ -160,6 +173,7 @@ impl KafkaConsumer {
             decode_errors: AtomicU64::new(0),
             lag: std::sync::atomic::AtomicI64::new(-1),
             started_at: std::time::Instant::now(),
+            state: parking_lot::Mutex::new(ConnectorStatus::Stopped),
         }
     }
 
@@ -205,6 +219,17 @@ mod consumer_impl {
 
     /// How long one `poll` waits for records before yielding to the
     /// cancellation branch.
+    /// How long to wait before the first retry of a failed setup.
+    const SETUP_BACKOFF_MIN: Duration = Duration::from_millis(250);
+    /// The ceiling the retry backoff doubles up to.
+    const SETUP_BACKOFF_MAX: Duration = Duration::from_secs(30);
+    /// Consecutive setup failures after which the status names the error
+    /// rather than saying "reconnecting". Retrying continues either way.
+    const SETUP_ATTEMPTS_BEFORE_FAILED: u32 = 5;
+    /// Consecutive empty polls after which a connected consumer reports
+    /// `Idle` rather than `Running`: connected, and nothing arriving.
+    const EMPTY_POLLS_BEFORE_IDLE: u32 = 30;
+
     const POLL_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// Ceiling on one batch write, so a stalled insert cannot pin the loop.
@@ -314,29 +339,67 @@ mod consumer_impl {
             let this = Arc::clone(self);
 
             tokio::spawn(async move {
-                let mut builder = Consumer::builder()
-                    .bootstrap_servers(this.config.brokers.clone())
-                    .group_id(this.config.group_id.clone())
-                    .client_id(format!("chronixd-{}", this.name))
-                    .auto_offset_reset(offset_reset)
-                    .enable_auto_commit(false);
-                if let Some(auth) = auth {
-                    builder = builder.auth(auth);
-                }
+                // Connecting is retried, not attempted once: a broker that
+                // has just started has no `__consumer_offsets` topic yet, so
+                // a first `subscribe` legitimately gets
+                // `CoordinatorNotAvailable`.
+                let mut backoff = SETUP_BACKOFF_MIN;
+                let mut attempts: u32 = 0;
 
-                let consumer = match builder.build().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(name = %this.name, %e, "Kafka consumer creation failed");
+                let consumer = loop {
+                    if this.stopped.load(Ordering::SeqCst) {
                         return;
                     }
-                };
 
-                let topics: Vec<&str> = this.config.topics.iter().map(String::as_str).collect();
-                if let Err(e) = consumer.subscribe(&topics).await {
-                    error!(name = %this.name, %e, "Kafka subscribe failed");
-                    return;
-                }
+                    let mut builder = Consumer::builder()
+                        .bootstrap_servers(this.config.brokers.clone())
+                        .group_id(this.config.group_id.clone())
+                        .client_id(format!("chronixd-{}", this.name))
+                        .auto_offset_reset(offset_reset)
+                        .enable_auto_commit(false);
+                    if let Some(auth) = auth.clone() {
+                        builder = builder.auth(auth);
+                    }
+
+                    let topics: Vec<&str> = this.config.topics.iter().map(String::as_str).collect();
+
+                    let outcome = match builder.build().await {
+                        Ok(c) => match c.subscribe(&topics).await {
+                            Ok(()) => Ok(c),
+                            Err(e) => Err(format!("subscribe failed: {e}")),
+                        },
+                        Err(e) => Err(format!("consumer creation failed: {e}")),
+                    };
+
+                    match outcome {
+                        Ok(c) => break c,
+                        Err(reason) => {
+                            attempts += 1;
+                            // Past the threshold the status names the error
+                            // instead of saying "reconnecting". Retrying
+                            // continues either way.
+                            if attempts >= SETUP_ATTEMPTS_BEFORE_FAILED {
+                                error!(
+                                    name = %this.name, attempts, %reason,
+                                    "Kafka consumer still cannot start"
+                                );
+                                this.set_state(ConnectorStatus::Failed(reason));
+                            } else {
+                                warn!(
+                                    name = %this.name, attempts, %reason,
+                                    "Kafka consumer setup failed, retrying"
+                                );
+                                this.set_state(ConnectorStatus::Reconnecting);
+                            }
+
+                            tokio::select! {
+                                () = this.cancel.notified() => return,
+                                () = tokio::time::sleep(backoff) => {}
+                            }
+                            backoff = (backoff * 2).min(SETUP_BACKOFF_MAX);
+                        }
+                    }
+                };
 
                 info!(
                     name = %this.name,
@@ -344,6 +407,8 @@ mod consumer_impl {
                     topics = ?this.config.topics,
                     "Kafka consumer polling started"
                 );
+                this.set_state(ConnectorStatus::Running);
+                let mut empty_polls: u32 = 0;
 
                 loop {
                     let records = tokio::select! {
@@ -360,8 +425,16 @@ mod consumer_impl {
                         }
                     };
                     if records.is_empty() {
+                        empty_polls = empty_polls.saturating_add(1);
+                        if empty_polls == EMPTY_POLLS_BEFORE_IDLE {
+                            this.set_state(ConnectorStatus::Idle);
+                        }
                         continue;
                     }
+                    if empty_polls >= EMPTY_POLLS_BEFORE_IDLE {
+                        this.set_state(ConnectorStatus::Running);
+                    }
+                    empty_polls = 0;
 
                     // One insert per poll batch: a WAL group commit per
                     // record is what makes a Kafka-fed gateway fsync-bound.
@@ -454,6 +527,9 @@ impl IngestionConnector for KafkaConsumer {
 
         self.running.store(true, Ordering::SeqCst);
         self.stopped.store(false, Ordering::SeqCst);
+        // Nothing has reached the broker yet; the task promotes this once
+        // its subscribe succeeds.
+        self.set_state(ConnectorStatus::Reconnecting);
 
         #[cfg(feature = "kafka")]
         {
@@ -467,10 +543,13 @@ impl IngestionConnector for KafkaConsumer {
                 // reporting Running with no loop behind it.
                 self.running.store(false, Ordering::SeqCst);
                 self.stopped.store(true, Ordering::SeqCst);
+                self.set_state(ConnectorStatus::Failed(e.to_string()));
                 return Err(e);
             }
         }
 
+        #[cfg(not(feature = "kafka"))]
+        self.set_state(ConnectorStatus::Idle);
         #[cfg(not(feature = "kafka"))]
         info!(
             name = %self.name,
@@ -492,19 +571,19 @@ impl IngestionConnector for KafkaConsumer {
         self.cancel.notify_one();
         self.running.store(false, Ordering::SeqCst);
         self.stopped.store(true, Ordering::SeqCst);
+        self.set_state(ConnectorStatus::Stopped);
 
         info!(name = %self.name, "Kafka consumer stopped");
         Ok(())
     }
 
+    /// What the consumer task is doing. A stop wins immediately, since it is
+    /// the caller's decision and takes effect before the task notices.
     async fn status(&self) -> ConnectorStatus {
-        if self.stopped.load(Ordering::SeqCst) {
-            ConnectorStatus::Stopped
-        } else if self.running.load(Ordering::SeqCst) {
-            ConnectorStatus::Running
-        } else {
-            ConnectorStatus::Stopped
+        if self.stopped.load(Ordering::SeqCst) || !self.running.load(Ordering::SeqCst) {
+            return ConnectorStatus::Stopped;
         }
+        self.state.lock().clone()
     }
 
     async fn metrics(&self) -> ConnectorMetrics {
@@ -666,7 +745,10 @@ mod tests {
         assert_eq!(consumer.status().await, ConnectorStatus::Stopped);
 
         consumer.start().await.unwrap();
-        assert_eq!(consumer.status().await, ConnectorStatus::Running);
+        // No broker here, so `Running` is the one thing this must not say:
+        // started, trying, not yet connected.
+        assert_eq!(consumer.status().await, ConnectorStatus::Reconnecting);
+        assert!(!consumer.is_healthy().await);
 
         consumer.stop().await.unwrap();
         assert_eq!(consumer.status().await, ConnectorStatus::Stopped);

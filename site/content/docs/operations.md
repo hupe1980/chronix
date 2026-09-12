@@ -227,14 +227,22 @@ hmac_key_env = "CHRONIX_AUDIT_KEY"
 ```
 
 `auth.exempt_paths` defaults to the health endpoints. Cedar is default-deny
-once `authz_policy_dir` is set.
+once `authz_policy_dir` is set — an empty directory refuses everything, which
+is why "no directory" means no engine rather than an empty one. Policies are
+validated against the compiled-in schema at startup, so a rule naming an
+action or entity type the server never asks about stops the start rather than
+loading and never firing. `authz_policy_dir` without an `[auth]` section is
+also a startup error: a policy names a principal.
 
 Two settings fail **open** if left out, so check them before going live:
 
 - A key with no `namespaces` under `multi_tenancy = true` reads every
   tenant. The server refuses to start rather than allow it.
 - A key with no `admin` cannot reach restore, namespace management or key
-  management. Grant it deliberately, to the one key that needs it.
+  management. Grant it deliberately, to the one key that needs it — and with
+  Cedar configured, grant each administrative key the **one** capability it
+  needs (`action == Chronix::Action::"ManageBackups"`) rather than the whole
+  `Admin` group.
 
 Without an `[audit]` section the audit trail lives only in the process log.
 With one it is `fsync`ed, and its hash chain continues across restarts —

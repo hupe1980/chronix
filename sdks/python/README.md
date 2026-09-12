@@ -32,7 +32,7 @@ import asyncio
 from chronix_client import ChronixClient, Point, TimeRange
 
 async def main():
-    async with ChronixClient("http://localhost:5555") as client:
+    async with ChronixClient("http://localhost:8086") as client:
         # Write
         await client.write([
             Point("cpu", {"usage": 42.5}, tags={"host": "a"})
@@ -42,7 +42,7 @@ async def main():
         result = await client.query(
             "cpu",
             TimeRange(start=0, end=2**63 - 1),
-            tag_filters={"host": "a"},
+            tags={"host": "a"},
         )
         for row in result:
             print(row)
@@ -112,7 +112,7 @@ For high-throughput analytical queries, use Arrow Flight SQL via ADBC:
 ```python
 import adbc_driver_flightsql.dbapi
 
-uri = ChronixClient.flight_sql_uri("localhost", 5557)
+uri = ChronixClient.flight_sql_uri("localhost", 8817)
 conn = adbc_driver_flightsql.dbapi.connect(uri)
 cursor = conn.cursor()
 cursor.execute("SELECT * FROM cpu WHERE _time > now() - INTERVAL '1 hour'")
@@ -124,7 +124,7 @@ df = table.to_pandas()
 
 ```python
 client = ChronixClient(
-    "http://localhost:5555",
+    "http://localhost:8086",
     api_key="your-api-key",
     namespace="production",
 )
@@ -149,9 +149,9 @@ await client.write(
 | `health()` | Health check |
 | `ready()` | Readiness check |
 | `server_info()` | Server metadata |
-| `write(points, *, idempotency_key)` | Write points (JSON) |
+| `write(points, *, idempotency_key, backfill)` | Write points (JSON); `backfill=True` imports history outside the out-of-order window |
 | `write_line_protocol(lines, *, idempotency_key)` | Write (line protocol) |
-| `query(measurement, time_range, *, tag_filters, field_columns, limit)` | Structured query |
+| `query(measurement, time_range, *, tags, fields, limit, offset)` | Structured query |
 | `sql(query)` | SQL query |
 | `explain(measurement, time_range)` | Explain query plan |
 | `list_measurements()` | List measurements |
@@ -185,8 +185,10 @@ await client.write(
 |-----------|------|
 | `ChronixError` | Base exception (server errors) |
 | `ConnectionError` | Cannot reach server |
-| `WriteError` | Write failure (including idempotency conflict) |
-| `QueryError` | Query/client error (4xx) |
+| `WriteError` | Write failure (including idempotency conflict, HTTP 409) |
+| `QueryError` | Query/client error (other 4xx) |
+| `BackpressureError` | HTTP 503/507 — back off and retry; `.retry_after` carries the server's hint |
+| `DeadlineExceeded` | HTTP 504 — the server stopped waiting; the write may still land |
 
 ## License
 

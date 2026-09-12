@@ -13,6 +13,7 @@ use chronix_core::{ChronixConfig, MeasurementSchema, SchemaRegistry};
 use chronix_engine::index::{SegmentCatalog, SeriesBloomFilter, TagInvertedIndex};
 use chronix_engine::memtable::ShardRouter;
 use chronix_engine::wal::WalWriter;
+#[cfg(feature = "streaming")]
 use chronix_streaming::cdc::{EventBus, FilteredSubscription, SubscriptionFilter};
 
 use crate::lock_order::{BloomsLock, CatalogLock, RollupRegistryLock};
@@ -533,6 +534,7 @@ impl Chronix {
     ///
     /// Use this to create raw [`chronix_streaming::cdc::Subscription`]s or inspect
     /// bus statistics (published/lagged counts).
+    #[cfg(feature = "streaming")]
     pub fn event_bus(&self) -> &EventBus {
         &self.cdc_bus
     }
@@ -554,6 +556,7 @@ impl Chronix {
     ///     .event_type("point_written");
     /// let sub = db.subscribe(filter);
     /// ```
+    #[cfg(feature = "streaming")]
     pub fn subscribe(&self, filter: SubscriptionFilter) -> FilteredSubscription {
         FilteredSubscription::new(&self.cdc_bus, filter)
     }

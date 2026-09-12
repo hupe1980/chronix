@@ -18,9 +18,16 @@
 //!
 //! ## Policy Model
 //!
-//! - **Principals:** `Chronix::User` with role membership via `Chronix::Role`
-//! - **Actions:** `Chronix::Action::{ Write, Read, Delete, Admin, ... }`
-//! - **Resources:** `Chronix::Measurement` with name and optional tags
+//! - **Principals:** `Chronix::User`, with role membership via `Chronix::Role`
+//! - **Resources:** `Chronix::Namespace` for data, `Chronix::System` for
+//!   administration — the two things `chronixd` asks about, and nothing else
+//! - **Actions:** `Read`, `Write`, `Delete` on a namespace; the capabilities
+//!   in the `Admin` group on the system
+//!
+//! The model is compiled in as a Cedar schema ([`AuthzEngine::SCHEMA_SRC`])
+//! and **every policy is validated against it**, so a rule naming something
+//! this server never asks about is refused at load rather than accepted and
+//! never consulted.
 //!
 //! ## Default-Deny
 //!
@@ -29,22 +36,28 @@
 //!
 //! ## Example
 //!
-//! ```no_run
-//! use chronix_security::authz::{AuthzEngine, ChronixAction, ChronixPrincipal, ChronixResource};
+//! ```
+//! use chronix_security::authz::{
+//!     AuthzEngine, ChronixAction, ChronixNamespace, ChronixPrincipal,
+//! };
 //!
 //! let engine = AuthzEngine::new();
 //! engine.load_policies(r#"
 //!     permit(
-//!         principal in Chronix::Role::"admin",
-//!         action,
-//!         resource
+//!         principal in Chronix::Role::"operator",
+//!         action in [Chronix::Action::"Read", Chronix::Action::"Write"],
+//!         resource == Chronix::Namespace::"production"
 //!     );
 //! "#).unwrap();
 //!
-//! let admin = ChronixPrincipal::new("alice").with_role("admin");
-//! let resource = ChronixResource::measurement("cpu");
-//! let decision = engine.authorize(&admin, ChronixAction::Write, &resource);
-//! assert!(decision.is_allowed());
+//! let operator = ChronixPrincipal::new("alice").with_role("operator");
+//! let production = ChronixNamespace::new("production");
+//! assert!(engine
+//!     .authorize_namespace(&operator, ChronixAction::Write, &production)
+//!     .is_allowed());
+//! assert!(engine
+//!     .authorize_namespace(&operator, ChronixAction::Delete, &production)
+//!     .is_denied());
 //! ```
 
 #![warn(missing_docs)]
@@ -56,6 +69,6 @@ mod model;
 #[cfg(test)]
 mod perf;
 
-pub use engine::{AuthzEngine, PolicyVersion};
+pub use engine::{schema_action_names, AuthzEngine, SCHEMA_SRC};
 pub use error::AuthzError;
-pub use model::{ChronixAction, ChronixNamespace, ChronixPrincipal, ChronixResource, Decision};
+pub use model::{ChronixAction, ChronixNamespace, ChronixPrincipal, ChronixSystem, Decision};

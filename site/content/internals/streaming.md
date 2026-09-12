@@ -42,27 +42,42 @@ the EventBus and streams matching CDC events as JSON frames with a
 Typical use-cases: Grafana live dashboards, cross-region replication
 triggers, external audit log sinks, and custom analytics pipelines.
 
-### Arrow Flight CDC Export
+### CDC as Arrow batches
 
-For high-throughput, zero-copy CDC delivery, `chronix-streaming` provides an
-Arrow Flight transport behind the `flight` feature flag:
+`chronix-streaming` can encode CDC events as Arrow `RecordBatch`es, behind
+the `arrow` feature flag:
 
 ```toml
 [dependencies]
-chronix-streaming = { version = "0.1", features = ["flight"] }
+chronix-streaming = { version = "0.5", features = ["arrow"] }
 ```
+
+This is an **encoding, not a transport**: it produces record batches, and
+what carries them — Arrow Flight, IPC, a Parquet writer — is yours to
+choose. Over the network `chronixd` streams CDC as JSON over SSE at
+`/api/v1/cdc/stream`.
 
 **Components:**
 
-- `CdcBatchConverter` — converts `CdcEvent` sequences into Arrow
-  `RecordBatch` with a fixed schema (`op: Utf8`, `timestamp: Int64`,
-  `metric: Utf8`, `tags: Utf8`, `value: Float64`, `seq: UInt64`).
-- `CdcFlightExporter` — wraps `CdcBatchConverter` output in Arrow
-  Flight `FlightData` frames suitable for gRPC `DoExchange` streaming.
+- `CdcBatchConverter` — converts a `CdcEvent` sequence into a
+  `RecordBatch`.
+- `CdcBatchExporter` — subscribes to an `EventBus` and yields batches,
+  counting the events a slow consumer missed (`gap_count`).
 
-This enables downstream consumers (Spark, Flink, DataFusion, Pandas) to
-consume CDC streams as native Arrow data without JSON serialization
-overhead.
+The schema is fixed:
+
+| Column | Type | Description |
+|---|---|---|
+| `seq` | `UInt64` | Monotonic sequence number |
+| `event_type` | `Utf8` | `point_written`, `series_deleted`, or `measurement_dropped` |
+| `measurement` | `Utf8` | Measurement name |
+| `event_timestamp` | `Int64` | Nanosecond timestamp (0 for non-write events) |
+| `tags_json` | `Utf8` | JSON-encoded tag map |
+| `fields_json` | `Utf8` | JSON-encoded field map (empty for non-write events) |
+| `series_hash` | `UInt64` | FNV-1a series hash (0 for non-delete events) |
+
+Downstream consumers (Spark, Flink, DataFusion, Pandas) read it as native
+Arrow, without JSON serialization in the middle.
 
 ## Change Data Capture (CDC)
 

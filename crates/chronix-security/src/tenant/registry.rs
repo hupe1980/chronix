@@ -7,13 +7,12 @@
 //! Optionally persists namespace state to disk via JSON snapshots.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use chronix_core::{NamespaceId, NamespaceQuota, NamespaceUsage};
 
@@ -59,8 +58,6 @@ pub struct NamespaceRegistry {
     namespaces: DashMap<String, NamespaceState>,
     /// Optional directory for persisting namespace state.
     persist_dir: Option<PathBuf>,
-    /// Handle for the most recent background snapshot thread.
-    pending_snapshot: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// File name for the namespace snapshot inside the persist directory.
@@ -74,21 +71,19 @@ fn write_snapshot(dir: &Path, states: &[NamespaceState]) -> Result<()> {
     let tmp_path = dir.join("namespaces.json.tmp");
     let final_path = dir.join(SNAPSHOT_FILE);
     std::fs::write(&tmp_path, &json)
-        .map_err(|e| TenantError::InvalidConfig(format!("cannot write namespace snapshot: {e}")))?;
+        .map_err(|e| TenantError::Persist(format!("cannot write namespace snapshot: {e}")))?;
 
     // Clean up tmp file on fsync or rename failure to avoid
     // stale tmp files leaking on disk.
     let result = (|| -> Result<()> {
         let f = std::fs::File::open(&tmp_path).map_err(|e| {
-            TenantError::InvalidConfig(format!("cannot open tmp snapshot for fsync: {e}"))
+            TenantError::Persist(format!("cannot open tmp snapshot for fsync: {e}"))
         })?;
-        f.sync_all().map_err(|e| {
-            TenantError::InvalidConfig(format!("cannot fsync namespace snapshot: {e}"))
-        })?;
+        f.sync_all()
+            .map_err(|e| TenantError::Persist(format!("cannot fsync namespace snapshot: {e}")))?;
 
-        std::fs::rename(&tmp_path, &final_path).map_err(|e| {
-            TenantError::InvalidConfig(format!("cannot rename namespace snapshot: {e}"))
-        })?;
+        std::fs::rename(&tmp_path, &final_path)
+            .map_err(|e| TenantError::Persist(format!("cannot rename namespace snapshot: {e}")))?;
         Ok(())
     })();
 
@@ -110,7 +105,6 @@ impl NamespaceRegistry {
         let registry = Self {
             namespaces: DashMap::new(),
             persist_dir: None,
-            pending_snapshot: Mutex::new(None),
         };
 
         registry.ensure_default();
@@ -148,13 +142,11 @@ impl NamespaceRegistry {
             Self {
                 namespaces,
                 persist_dir: Some(dir),
-                pending_snapshot: Mutex::new(None),
             }
         } else {
             Self {
                 namespaces: DashMap::new(),
                 persist_dir: Some(dir),
-                pending_snapshot: Mutex::new(None),
             }
         };
 
@@ -202,59 +194,6 @@ impl NamespaceRegistry {
         write_snapshot(dir, &states)
     }
 
-    /// Save a best-effort snapshot on a background thread,
-    /// avoiding blocking the caller with fsync I/O.
-    fn save_snapshot_best_effort(&self) {
-        let dir = match &self.persist_dir {
-            Some(d) => d.clone(),
-            None => return,
-        };
-
-        // Collect state snapshot from DashMap on the caller thread
-        // (fast — only clones the current namespace states).
-        let states: Vec<NamespaceState> =
-            self.namespaces.iter().map(|r| r.value().clone()).collect();
-
-        // Serialize snapshot writers: join the previous in-flight snapshot
-        // BEFORE spawning the new one. Spawning first would let an older
-        // snapshot race a newer one for the final rename — last-rename-wins
-        // could then persist stale state.
-        let Ok(mut guard) = self.pending_snapshot.lock() else {
-            // Poisoned lock: fall back to a synchronous write so the update
-            // is never silently lost.
-            if let Err(e) = write_snapshot(&dir, &states) {
-                warn!("failed to persist namespace snapshot: {e}");
-            }
-            return;
-        };
-        if let Some(prev) = guard.take() {
-            let _ = prev.join();
-        }
-
-        // Offload serialization + file I/O to a background thread.
-        match std::thread::Builder::new()
-            .name("chronix-ns-snapshot".into())
-            .spawn(move || {
-                if let Err(e) = write_snapshot(&dir, &states) {
-                    warn!("failed to persist namespace snapshot: {e}");
-                }
-            }) {
-            Ok(handle) => {
-                // Store the handle so Drop (or the next snapshot) joins it.
-                *guard = Some(handle);
-            }
-            Err(e) => {
-                // Thread spawn failed (e.g. resource exhaustion): write
-                // synchronously rather than dropping the snapshot.
-                warn!("failed to spawn namespace snapshot thread, writing synchronously: {e}");
-                drop(guard);
-                if let Err(e) = self.save_snapshot_inner() {
-                    warn!("failed to persist namespace snapshot: {e}");
-                }
-            }
-        }
-    }
-
     /// Create a new namespace.
     ///
     /// # Errors
@@ -295,7 +234,19 @@ impl NamespaceRegistry {
                 #[allow(clippy::cast_precision_loss)]
                 metrics::gauge!("chronix_namespace_count").set(self.namespaces.len() as f64);
 
-                self.save_snapshot_best_effort();
+                // Synchronous, like the delete below. A create that is
+                // acknowledged and then lost is the delete case mirrored:
+                // the operator provisions a tenant, hands out a credential
+                // bound to it, and after the next restart every request from
+                // that tenant answers `400 namespace not found`. The
+                // in-memory entry is rolled back so the running process does
+                // not disagree with its own restart.
+                if let Err(e) = self.save_snapshot_inner() {
+                    self.namespaces.remove(&name);
+                    #[allow(clippy::cast_precision_loss)]
+                    metrics::gauge!("chronix_namespace_count").set(self.namespaces.len() as f64);
+                    return Err(e);
+                }
                 Ok(info)
             }
         }
@@ -322,14 +273,6 @@ impl NamespaceRegistry {
         info!(namespace = %name, "namespace deleted");
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!("chronix_namespace_count").set(self.namespaces.len() as f64);
-
-        // Join any in-flight background snapshot to prevent it from
-        // overwriting our synchronous save with stale state.
-        if let Ok(mut guard) = self.pending_snapshot.lock() {
-            if let Some(handle) = guard.take() {
-                let _ = handle.join();
-            }
-        }
 
         // Persist synchronously — deletes are destructive and must be
         // durable before returning to the caller.
@@ -389,7 +332,10 @@ impl NamespaceRegistry {
             entry.value_mut().info.quota = quota;
         }
         debug!(namespace = %name, "quota updated");
-        self.save_snapshot_best_effort();
+        // Synchronous for the same reason: a quota the API reports as
+        // applied and the next restart reverts is a setting that is accepted
+        // and ignored.
+        self.save_snapshot_inner()?;
         Ok(())
     }
 
@@ -684,18 +630,6 @@ impl Default for NamespaceRegistry {
     }
 }
 
-impl Drop for NamespaceRegistry {
-    fn drop(&mut self) {
-        // Wait for any in-flight background snapshot to complete so the
-        // data is durable before the registry goes away.
-        if let Ok(mut guard) = self.pending_snapshot.lock() {
-            if let Some(handle) = guard.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-}
-
 fn now_ms() -> u64 {
     #[allow(clippy::cast_possible_truncation)]
     SystemTime::now()
@@ -712,6 +646,63 @@ pub fn shared_registry() -> Arc<NamespaceRegistry> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Creating a tenant must be durable before it is acknowledged.**
+    ///
+    /// A delete was — with a comment saying destructive operations must be —
+    /// and a create was not: it snapshotted *best effort* on a background
+    /// thread and returned `Ok` regardless. So an operator could provision a
+    /// namespace, be told it exists, hand out a credential bound to it, and
+    /// find after the next restart that every request from that tenant
+    /// answers `400 namespace not found`. The mirror of the delete case, and
+    /// the asymmetry is the tell that only one of the two was thought about.
+    #[test]
+    fn creating_a_namespace_is_durable_or_it_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = NamespaceRegistry::open(dir.path()).unwrap();
+
+        // A directory where the snapshot wants to write its temp file.
+        std::fs::create_dir_all(dir.path().join("namespaces.json.tmp")).unwrap();
+
+        let err = registry.create_namespace(
+            NamespaceId::new("tenant-a").unwrap(),
+            "a tenant",
+            "ops",
+            NamespaceQuota::default(),
+        );
+        assert!(
+            err.is_err(),
+            "a namespace that cannot be persisted must not be acknowledged"
+        );
+    }
+
+    /// The same for a quota change, which `PUT /namespaces/{name}/quota`
+    /// returns as though it had taken effect.
+    #[test]
+    fn changing_a_quota_is_durable_or_it_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = NamespaceRegistry::open(dir.path()).unwrap();
+        registry
+            .create_namespace(
+                NamespaceId::new("tenant-a").unwrap(),
+                "a tenant",
+                "ops",
+                NamespaceQuota::default(),
+            )
+            .unwrap();
+
+        std::fs::create_dir_all(dir.path().join("namespaces.json.tmp")).unwrap();
+
+        let quota = NamespaceQuota {
+            max_series_count: 42,
+            ..NamespaceQuota::default()
+        };
+        assert!(
+            registry.update_quota("tenant-a", quota).is_err(),
+            "a quota that cannot be persisted reverts at the next restart, so \
+             reporting it as applied is a setting that is accepted and ignored"
+        );
+    }
     use super::*;
 
     #[test]

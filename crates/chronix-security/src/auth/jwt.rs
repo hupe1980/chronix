@@ -118,6 +118,27 @@ impl std::fmt::Debug for JwtConfig {
     }
 }
 
+/// Resolve a dot-separated claim path against a claim map.
+///
+/// `realm_access.roles` is Keycloak, `https://example.com/roles` is Auth0 —
+/// the second contains dots that are not path separators, so a path that
+/// looks like a URI is treated as one key.
+#[must_use]
+pub fn resolve_claim_path<'a>(
+    claims: &'a std::collections::HashMap<String, serde_json::Value>,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    if !path.contains('.') || path.contains("://") {
+        return claims.get(path);
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut current: &serde_json::Value = claims.get(*segments.first()?)?;
+    for segment in &segments[1..] {
+        current = current.as_object()?.get(*segment)?;
+    }
+    Some(current)
+}
+
 /// Validated JWT claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtClaims {
@@ -458,6 +479,37 @@ impl JwtValidator {
     }
 
     /// Extract the principal identity from JWT claims.
+    /// The claim path roles are read from (`roles` unless configured).
+    #[must_use]
+    pub fn role_claim(&self) -> &str {
+        self.config.role_claim.as_deref().unwrap_or("roles")
+    }
+
+    /// The roles this token carries, as `Chronix::Role` names.
+    ///
+    /// Resolved here rather than at a gate, so every gate sees the same set.
+    /// The administrative gate used to do it alone, which is why a role
+    /// granted an admin operation and matched nothing in a namespace policy.
+    ///
+    /// Accepts an array of strings, or a single string — identity providers
+    /// emit both, and a one-element list is often flattened on the way
+    /// through. A space-separated string is *not* split: `scope` is
+    /// space-separated and `roles` is not, and guessing turns one role named
+    /// `"data science"` into two that do not exist.
+    #[must_use]
+    pub fn extract_roles(&self, claims: &JwtClaims) -> Vec<String> {
+        match resolve_claim_path(&claims.extra, self.role_claim()) {
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The principal this token names, from `subject_claim` (default `sub`).
+    #[must_use]
     pub fn extract_principal(&self, claims: &JwtClaims) -> Option<String> {
         let claim_name = self.config.subject_claim.as_deref().unwrap_or("sub");
 

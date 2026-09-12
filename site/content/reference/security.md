@@ -108,20 +108,28 @@ Fine-grained authorization using the [Cedar](https://www.cedarpolicy.com/) polic
 language (formally verified pure Rust evaluator).
 
 ```text
-Request → AuthMiddleware → AuthContext
+Request → AuthMiddleware → AuthContext (principal + roles, resolved once)
                                │
                                ▼
                         AuthzEngine (Cedar)
-                           ├── PolicySet (hot-reloadable)
-                           ├── Entities (principal, resource, roles)
+                           ├── compiled-in schema — every policy validated
+                           ├── PolicySet (replaced atomically)
                            └── Decision: Allow | Deny { reasons }
 ```
 
-- **Default-deny:** No policy match → deny.
-- **Entity model:** `Chronix::User`, `Chronix::Role`, `Chronix::Measurement`,
-  `Chronix::Action` (Write, Read, Delete, Admin, Forecast, DetectAnomalies,
-  Subscribe).
-- **Hot-reload:** `load_policies()` replaces the active policy set atomically.
+- **Default-deny:** no policy match → deny. An engine with no policies denies
+  everything, which is why "no policy directory" means *no engine* rather
+  than an empty one.
+- **Entity model:** `Chronix::User` (in `Chronix::Role`), and two resources —
+  `Chronix::Namespace` for data, `Chronix::System` for administration. The
+  authoritative list is the schema itself,
+  [`chronix.cedarschema`](https://github.com/hupe1980/chronix/blob/main/crates/chronix-security/src/authz/chronix.cedarschema),
+  which is compiled in and validated against.
+- **Two entry points:** `authorize_namespace` and `authorize_system`. There is
+  no measurement resource — the unit of authorization is the namespace,
+  which is the unit storage, SQL scoping, quotas and credentials all use.
+- **Validation:** a policy naming an unknown action or entity type is refused
+  at load, so it cannot become a rule that silently never fires.
 - **Performance:** < 100 µs p99 per decision in release mode for 1 000+ policies.
 ## Audit Trail (`chronix-security::audit`)
 

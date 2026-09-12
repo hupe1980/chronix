@@ -119,7 +119,14 @@ pub trait IngestionConnector: Send + Sync {
     /// Runtime metrics snapshot.
     async fn metrics(&self) -> ConnectorMetrics;
 
-    /// Whether this connector is healthy (contributes to `/ready`).
+    /// Whether this connector is ingesting, or could be at any moment —
+    /// `Running | Idle`. A connector with nothing to read is working; one
+    /// that cannot reach its broker is not.
+    ///
+    /// This does **not** gate `/ready`, which asks only whether the database
+    /// is writable: a connector that cannot reach its broker does not stop
+    /// this node answering queries. Surfaced on `/api/v1/connectors` and as
+    /// the `chronix_connector_up` gauge, which is what an alert watches.
     async fn is_healthy(&self) -> bool {
         matches!(
             self.status().await,
@@ -269,15 +276,23 @@ impl ConnectorManager {
         infos
     }
 
-    /// Check if all connectors are healthy.
-    pub async fn all_healthy(&self) -> bool {
+    /// Publish each connector's health as `chronix_connector_up`.
+    ///
+    /// Called from the metrics scrape, like the engine's `statistics()`: a
+    /// gauge nobody writes reads as "no data", which Prometheus renders
+    /// identically to a quiet one. One gauge per connector rather than a
+    /// rollup, so an alert can say *which* one is down.
+    pub async fn refresh_gauges(&self) {
         let connectors = self.connectors.read().await;
         for c in connectors.iter() {
-            if !c.is_healthy().await {
-                return false;
-            }
+            let up = f64::from(u8::from(c.is_healthy().await));
+            metrics::gauge!(
+                "chronix_connector_up",
+                "connector" => c.name().to_string(),
+                "type" => c.connector_type().to_string(),
+            )
+            .set(up);
         }
-        true
     }
 
     /// Reload connectors from updated configuration.
@@ -669,8 +684,8 @@ mod tests {
         assert_eq!(infos[0].connector_type, "mock");
         assert_eq!(infos[0].status, ConnectorStatus::Running);
 
-        // Health
-        assert!(manager.all_healthy().await);
+        // Health — published as a gauge rather than rolled into a bool.
+        manager.refresh_gauges().await;
 
         // Stop all
         manager.stop_all().await;
@@ -692,7 +707,7 @@ mod tests {
         let manager = ConnectorManager::new(db);
 
         assert_eq!(manager.count().await, 0);
-        assert!(manager.all_healthy().await);
+        manager.refresh_gauges().await;
         assert!(manager.list_connectors().await.is_empty());
 
         // start/stop with no connectors should be fine

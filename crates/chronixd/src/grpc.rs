@@ -65,6 +65,18 @@ pub struct ChronixGrpcService {
     write_timeout: Duration,
     /// Whether namespace isolation is enforced (`multi_tenancy` in the config).
     multi_tenancy: bool,
+    /// The policy engine, when one is configured.
+    ///
+    /// Held per service rather than reached through a request extension:
+    /// tonic has no middleware chain the axum gate lives in, which is why
+    /// Cedar was consulted on HTTP and on neither of these surfaces.
+    authz: Option<std::sync::Arc<chronix_security::authz::AuthzEngine>>,
+    /// The audit logger, when one is configured.
+    ///
+    /// A refused request is recorded on every protocol or on none: the trail
+    /// answers "was this attempted?", and an answer that depends on which
+    /// port the attempt came in on is not one.
+    audit: Option<std::sync::Arc<chronix_security::audit::AuditLogger>>,
 }
 
 /// Default max dedup entries.
@@ -87,6 +99,8 @@ impl ChronixGrpcService {
             sql_max_rows: 100_000,
             write_timeout: Duration::ZERO,
             multi_tenancy: false,
+            authz: None,
+            audit: None,
         }
     }
 
@@ -112,7 +126,32 @@ impl ChronixGrpcService {
             sql_max_rows: 100_000,
             write_timeout: Duration::ZERO,
             multi_tenancy: false,
+            authz: None,
+            audit: None,
         }
+    }
+
+    /// Attach the Cedar policy engine.
+    ///
+    /// `None` means no engine is configured, which is not the same as an
+    /// empty one: an empty policy set denies everything.
+    pub fn with_authz(
+        mut self,
+        authz: Option<std::sync::Arc<chronix_security::authz::AuthzEngine>>,
+    ) -> Self {
+        self.authz = authz;
+        self
+    }
+
+    /// Attach the audit logger, so a refusal here is recorded as it is on
+    /// HTTP.
+    #[must_use]
+    pub fn with_audit(
+        mut self,
+        audit: Option<std::sync::Arc<chronix_security::audit::AuditLogger>>,
+    ) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Enforce namespace isolation, reading the namespace from `x-namespace`.
@@ -153,7 +192,13 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::WriteRequest>,
     ) -> GrpcResult<proto::WriteResponse> {
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Write,
+            &request,
+        )?;
         let req = request.into_inner();
         let points = req
             .points
@@ -195,7 +240,13 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<Streaming<proto::StreamWriteRequest>>,
     ) -> GrpcResult<proto::StreamWriteResponse> {
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Write,
+            &request,
+        )?;
         let mut stream = request.into_inner();
         let mut total_written: u64 = 0;
         let mut last_batch_written: u64 = 0;
@@ -305,7 +356,13 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
     type QueryStream = QueryStream;
 
     async fn query(&self, request: Request<proto::QueryRequest>) -> GrpcResult<Self::QueryStream> {
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Read,
+            &request,
+        )?;
         let req = request.into_inner();
         let db = self.db.clone();
         let measurement = req.measurement.clone();
@@ -414,7 +471,33 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::SchemaRequest>,
     ) -> GrpcResult<proto::SchemaResponse> {
+        // **This RPC had no scope and no gate at all**, while its HTTP
+        // sibling `GET /api/v1/measurements/{name}/schema` had both. The
+        // schema registry is process-wide, so answering from it directly told
+        // a tenant that another tenant's measurement exists, and its column
+        // names — a cross-tenant leak that the gRPC tenancy suite could not
+        // see, because it walks the RPCs that *take* a scope and this one
+        // did not.
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Read,
+            &request,
+        )?;
         let measurement = request.into_inner().measurement;
+
+        if let Some(ref ns) = scope {
+            let now_ns = crate::util::now_nanos().map_err(|e| Status::internal(e.to_string()))?;
+            let visible =
+                crate::namespace::measurements_in(&self.db, Some(ns), i64::MIN, now_ns, usize::MAX);
+            if !visible.iter().any(|m| m == &measurement) {
+                return Err(Status::not_found(format!(
+                    "measurement not found: {measurement}"
+                )));
+            }
+        }
+
         let schema = self
             .db
             .schema(&measurement)
@@ -438,7 +521,13 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         // every tenant what the others were writing, column names included.
         // A namespace sees the measurements it holds data for — the same
         // rule the HTTP and Prometheus listings follow.
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Read,
+            &_request,
+        )?;
 
         let measurements = tokio::task::spawn_blocking(move || {
             let names = match scope.as_deref() {
@@ -476,7 +565,13 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::DeleteRequest>,
     ) -> GrpcResult<proto::DeleteResponse> {
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Delete,
+            &request,
+        )?;
         let req = request.into_inner();
         let db = self.db.clone();
 
@@ -512,7 +607,13 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::DropMeasurementRequest>,
     ) -> GrpcResult<proto::DropMeasurementResponse> {
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Delete,
+            &request,
+        )?;
         let name = request.into_inner().measurement;
         let db = self.db.clone();
 
@@ -568,7 +669,13 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
         &self,
         request: Request<proto::SqlRequest>,
     ) -> GrpcResult<proto::SqlResponse> {
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Read,
+            &request,
+        )?;
         let query = request.into_inner().query;
         debug!(%query, "gRPC ExecuteSql");
 

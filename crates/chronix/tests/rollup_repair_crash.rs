@@ -1,9 +1,8 @@
 //! A crash **inside** a rollup repair.
 //!
-//! `QUALITY.md` §6 named this as the one interleaving the invalidation-log
-//! design is subtle about and does not test: a repair writes its recomputed
-//! points, syncs them, and only then clears the invalidation entry and
-//! persists the rollup state. A crash between the sync and the clear leaves a
+//! The one interleaving the invalidation-log design is subtle about and did
+//! not test: a repair writes its recomputed points, syncs them, and only then
+//! clears the invalidation entry and persists the rollup state. A crash between the sync and the clear leaves a
 //! pending entry whose work is already done, so the repair runs a second time
 //! — and the argument that this is safe (the delete-then-rewrite is
 //! idempotent) was an argument, not a test.

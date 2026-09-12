@@ -39,6 +39,18 @@ pub struct ChronixFlightSqlService {
     write_timeout: Duration,
     /// Whether namespace isolation is enforced (`multi_tenancy` in the config).
     multi_tenancy: bool,
+    /// The policy engine, when one is configured.
+    ///
+    /// Held per service rather than reached through a request extension:
+    /// tonic has no middleware chain the axum gate lives in, which is why
+    /// Cedar was consulted on HTTP and on neither of these surfaces.
+    authz: Option<std::sync::Arc<chronix_security::authz::AuthzEngine>>,
+    /// The audit logger, when one is configured.
+    ///
+    /// A refused request is recorded on every protocol or on none: the trail
+    /// answers "was this attempted?", and an answer that depends on which
+    /// port the attempt came in on is not one.
+    audit: Option<std::sync::Arc<chronix_security::audit::AuditLogger>>,
 }
 
 impl ChronixFlightSqlService {
@@ -52,7 +64,32 @@ impl ChronixFlightSqlService {
             sql_max_rows: 100_000,
             write_timeout: Duration::ZERO,
             multi_tenancy: false,
+            authz: None,
+            audit: None,
         }
+    }
+
+    /// Attach the Cedar policy engine.
+    ///
+    /// `None` means no engine is configured, which is not the same as an
+    /// empty one: an empty policy set denies everything.
+    pub fn with_authz(
+        mut self,
+        authz: Option<std::sync::Arc<chronix_security::authz::AuthzEngine>>,
+    ) -> Self {
+        self.authz = authz;
+        self
+    }
+
+    /// Attach the audit logger, so a refusal here is recorded as it is on
+    /// HTTP.
+    #[must_use]
+    pub fn with_audit(
+        mut self,
+        audit: Option<std::sync::Arc<chronix_security::audit::AuditLogger>>,
+    ) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// Enforce namespace isolation, reading the namespace from `x-namespace`.
@@ -105,7 +142,13 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         // The namespace travels with the ticket: `DoGet` arrives as a separate
         // request, potentially on a different connection, so a scope resolved
         // only here would be lost before the query runs.
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Read,
+            &request,
+        )?;
         let sql_ctx = self.sql_contexts.get(scope.as_deref());
 
         // Plan through the **read-only** path, exactly as `DoGet` does.
@@ -167,7 +210,13 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         // Disagreement is refused rather than silently resolved, so a client
         // whose ticket outlived a namespace change gets an error instead of
         // another tenant's rows.
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Read,
+            &_request,
+        )?;
         if self.multi_tenancy && handle_scope.as_deref() != scope.as_deref() {
             return Err(Status::permission_denied(
                 "the statement handle names a different namespace than this request",
@@ -266,7 +315,13 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             ));
         }
 
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Write,
+            &request,
+        )?;
 
         // Collect all FlightData from the stream
         let mut stream = request.into_inner();
@@ -557,7 +612,13 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         // tenant what the others were writing — which for a JDBC client is
         // the first thing it fetches to populate its schema browser. A
         // namespace sees the measurements it holds data for.
-        let scope = crate::namespace::scope_from_request(self.multi_tenancy, &_request)?;
+        let scope = crate::namespace::authorize_request(
+            self.multi_tenancy,
+            self.authz.as_deref(),
+            self.audit.as_deref(),
+            chronix_security::authz::ChronixAction::Read,
+            &_request,
+        )?;
 
         let names: Vec<String> = tokio::task::spawn_blocking(move || match scope.as_deref() {
             // Through `measurement_names_in`, not the raw registry: it

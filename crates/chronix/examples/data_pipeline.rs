@@ -115,15 +115,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 6. Query audit log ─────────────────────────────────────
     //
-    // The pipeline does not audit on your behalf: `Pipeline::audit` is where
-    // an application records the decisions *it* made, so that the trail
-    // reflects the application's semantics rather than the database's.
+    // The pipeline seals **one** thing on your behalf: that a signal fired,
+    // as `SignalFired`, because a signal is data leaving the database.
+    // `Pipeline::audit` is for the decisions *your application* made — its
+    // own semantics, not the database's — and `AuditAction::Custom` is how
+    // they are named, so the built-in categories stay the set the server
+    // itself emits.
     println!("\n─── 6. Audit trail ───");
     for signal in pipeline.signal_store().all() {
         pipeline.audit(
             AuditEvent::new(
-                "pipeline",
-                AuditAction::DetectAnomalies,
+                "on-call-router",
+                AuditAction::Custom("paged".into()),
                 format!("cpu_usage/{}", signal.trigger_name),
                 AuditDecision::Allow,
             )

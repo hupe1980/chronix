@@ -389,6 +389,95 @@ mod tests {
     fn checked_string_len_overflow() {
         assert!(checked_string_len(65536).is_err());
     }
+    // ── Properties ─────────────────────────────────────────────────────
+    //
+    // These are the primitives every other codec in this crate is built
+    // from: RLE, frame-of-reference and the delta stack all pack through
+    // `pack_bits` and all read back through `unpack_bits`. `bit_width`
+    // ranges over 1..=64 and the two round-trip tests above pin it at 6
+    // and 64 — so 62 widths, and every boundary where a value straddles a
+    // byte or a word, were covered by nothing. `coding` and `decimal` were
+    // the only modules here with no `proptest!`.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Pack then unpack returns the input, at every width.
+        ///
+        /// Values are masked to `bit_width` first, because that is the
+        /// contract: `pack_bits` stores the low `bit_width` bits and the
+        /// caller is responsible for the range. Passing unmasked values
+        /// would assert a promise the function does not make.
+        #[test]
+        fn pack_unpack_roundtrips_at_every_width(
+            bit_width in 1u8..=64,
+            raw in prop::collection::vec(any::<u64>(), 1..100),
+        ) {
+            let mask = if bit_width >= 64 { u64::MAX } else { (1u64 << bit_width) - 1 };
+            let values: Vec<u64> = raw.iter().map(|v| v & mask).collect();
+
+            let mut buf = Vec::new();
+            pack_bits(&values, bit_width, &mut buf);
+            let unpacked = unpack_bits(&buf, values.len(), bit_width).unwrap();
+            prop_assert_eq!(unpacked, values);
+        }
+
+        /// The packed form is no larger than the bits it was asked to store,
+        /// rounded up to a byte — the whole reason the function exists.
+        #[test]
+        fn packing_costs_bit_width_bits_per_value(
+            bit_width in 1u8..=64,
+            count in 1usize..100,
+        ) {
+            let values = vec![u64::MAX; count];
+            let mut buf = Vec::new();
+            pack_bits(&values, bit_width, &mut buf);
+            let expected = (count * bit_width as usize).div_ceil(8);
+            prop_assert_eq!(buf.len(), expected);
+        }
+
+        /// `unpack_bits` must error, never panic, on a short or hostile
+        /// buffer — it is reached from every corrupt segment.
+        #[test]
+        fn unpack_never_panics(
+            data in prop::collection::vec(any::<u8>(), 0..64),
+            count in 0usize..200,
+            bit_width in 0u8..=70,
+        ) {
+            let _ = unpack_bits(&data, count, bit_width);
+        }
+
+        /// `ZigZag` and the `u64` varint, over their full ranges.
+        #[test]
+        fn zigzag_roundtrips_every_i64(value in any::<i64>()) {
+            prop_assert_eq!(zigzag_decode(zigzag_encode(value)), value);
+        }
+
+        #[test]
+        fn varint_roundtrips_every_u64(value in any::<u64>()) {
+            let mut buf = Vec::new();
+            varint_encode(value, &mut buf);
+            let (decoded, used) = varint_decode(&buf).unwrap();
+            prop_assert_eq!(decoded, value);
+            prop_assert_eq!(used, buf.len());
+            prop_assert!(buf.len() <= 10);
+        }
+
+        /// `bits_needed` returns the smallest width that can hold the value.
+        #[test]
+        fn bits_needed_is_the_smallest_sufficient_width(value in any::<u64>()) {
+            let width = bits_needed(value);
+            let fits = width >= 64 || value < (1u64 << width);
+            prop_assert!(fits, "{value} does not fit {width} bits");
+            if width > 0 {
+                let narrower = width - 1;
+                prop_assert!(
+                    value >= (1u64 << narrower),
+                    "{value} would have fitted {narrower} bits"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

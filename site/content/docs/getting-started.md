@@ -20,9 +20,27 @@ cargo add chronix
 SQL is on by default. If you do not need it, `default-features = false` drops
 DataFusion and takes **96 seconds off a clean build** (131 s against 227 s for
 a small consumer); everything else — writes, the native query API, PromQL,
-rollups, retention, analytics, triggers, the cold archive — is unaffected. It
-is not a way to shrink the binary: the linker already discards DataFusion when
-nothing calls it, so the difference there is 0.34 MiB.
+rollups, retention, analytics, the cold archive — is unaffected. It is not a
+way to shrink the binary: the linker already discards DataFusion when nothing
+calls it, so the difference there is 0.34 MiB.
+
+**Three things are off by default**, because an embedded database that opens
+a directory and writes to it needs none of them and should not carry their
+dependencies:
+
+```bash
+cargo add chronix --features streaming
+```
+
+| Feature | What it adds | Cost |
+|---|---|---|
+| `streaming` | The CDC bus and `db.subscribe()`, triggers and delivery | +63 packages, including an HTTP client and a TLS stack |
+| `security` | API keys, JWT/OIDC, mTLS, Cedar authorization, the audit chain, namespaces | +126 packages, including a JWT library, Cedar and Argon2 |
+| `pipeline` | The real-time pipeline — CDC → triggers → delivery, streaming anomaly detection, continuous forecasting. Implies both | — |
+
+Without them a build resolves **175 packages**; with all three, 304. If you
+are running the server rather than embedding the library, `chronixd` has all
+of it and cannot be built otherwise.
 
 Open a database, write a point, read it back — this is
 [`examples/quickstart.rs`](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/quickstart.rs),

@@ -193,9 +193,16 @@ pub struct ServerSettings {
     #[serde(default)]
     pub backup_root: Option<PathBuf>,
 
-    /// Authorization — path to a directory of `.cedar` policy files.
-    /// When set, the Cedar authorization engine is enabled.
-    /// When absent, all requests are permitted (open mode).
+    /// Authorization — a directory of `.cedar` policy files.
+    ///
+    /// Setting it turns on policy evaluation; leaving it unset means no
+    /// engine, which is **not** an empty policy set — an empty set denies
+    /// everything. Policies are validated against the compiled-in schema at
+    /// startup, so a rule naming an action or entity type this server never
+    /// asks about is a startup error rather than a rule that never fires.
+    ///
+    /// Requires `[auth]`: a policy is written about a principal, and without
+    /// authentication there is no principal to write one about.
     #[serde(default)]
     pub authz_policy_dir: Option<PathBuf>,
 
@@ -752,8 +759,20 @@ pub struct ApiKeyEntry {
     pub namespaces: Vec<String>,
     /// Whether this key may perform administrative operations (restore,
     /// namespace management, key management).
+    ///
+    /// The capability, not the policy: with Cedar configured a request needs
+    /// **both** this and a policy permitting the specific capability the
+    /// route asks for, so adding policies can only narrow what a key can do.
     #[serde(default)]
     pub admin: bool,
+    /// Cedar roles this key carries.
+    ///
+    /// Every policy in the security guide is written
+    /// `principal in Chronix::Role::"…"`, and a key had no way to be in one:
+    /// roles came from a JWT claim or from nowhere, so on the credential
+    /// `chronixd` is usually deployed with, those policies matched nothing.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 impl std::fmt::Debug for ApiKeyEntry {
@@ -1062,6 +1081,31 @@ impl ServerConfig {
                  least one [[auth.api_keys]] entry or an [auth.jwt] section. \
                  As written, every request would be rejected. To run without \
                  authentication, remove the [auth] section entirely."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the authorization configuration.
+    ///
+    /// Policies are about principals, and a deployment with no `[auth]`
+    /// section has none: every request would reach the gate anonymous, the
+    /// gate would have nobody to decide about, and it would pass. So a
+    /// policy directory without authentication is a set of rules that cannot
+    /// apply — the failure mode this whole subsystem keeps producing, and
+    /// the one moment the server can still say so.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `authz_policy_dir` is set and `[auth]` is not.
+    pub fn validate_authz(&self) -> Result<(), ServerConfigError> {
+        if self.server.authz_policy_dir.is_some() && self.auth.is_none() {
+            return Err(ServerConfigError::Invalid(
+                "server.authz_policy_dir is set but there is no [auth] section. \
+                 Cedar policies name principals, and without authentication \
+                 every request is anonymous, so no policy could ever apply. \
+                 Add an [auth] section, or remove authz_policy_dir."
                     .to_string(),
             ));
         }

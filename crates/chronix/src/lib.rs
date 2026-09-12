@@ -77,6 +77,7 @@ pub(crate) mod lock_order;
 mod maintenance;
 #[macro_use]
 pub mod macros;
+#[cfg(feature = "pipeline")]
 pub mod pipeline;
 pub mod promql;
 pub mod retention;
@@ -92,7 +93,9 @@ pub use chronix_core;
 pub use chronix_encoding;
 pub use chronix_engine;
 pub use chronix_query;
+#[cfg(feature = "security")]
 pub use chronix_security;
+#[cfg(feature = "streaming")]
 pub use chronix_streaming;
 
 // Primary export
@@ -104,6 +107,7 @@ pub use delete::{DeleteBuilder, DeleteOutcome, DeleteRequest};
 pub use error::DbError;
 pub use error::InsertResult;
 pub use export::{ParquetCompression, ParquetExportConfig};
+#[cfg(feature = "pipeline")]
 pub use pipeline::{Pipeline, PipelineConfig};
 pub use rollup::{RollupAggFn, RollupBuilder, RollupConfig, RollupRegistry, RollupState};
 

@@ -1070,6 +1070,20 @@ have it retry the same doomed batch for ever.
 ]
 ```
 
+`status` reports what the connector's task is doing:
+
+| Status | Meaning | `chronix_connector_up` |
+|---|---|---|
+| `Running` | Connected and receiving | `1` |
+| `Idle` | Connected, nothing arriving | `1` |
+| `Reconnecting` | Cannot reach the broker; retrying with backoff | `0` |
+| `Failed` | Retrying, and naming the error — `{"failed": "<reason>"}`. Not terminal | `0` |
+| `Stopped` | Not started, or stopped | `0` |
+
+Alert on `chronix_connector_up`, not on `/ready`: a connector that cannot
+reach its broker does not stop this node answering queries, so readiness does
+not fail on it.
+
 `lag` is **messages behind the source's newest offset**, and it is `null` for a
 source that has no such measure — MQTT, which pushes rather than being polled.
 Kafka's figure comes from the watermarks the last fetch response already
@@ -1319,9 +1333,25 @@ curl http://localhost:8086/api/v1/namespaces/production/usage
 
 ## Admin — Cluster Management
 
-All admin endpoints require the `Chronix::Action::"Admin"` Cedar action
-when an authorization engine is configured. The authorization middleware
-checks against the synthetic `Chronix::Measurement::"__system__"` resource.
+Every admin endpoint requires **two** things: a credential marked `admin`,
+and — when an authorization engine is configured — a policy permitting the
+capability that route group asks for, on `Chronix::System`. The capabilities
+are separate so a backup credential cannot mint API keys:
+
+| Route group | Capability |
+|---|---|
+| `/api/v1/admin/auth/keys*` | `ManageKeys` |
+| `/api/v1/admin/backup*`, `/api/v1/admin/restore` | `ManageBackups` |
+| `/api/v1/admin/log-level` | `ManageConfig` |
+| `/api/v1/admin/analytics/*` | `ManageModels` |
+| `/api/v1/namespaces*` | `ManageNamespaces` |
+| `/api/v1/admin/nodes*`, `/heartbeat` | `ManageNodes` |
+| `/api/v1/admin/regions*` | `ManageRegions` |
+| `/api/v1/admin/routing`, `/health`, `/topology` | `ViewCluster` |
+| `/api/v1/admin/rebalance` | `ManageCluster` |
+
+`action in Chronix::Action::"Admin"` grants all of them at once — `Admin` is
+an action group, so it is `in`, not `==`.
 
 | Method | Path | Description |
 |--------|------|-------------|

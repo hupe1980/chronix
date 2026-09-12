@@ -23,7 +23,7 @@ from chronix_client import (
 )
 
 
-BASE = "http://chronix-test:5555"
+BASE = "http://chronix-test:8086"
 
 
 # ── Model Tests ──────────────────────────────────────────────────
@@ -507,10 +507,35 @@ async def test_api_key_header(mock_api):
 
 @pytest.mark.asyncio
 async def test_namespace_header(mock_api):
+    """The header name is the server's, read out of the server.
+
+    This asserted `X-Chronix-Namespace` — a name this client invented and
+    `chronixd` does not read — so a client configured for `tenant-a` was
+    served `default`, and on a deployment whose credential is bound to a
+    tenant every request was refused for a namespace nobody asked for. A
+    mock proves the client sends what its author expected; pinning the
+    constant to `namespace.rs` is what makes it the server's expectation.
+    """
+    import pathlib
+    import re
+
+    from chronix_client.client import NAMESPACE_HEADER
+
+    source = (
+        pathlib.Path(__file__).resolve().parents[3]
+        / "crates"
+        / "chronixd"
+        / "src"
+        / "namespace.rs"
+    ).read_text()
+    declared = re.search(r'NAMESPACE_HEADER: &str = "([^"]+)"', source)
+    assert declared, "chronixd no longer declares NAMESPACE_HEADER"
+    assert NAMESPACE_HEADER == declared.group(1)
+
     route = mock_api.get("/health").respond(json={"status": "ok"})
     async with ChronixClient(BASE, namespace="prod") as c:
         await c.health()
-    assert route.calls[0].request.headers["X-Chronix-Namespace"] == "prod"
+    assert route.calls[0].request.headers[NAMESPACE_HEADER] == "prod"
 
 
 @pytest.mark.asyncio

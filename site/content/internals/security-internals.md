@@ -93,27 +93,57 @@ Roles are **names in a policy**, not a fixed set with fixed permissions.
 There is no `viewer`/`writer`/`admin` hierarchy.
 
 - **Cedar policies**, when `authz_policy_dir` is configured. A principal
-  carries whatever roles its JWT's `role_claim` names, and the policies
-  decide. Cedar is default-deny, so a role no policy mentions grants nothing.
+  carries the roles its credential names — a key's `roles` list, or the JWT
+  claim `role_claim` points at, resolved once at authentication — and the
+  policies decide. Cedar is default-deny, so a role no policy mentions grants
+  nothing.
 - **Capabilities on the credential**, which apply whether or not Cedar is
   configured: the namespaces a credential may act in, and whether it may
   perform administrative operations.
 
 The second layer exists because the first is optional. An authorization
 model enforced only when an optional component is present is not an
-authorization model.
+authorization model — and the two are **conjunctive** for administrative
+requests, so configuring Cedar can only narrow what a credential reaches —
+never widen it. A disjunctive gate would mean a permissive policy file
+granting access to every ordinary key.
 
 ### Policy evaluation
 
 ```text
-Request: alice, write, namespace "production"
+Request: alice, POST, namespace "production"
 
 1. Is alice's credential allowed to act in "production"?   ← always checked
 2. If a Cedar policy directory is configured, does a policy
-   permit (alice + her roles, Write, production)?          ← default-deny
-3. Otherwise: allowed, unless the endpoint is administrative,
-   which requires the admin capability.
+   permit (alice + her roles, Write, Namespace::"production")?
+                                                           ← default-deny
 ```
+
+```text
+Request: alice, POST /api/v1/admin/backup
+
+1. Is alice's credential marked `admin`?                   ← always checked
+2. If a Cedar policy directory is configured, does a policy
+   permit (alice + her roles, ManageBackups, System::"chronix")?
+```
+
+Step 2 runs on **every** surface, not only the ones behind an axum
+middleware: each gRPC and Flight SQL RPC names the action it performs, and
+the HTTP gate derives it from the method. It is also not conditional on
+multi-tenancy — a single-tenant server's namespace is `default`, and a policy
+naming `Chronix::Namespace::"default"` governs it.
+
+Health, readiness, the metrics scrape and the OpenAPI document are outside
+step 2 by name: a policy file must not be able to fail a liveness probe.
+
+### The schema is not optional
+
+The entity types and actions live in a Cedar schema compiled into the binary,
+and every policy is validated against it at load, so a rule naming something
+this server never asks about is a startup error rather than a rule that
+silently never fires. Without a schema Cedar accepts any well-formed policy,
+which makes a `forbid` clause that can never match indistinguishable from one
+that protects something.
 
 ## Tenant Isolation
 

@@ -119,6 +119,7 @@ pub async fn get_schema_handler(
 pub async fn declare_field_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    req_extensions: axum::http::Extensions,
     Path(name): Path<String>,
     Json(req): Json<crate::http::types::DeclareFieldRequest>,
 ) -> Result<Json<MeasurementInfo>, ServerError> {
@@ -155,6 +156,21 @@ pub async fn declare_field_handler(
         .db
         .declare_field(&measurement, &req.name, column_type)
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    // A declared column is permanent — schema-on-write is additive-only and
+    // a decimal's scale cannot change once fixed — and under multi-tenancy a
+    // measurement is shared, so one tenant's declaration binds them all.
+    crate::audit::record(
+        &state,
+        &crate::audit::principal_of(&req_extensions),
+        chronix_security::audit::AuditAction::SchemaChange,
+        measurement.clone(),
+        chronix_security::audit::AuditDecision::Allow,
+        &[
+            ("column", req.name.clone()),
+            ("type", format!("{column_type:?}")),
+        ],
+    );
 
     let schema = state
         .db
@@ -605,6 +621,7 @@ pub struct CreateRollupRequest {
 pub async fn create_rollup_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    req_extensions: axum::http::Extensions,
     Json(body): Json<CreateRollupRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
@@ -650,6 +667,7 @@ pub async fn create_rollup_handler(
     }
 
     let name_for_builder = rollup_name.clone();
+    let audited_source = body.source_measurement.clone();
     tokio::task::spawn_blocking(move || {
         let mut builder = chronix::RollupBuilder::new()
             .name(&name_for_builder)
@@ -680,6 +698,14 @@ pub async fn create_rollup_handler(
     .map_err(|e| ServerError::Internal(e.to_string()))??;
 
     tracing::info!(rollup = %rollup_name, "rollup created");
+    crate::audit::record(
+        &state,
+        &crate::audit::principal_of(&req_extensions),
+        chronix_security::audit::AuditAction::CreateRollup,
+        rollup_name.clone(),
+        chronix_security::audit::AuditDecision::Allow,
+        &[("source", audited_source)],
+    );
 
     Ok(StatusCode::CREATED)
 }
@@ -688,6 +714,7 @@ pub async fn create_rollup_handler(
 pub async fn delete_rollup_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    req_extensions: axum::http::Extensions,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ServerError> {
     let db = state.db.clone();
@@ -704,6 +731,14 @@ pub async fn delete_rollup_handler(
     }
 
     tracing::info!(rollup = %name, "rollup deleted");
+    crate::audit::record(
+        &state,
+        &crate::audit::principal_of(&req_extensions),
+        chronix_security::audit::AuditAction::DropRollup,
+        name.clone(),
+        chronix_security::audit::AuditDecision::Allow,
+        &[],
+    );
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -728,6 +763,7 @@ pub struct ExportRequest {
 pub async fn export_parquet_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    req_extensions: axum::http::Extensions,
     Json(body): Json<ExportRequest>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
@@ -737,6 +773,8 @@ pub async fn export_parquet_handler(
     let data_dir = state.db.data_dir().to_path_buf();
     let export_dir = data_dir.join("exports");
 
+    let audited_measurement = body.measurement.clone();
+    let audited_scope = scope.clone().unwrap_or_default();
     let export = tokio::task::spawn_blocking(move || {
         // Ensure the export directory exists.
         std::fs::create_dir_all(&export_dir)
@@ -780,6 +818,22 @@ pub async fn export_parquet_handler(
 
     // Surface the size and whether a size budget cut the export short — a
     // caller uploading the file needs to know it is incomplete.
+    // Data leaving the database is the event an erasure or residency
+    // obligation is audited against, and it was recorded nowhere.
+    crate::audit::record(
+        &state,
+        &crate::audit::principal_of(&req_extensions),
+        chronix_security::audit::AuditAction::DataExport,
+        audited_measurement,
+        chronix_security::audit::AuditDecision::Allow,
+        &[
+            ("rows", export.rows_written.to_string()),
+            ("bytes", export.bytes_written.to_string()),
+            ("truncated", export.truncated.to_string()),
+            ("namespace", audited_scope),
+        ],
+    );
+
     Ok(Json(serde_json::json!({
         "rows_written": export.rows_written,
         "bytes_written": export.bytes_written,

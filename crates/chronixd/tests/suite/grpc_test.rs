@@ -937,6 +937,45 @@ async fn grpc_query_only_sees_the_requesting_namespace() {
     }
 }
 
+/// **A measurement's schema is a tenant's business.**
+///
+/// `GetSchema` answered from the process-wide registry with no scope at all,
+/// so one tenant could ask for another's measurement by name and be told its
+/// column names — while `GET /api/v1/measurements/{name}/schema` had scoped
+/// since the tenancy pass. One question, two answers, and only one of them
+/// tested: this suite walks the RPCs that *take* a scope, and this RPC did
+/// not take one, so it was never in the walk.
+#[tokio::test]
+async fn grpc_get_schema_is_namespace_scoped() {
+    let (mut client, _tmp) = start_tenant_grpc_server().await;
+    write_as(&mut client, "tenant-a", 1.0).await;
+
+    let own = client
+        .get_schema(as_tenant(
+            proto::SchemaRequest {
+                measurement: "cpu".into(),
+            },
+            "tenant-a",
+        ))
+        .await
+        .expect("a tenant reads its own schema");
+    assert!(
+        own.into_inner().columns.iter().any(|c| c.name == "usage"),
+        "tenant-a must see its own columns"
+    );
+
+    let other = client
+        .get_schema(as_tenant(
+            proto::SchemaRequest {
+                measurement: "cpu".into(),
+            },
+            "tenant-b",
+        ))
+        .await;
+    let err = other.expect_err("tenant-b holds no cpu data and must not see its schema");
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+}
+
 #[tokio::test]
 async fn grpc_list_measurements_is_namespace_scoped() {
     let (mut client, _tmp) = start_tenant_grpc_server().await;
@@ -1171,4 +1210,193 @@ async fn grpc_keeps_a_non_finite_float_that_json_cannot() {
         }
         ref other => panic!("expected a float64 cell, got {other:?}"),
     }
+}
+
+// ══ Authorization ═══════════════════════════════════════════════════════
+//
+// The Cedar gate lived in an axum middleware, and gRPC does not pass through
+// one — so a principal a policy denied `Read` on a namespace could read it by
+// pointing a gRPC client at the same server. Nothing here could see it: the
+// tenancy tests above build the service directly, with no authentication and
+// no engine, which is the configuration where there is nothing to enforce.
+//
+// These drive the real stack: the auth interceptor that produces the
+// principal, and the service holding the engine, exactly as `run()` wires
+// them.
+
+/// A gRPC server with authentication and `policies` in force.
+async fn start_authorized_grpc_server(
+    policies: &str,
+    roles: Vec<String>,
+) -> (ChronixServiceClient<Channel>, TempDir) {
+    let tmp = TempDir::new().expect("tempdir");
+    let config = ChronixConfigBuilder::default()
+        .data_dir(tmp.path().to_path_buf())
+        .build()
+        .expect("chronix config");
+    let db = Arc::new(Chronix::open(config).expect("open db"));
+
+    let auth_config = chronixd::config::AuthConfig {
+        api_keys: vec![chronixd::config::ApiKeyEntry {
+            name: "tester".to_string(),
+            key: "grpc-authz-key".to_string(),
+            namespaces: Vec::new(),
+            admin: false,
+            roles,
+        }],
+        jwt: None,
+        exempt_paths: vec![],
+    };
+    let auth_state = chronixd::auth::AuthState::from_config(&auth_config).expect("auth state");
+
+    let engine = chronix_security::authz::AuthzEngine::new();
+    if !policies.trim().is_empty() {
+        engine.load_policies(policies).expect("policies load");
+    }
+
+    let grpc_service =
+        ChronixGrpcService::new(db, std::time::Instant::now()).with_authz(Some(Arc::new(engine)));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let interceptor = auth_state.grpc_interceptor();
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                proto::chronix_service_server::ChronixServiceServer::with_interceptor(
+                    grpc_service,
+                    interceptor,
+                ),
+            )
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client = ChronixServiceClient::connect(format!("http://127.0.0.1:{}", addr.port()))
+        .await
+        .unwrap();
+    (client, tmp)
+}
+
+/// Attach the API key the authorized server above expects.
+fn authenticated<T>(msg: T) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    req.metadata_mut()
+        .insert("authorization", "Bearer grpc-authz-key".parse().unwrap());
+    req
+}
+
+/// **The bypass, pinned.** A policy that permits reading and nothing else must
+/// refuse a write over gRPC, exactly as it does over HTTP.
+#[tokio::test]
+async fn grpc_honours_a_read_only_policy() {
+    let (mut client, _tmp) = start_authorized_grpc_server(
+        r#"permit(principal in Chronix::Role::"reader",
+                  action == Chronix::Action::"Read", resource);"#,
+        vec!["reader".to_string()],
+    )
+    .await;
+
+    let read = client
+        .list_measurements(authenticated(proto::ListMeasurementsRequest::default()))
+        .await;
+    assert!(read.is_ok(), "Read is permitted: {read:?}");
+
+    let write = client
+        .write(authenticated(proto::WriteRequest {
+            backfill: false,
+            points: vec![make_point(
+                "cpu",
+                &[("host", "a")],
+                &[("usage", 1.0)],
+                1_700_000_000_000_000_000,
+            )],
+        }))
+        .await;
+    let err = write.expect_err("Write must be refused");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "a gRPC write under a read-only policy: {err:?}"
+    );
+}
+
+/// With no policy permitting anything, every gRPC RPC that touches data
+/// refuses — the gRPC half of `every_route_refuses_under_a_deny_all_policy`.
+#[tokio::test]
+async fn grpc_refuses_every_data_rpc_under_a_deny_all_policy() {
+    let (mut client, _tmp) = start_authorized_grpc_server("", Vec::new()).await;
+
+    let outcomes: Vec<(&str, tonic::Code)> = vec![
+        (
+            "write",
+            client
+                .write(authenticated(proto::WriteRequest {
+                    backfill: false,
+                    points: vec![make_point(
+                        "cpu",
+                        &[("host", "a")],
+                        &[("usage", 1.0)],
+                        1_700_000_000_000_000_000,
+                    )],
+                }))
+                .await
+                .err()
+                .map_or(tonic::Code::Ok, |e| e.code()),
+        ),
+        (
+            "list_measurements",
+            client
+                .list_measurements(authenticated(proto::ListMeasurementsRequest::default()))
+                .await
+                .err()
+                .map_or(tonic::Code::Ok, |e| e.code()),
+        ),
+        (
+            "get_schema",
+            client
+                .get_schema(authenticated(proto::SchemaRequest {
+                    measurement: "cpu".into(),
+                }))
+                .await
+                .err()
+                .map_or(tonic::Code::Ok, |e| e.code()),
+        ),
+        (
+            "execute_sql",
+            client
+                .execute_sql(authenticated(proto::SqlRequest {
+                    query: "SELECT 1".into(),
+                }))
+                .await
+                .err()
+                .map_or(tonic::Code::Ok, |e| e.code()),
+        ),
+        (
+            "drop_measurement",
+            client
+                .drop_measurement(authenticated(proto::DropMeasurementRequest {
+                    measurement: "cpu".into(),
+                }))
+                .await
+                .err()
+                .map_or(tonic::Code::Ok, |e| e.code()),
+        ),
+    ];
+
+    let reachable: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, code)| *code != tonic::Code::PermissionDenied)
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        reachable.is_empty(),
+        "gRPC RPCs that answered with no policy permitting anything: {reachable:?}"
+    );
 }

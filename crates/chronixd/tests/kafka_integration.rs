@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use krafka::admin::{AdminClient, NewTopic};
 use krafka::producer::Producer;
 use tempfile::TempDir;
 
@@ -47,6 +48,67 @@ fn open_test_db() -> (Arc<Chronix>, TempDir) {
         .expect("chronix config");
     let db = Arc::new(Chronix::open(config).expect("open db"));
     (db, tmp)
+}
+
+/// Send the connector's own `tracing` output to the test's stdout.
+///
+/// The consumer loop reports every unrecoverable failure — a broker it
+/// cannot reach, a `subscribe` the broker refuses — with `error!` and then
+/// returns, so without a subscriber a broken consumer is indistinguishable
+/// from an idle one: `metrics()` reads zero either way.
+fn capture_logs() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "chronixd=debug".into()),
+            )
+            .with_test_writer()
+            .try_init();
+    });
+}
+
+/// Create the topics a test produces to, and wait until they exist.
+///
+/// **Auto-creation is not something to rely on.** Every test here produced
+/// to a topic nothing had created, on the assumption that the broker would
+/// make it: four of the five then failed with `unknown topic`, because a
+/// KRaft broker resolves the metadata request that triggers auto-creation
+/// *after* answering the produce. Nobody saw it, because all five are
+/// `#[ignore]`d and CI ran them with no `--ignored` — the job reported
+/// "ok. 0 passed; 5 ignored" for years.
+///
+/// One partition and one replica: these assert ingestion, and more than one
+/// partition would make the order the consumer sees non-deterministic for
+/// no gain.
+async fn create_topics(bootstrap_servers: &str, topics: &[&str]) {
+    capture_logs();
+    let admin = AdminClient::builder()
+        .bootstrap_servers(bootstrap_servers)
+        .build()
+        .await
+        .expect("Failed to create Kafka admin client");
+
+    let specs: Vec<NewTopic> = topics
+        .iter()
+        .map(|name| NewTopic::new(*name, 1, 1).expect("a valid topic spec"))
+        .collect();
+
+    let results = admin
+        .create_topics(specs, Duration::from_secs(20), false)
+        .await
+        .expect("CreateTopics request failed");
+
+    for result in results {
+        assert!(
+            result.error.is_none(),
+            "could not create topic {}: {}",
+            result.name,
+            result.error.unwrap_or_default()
+        );
+    }
 }
 
 /// Create a `krafka` producer pointing at the given bootstrap server.
@@ -103,6 +165,7 @@ async fn kafka_line_protocol_end_to_end() {
     );
 
     let topic = "test-lp";
+    create_topics(&bootstrap, &[topic]).await;
     let producer = make_producer(&bootstrap).await;
 
     // Produce line-protocol messages
@@ -184,6 +247,7 @@ async fn kafka_json_end_to_end() {
     );
 
     let topic = "test-json";
+    create_topics(&bootstrap, &[topic]).await;
     let producer = make_producer(&bootstrap).await;
 
     // Produce JSON messages (topic name becomes measurement)
@@ -256,6 +320,7 @@ async fn kafka_multi_topic_mapping() {
     );
 
     let topics = vec!["topic-a".to_string(), "topic-b".to_string()];
+    create_topics(&bootstrap, &["topic-a", "topic-b"]).await;
     let producer = make_producer(&bootstrap).await;
 
     // Produce to topic-a (line protocol)
@@ -341,6 +406,7 @@ async fn kafka_decode_error_resilience() {
     );
 
     let topic = "test-errors";
+    create_topics(&bootstrap, &[topic]).await;
     let producer = make_producer(&bootstrap).await;
 
     // First: valid message
@@ -436,14 +502,38 @@ async fn kafka_connector_lifecycle_live() {
         vec!["lifecycle-test".to_string()],
         ConnectorFormat::Json,
     );
+    create_topics(&bootstrap, &["lifecycle-test"]).await;
     let consumer = KafkaConsumer::new_arc("kafka-lifecycle", config, db, false);
 
     assert_eq!(consumer.status().await, ConnectorStatus::Stopped);
 
     consumer.start().await.expect("start");
-    assert_eq!(consumer.status().await, ConnectorStatus::Running);
+
+    // **`start()` returning is not "connected".** This assertion used to be
+    // `assert_eq!(status(), Running)` on the line after `start()`, and it
+    // passed because `status()` was computed from the flag `start()` had
+    // just set — it would have passed with no broker at all, and with the
+    // consumer task already dead. It now reports what the task is doing, so
+    // the connected state is something to wait for.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = consumer.status().await;
+        if status == ConnectorStatus::Running {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "consumer never reached Running; last status: {status:?}"
+        );
+        assert!(
+            matches!(status, ConnectorStatus::Reconnecting),
+            "a consumer that is still connecting must say so, not {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(consumer.is_healthy().await);
 
     consumer.stop().await.expect("stop");
     assert_eq!(consumer.status().await, ConnectorStatus::Stopped);
+    assert!(!consumer.is_healthy().await);
 }

@@ -65,7 +65,7 @@ async fn start_server_with(multi_tenancy: bool) -> (String, TempDir) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: Some(Arc::new(registry)),
+        namespace_registry: Arc::new(registry),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -489,6 +489,7 @@ async fn start_authenticated_server() -> (String, TempDir) {
             key: "test-key".to_string(),
             namespaces: Vec::new(),
             admin: false,
+            roles: Vec::new(),
         }],
         jwt: None,
         exempt_paths: vec!["/health".to_string()],
@@ -504,7 +505,7 @@ async fn start_authenticated_server() -> (String, TempDir) {
         auth_state: Some(auth_state),
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
@@ -764,6 +765,7 @@ fn multi_tenancy_refuses_an_unconfined_api_key() {
                 key: "k".to_string(),
                 namespaces: Vec::new(),
                 admin: false,
+                roles: Vec::new(),
             }],
             jwt: None,
             exempt_paths: Vec::new(),
@@ -820,12 +822,14 @@ async fn start_confined_server() -> (String, TempDir) {
                 key: "key-a".to_string(),
                 namespaces: vec!["tenant-a".to_string()],
                 admin: false,
+                roles: Vec::new(),
             },
             chronixd::config::ApiKeyEntry {
                 name: "b".to_string(),
                 key: "key-b".to_string(),
                 namespaces: vec!["tenant-b".to_string()],
                 admin: false,
+                roles: Vec::new(),
             },
         ],
         jwt: None,
@@ -842,7 +846,7 @@ async fn start_confined_server() -> (String, TempDir) {
         auth_state: Some(auth_state),
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: Some(Arc::new(registry)),
+        namespace_registry: Arc::new(registry),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),

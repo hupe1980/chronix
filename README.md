@@ -60,10 +60,14 @@ crate.
   default. Each is driven by a test that sends the client's own bytes: a
   conformance suite that builds its own requests never posts a form body,
   never gzips, and never uses a route derived from a base URL.
-- **Security depth** — Cedar policies (a formally verified engine),
-  credential-bound namespace isolation, mTLS, Argon2 API keys, JWT/OIDC, and a
-  tamper-evident HMAC-chained audit trail. All feature-gated; embedded builds
-  compile none of it by default.
+- **Security depth** — Cedar policies (a formally verified engine, with the
+  schema compiled in so a policy naming something the server never asks about
+  is a startup error rather than a rule that never fires), credential-bound
+  namespace isolation, mTLS, Argon2 API keys, JWT/OIDC, and a tamper-evident
+  HMAC-chained audit trail. `chronixd` always has all of it; the embedded
+  crate compiles **none** of it unless you ask — `security` and `streaming`
+  are off by default, which is 129 packages an embedded build does not
+  carry.
 
   > **Per-column encryption.** `[database.field_encryption]` names a column
   > and an **environment variable** — never a key — so the key is not on the
@@ -114,7 +118,7 @@ Nine crates in the default build:
 | `chronix-analytics` | Preprocessing, six forecast models, seven anomaly detectors, multivariate analysis (correlation, VAR, Mahalanobis/Isolation Forest/PCA), model lifecycle (versioning, A/B, drift), streaming analytics, 5-tier SIMD compute |
 | `chronix-streaming` | CDC event bus, filtered/resumable subscriptions, trigger engine with webhook delivery |
 | `chronix-security` | API keys, JWT/OIDC, mTLS, an AES-256-GCM `EncryptionService` with key rotation, Cedar policies, a durable hash-chained audit trail, namespaces & quotas |
-| `chronix` | Public facade — embedded API, SQL (DataFusion), PromQL |
+| `chronix` | Public facade — embedded API, SQL (DataFusion), PromQL. `chronix-streaming` and `chronix-security` are behind the `streaming` and `security` features, off by default |
 | `chronixd` | Server binary — HTTP, gRPC, Flight SQL, connectors, TLS |
 
 Additional workspace crates outside the default build: the **frozen**
@@ -326,6 +330,13 @@ retention, analytics, triggers and the cold archive are unaffected; only
 shrink the binary — the linker already discards DataFusion when nothing calls
 it, so that difference is 0.34 MiB.
 
+**Security and streaming are off by default in the embedded crate.** A
+gateway that calls `Chronix::open` and writes to it does not authenticate
+anyone, evaluate a policy or subscribe to a change feed — and it was carrying
+a JWT library, Cedar, Argon2, `aes-gcm`, an HTTP client and a whole TLS stack
+for the privilege: **304 packages against 175**. `chronixd` takes all three
+features at its dependency and will not compile without them.
+
 **No C toolchain for the connectors.** `krafka` and `rumqttc` are pure Rust.
 One dependency does compile C — `aws-lc-rs`, the single rustls crypto provider
 the whole workspace shares rather than inheriting each dependency's default —
@@ -370,7 +381,10 @@ cargo +nightly miri test -p chronix-core -- --skip proptests --skip config_toml_
 | `chronix-engine`, `chronix` | `field-encryption` | on | Per-column AES-256-GCM in the `.csx` format, declared by `[database.field_encryption]` |
 | `chronix-engine` | `object-store` | off | S3/GCS/Azure cold tier, Parquet archive writer |
 | `chronix` | `object-store` | off | `register_cold_tier()` — SQL over the Parquet archive |
-| `chronix-streaming` | `flight` | off | Arrow Flight CDC export |
+| `chronix` | `streaming` | **off** | CDC bus, `db.subscribe()`, triggers and delivery (+63 packages) |
+| `chronix` | `security` | **off** | API keys, JWT, mTLS, Cedar, audit, namespaces (+126 packages) |
+| `chronix` | `pipeline` | off | The real-time pipeline; implies `streaming` + `security` |
+| `chronix-streaming` | `arrow` | off | CDC events as Arrow `RecordBatch`es (+45 packages) |
 | `chronix-security` | `webhook` | on | Audit webhook sink |
 | `chronixd` | `kafka`, `mqtt` | off | Ingestion connectors (`krafka` / `rumqttc`, both pure Rust) |
 | `chronixd` | `object-store` | off | Periodic cold archiving to S3/GCS/Azure (`[cold_archive]`) |
@@ -459,7 +473,14 @@ default build at the configured lint level; the frozen cluster crates
 (`chronix-meta`, `chronix-cluster`, `chronix-dsim`, outside
 `default-members`) are compile-checked in CI but not lint-clean. The release
 procedure and version policy are in [CONTRIBUTING.md](CONTRIBUTING.md), and
-notable changes are in [CHANGELOG.md](CHANGELOG.md).
+notable changes are in
+[CHANGELOG.md](https://github.com/hupe1980/chronix/blob/main/CHANGELOG.md) —
+an absolute link on purpose, because this README *is* the crate's front page
+on crates.io and docs.rs, where a relative one 404s. `cargo package` takes
+nothing from outside a package directory, so the changelog itself cannot
+travel with the crate; the link is how a consumer who already depends on a
+version finds out what moved. Chronix is pre-1.0 and a breaking change bumps
+the minor version, so read it before a minor bump.
 
 ## License
 

@@ -235,8 +235,18 @@ pub struct SharedState {
     /// Optional cluster meta client for admin operations.
     #[cfg(feature = "cluster")]
     pub meta_client: Option<Arc<dyn chronix_cluster::MetaClient>>,
-    /// Optional namespace registry for multi-tenancy.
-    pub namespace_registry: Option<Arc<chronix_security::tenant::NamespaceRegistry>>,
+    /// The namespace registry.
+    ///
+    /// **Not an `Option`.** It was one, and `run()` is the only thing that
+    /// builds a production `SharedState` — it always set `Some`, because the
+    /// registry is durable state beside the data and `default` always exists
+    /// in it. So the `None` branch was unreachable in the product and taken
+    /// by every test and bench: the data-plane gate read
+    /// `match &state.namespace_registry { None => return next.run(req) }`,
+    /// which meant the one branch under test was the one that skipped the
+    /// gate. An `Option` that is never `None` where it matters is a second
+    /// configuration nobody runs, and the fixtures were exercising it.
+    pub namespace_registry: Arc<chronix_security::tenant::NamespaceRegistry>,
     /// Model catalog for analytics model management.
     pub model_catalog: Arc<parking_lot::RwLock<chronix::chronix_analytics::forecast::ModelCatalog>>,
     /// SQL plan cache, keyed by (namespace, SQL) to

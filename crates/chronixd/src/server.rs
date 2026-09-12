@@ -90,6 +90,14 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     // errors" rather than "No data" — which is what an operator sees when a
     // metric does not exist at all.
     crate::util::register_write_metrics();
+    // The security counters, for the same reason and with more of it: an
+    // alert on "requests are being refused" has to be able to fire from the
+    // first scrape, and a counter that does not exist until the first refusal
+    // is one whose alert cannot be tested before the incident.
+    metrics::counter!("chronix_auth_failures_total", "protocol" => "http").absolute(0);
+    metrics::counter!("chronix_auth_failures_total", "protocol" => "grpc").absolute(0);
+    metrics::counter!("chronix_namespace_denied_total").absolute(0);
+    metrics::counter!("chronix_authz_denied_total").absolute(0);
 
     // ── Connector manager ───────────────────────────────────────────────
     let connector_manager = Arc::new(
@@ -136,10 +144,14 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         }
     }
 
+    // Beside the namespace registry, in the data directory: the durable
+    // record of runtime key changes belongs with the data it guards, not
+    // beside the config file that only *declares* keys.
+    let auth_dir = db.data_dir().join("auth");
     let mut auth_state = config
         .auth
         .as_ref()
-        .map(crate::auth::AuthState::from_config)
+        .map(|c| crate::auth::AuthState::from_config_at(c, Some(&auth_dir)))
         .transpose()
         .map_err(|e| ServerError::Internal(format!("auth configuration error: {e}")))?;
 
@@ -248,6 +260,33 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         Some(Arc::new(logger))
     };
 
+    // **What the server is enforcing, sealed into the chain at startup.**
+    // The policy set decides every administrative and data decision that
+    // follows, and it was recorded only as an `info!` — so a trail could show
+    // a refusal and nothing about the rules that produced it, and a change of
+    // rules between two restarts left no evidence at all. `PolicyLoad` was a
+    // category nothing constructed.
+    //
+    // Recorded here rather than where the policies load, because the logger
+    // does not exist yet at that point.
+    if let (Some(engine), Some(logger)) = (authz_engine.as_ref(), audit_logger.as_ref()) {
+        let mut event = chronix_security::audit::AuditEvent::new(
+            "system",
+            chronix_security::audit::AuditAction::PolicyLoad,
+            config
+                .server
+                .authz_policy_dir
+                .as_ref()
+                .map_or_else(String::new, |d| d.display().to_string()),
+            chronix_security::audit::AuditDecision::Allow,
+        )
+        .with_metadata("policy_count", engine.policy_count().to_string());
+        for id in engine.policy_ids() {
+            event = event.with_metadata("policy", id);
+        }
+        logger.log(event);
+    }
+
     // ── Shared state ───────────────────────────────────────────────────
     // The registry lives beside the data it scopes, so a restart keeps the
     // tenants. A failure to open it is fatal rather than a silent fall back
@@ -286,12 +325,12 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         // answers `400 namespace not found` for a namespace the registry
         // does not know, so the rows were still on disk and nothing could
         // ask for them. `open()` existed the whole time.
-        namespace_registry: Some(Arc::new(namespace_registry)),
+        namespace_registry: Arc::new(namespace_registry),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-        authz_engine,
+        authz_engine: authz_engine.clone(),
         audit_logger: audit_logger.clone(),
         namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
         // Write dedup cache for idempotency keys.
@@ -456,6 +495,8 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         config.server.dedup_window_secs,
     )
     .with_multi_tenancy(config.server.multi_tenancy)
+    .with_authz(authz_engine.clone())
+    .with_audit(audit_logger.clone())
     .with_max_dedup_entries(config.server.max_dedup_entries)
     .with_sql_limits(
         config.server.sql_query_timeout_secs,
@@ -605,6 +646,9 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     let flight_drain_timeout = shutdown_timeout;
     let flight_service = ChronixFlightSqlService::new(db.clone())
         .with_multi_tenancy(config.server.multi_tenancy)
+        .with_authz(authz_engine.clone())
+        .with_audit(audit_logger.clone())
+        .with_audit(audit_logger.clone())
         .with_limits(
             std::time::Duration::from_secs(config.server.sql_query_timeout_secs),
             config.server.sql_max_rows,
@@ -815,6 +859,23 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// One administrative route group, guarded by the capability it needs.
+///
+/// The routes carry their full paths rather than being `nest`ed, because
+/// `route_inventory` reads the router out of this source and a nest whose
+/// prefix is applied in two places is an inventory that can disagree with
+/// itself.
+fn admin_group(
+    state: &AppState,
+    action: chronix_security::authz::ChronixAction,
+    routes: Router<AppState>,
+) -> Router<AppState> {
+    routes.layer(axum::middleware::from_fn_with_state(
+        (state.clone(), action),
+        crate::auth::capability_layer,
+    ))
+}
+
 /// Build the axum router with all REST endpoints.
 #[allow(clippy::needless_pass_by_value)] // auth_state moves into middleware closures
 pub fn build_router(
@@ -827,7 +888,7 @@ pub fn build_router(
     let metrics_path_owned = metrics_path.to_string();
     let state_for_metrics = state.clone();
 
-    let mut router = Router::new()
+    let mut router: Router<AppState> = Router::new()
         // Health / Readiness — un-versioned so probes work without
         // knowing the API version.
         .route("/health", get(http::health_handler))
@@ -861,6 +922,12 @@ pub fn build_router(
                     let state = stats_state.clone();
                     async move {
                         let _ = state.db.statistics();
+                        // Same argument one subsystem over: a connector
+                        // that cannot reach its broker had no gauge at all,
+                        // and reported `Running` on the API.
+                        if let Some(manager) = &state.connector_manager {
+                            manager.refresh_gauges().await;
+                        }
                         handle.render()
                     }
                 }
@@ -1004,122 +1071,152 @@ pub fn build_router(
             "/api/v1/openapi.json",
             get(crate::openapi::openapi_handler),
         )
-        // Admin — cluster management (Cedar Admin authorization enforced via layer)
-        .nest("/api/v1/admin", {
-            let admin_routes = axum::Router::new()
-                // Admin — analytics model management
+        // ── Administration ──────────────────────────────────────────
+        // Each group carries the capability it needs, so a credential can be
+        // granted backups without also being able to mint API keys. They all
+        // asked for `Admin` once, which is why nine granular capabilities
+        // existed in the model and were requested by nothing.
+        //
+        // `capability_layer` is per group rather than one layer over
+        // `/api/v1/admin`: an action derived from a path prefix is a mapping
+        // that drifts from the routes, and this cannot.
+        .merge(admin_group(
+            &state,
+            chronix_security::authz::ChronixAction::ManageModels,
+            axum::Router::new()
                 .route(
-                    "/analytics/models",
+                    "/api/v1/admin/analytics/models",
                     get(crate::admin::list_models_handler),
                 )
                 .route(
-                    "/analytics/models/{measurement}/{name}",
+                    "/api/v1/admin/analytics/models/{measurement}/{name}",
                     get(crate::admin::get_model_handler)
                         .delete(crate::admin::delete_model_handler),
                 )
                 .route(
-                    "/analytics/retrain",
+                    "/api/v1/admin/analytics/retrain",
                     post(crate::admin::retrain_handler),
-                );
-            // Admin — cluster management (compiled with `--features cluster`)
-            #[cfg(feature = "cluster")]
-            let admin_routes = admin_routes
+                ),
+        ))
+        .merge(admin_group(
+            &state,
+            chronix_security::authz::ChronixAction::ManageKeys,
+            axum::Router::new()
                 .route(
-                    "/nodes",
-                    post(crate::admin::register_node_handler)
-                        .get(crate::admin::list_nodes_handler)
-                        .delete(crate::admin::deregister_node_handler),
-                )
-                .route(
-                    "/heartbeat",
-                    post(crate::admin::heartbeat_handler),
-                )
-                .route(
-                    "/regions",
-                    post(crate::admin::create_region_handler),
-                )
-                .route(
-                    "/regions/{id}/state",
-                    put(crate::admin::update_region_state_handler),
-                )
-                .route(
-                    "/routing",
-                    get(crate::admin::get_routing_handler),
-                )
-                .route(
-                    "/health",
-                    get(crate::admin::cluster_health_handler),
-                )
-                .route(
-                    "/topology",
-                    get(crate::admin::cluster_topology_handler),
-                )
-                .route(
-                    "/rebalance",
-                    post(crate::admin::rebalance_handler),
-                )
-                .route(
-                    "/nodes/{id}/decommission",
-                    post(crate::admin::decommission_node_handler),
-                );
-            admin_routes
-                // Admin — API key management (requires admin authz)
-                .route(
-                    "/auth/keys",
+                    "/api/v1/admin/auth/keys",
                     post(crate::auth::create_key_handler).get(crate::auth::list_keys_handler),
                 )
                 .route(
-                    "/auth/keys/{name}",
+                    "/api/v1/admin/auth/keys/{name}",
                     delete(crate::auth::revoke_key_handler),
-                )
-                // Admin — runtime log-level adjustment
+                ),
+        ))
+        .merge(admin_group(
+            &state,
+            chronix_security::authz::ChronixAction::ManageConfig,
+            axum::Router::new().route(
+                "/api/v1/admin/log-level",
+                put(http::update_log_level_handler),
+            ),
+        ))
+        .merge(admin_group(
+            &state,
+            chronix_security::authz::ChronixAction::ManageBackups,
+            axum::Router::new()
+                .route("/api/v1/admin/backup", post(crate::admin::backup_handler))
                 .route(
-                    "/log-level",
-                    put(http::update_log_level_handler),
-                )
-                // Admin — backup / restore
-                .route(
-                    "/backup",
-                    post(crate::admin::backup_handler),
-                )
-                .route(
-                    "/backup/verify",
+                    "/api/v1/admin/backup/verify",
                     post(crate::admin::verify_backup_handler),
                 )
-                .route(
-                    "/restore",
-                    post(crate::admin::restore_handler),
-                )
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::auth::admin_authz_layer,
-                ))
-                .with_state(state.clone())
-        })
-        // Namespaces — multi-tenancy management (Cedar Admin authorization enforced)
-        .nest("/api/v1/namespaces", {
-
+                .route("/api/v1/admin/restore", post(crate::admin::restore_handler)),
+        ))
+        .merge(admin_group(
+            &state,
+            chronix_security::authz::ChronixAction::ManageNamespaces,
             axum::Router::new()
                 .route(
-                    "/",
+                    "/api/v1/namespaces",
                     post(crate::namespace::create_namespace_handler)
                         .get(crate::namespace::list_namespaces_handler),
                 )
                 .route(
-                    "/{name}",
+                    "/api/v1/namespaces/{name}",
                     get(crate::namespace::get_namespace_handler)
                         .delete(crate::namespace::delete_namespace_handler),
                 )
                 .route(
-                    "/{name}/usage",
+                    "/api/v1/namespaces/{name}/usage",
                     get(crate::namespace::get_namespace_usage_handler),
                 )
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::auth::admin_authz_layer,
-                ))
-                .with_state(state.clone())
-        });
+                .route(
+                    "/api/v1/namespaces/{name}/quota",
+                    put(crate::namespace::update_namespace_quota_handler),
+                ),
+        ));
+
+    // Cluster administration is compiled with `--features cluster`. Three
+    // capabilities rather than one: reading topology is not rebalancing.
+    #[cfg(feature = "cluster")]
+    {
+        router = router
+            .merge(admin_group(
+                &state,
+                chronix_security::authz::ChronixAction::ManageNodes,
+                axum::Router::new()
+                    .route(
+                        "/api/v1/admin/nodes",
+                        post(crate::admin::register_node_handler)
+                            .get(crate::admin::list_nodes_handler)
+                            .delete(crate::admin::deregister_node_handler),
+                    )
+                    .route(
+                        "/api/v1/admin/heartbeat",
+                        post(crate::admin::heartbeat_handler),
+                    )
+                    .route(
+                        "/api/v1/admin/nodes/{id}/decommission",
+                        post(crate::admin::decommission_node_handler),
+                    ),
+            ))
+            .merge(admin_group(
+                &state,
+                chronix_security::authz::ChronixAction::ManageRegions,
+                axum::Router::new()
+                    .route(
+                        "/api/v1/admin/regions",
+                        post(crate::admin::create_region_handler),
+                    )
+                    .route(
+                        "/api/v1/admin/regions/{id}/state",
+                        put(crate::admin::update_region_state_handler),
+                    ),
+            ))
+            .merge(admin_group(
+                &state,
+                chronix_security::authz::ChronixAction::ViewCluster,
+                axum::Router::new()
+                    .route(
+                        "/api/v1/admin/routing",
+                        get(crate::admin::get_routing_handler),
+                    )
+                    .route(
+                        "/api/v1/admin/health",
+                        get(crate::admin::cluster_health_handler),
+                    )
+                    .route(
+                        "/api/v1/admin/topology",
+                        get(crate::admin::cluster_topology_handler),
+                    ),
+            ))
+            .merge(admin_group(
+                &state,
+                chronix_security::authz::ChronixAction::ManageCluster,
+                axum::Router::new().route(
+                    "/api/v1/admin/rebalance",
+                    post(crate::admin::rebalance_handler),
+                ),
+            ));
+    }
 
     // Namespace resolution middleware — applied BEFORE auth layer so that
     // Tower runs it AFTER auth (Tower wraps inside-out), ensuring

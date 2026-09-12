@@ -4,6 +4,17 @@
 //! Merges integration, TLS, gRPC and Flight SQL tests into a single
 //! binary to reduce link-time overhead (saves ~3 link cycles).
 
+// Declared once for the whole binary: two modules read the router's table,
+// and `#[path]`-including it twice compiles it twice.
+#[path = "suite/route_scan.rs"]
+mod route_scan;
+
+#[path = "suite/route_scoping.rs"]
+mod route_scoping;
+
+#[path = "suite/authz_test.rs"]
+mod authz_test;
+
 #[path = "suite/client_compat.rs"]
 mod client_compat;
 

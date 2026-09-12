@@ -2127,6 +2127,156 @@ mod tests {
     /// seasonal unit-root test (OCSB, Canova–Hansen) is for, and why R keeps
     /// them as options beside this default. Recorded as a test so the limit
     /// is a known quantity rather than a surprise.
+    /// Smallest |root| of `1 + θ₁z + … + θ_qz^q`, by Durand–Kerner.
+    ///
+    /// The MA polynomial is invertible iff every root lies strictly outside
+    /// the unit circle, so the answer is compared against 1.
+    fn min_ma_root_modulus(theta: &[f64]) -> f64 {
+        let q = theta.len();
+        if q == 0 {
+            return f64::INFINITY;
+        }
+        let mut c: Vec<(f64, f64)> = std::iter::once(1.0)
+            .chain(theta.iter().copied())
+            .map(|v| (v, 0.0))
+            .collect();
+        let lead = c[q].0;
+        if lead.abs() < 1e-12 {
+            return min_ma_root_modulus(&theta[..q - 1]);
+        }
+        for v in &mut c {
+            v.0 /= lead;
+        }
+        let mul = |a: (f64, f64), b: (f64, f64)| (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0);
+        let sub = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0, a.1 - b.1);
+        let div = |a: (f64, f64), b: (f64, f64)| {
+            let d = b.0 * b.0 + b.1 * b.1;
+            ((a.0 * b.0 + a.1 * b.1) / d, (a.1 * b.0 - a.0 * b.1) / d)
+        };
+        let eval = |z: (f64, f64)| {
+            let mut acc = (0.0, 0.0);
+            for k in (0..=q).rev() {
+                acc = mul(acc, z);
+                acc = (acc.0 + c[k].0, acc.1 + c[k].1);
+            }
+            acc
+        };
+        let mut roots: Vec<(f64, f64)> = (0..q)
+            .map(|k| {
+                let a = 0.4 + 0.9 * k as f64;
+                (a.cos() * 0.9, a.sin() * 0.9)
+            })
+            .collect();
+        for _ in 0..500 {
+            let mut moved = 0.0f64;
+            for i in 0..q {
+                let mut denom = (1.0, 0.0);
+                for j in 0..q {
+                    if i != j {
+                        denom = mul(denom, sub(roots[i], roots[j]));
+                    }
+                }
+                if denom.0.abs() + denom.1.abs() < 1e-300 {
+                    continue;
+                }
+                let delta = div(eval(roots[i]), denom);
+                roots[i] = sub(roots[i], delta);
+                moved = moved.max(delta.0.abs() + delta.1.abs());
+            }
+            if moved < 1e-14 {
+                break;
+            }
+        }
+        roots
+            .iter()
+            .map(|r| (r.0 * r.0 + r.1 * r.1).sqrt())
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    #[test]
+    fn the_root_finder_agrees_with_the_quadratic_formula() {
+        // `1 + 0.99z - 0.99z²` has a root at ≈ -0.6225: inside the unit
+        // circle, so this θ is non-invertible *and* inside the ±0.99 box
+        // every coefficient is bounded to. The box is not the constraint.
+        let m = min_ma_root_modulus(&[0.99, -0.99]);
+        assert!((m - 0.6225).abs() < 1e-3, "min |root| was {m}");
+        // An invertible one, for the other direction.
+        assert!(min_ma_root_modulus(&[0.5]) > 1.0);
+    }
+
+    #[test]
+    fn a_fitted_ma_polynomial_is_invertible() {
+        // `estimate_ma` bounds each coefficient to ±0.99, which does not
+        // imply invertibility for q > 1 — see the test above. What keeps
+        // fits inside the invertible region is the **objective**: the CSS
+        // error recursion diverges outside it, so the optimiser has no
+        // reason to go there. That is a property of the estimator, not of
+        // the bounds, so it is worth checking rather than assuming — if the
+        // estimator is ever replaced (an exact likelihood, say), this is the
+        // guarantee that quietly changes.
+        let mut state = 7u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 33) as f64 / f64::from(u32::MAX >> 1)) - 1.0
+        };
+
+        let mut checked = 0usize;
+        let mut worst = f64::INFINITY;
+        for q in 2..=3usize {
+            for trial in 0..40 {
+                let n = 160usize;
+                let mut v = Vec::with_capacity(n);
+                let (mut prev0, mut prev1, mut walk) = (0.0f64, 0.0f64, 0.0f64);
+                for i in 0..n {
+                    let e = next();
+                    v.push(match trial % 4 {
+                        0 => e,
+                        1 => e + 0.95 * prev0 + 0.9 * prev1,
+                        2 => {
+                            walk += e;
+                            walk
+                        }
+                        _ => i as f64 * 0.05 + e,
+                    });
+                    prev1 = prev0;
+                    prev0 = e;
+                }
+                let ts: Vec<i64> = (0..n as i64).collect();
+                let mut model = ArimaModel::new(1, 0, q);
+                if model.fit(&ts, &v).is_err() {
+                    continue;
+                }
+                let ModelParams::Arima { ma_coeffs, .. } = model.params() else {
+                    continue;
+                };
+                let r = min_ma_root_modulus(ma_coeffs);
+                worst = worst.min(r);
+                assert!(
+                    r > 1.0,
+                    "q={q} trial={trial}: fitted θ={ma_coeffs:?} is non-invertible \
+                     (min |root| = {r})"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 60, "only {checked} fits were checked");
+        // Over-differenced noise is the textbook way to manufacture a
+        // non-invertible MA(1), so it belongs in the sample rather than
+        // beside it.
+        let raw: Vec<f64> = (0..121).map(|_| next()).collect();
+        let over: Vec<f64> = raw.windows(2).map(|w| w[1] - w[0]).collect();
+        let ts: Vec<i64> = (0..over.len() as i64).collect();
+        let mut model = ArimaModel::new(1, 0, 2);
+        if model.fit(&ts, &over).is_ok() {
+            if let ModelParams::Arima { ma_coeffs, .. } = model.params() {
+                let r = min_ma_root_modulus(ma_coeffs);
+                assert!(r > 1.0, "over-differenced fit is non-invertible: {r}");
+            }
+        }
+    }
+
     #[test]
     fn the_strength_measure_is_blind_to_a_stochastic_seasonal_level() {
         let m = 24usize;

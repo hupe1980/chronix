@@ -25,38 +25,58 @@ impl fmt::Display for AuditDecision {
 }
 
 /// Category of auditable actions.
+///
+/// Every variant has a producer. That was not true: **nineteen of twenty-five
+/// were constructed by nothing** — `NamespaceDelete`, `DataExport`,
+/// `PolicyLoad`, `ApiKeyCreate` and `SchemaChange` among them — while the
+/// hardening checklist told an operator to "review audit event coverage
+/// (26 built-in action types)". A category nothing emits is not coverage; it
+/// is a gap wearing the shape of one. `audit_action_coverage` walks this enum
+/// and requires a construction site outside this crate for each.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditAction {
-    // Authorization actions
+    // ── Data ────────────────────────────────────────────────────────
     /// Data write.
     Write,
     /// Data read / query.
     Read,
     /// Data deletion.
     Delete,
-    /// Administrative operation.
-    Admin,
-    /// Rollup creation.
-    CreateRollup,
-    /// Forecast execution.
-    Forecast,
-    /// Anomaly detection.
-    DetectAnomalies,
-    /// CDC subscription.
-    Subscribe,
+    /// Schema change — a column declared, a measurement dropped or restored.
+    SchemaChange,
+    /// Data exported out of the database.
+    DataExport,
 
-    // Authentication events
-    /// Successful login.
-    LoginSuccess,
-    /// Failed login attempt.
+    // ── Authentication ──────────────────────────────────────────────
+    /// Failed authentication attempt.
+    ///
+    /// There is deliberately no `LoginSuccess`: a database authenticates
+    /// every request, so recording the successes would make the trail a
+    /// second request log and bury the events it exists for.
     LoginFailure,
-    /// API key rotation.
-    KeyRotation,
-    /// Token refresh.
-    TokenRefresh,
 
-    // Trigger / signal events
+    // ── Administration ──────────────────────────────────────────────
+    /// Administrative operation — backup, restore, a runtime setting.
+    Admin,
+    /// API key created.
+    ApiKeyCreate,
+    /// API key revoked.
+    ApiKeyRevoke,
+    /// Cedar policy set loaded.
+    PolicyLoad,
+    /// Namespace created.
+    NamespaceCreate,
+    /// Namespace deleted.
+    NamespaceDelete,
+    /// Namespace quota changed.
+    QuotaChange,
+
+    // ── Rollups, triggers and signals ───────────────────────────────
+    /// Rollup rule created.
+    CreateRollup,
+    /// Rollup rule dropped.
+    DropRollup,
     /// Trigger created.
     TriggerCreate,
     /// Trigger dropped.
@@ -64,30 +84,32 @@ pub enum AuditAction {
     /// Signal fired.
     SignalFired,
 
-    // Additional auditable actions for complete coverage.
-    /// Schema change (create/alter/drop measurement).
-    SchemaChange,
-    /// Rollup rule dropped.
-    DropRollup,
-    /// Data exported.
-    DataExport,
-    /// Permission or role change.
-    PermissionChange,
-    /// Cedar/authz policy loaded or updated.
-    PolicyLoad,
-    /// API key created.
-    ApiKeyCreate,
-    /// API key revoked.
-    ApiKeyRevoke,
-    /// Namespace created.
-    NamespaceCreate,
-    /// Namespace deleted.
-    NamespaceDelete,
-    /// Quota changed.
-    QuotaChange,
-
-    /// Custom action.
+    /// Anything an embedded consumer wants to record that is not above.
     Custom(String),
+}
+
+impl AuditAction {
+    /// Every variant except [`Custom`](Self::Custom), for the coverage check.
+    pub const ALL: &'static [Self] = &[
+        Self::Write,
+        Self::Read,
+        Self::Delete,
+        Self::SchemaChange,
+        Self::DataExport,
+        Self::LoginFailure,
+        Self::Admin,
+        Self::ApiKeyCreate,
+        Self::ApiKeyRevoke,
+        Self::PolicyLoad,
+        Self::NamespaceCreate,
+        Self::NamespaceDelete,
+        Self::QuotaChange,
+        Self::CreateRollup,
+        Self::DropRollup,
+        Self::TriggerCreate,
+        Self::TriggerDrop,
+        Self::SignalFired,
+    ];
 }
 
 impl fmt::Display for AuditAction {
@@ -96,28 +118,21 @@ impl fmt::Display for AuditAction {
             Self::Write => write!(f, "write"),
             Self::Read => write!(f, "read"),
             Self::Delete => write!(f, "delete"),
-            Self::Admin => write!(f, "admin"),
-            Self::CreateRollup => write!(f, "create_rollup"),
-            Self::Forecast => write!(f, "forecast"),
-            Self::DetectAnomalies => write!(f, "detect_anomalies"),
-            Self::Subscribe => write!(f, "subscribe"),
-            Self::LoginSuccess => write!(f, "login_success"),
-            Self::LoginFailure => write!(f, "login_failure"),
-            Self::KeyRotation => write!(f, "key_rotation"),
-            Self::TokenRefresh => write!(f, "token_refresh"),
-            Self::TriggerCreate => write!(f, "trigger_create"),
-            Self::TriggerDrop => write!(f, "trigger_drop"),
-            Self::SignalFired => write!(f, "signal_fired"),
             Self::SchemaChange => write!(f, "schema_change"),
-            Self::DropRollup => write!(f, "drop_rollup"),
             Self::DataExport => write!(f, "data_export"),
-            Self::PermissionChange => write!(f, "permission_change"),
-            Self::PolicyLoad => write!(f, "policy_load"),
+            Self::LoginFailure => write!(f, "login_failure"),
+            Self::Admin => write!(f, "admin"),
             Self::ApiKeyCreate => write!(f, "api_key_create"),
             Self::ApiKeyRevoke => write!(f, "api_key_revoke"),
+            Self::PolicyLoad => write!(f, "policy_load"),
             Self::NamespaceCreate => write!(f, "namespace_create"),
             Self::NamespaceDelete => write!(f, "namespace_delete"),
             Self::QuotaChange => write!(f, "quota_change"),
+            Self::CreateRollup => write!(f, "create_rollup"),
+            Self::DropRollup => write!(f, "drop_rollup"),
+            Self::TriggerCreate => write!(f, "trigger_create"),
+            Self::TriggerDrop => write!(f, "trigger_drop"),
+            Self::SignalFired => write!(f, "signal_fired"),
             Self::Custom(s) => write!(f, "{s}"),
         }
     }
@@ -465,8 +480,8 @@ mod tests {
 
     #[test]
     fn audit_action_display() {
-        assert_eq!(AuditAction::LoginSuccess.to_string(), "login_success");
-        assert_eq!(AuditAction::KeyRotation.to_string(), "key_rotation");
+        assert_eq!(AuditAction::LoginFailure.to_string(), "login_failure");
+        assert_eq!(AuditAction::ApiKeyCreate.to_string(), "api_key_create");
         assert_eq!(AuditAction::Custom("foo".into()).to_string(), "foo");
     }
 

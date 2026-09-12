@@ -1,151 +1,173 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // examples favour brevity
-//! # Authorization (Cedar RBAC)
+//! # Authorization (Cedar)
 //!
-//! Demonstrates the embedded Cedar-based authorization engine:
-//! creating policies, principals, resources, and evaluating
-//! allow/deny decisions.
+//! The two decisions `chronixd` puts to Cedar, driven directly: may this
+//! principal touch this tenant's data, and may it administer the server.
 //!
 //! ```sh
 //! cargo run -p chronix --example authz
 //! ```
 
 use chronix::chronix_security::authz::{
-    AuthzEngine, ChronixAction, ChronixPrincipal, ChronixResource,
+    AuthzEngine, ChronixAction, ChronixNamespace, ChronixPrincipal,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = AuthzEngine::new();
 
-    // ── 1. Load Cedar policies ─────────────────────────────────
+    // ── 1. Policies ────────────────────────────────────────────
     println!("─── 1. Loading Cedar policies ───");
-    // Chronix uses Cedar entity types: Chronix::Role::"<role>",
-    // Chronix::Action::"<action>", Chronix::Measurement::"<name>"
+    // Every entity type is namespaced under `Chronix::`. `Action::"Read"` is
+    // a *different type* and would match nothing — which is why the schema is
+    // compiled in and every policy is validated against it, rather than
+    // accepted and never consulted.
     let policies = r#"
-        // Operators can read and write all measurements
+        // Operators read and write production.
         permit(
             principal in Chronix::Role::"operator",
             action in [Chronix::Action::"Read", Chronix::Action::"Write"],
-            resource
+            resource == Chronix::Namespace::"production"
         );
 
-        // Analysts can only read
+        // Analysts read, anywhere.
         permit(
             principal in Chronix::Role::"analyst",
             action == Chronix::Action::"Read",
             resource
         );
 
-        // Admins can do everything
-        permit(
-            principal in Chronix::Role::"admin",
-            action,
-            resource
-        );
-
-        // Deny deletes on secret_metrics for non-admins
+        // Nobody deletes the internal namespace.
         forbid(
             principal,
             action == Chronix::Action::"Delete",
-            resource == Chronix::Measurement::"secret_metrics"
+            resource == Chronix::Namespace::"internal"
+        );
+
+        // One administrative capability, and only that one. `Admin` is an
+        // action *group*: `action in Chronix::Action::"Admin"` would grant
+        // every capability at once.
+        permit(
+            principal == Chronix::User::"backup-runner",
+            action == Chronix::Action::"ManageBackups",
+            resource
         );
     "#;
+    println!("   Loaded {} policies\n", engine.load_policies(policies)?);
 
-    let loaded = engine.load_policies(policies)?;
-    println!("   Loaded {loaded} policies\n");
+    // A typo is refused rather than accepted and never matched.
+    let typo = r#"permit(principal, action == Chronix::Action::"Query", resource);"#;
+    match AuthzEngine::check_policies(typo) {
+        Ok(_) => println!("   (unreachable: a bad action was accepted)"),
+        Err(e) => println!("   A misspelt action is refused at load:\n     {e}\n"),
+    }
 
-    // ── 2. Define principals ───────────────────────────────────
+    // ── 2. Principals ──────────────────────────────────────────
     println!("─── 2. Principals ───");
     let alice = ChronixPrincipal::new("alice").with_role("operator");
     let bob = ChronixPrincipal::new("bob").with_role("analyst");
-    let carol = ChronixPrincipal::new("carol").with_role("admin");
-
+    let backup = ChronixPrincipal::new("backup-runner");
     println!("   alice: operator");
     println!("   bob  : analyst");
-    println!("   carol: admin\n");
+    println!("   backup-runner: no role, named directly\n");
 
-    // ── 3. Define resources ────────────────────────────────────
-    println!("─── 3. Resources ───");
-    let cpu = ChronixResource::measurement("cpu")
-        .with_namespace("production")
-        .with_tag("host", "web-1");
+    // ── 3. Data-plane decisions ────────────────────────────────
+    println!("─── 3. Namespace decisions ───");
+    let production = ChronixNamespace::new("production");
+    let internal = ChronixNamespace::new("internal");
 
-    let secret_metrics = ChronixResource::measurement("secret_metrics").with_namespace("internal");
-
-    println!("   cpu (production, host=web-1)");
-    println!("   secret_metrics (internal)\n");
-
-    // ── 4. Evaluate access decisions ───────────────────────────
-    println!("─── 4. Access decisions ───");
-
-    let checks: &[(&str, &ChronixPrincipal, ChronixAction, &ChronixResource)] = &[
-        ("alice Read cpu", &alice, ChronixAction::Read, &cpu),
-        ("alice Write cpu", &alice, ChronixAction::Write, &cpu),
-        ("alice Delete cpu", &alice, ChronixAction::Delete, &cpu),
-        ("bob Read cpu", &bob, ChronixAction::Read, &cpu),
-        ("bob Write cpu", &bob, ChronixAction::Write, &cpu),
+    let checks: &[(&str, &ChronixPrincipal, ChronixAction, &ChronixNamespace)] = &[
         (
-            "carol Delete secret",
-            &carol,
-            ChronixAction::Delete,
-            &secret_metrics,
-        ),
-        (
-            "carol Admin secret",
-            &carol,
-            ChronixAction::Admin,
-            &secret_metrics,
-        ),
-        ("bob Forecast cpu", &bob, ChronixAction::Forecast, &cpu),
-        (
-            "alice Subscribe cpu",
+            "alice Read production",
             &alice,
-            ChronixAction::Subscribe,
-            &cpu,
+            ChronixAction::Read,
+            &production,
+        ),
+        (
+            "alice Write production",
+            &alice,
+            ChronixAction::Write,
+            &production,
+        ),
+        (
+            "alice Write internal",
+            &alice,
+            ChronixAction::Write,
+            &internal,
+        ),
+        ("bob Read internal", &bob, ChronixAction::Read, &internal),
+        (
+            "bob Write production",
+            &bob,
+            ChronixAction::Write,
+            &production,
+        ),
+        (
+            "bob Delete internal",
+            &bob,
+            ChronixAction::Delete,
+            &internal,
         ),
     ];
-
-    for &(label, principal, ref action, resource) in checks {
-        let decision = engine.authorize(principal, *action, resource);
+    for &(label, principal, action, namespace) in checks {
+        let decision = engine.authorize_namespace(principal, action, namespace);
         let icon = if decision.is_allowed() { "✅" } else { "❌" };
-        print!("   {icon} {label:<30}");
-        if decision.is_denied() {
-            println!(" DENIED");
+        let verdict = if decision.is_allowed() {
+            "ALLOWED"
         } else {
-            println!(" ALLOWED");
-        }
+            "DENIED"
+        };
+        println!("   {icon} {label:<26} {verdict}");
     }
 
-    // ── 5. Dynamic policy management ───────────────────────────
-    println!("\n─── 5. Dynamic policy update ───");
-    println!("   Adding policy: analysts can forecast");
+    // ── 4. Control-plane decisions ─────────────────────────────
+    println!("\n─── 4. Administrative decisions ───");
+    for action in [ChronixAction::ManageBackups, ChronixAction::ManageKeys] {
+        let decision = engine.authorize_system(&backup, action);
+        let icon = if decision.is_allowed() { "✅" } else { "❌" };
+        let verdict = if decision.is_allowed() {
+            "ALLOWED"
+        } else {
+            "DENIED"
+        };
+        println!("   {icon} backup-runner {action:<16} {verdict}");
+    }
+    println!("   (least privilege: the capability granted, and nothing else)");
+
+    // ── 5. Policies change; the active set is swapped atomically ─
+    println!("\n─── 5. Adding and removing a policy ───");
     engine.add_policy(
-        "analyst_forecast",
-        r#"permit(principal in Chronix::Role::"analyst", action == Chronix::Action::"Forecast", resource);"#,
+        "analyst_writes_staging",
+        r#"permit(principal in Chronix::Role::"analyst",
+                  action == Chronix::Action::"Write",
+                  resource == Chronix::Namespace::"staging");"#,
     )?;
-
-    let decision = engine.authorize(&bob, ChronixAction::Forecast, &cpu);
+    let staging = ChronixNamespace::new("staging");
     println!(
-        "   bob Forecast cpu: {}",
-        if decision.is_allowed() {
-            "ALLOWED ✅"
-        } else {
-            "DENIED ❌"
-        }
+        "   bob Write staging: {}",
+        verdict(&engine, &bob, ChronixAction::Write, &staging)
+    );
+    engine.remove_policy("analyst_writes_staging");
+    println!(
+        "   bob Write staging: {} (policy removed)",
+        verdict(&engine, &bob, ChronixAction::Write, &staging)
     );
 
-    println!("   Removing policy: analyst_forecast");
-    engine.remove_policy("analyst_forecast");
-
-    let decision = engine.authorize(&bob, ChronixAction::Forecast, &cpu);
-    println!(
-        "   bob Forecast cpu: {}",
-        if decision.is_allowed() {
-            "ALLOWED ✅"
-        } else {
-            "DENIED ❌"
-        }
-    );
-
-    println!("\n✅ Done");
+    println!("\n   Active policies: {}", engine.policy_count());
     Ok(())
+}
+
+fn verdict(
+    engine: &AuthzEngine,
+    principal: &ChronixPrincipal,
+    action: ChronixAction,
+    namespace: &ChronixNamespace,
+) -> &'static str {
+    if engine
+        .authorize_namespace(principal, action, namespace)
+        .is_allowed()
+    {
+        "ALLOWED ✅"
+    } else {
+        "DENIED ❌"
+    }
 }

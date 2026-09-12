@@ -43,7 +43,7 @@ async def main():
         result = await client.query(
             "cpu",
             TimeRange(start=0, end=2**63 - 1),
-            tag_filters={"host": "server-1"},
+            tags={"host": "server-1"},
         )
         for row in result:
             print(row)

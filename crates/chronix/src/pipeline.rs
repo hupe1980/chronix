@@ -292,6 +292,28 @@ impl Pipeline {
         &self.authz_engine
     }
 
+    /// Seal a fired signal into the audit chain.
+    ///
+    /// A signal is data leaving the database — a webhook to somewhere, a
+    /// metric, a log line — so *that it fired* belongs in the trail beside
+    /// the export that is its batch equivalent. `SignalStore` holds the last
+    /// N in memory for `GET /api/v1/signals`, which is a different thing: it
+    /// is bounded, unsealed and gone at restart. `SignalFired` was a category
+    /// this pipeline declared and never constructed.
+    fn record_signal(&self, signal: &SignalEvent) {
+        self.audit_logger.log(
+            AuditEvent::new(
+                "pipeline",
+                chronix_security::audit::AuditAction::SignalFired,
+                signal.measurement.clone(),
+                chronix_security::audit::AuditDecision::Allow,
+            )
+            .with_metadata("trigger", signal.trigger_name.clone())
+            .with_metadata("signal_type", signal.signal_type.clone())
+            .with_metadata("severity", signal.severity.to_string()),
+        );
+    }
+
     /// Access the audit logger.
     #[must_use]
     pub fn audit_logger(&self) -> &Arc<AuditLogger> {
@@ -327,6 +349,7 @@ impl Pipeline {
         let signals = self.trigger_engine.process_event_collect(event);
         for signal in &signals {
             self.signal_store.store(signal.clone());
+            self.record_signal(signal);
             self.delivery_router.deliver(signal);
         }
         if !signals.is_empty() {
@@ -378,6 +401,7 @@ impl Pipeline {
                         delivery_targets: Vec::new(),
                     };
                     self.signal_store.store(signal.clone());
+                    self.record_signal(&signal);
                     self.delivery_router.deliver(&signal);
                     total_signals += 1;
                 }

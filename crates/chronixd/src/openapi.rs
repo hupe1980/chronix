@@ -977,6 +977,17 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
     paths = paths.path(
+        "/api/v1/namespaces/{name}/quota",
+        PathItem::new(
+            HttpMethod::Put,
+            OperationBuilder::new()
+                .tag("Admin")
+                .summary(Some("Change a namespace quota"))
+                .response("200", ok_json("Quota", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
         "/api/v1/namespaces/{name}/usage",
         PathItem::new(
             HttpMethod::Get,

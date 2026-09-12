@@ -168,6 +168,11 @@ jobs:
       # were compiled and never run.
       - run: cargo test -p chronixd --features kafka
       - run: cargo test -p chronixd --features mqtt
+      # Every test that talks to a real broker is `#[ignore]`d, so the two
+      # lines above run none of them. `testcontainers` starts Kafka and
+      # Mosquitto from the test itself, and `ubuntu-latest` has Docker.
+      - run: cargo test -p chronixd --features kafka --test kafka_integration -- --ignored --test-threads=1
+      - run: cargo test -p chronixd --features mqtt --test mqtt_integration -- --ignored --test-threads=1
       - run: cargo test -p chronix-engine --features field-encryption
       - run: cargo check -p chronix-engine --features object-store --all-targets
       - run: cargo test -p chronix-engine --features object-store objstore
@@ -182,6 +187,16 @@ jobs:
       - run: cargo test -p chronixd --features object-store
       - run: cargo check -p chronix-streaming --features flight --all-targets
       - run: cargo check -p chronix-security --no-default-features --all-targets
+      # `security`, `streaming` and `pipeline` are off by default in the
+      # facade (D225), so the default build compiles none of the code behind
+      # them — a `#[cfg(feature = "streaming")]` that stops compiling would be
+      # invisible to every other job, which is the same blindness `sql` had.
+      # Each alone as well as together: `pipeline` implies both, so a
+      # `streaming` item that a `security` module imports builds there and
+      # nowhere else.
+      - run: cargo clippy -p chronix --features streaming --all-targets -- -D warnings
+      - run: cargo clippy -p chronix --features security --all-targets -- -D warnings
+      - run: cargo test -p chronix --features pipeline
       - run: cargo check -p chronix-engine --no-default-features --all-targets
       # The embedded build without DataFusion. A `#[cfg(feature = "sql")]`
       # that stops compiling is invisible to every other job, because `sql`
@@ -243,6 +258,18 @@ jobs:
       - name: Check documentation against the code
         run: ./scripts/check-docs.sh
 
+      # `cargo machete` cannot read the `[features]` table and `cargo udeps`
+      # needs nightly and a full build, so a `dep:` entry that no code names
+      # is invisible to both on a pull request.
+      - name: Check feature dependencies against the code
+        run: ./scripts/check-features.sh
+
+      # The "+N packages" figures are the whole argument for the feature
+      # gates, and nothing else in the tree reads arithmetic: removing three
+      # unused dependencies moved two of them and no check noticed.
+      - name: Check documented package counts
+        run: ./scripts/check-package-counts.sh
+
   python-sdk:
     # The SDK shipped with a test suite and no job that ran it, which is the
     # same shape as the `otlp` feature that did not compile (D29, R6). It cost
@@ -303,6 +330,12 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --all-features
+      # An unused dependency is not a warning, so nothing else here can see
+      # one — and a consumer inherits it.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - run: cargo machete
 
   doc:
     name: Documentation

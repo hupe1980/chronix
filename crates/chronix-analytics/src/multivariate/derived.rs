@@ -1,6 +1,4 @@
 //! Derived series engine with DAG-based dependency resolution.
-// Public API types — used by external consumers, suppress "never constructed" warnings.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 

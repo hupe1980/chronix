@@ -8,6 +8,7 @@ use tracing::{info, warn};
 use arrow::array::Array;
 use chronix_core::{SeriesKey, Tombstone};
 use chronix_engine::index::SegmentCatalogEntry;
+#[cfg(feature = "streaming")]
 use chronix_streaming::cdc::CdcEvent;
 
 use crate::delete::{DeleteBuilder, DeleteOutcome, DeleteRequest};
@@ -57,6 +58,7 @@ impl super::Chronix {
             );
 
             // Emit CDC event so subscribers know about the pending drop.
+            #[cfg(feature = "streaming")]
             self.cdc_bus.publish(CdcEvent::MeasurementDropped {
                 measurement: measurement.to_string(),
                 seq: 0,
@@ -140,6 +142,7 @@ impl super::Chronix {
         info!(measurement, segments = entries.len(), "Measurement dropped");
 
         // Emit CDC event for subscribers (seq auto-assigned by publish)
+        #[cfg(feature = "streaming")]
         self.cdc_bus.publish(CdcEvent::MeasurementDropped {
             measurement: measurement.to_string(),
             seq: 0,
@@ -165,8 +168,13 @@ impl super::Chronix {
     ///
     /// Returns an error if the database is closed or the delete fails.
     pub fn delete_series(&self, measurement: &str, tags: &BTreeMap<String, String>) -> Result<()> {
+        // Validated here rather than only inside the CDC event: a tag set the
+        // canonical form cannot represent is a bad request whether or not
+        // anybody is subscribed.
         let key = SeriesKey::new(measurement.to_string(), tags.clone())
             .map_err(|e| DbError::Internal(format!("Invalid series key: {e}")))?;
+        #[cfg(not(feature = "streaming"))]
+        let _ = &key;
 
         let req = DeleteRequest {
             measurement: measurement.to_string(),
@@ -176,6 +184,7 @@ impl super::Chronix {
         };
         self.execute_delete(&req)?;
 
+        #[cfg(feature = "streaming")]
         self.cdc_bus.publish(CdcEvent::SeriesDeleted {
             measurement: measurement.to_string(),
             tags: tags.clone(),

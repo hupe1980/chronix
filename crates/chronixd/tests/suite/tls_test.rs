@@ -50,7 +50,7 @@ async fn start_tls_server() -> (String, Vec<u8>, TempDir) {
         auth_state: None,
         #[cfg(feature = "cluster")]
         meta_client: None,
-        namespace_registry: None,
+        namespace_registry: std::sync::Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
         )),

@@ -24,7 +24,6 @@ const SURFACE: &[&str] = &[
     "mod error",
     "mod export",
     "mod macros",
-    "mod pipeline",
     "mod prelude",
     "mod promql",
     "mod retention",
@@ -35,8 +34,6 @@ const SURFACE: &[&str] = &[
     "mod chronix_encoding",
     "mod chronix_engine",
     "mod chronix_query",
-    "mod chronix_security",
-    "mod chronix_streaming",
     // ── Types and macros at the crate root (tier 1) ────────────────
     "AnomalyConfig",
     "BackupManifest",
@@ -50,8 +47,6 @@ const SURFACE: &[&str] = &[
     "InsertResult",
     "ParquetCompression",
     "ParquetExportConfig",
-    "Pipeline",
-    "PipelineConfig",
     "RollupAggFn",
     "RollupBuilder",
     "RollupConfig",
@@ -69,6 +64,13 @@ const FEATURE_SURFACE: &[(&str, &[&str])] = &[
     // rest of the surface — writes, the native query API, PromQL, rollups,
     // retention, triggers — is unchanged.
     ("sql", &["mod sql"]),
+    // Off by default, so an embedded build carries neither the CDC bus nor
+    // the security crate — 129 packages, a JWT library and a TLS stack among
+    // them. `chronixd` enables all three at its dependency and asserts at
+    // compile time that it has them.
+    ("streaming", &["mod chronix_streaming"]),
+    ("security", &["mod chronix_security"]),
+    ("pipeline", &["mod pipeline", "Pipeline", "PipelineConfig"]),
 ];
 
 /// Parse `lib.rs` for what it declares public.
@@ -121,9 +123,16 @@ fn declared_surface() -> (Vec<String>, Vec<(String, String)>) {
             }
         }
 
+        // One `pub use` may export several names, and the `cfg` above it
+        // applies to **all** of them. This used to `take()` the pending
+        // feature on the first name, so `pub use pipeline::{Pipeline,
+        // PipelineConfig}` recorded the first as gated and the second as
+        // always-present — a surface entry that would survive its own
+        // feature being turned off.
+        let feature = pending_feature.take();
         for name in names {
-            match pending_feature.take() {
-                Some(f) => gated.push((f, name)),
+            match &feature {
+                Some(f) => gated.push((f.clone(), name)),
                 None => always.push(name),
             }
         }

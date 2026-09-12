@@ -43,6 +43,7 @@ use chronix_engine::wal::WalWriter;
 
 use chronix_engine::compaction::CompactionPicker;
 
+#[cfg(feature = "streaming")]
 use chronix_streaming::cdc::EventBus;
 
 use crate::error::{DbError, Result};
@@ -282,6 +283,7 @@ pub struct DbInner {
     /// Compaction picker for selecting segments to compact.
     pub(super) compaction_picker: CompactionPicker,
     /// CDC event bus for streaming change events.
+    #[cfg(feature = "streaming")]
     pub(super) cdc_bus: EventBus,
     /// Wakes the maintenance thread: writers set the flag when a memtable
     /// crosses its threshold so the flush happens off the write path.
@@ -626,6 +628,7 @@ impl Chronix {
         };
 
         let segment_cache_size = config.segment_cache_size;
+        #[cfg(feature = "streaming")]
         let cdc_capacity = config.cdc_capacity;
 
         let db = Self {
@@ -651,6 +654,7 @@ impl Chronix {
                 segment_leases: Arc::new(leases::SegmentLeases::default()),
                 rollup_registry: Arc::new(RollupRegistryLock::new(rollup_registry)),
                 compaction_picker: CompactionPicker::default(),
+                #[cfg(feature = "streaming")]
                 cdc_bus: EventBus::new(cdc_capacity),
                 maintenance_wake: Arc::new((
                     parking_lot::Mutex::new(false),

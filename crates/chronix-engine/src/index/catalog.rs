@@ -18,7 +18,7 @@
 //! Snapshots use the same postcard format (single blob).
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -234,8 +234,19 @@ pub struct SegmentCatalog {
     changes_since_snapshot: u64,
     /// Next segment ID to assign.
     next_segment_id: u64,
-    /// Persistent WAL file handle (kept open for append).
-    manifest_wal_file: Option<std::fs::File>,
+    /// Persistent manifest-log handle (kept open for append).
+    ///
+    /// `dyn DurableFile` rather than `File` so a test can make the write
+    /// fail. A durability path is defined by what it does when the write
+    /// fails, and a filesystem will not fail on request.
+    manifest_wal_file: Option<Box<dyn crate::durable::DurableFile>>,
+    /// Bytes of `manifest.wal` known to hold whole records.
+    ///
+    /// The rewind point. An append that fails part-way truncates back to it,
+    /// so the file never holds a fragment with a valid record after it —
+    /// which replay reads as corruption, and used to answer by silently
+    /// discarding every transition that followed.
+    manifest_good_len: u64,
     /// Number of appends written but not yet `sync_data()`d.
     ///
     /// Normally at most one: every append syncs. It grows only inside
@@ -255,8 +266,42 @@ pub struct SegmentCatalog {
     manifest_syncs: u64,
 }
 
+/// The largest a single manifest record may plausibly be.
+///
+/// A length header that claims more than this is corruption rather than a
+/// record: the biggest real entry is a schema or a batch of tombstones, and
+/// neither approaches it.
+const MAX_MANIFEST_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
+/// What sits at an offset in the manifest log.
+enum RecordAt {
+    /// A whole record whose CRC checks out.
+    Valid {
+        /// Byte range of the postcard payload.
+        payload: std::ops::Range<usize>,
+        /// Offset the next record starts at.
+        next: usize,
+    },
+    /// Not a record, with the reason for the log.
+    Bad(String),
+}
+
 /// Snapshot interval: take a snapshot every N changes.
 const SNAPSHOT_INTERVAL: u64 = 1000;
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes the manifest log may still accept on this thread before every
+    /// write returns `ENOSPC`.
+    ///
+    /// Thread-local rather than a field, so the budget reaches the file a
+    /// `SegmentCatalog` opens *lazily*, without a constructor argument every
+    /// caller in the tree would have to thread through for one test.
+    /// `i64::MAX` is a disk that never fills, which is what every test that
+    /// is not about `ENOSPC` gets.
+    static MANIFEST_DISK_BUDGET: std::sync::Arc<std::sync::atomic::AtomicI64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX));
+}
 
 /// Sync on **every** manifest append, so no catalog mutation is lost to a
 /// power failure.
@@ -297,6 +342,7 @@ impl SegmentCatalog {
             changes_since_snapshot: 0,
             next_segment_id: 1,
             manifest_wal_file: None,
+            manifest_good_len: 0,
             pending_sync: 0,
             defer_sync: 0,
             manifest_syncs: 0,
@@ -342,6 +388,7 @@ impl SegmentCatalog {
                 changes_since_snapshot: 0,
                 next_segment_id: snapshot.next_segment_id,
                 manifest_wal_file: None,
+                manifest_good_len: 0,
                 pending_sync: 0,
                 defer_sync: 0,
                 manifest_syncs: 0,
@@ -359,6 +406,7 @@ impl SegmentCatalog {
                 changes_since_snapshot: 0,
                 next_segment_id: 1,
                 manifest_wal_file: None,
+                manifest_good_len: 0,
                 pending_sync: 0,
                 defer_sync: 0,
                 manifest_syncs: 0,
@@ -385,7 +433,7 @@ impl SegmentCatalog {
 
         self.segments.entry(entry.shard_id).or_default().push(entry);
 
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -403,12 +451,12 @@ impl SegmentCatalog {
         for entries in self.segments.values_mut() {
             if let Some(pos) = entries.iter().position(|e| e.segment_id == segment_id) {
                 let removed = entries.remove(pos);
-                self.maybe_snapshot()?;
+                self.maybe_snapshot();
                 return Ok(Some(removed));
             }
         }
 
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(None)
     }
 
@@ -621,7 +669,7 @@ impl SegmentCatalog {
         })?;
         self.rollups.entry(name.to_string()).or_default().definition = definition;
         self.sync_manifest()?;
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -642,7 +690,7 @@ impl SegmentCatalog {
         })?;
         self.rollups.entry(name.to_string()).or_default().state = state;
         self.sync_manifest()?;
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -658,7 +706,7 @@ impl SegmentCatalog {
         self.append_manifest(&ManifestEntry::RemoveRollup(name.to_string()))?;
         self.rollups.remove(name);
         self.sync_manifest()?;
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(true)
     }
 
@@ -692,7 +740,7 @@ impl SegmentCatalog {
         self.pending_measurement_drops
             .insert(measurement.to_string(), deadline_ms);
         self.sync_manifest()?;
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -713,7 +761,7 @@ impl SegmentCatalog {
         ))?;
         self.pending_measurement_drops.remove(measurement);
         self.sync_manifest()?;
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(true)
     }
 
@@ -743,7 +791,7 @@ impl SegmentCatalog {
             }
             Ok(())
         })?;
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -781,7 +829,7 @@ impl SegmentCatalog {
         })?;
         self.tombstones
             .extend_to_compaction_output(&input_ids, output_id);
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -815,7 +863,7 @@ impl SegmentCatalog {
         }
         if !removed.is_empty() {
             self.sync_manifest()?;
-            self.maybe_snapshot()?;
+            self.maybe_snapshot();
         }
         Ok(removed.len())
     }
@@ -830,7 +878,7 @@ impl SegmentCatalog {
         self.append_manifest(&entry)?;
         self.schemas
             .insert(schema.measurement().to_string(), schema);
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -843,7 +891,7 @@ impl SegmentCatalog {
         let entry = ManifestEntry::RemoveSchema(measurement.to_string());
         self.append_manifest(&entry)?;
         let removed = self.schemas.remove(measurement);
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(removed)
     }
 
@@ -870,7 +918,7 @@ impl SegmentCatalog {
         }
         self.append_manifest(&ManifestEntry::SetWalFloor(sequence_no))?;
         self.wal_floor = sequence_no;
-        self.maybe_snapshot()?;
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -902,9 +950,45 @@ impl SegmentCatalog {
         Ok(())
     }
 
-    /// Append a manifest entry to the WAL file.
+    /// Wrap the manifest file, so a test can make the write fail.
+    ///
+    /// The production build hands the `File` through untouched; the test
+    /// build routes it via a budget that reports `ENOSPC`, which is the
+    /// failure a flash-backed gateway actually meets. Mirrors the WAL's own
+    /// `sink`.
+    #[cfg(not(test))]
+    fn sink(file: std::fs::File) -> Box<dyn crate::durable::DurableFile> {
+        Box::new(file)
+    }
+
+    /// See the production `sink`. A budget of `i64::MAX` is a file that never
+    /// fills, which is what every test that is not about `ENOSPC` gets.
+    #[cfg(test)]
+    fn sink(file: std::fs::File) -> Box<dyn crate::durable::DurableFile> {
+        let budget = MANIFEST_DISK_BUDGET.with(Clone::clone);
+        Box::new(crate::durable::FullDiskFile::new(file, budget))
+    }
+
+    /// Append a manifest entry to the log.
     ///
     /// Format: `[u32-le length][postcard payload][u32-le CRC32c]`
+    ///
+    /// # A failed append leaves nothing behind
+    ///
+    /// Three `write_all` calls, and a short write inside any of them — an
+    /// `ENOSPC` at the boundary — leaves a fragment. That used to stay: the
+    /// next append, once a retention pass had freed space, wrote a valid
+    /// record *after* it, and replay then read the fragment as the end of the
+    /// log and **silently discarded every transition that followed**. The
+    /// caller had been told those transitions were durable, and `open()`'s
+    /// orphan sweep deletes the segment files the restored catalog no longer
+    /// names.
+    ///
+    /// So a failed append truncates back to the last whole record, the same
+    /// way `WalWriter::rewind_to_durable` does — the error the caller sees
+    /// and the bytes on the disk say the same thing. The catalog is the
+    /// durable record of what may be deleted; it is the last place a write
+    /// may half-succeed in silence.
     fn append_manifest(&mut self, entry: &ManifestEntry) -> Result<()> {
         self.manifest_seq += 1;
 
@@ -915,7 +999,8 @@ impl SegmentCatalog {
                 .create(true)
                 .append(true)
                 .open(&wal_path)?;
-            self.manifest_wal_file = Some(f);
+            self.manifest_good_len = f.metadata()?.len();
+            self.manifest_wal_file = Some(Self::sink(f));
         }
         let file = self
             .manifest_wal_file
@@ -926,11 +1011,28 @@ impl SegmentCatalog {
             .map_err(|e| IndexError::BinarySerialization(e.to_string()))?;
         let len = payload.len() as u32;
         let crc = crc32c::crc32c(&payload);
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(&payload)?;
-        file.write_all(&crc.to_le_bytes())?;
-        // Always flush to kernel buffers so data is ordered.
-        file.flush()?;
+
+        let record_len = 4 + payload.len() as u64 + 4;
+        let written = (|| -> std::io::Result<()> {
+            file.write_all(&len.to_le_bytes())?;
+            file.write_all(&payload)?;
+            file.write_all(&crc.to_le_bytes())?;
+            // Always flush to kernel buffers so data is ordered.
+            file.flush()
+        })();
+
+        if let Err(e) = written {
+            // The record is not whole. Truncate back to the last one that
+            // was, so the file never holds a fragment with a valid record
+            // after it — see this function's own documentation for what that
+            // used to cost. `manifest_seq` is put back too: a sequence
+            // consumed by a record that does not exist makes the catalog's
+            // version disagree with its log.
+            self.manifest_seq -= 1;
+            self.rewind_manifest();
+            return Err(e.into());
+        }
+        self.manifest_good_len += record_len;
 
         // Synced here unless a caller has declared that this append is one
         // step of a larger transition (`in_one_sync`), in which case that
@@ -946,6 +1048,31 @@ impl SegmentCatalog {
 
         self.changes_since_snapshot += 1;
         Ok(())
+    }
+
+    /// Discard whatever a failed append left past the last whole record.
+    ///
+    /// The handle is dropped and reopened rather than reused: a write that
+    /// failed leaves the file position where the kernel left it, and an
+    /// append-mode handle would then write the *next* record after the
+    /// fragment we are about to remove. Reopening also means a rewind that
+    /// itself fails leaves no handle behind — the next append reopens, sees
+    /// the real length, and tells the truth about where the log ends.
+    fn rewind_manifest(&mut self) {
+        let good = self.manifest_good_len;
+        self.manifest_wal_file = None;
+        self.pending_sync = 0;
+        let path = self.manifest_dir.join("manifest.wal");
+        match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(f) => {
+                if let Err(e) = crate::durable::DurableFile::set_len(&f, good) {
+                    warn!(error = %e, offset = good, "manifest rewind failed");
+                } else if let Err(e) = crate::durable::DurableFile::sync_all(&f) {
+                    warn!(error = %e, "manifest rewind sync failed");
+                }
+            }
+            Err(e) => warn!(error = %e, "manifest rewind could not reopen the log"),
+        }
     }
 
     /// How many times the manifest has been fsynced since this catalog was
@@ -1010,141 +1137,130 @@ impl SegmentCatalog {
         Ok(())
     }
 
-    /// Replay manifest WAL entries from a file.
+    /// Replay manifest log entries from a file.
     ///
     /// Reads length-prefixed postcard records with CRC32c integrity.
-    /// Truncated tail records (common crash artefact) are skipped
-    /// with a warning. Mid-stream corruption returns an error.
+    ///
+    /// # A bad record is the tail, or it is corruption
+    ///
+    /// The difference decides everything and it was decided by a *byte
+    /// count*: "more than eight bytes remain, so this is mid-stream". A
+    /// process that dies between two `write_all` calls leaves a fragment at
+    /// the end of the log, which is ordinary and must be skipped; a fragment
+    /// with **valid records after it** is corruption, and treating it as the
+    /// tail silently discards every transition that follows. Those
+    /// transitions were acknowledged, and the segment files a restored
+    /// catalog no longer names are deleted by `open()`'s orphan sweep — so
+    /// the quiet answer ends in deleted data, which is the one outcome a
+    /// durable record of *what may be deleted* must not produce.
+    ///
+    /// So the question is asked directly: **is there a whole, CRC-valid
+    /// record later in this file?** If there is, this is corruption and the
+    /// catalog refuses to open, naming both offsets. If there is not, it is
+    /// the tail, and it is skipped. Refusing is the right failure: pass 53
+    /// made `open()` refuse a catalog naming a segment file that is not
+    /// there, for the same reason — a catalog that is *partly* true reads as
+    /// a catalog.
     fn replay_manifest(&mut self, wal_path: &Path) -> Result<()> {
-        let mut file = std::fs::File::open(wal_path)?;
-        let file_len = file.metadata()?.len();
+        let buf = std::fs::read(wal_path)?;
 
         let mut replayed = 0u64;
-        let mut tail_skipped = 0u64;
-        let mut pos = 0u64;
+        let mut pos = 0usize;
 
-        loop {
-            if pos >= file_len {
-                break;
-            }
-            // Read length header (4 bytes)
-            let mut len_buf = [0u8; 4];
-            match file.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    tail_skipped += 1;
-                    warn!(
-                        offset = pos,
-                        "manifest replay: truncated length header at tail"
-                    );
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            }
-            let payload_len = u32::from_le_bytes(len_buf) as usize;
-            pos += 4;
-
-            // Sanity check payload length
-            if payload_len == 0 || payload_len > 64 * 1024 * 1024 {
-                if pos + (payload_len as u64) + 4 > file_len {
-                    tail_skipped += 1;
-                    warn!(
-                        offset = pos - 4,
-                        payload_len, "manifest replay: truncated entry at tail"
-                    );
-                    break;
-                }
-                return Err(IndexError::Manifest {
-                    detail: format!(
-                        "invalid manifest entry length {payload_len} at offset {}",
-                        pos - 4
-                    ),
-                });
-            }
-
-            // Read payload + CRC
-            let total = payload_len + 4; // payload + CRC32c
-            if pos + total as u64 > file_len {
-                tail_skipped += 1;
-                warn!(
-                    offset = pos - 4,
-                    "manifest replay: truncated payload at tail"
-                );
-                break;
-            }
-
-            let mut buf = vec![0u8; total];
-            if let Err(e) = file.read_exact(&mut buf) {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    tail_skipped += 1;
-                    warn!(offset = pos - 4, "manifest replay: truncated read at tail");
-                    break;
-                }
-                return Err(e.into());
-            }
-
-            let payload = &buf[..payload_len];
-            let stored_crc = u32::from_le_bytes([
-                buf[payload_len],
-                buf[payload_len + 1],
-                buf[payload_len + 2],
-                buf[payload_len + 3],
-            ]);
-            let computed_crc = crc32c::crc32c(payload);
-
-            if stored_crc != computed_crc {
-                // Check if there are more valid records after this
-                let remaining = file_len - pos - total as u64;
-                if remaining > 8 {
-                    return Err(IndexError::Manifest {
-                        detail: format!(
-                            "CRC mismatch at offset {} (stored={stored_crc:#x}, computed={computed_crc:#x}) — mid-stream corruption",
-                            pos - 4,
-                        ),
-                    });
-                }
-                tail_skipped += 1;
-                warn!(
-                    offset = pos - 4,
-                    "manifest replay: CRC mismatch at tail, skipping"
-                );
-                break;
-            }
-
-            match postcard::from_bytes::<ManifestEntry>(payload) {
-                Ok(entry) => {
-                    self.apply_manifest_entry(entry);
-                    self.manifest_seq += 1;
-                    replayed += 1;
-                }
-                Err(e) => {
-                    // Check if remaining data could contain valid entries
-                    let remaining = file_len - pos - total as u64;
-                    if remaining > 8 {
-                        return Err(IndexError::Manifest {
-                            detail: format!("deserialization error at offset {}: {e}", pos - 4,),
-                        });
+        while pos < buf.len() {
+            match Self::decode_record(&buf, pos) {
+                RecordAt::Valid { payload, next } => {
+                    match postcard::from_bytes::<ManifestEntry>(&buf[payload]) {
+                        Ok(entry) => {
+                            self.apply_manifest_entry(entry);
+                            self.manifest_seq += 1;
+                            replayed += 1;
+                            pos = next;
+                        }
+                        Err(e) => {
+                            match Self::classify_bad_record(
+                                &buf,
+                                pos,
+                                &format!("entry does not decode: {e}"),
+                            ) {
+                                Some(err) => return Err(err),
+                                None => break,
+                            }
+                        }
                     }
-                    tail_skipped += 1;
-                    warn!(offset = pos - 4, error = %e, "manifest replay: skipping corrupt tail entry");
-                    break;
                 }
+                RecordAt::Bad(reason) => match Self::classify_bad_record(&buf, pos, &reason) {
+                    Some(err) => return Err(err),
+                    None => break,
+                },
             }
-
-            pos += total as u64;
         }
 
-        if tail_skipped > 0 {
-            warn!(
-                tail_skipped,
-                "manifest replay: truncated tail entries skipped"
-            );
-        }
         if replayed > 0 {
             debug!(replayed, "replayed manifest entries");
         }
 
         Ok(())
+    }
+
+    /// Decide whether a bad record at `pos` is the log's tail or corruption.
+    ///
+    /// `Some` when a valid record follows, so this is corruption and the
+    /// catalog must refuse; `None` when nothing does, which is the tail a
+    /// crash between two writes leaves and is skipped.
+    fn classify_bad_record(buf: &[u8], pos: usize, reason: &str) -> Option<IndexError> {
+        if let Some(next) = Self::next_valid_record(buf, pos) {
+            return Some(IndexError::Manifest {
+                detail: format!(
+                    "mid-stream corruption in the manifest at offset {pos} ({reason}); a \
+                     valid record follows at offset {next}, so this is not a \
+                     truncated tail — replaying past it would silently drop every \
+                     transition between them. Restore from a backup, or verify the \
+                     volume."
+                ),
+            });
+        }
+        warn!(
+            offset = pos,
+            reason, "manifest replay: incomplete record at the tail, skipping"
+        );
+        metrics::counter!("chronix_catalog_tail_records_skipped_total").increment(1);
+        None
+    }
+
+    /// The offset of the next whole, CRC-valid record after `pos`, if any.
+    ///
+    /// A byte-by-byte scan, which is affordable because it runs once, only on
+    /// the corruption path, over a log bounded by the snapshot interval.
+    fn next_valid_record(buf: &[u8], pos: usize) -> Option<usize> {
+        (pos + 1..buf.len())
+            .find(|&at| matches!(Self::decode_record(buf, at), RecordAt::Valid { .. }))
+    }
+
+    /// Read one record at `at`.
+    fn decode_record(buf: &[u8], at: usize) -> RecordAt {
+        let Some(len_bytes) = buf.get(at..at + 4) else {
+            return RecordAt::Bad("truncated length header".into());
+        };
+        let payload_len =
+            u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+        if payload_len == 0 || payload_len > MAX_MANIFEST_RECORD_BYTES {
+            return RecordAt::Bad(format!("implausible record length {payload_len}"));
+        }
+        let payload_start = at + 4;
+        let crc_start = payload_start + payload_len;
+        let Some(crc_bytes) = buf.get(crc_start..crc_start + 4) else {
+            return RecordAt::Bad("record extends past the end of the log".into());
+        };
+        let stored = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        let payload = payload_start..crc_start;
+        if crc32c::crc32c(&buf[payload.clone()]) != stored {
+            return RecordAt::Bad("CRC mismatch".into());
+        }
+        RecordAt::Valid {
+            payload,
+            next: crc_start + 4,
+        }
     }
 
     /// Apply a manifest entry to the in-memory state (no persistence).
@@ -1321,18 +1437,47 @@ impl SegmentCatalog {
             file.sync_all()?;
         }
         self.manifest_wal_file = None;
+        // The log is empty, so the rewind point is the start of it. Leaving
+        // the old value would make the next failed append truncate *up*,
+        // which `set_len` will happily do — extending the file with zeros
+        // that replay reads as a zero-length record.
+        self.manifest_good_len = 0;
 
         debug!(seq = self.manifest_seq, "catalog snapshot written");
         Ok(())
     }
 
     /// Take a snapshot if the change count exceeds the threshold.
-    fn maybe_snapshot(&mut self) -> Result<()> {
-        if self.changes_since_snapshot >= SNAPSHOT_INTERVAL {
-            self.write_snapshot()?;
-            self.changes_since_snapshot = 0;
+    ///
+    /// **A failed snapshot is not a failed transition**, and it must not be
+    /// reported as one. The manifest append is the commit point; a snapshot
+    /// only shortens the log that replay reads. Returning the snapshot's
+    /// error from `add_segment` told the flush that registering the segment
+    /// had failed — and the flush answers that by **deleting the segment
+    /// files it just wrote**, while the catalog entry naming them is already
+    /// durable. The next `open()` then refuses the database outright,
+    /// because a catalog that names a file which is not there is one pass 53
+    /// taught it not to trust.
+    ///
+    /// So it is logged and retried: `changes_since_snapshot` is left where it
+    /// is, so the next mutation attempts it again, and a longer log costs
+    /// replay time rather than data.
+    fn maybe_snapshot(&mut self) {
+        if self.changes_since_snapshot < SNAPSHOT_INTERVAL {
+            return;
         }
-        Ok(())
+        match self.write_snapshot() {
+            Ok(()) => self.changes_since_snapshot = 0,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    changes = self.changes_since_snapshot,
+                    "catalog snapshot failed; the transition is committed and the \
+                     log keeps growing until one succeeds"
+                );
+                metrics::counter!("chronix_catalog_snapshot_failures_total").increment(1);
+            }
+        }
     }
 }
 
@@ -1389,6 +1534,141 @@ mod tests {
             column_stats: Vec::new(),
             state: SegmentState::default(),
         }
+    }
+
+    /// Set the manifest log's remaining byte budget for this thread.
+    fn set_disk_budget(bytes: i64) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+        MANIFEST_DISK_BUDGET.with(|b| {
+            b.store(bytes, std::sync::atomic::Ordering::SeqCst);
+            std::sync::Arc::clone(b)
+        })
+    }
+
+    /// **A failed manifest append must lose the transition it failed on, and
+    /// nothing else.**
+    ///
+    /// The shape this reproduces is the one an embedded gateway on flash
+    /// actually meets: the disk fills, an append fails part-way, a retention
+    /// pass frees space, and the next append succeeds. The fragment the
+    /// failure left is then *mid-stream*, and replay used to read it as the
+    /// end of the log — returning `Ok` while **silently discarding every
+    /// transition after it**. Those transitions had been acknowledged, and
+    /// `open()`'s orphan sweep deletes the segment files a restored catalog
+    /// no longer names, so the silence ended in deleted data.
+    ///
+    /// Driven through the real write path rather than by writing a fragment
+    /// by hand: the question is what the *writer* leaves behind, and a
+    /// hand-made fragment answers a question nobody asked.
+    #[test]
+    fn a_failed_manifest_append_loses_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog");
+        let budget = set_disk_budget(i64::MAX);
+
+        {
+            let mut cat = SegmentCatalog::new(&path).unwrap();
+            cat.add_segment(test_entry(1, 0, 0, 100)).unwrap();
+
+            // Room for a few bytes of the next record and no more: a short
+            // write inside `write_all`, which is what a real filesystem does
+            // at the boundary.
+            budget.store(6, std::sync::atomic::Ordering::SeqCst);
+            let refused = cat.add_segment(test_entry(2, 0, 100, 200));
+            assert!(refused.is_err(), "a full disk must refuse the append");
+
+            // Retention frees space, and the next transition lands.
+            budget.store(i64::MAX, std::sync::atomic::Ordering::SeqCst);
+            cat.add_segment(test_entry(3, 0, 200, 300))
+                .expect("an append after the disk frees up must succeed");
+        }
+
+        set_disk_budget(i64::MAX);
+        let cat = SegmentCatalog::open(&path).expect("the catalog must still open");
+        let ids: Vec<u64> = cat.all_segments().iter().map(|e| e.segment_id.0).collect();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "the refused transition is gone and the two acknowledged ones are not"
+        );
+    }
+
+    /// **A failed snapshot must not be reported as a failed transition.**
+    ///
+    /// The snapshot only shortens the log replay reads; the append is the
+    /// commit point. Returning the snapshot's error from `add_segment` told
+    /// the flush that registration had failed — and the flush answers that by
+    /// **deleting the segment files it just wrote**, while the catalog entry
+    /// naming them is already durable. The next `open()` then refuses the
+    /// database outright, because a catalog naming a file that is not there
+    /// is one it does not trust.
+    ///
+    /// The snapshot is made to fail on its own, without touching the log: a
+    /// *directory* where it wants to create `manifest.snapshot.bin.tmp`. A
+    /// full disk would do it too, and would also stop the append — which is a
+    /// different case, and mixing them is how a test ends up proving neither.
+    #[test]
+    fn a_failed_snapshot_does_not_fail_the_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog");
+        set_disk_budget(i64::MAX);
+
+        let mut cat = SegmentCatalog::new(&path).unwrap();
+        for i in 0..SNAPSHOT_INTERVAL - 1 {
+            cat.add_segment(test_entry(i + 1, 0, 0, 100)).unwrap();
+        }
+
+        // The next append takes the change count to the threshold, so the
+        // snapshot runs — into this.
+        std::fs::create_dir_all(path.join("manifest.snapshot.bin.tmp")).unwrap();
+
+        let last = SNAPSHOT_INTERVAL;
+        cat.add_segment(test_entry(last, 0, 100, 200))
+            .expect("the append committed; only the snapshot failed");
+        assert_eq!(cat.segment_count() as u64, SNAPSHOT_INTERVAL);
+
+        // And it is durable: every transition replays, because the log was
+        // never truncated by the snapshot that did not happen.
+        drop(cat);
+        std::fs::remove_dir_all(path.join("manifest.snapshot.bin.tmp")).unwrap();
+        let reopened = SegmentCatalog::open(&path).expect("the catalog must open");
+        assert_eq!(
+            reopened.segment_count() as u64,
+            SNAPSHOT_INTERVAL,
+            "every acknowledged transition survives a failed snapshot"
+        );
+    }
+
+    /// The in-memory catalog and the log agree after a refusal.
+    ///
+    /// Write-ahead order already gave this — `append_manifest` runs before
+    /// the in-memory mutation — so it is pinned rather than fixed: a later
+    /// edit that mutates first would make the running process disagree with
+    /// its own restart, which is the hardest class of bug to see.
+    #[test]
+    fn a_refused_append_leaves_the_in_memory_catalog_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog");
+        let budget = set_disk_budget(i64::MAX);
+
+        let mut cat = SegmentCatalog::new(&path).unwrap();
+        cat.add_segment(test_entry(1, 0, 0, 100)).unwrap();
+        let before = cat.manifest_seq();
+
+        budget.store(6, std::sync::atomic::Ordering::SeqCst);
+        assert!(cat.add_segment(test_entry(2, 0, 100, 200)).is_err());
+        budget.store(i64::MAX, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            cat.all_segments().len(),
+            1,
+            "a refused append must not be visible in memory"
+        );
+        assert_eq!(
+            cat.manifest_seq(),
+            before,
+            "a sequence consumed by a record that does not exist makes the \
+             catalog's version disagree with its log"
+        );
     }
 
     /// A compaction is **one** fsync, whatever it retires.
@@ -1697,13 +1977,19 @@ mod tests {
         f.write_all(&valid_crc.to_le_bytes()).unwrap();
         drop(f);
 
-        // Replay should fail with a Manifest error.
+        // Replay must refuse, and say enough to act on: *where* the damage
+        // is and *where* the next good record is. A refusal an operator
+        // cannot locate is a refusal they can only answer by restoring.
         let result = SegmentCatalog::open(dir.path());
         assert!(result.is_err(), "expected error for mid-stream corruption");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.contains("mid-stream corruption"),
             "error should mention mid-stream corruption, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("a valid record follows at offset"),
+            "the error must name the offset that proves this is not a tail: {err_msg}"
         );
     }
 }

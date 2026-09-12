@@ -135,6 +135,7 @@ fn to_response(result: chronix::chronix_streaming::signal::SqlResult) -> Trigger
 pub async fn trigger_sql_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    req_extensions: axum::http::Extensions,
     Json(req): Json<TriggerSqlRequest>,
 ) -> Result<Json<TriggerResponse>, ServerError> {
     let pipeline = pipeline(&state)?;
@@ -143,6 +144,23 @@ pub async fn trigger_sql_handler(
     let result = pipeline
         .execute_signal_sql_scoped(&req.query, scope.as_deref())
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    // A trigger sends data somewhere — a webhook, a log, a metric — so
+    // creating one is a data-egress decision, and `TriggerCreate` was a
+    // category nothing produced.
+    //
+    // Only a `CREATE`: this endpoint runs one statement of the DSL, and a
+    // `SHOW TRIGGERS` through it is a read.
+    if let chronix::chronix_streaming::signal::SqlResult::Created(ref name) = result {
+        crate::audit::record(
+            &state,
+            &crate::audit::principal_of(&req_extensions),
+            chronix_security::audit::AuditAction::TriggerCreate,
+            name.clone(),
+            chronix_security::audit::AuditDecision::Allow,
+            &[("namespace", scope.clone().unwrap_or_default())],
+        );
+    }
     Ok(Json(to_response(result)))
 }
 
@@ -232,6 +250,7 @@ pub async fn get_trigger_handler(
 pub async fn drop_trigger_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    req_extensions: axum::http::Extensions,
     Path(name): Path<String>,
 ) -> Result<Json<TriggerResponse>, ServerError> {
     let pipeline = pipeline(&state)?;
@@ -242,6 +261,17 @@ pub async fn drop_trigger_handler(
     let result = pipeline
         .execute_signal_sql_scoped(&format!("DROP TRIGGER {name}"), scope.as_deref())
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    // Removing an alert is how an alert stops firing, which is worth as much
+    // in a trail as creating one.
+    crate::audit::record(
+        &state,
+        &crate::audit::principal_of(&req_extensions),
+        chronix_security::audit::AuditAction::TriggerDrop,
+        name.clone(),
+        chronix_security::audit::AuditDecision::Allow,
+        &[("namespace", scope.clone().unwrap_or_default())],
+    );
     Ok(Json(to_response(result)))
 }
 

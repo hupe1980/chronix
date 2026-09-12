@@ -26,6 +26,16 @@ from chronix_client.models import (
 
 _DEFAULT_TIMEOUT = 30.0
 
+#: The namespace header `chronixd` reads (`chronixd::namespace::NAMESPACE_HEADER`).
+NAMESPACE_HEADER = "X-Namespace"
+
+#: Default listen ports, from `chronixd`'s `default_http_addr` /
+#: `default_flight_addr`. They are the values in every example here, so a
+#: wrong one is a copy-pasted `ConnectionRefused`; `scripts/check-docs.sh`
+#: compares them against the server.
+DEFAULT_HTTP_PORT = 8086
+DEFAULT_FLIGHT_PORT = 8817
+
 
 class ChronixClient:
     """Async client for the Chronix time-series database REST API.
@@ -33,17 +43,20 @@ class ChronixClient:
     Parameters
     ----------
     base_url : str
-        Chronix server URL, e.g. ``"http://localhost:5555"``.
+        Chronix server URL, e.g. ``"http://localhost:8086"``.
     api_key : str | None
         Optional API key for authentication (sent as ``Authorization: Bearer``).
     timeout : float
         Default request timeout in seconds.
     namespace : str | None
-        Optional namespace header for multi-tenant deployments.
+        Namespace for multi-tenant deployments, sent as ``X-Namespace``.
+        The header name is the server's — it was ``X-Chronix-Namespace``
+        here, which `chronixd` does not read, so every request from a
+        namespaced client landed in ``default``.
 
     Examples
     --------
-    >>> async with ChronixClient("http://localhost:5555") as client:
+    >>> async with ChronixClient("http://localhost:8086") as client:
     ...     await client.write([Point("cpu", {"usage": 42.5}, tags={"host": "a"})])
     ...     result = await client.query("cpu", TimeRange(start=0, end=2**63 - 1))
     ...     print(len(result))
@@ -61,7 +74,7 @@ class ChronixClient:
         if api_key is not None:
             headers["Authorization"] = f"Bearer {api_key}"
         if namespace is not None:
-            headers["X-Chronix-Namespace"] = namespace
+            headers[NAMESPACE_HEADER] = namespace
 
         self._client = httpx.AsyncClient(
             base_url=base_url,
@@ -418,7 +431,7 @@ class ChronixClient:
     # ── Arrow Flight SQL ──────────────────────────────────────────
 
     @staticmethod
-    def flight_sql_uri(host: str = "localhost", port: int = 5557) -> str:
+    def flight_sql_uri(host: str = "localhost", port: int = DEFAULT_FLIGHT_PORT) -> str:
         """Build an ADBC Flight SQL connection URI.
 
         Use with ``adbc_driver_flightsql`` for Arrow-native queries::

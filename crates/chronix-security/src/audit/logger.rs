@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::audit::error::{AuditError, Result};
 use crate::audit::model::{AuditDecision, AuditEvent};
@@ -223,6 +223,14 @@ impl<W: Write + Send + Sync> AuditSink for WriterSink<W> {
 pub struct FileSink {
     file: parking_lot::Mutex<std::fs::File>,
     sync_each: bool,
+    /// Bytes known to hold whole lines — the rewind point.
+    ///
+    /// A `writeln!` that fails part-way leaves a line with no terminator, and
+    /// the *next* event is then appended to it: one line holding a fragment
+    /// and a whole event, which parses as neither. So a failed write loses
+    /// the event it failed on and takes the following one with it, which is
+    /// the opposite of what a trail is for.
+    good_len: std::sync::atomic::AtomicU64,
 }
 
 impl FileSink {
@@ -243,19 +251,40 @@ impl FileSink {
             .create(true)
             .append(true)
             .open(path)?;
+        let good_len = file.metadata()?.len();
         Ok(Self {
             file: parking_lot::Mutex::new(file),
             sync_each,
+            good_len: std::sync::atomic::AtomicU64::new(good_len),
         })
     }
 }
 
 impl AuditSink for FileSink {
     fn emit(&self, event: &AuditEvent) -> Result<()> {
-        let json =
-            serde_json::to_string(event).map_err(|e| AuditError::Serialization(e.to_string()))?;
+        use std::sync::atomic::Ordering;
+
+        let mut line =
+            serde_json::to_vec(event).map_err(|e| AuditError::Serialization(e.to_string()))?;
+        line.push(b'\n');
+
         let mut f = self.file.lock();
-        writeln!(f, "{json}")?;
+        // One `write_all` of the whole line, and a rewind if it does not
+        // land: a half-written line swallows the *next* event, because the
+        // fragment carries no terminator and the following write continues
+        // it. Losing the event that failed is unavoidable; losing the one
+        // after it is not.
+        match f.write_all(&line) {
+            Ok(()) => {}
+            Err(e) => {
+                let good = self.good_len.load(Ordering::SeqCst);
+                if let Err(t) = f.set_len(good) {
+                    tracing::error!(error = %t, offset = good, "audit log rewind failed");
+                }
+                return Err(e.into());
+            }
+        }
+        self.good_len.fetch_add(line.len() as u64, Ordering::SeqCst);
         if self.sync_each {
             f.sync_data()?;
         }
@@ -464,8 +493,25 @@ impl AuditLogger {
 
     /// Log an audit event to all sinks.
     ///
-    /// Assigns a monotonic sequence number, seals the event with a
-    /// SHA-256 hash chain, and updates metrics.
+    /// Assigns a monotonic sequence number, seals the event into the hash
+    /// chain, and writes it.
+    ///
+    /// # Sealing and writing are one step
+    ///
+    /// They were two, with the lock released in between — so two concurrent
+    /// callers could seal in one order and write in the other, leaving a file
+    /// in which `B` precedes `A` while `B.prev_hash` names `A`. That is
+    /// exactly what `verify_hash_chain` reports as **tampering**, and it
+    /// happened with no write failing and nothing logged: an ordinary pair of
+    /// simultaneous requests made a tamper-evident trail permanently
+    /// unverifiable. A trail whose whole purpose is to be checkable cannot
+    /// have a benign reason to fail its own check, because then no failure of
+    /// it means anything.
+    ///
+    /// So the chain lock is held across the emission. Audit events are rare
+    /// relative to requests, and the file sink serialises on its own mutex
+    /// anyway, so the lock is not a new bottleneck — it is the existing one,
+    /// now covering the invariant it always should have.
     pub fn log(&self, mut event: AuditEvent) {
         event.id = self.sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -476,11 +522,8 @@ impl AuditLogger {
         // links were computed two different ways, so it verified under
         // neither — and a plain hash is recomputable by anyone who can
         // write the file, which is the whole threat the key exists for.
-        {
-            let mut prev = self.prev_hash.lock();
-            event.seal_with_key(prev.as_deref(), self.hmac_key.as_deref());
-            *prev = event.event_hash.clone();
-        }
+        let mut prev = self.prev_hash.lock();
+        event.seal_with_key(prev.as_deref(), self.hmac_key.as_deref());
 
         counter!(
             "chronix_audit_events_total",
@@ -490,6 +533,8 @@ impl AuditLogger {
         .increment(1);
 
         let sinks = self.sinks.read();
+        let mut durable_failed = false;
+        let mut durable_wrote = false;
         for sink in sinks.iter() {
             if let Err(e) = sink.emit(&event) {
                 warn!(
@@ -506,8 +551,32 @@ impl AuditLogger {
                     "sink" => std::any::type_name_of_val(sink).to_string(),
                 )
                 .increment(1);
+                if sink.is_durable() {
+                    durable_failed = true;
+                }
+            } else if sink.is_durable() {
+                durable_wrote = true;
             }
         }
+
+        // **The chain advances only if the event reached a durable sink.**
+        // It advanced unconditionally, so an event the file never received
+        // still became the `prev_hash` of the next one — and every later
+        // verification of that file failed, reporting a full disk as
+        // tampering, for ever. A dropped event is gone either way; what this
+        // decides is whether the events *after* it remain checkable.
+        if durable_failed && !durable_wrote {
+            error!(
+                id = event.id,
+                action = %event.action,
+                "audit event reached no durable sink; it is dropped and the \
+                 chain continues from the last one that landed"
+            );
+            counter!("chronix_audit_chain_gaps_total").increment(1);
+        } else {
+            *prev = event.event_hash.clone();
+        }
+        drop(prev);
 
         debug!(id = event.id, action = %event.action, "Audit event logged");
     }
@@ -639,6 +708,176 @@ mod tests {
 
     fn make_event(action: AuditAction, decision: AuditDecision) -> AuditEvent {
         AuditEvent::new("alice", action, "cpu", decision).with_timestamp(1_700_000_000_000)
+    }
+
+    /// **Reproduction.** Two threads logging at once must leave a file that
+    /// verifies.
+    ///
+    /// `log()` seals the event under the `prev_hash` lock and then *releases
+    /// it* before the sinks write. So two concurrent callers can seal in one
+    /// order and write in the other, and the file then holds `B` before `A`
+    /// while `B.prev_hash` names `A` — which is precisely what
+    /// `verify_hash_chain` reports as tampering. No write fails, nothing is
+    /// logged, and the trail whose entire purpose is to be checkable is
+    /// permanently uncheckable.
+    #[test]
+    fn concurrent_events_leave_a_verifiable_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let logger = Arc::new(AuditLogger::new());
+        logger.add_sink(Box::new(FileSink::open(&path, true).unwrap()));
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 25;
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let logger = Arc::clone(&logger);
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        logger.log(
+                            AuditEvent::new(
+                                format!("worker-{t}"),
+                                AuditAction::Read,
+                                format!("m{i}"),
+                                AuditDecision::Allow,
+                            )
+                            .with_timestamp(1_700_000_000_000),
+                        );
+                    }
+                });
+            }
+        });
+        logger.flush();
+
+        let events = read_events(&path).unwrap();
+        assert_eq!(
+            events.len(),
+            THREADS * PER_THREAD,
+            "every event must reach the file"
+        );
+        crate::audit::model::verify_hash_chain(&events).expect(
+            "a log written by concurrent callers must verify; a chain that does \
+             not is indistinguishable from a tampered one",
+        );
+    }
+
+    /// Lets a test keep a handle on a sink the logger owns.
+    struct MemoryHandle(Arc<MemorySink>);
+
+    impl AuditSink for MemoryHandle {
+        fn emit(&self, event: &AuditEvent) -> Result<()> {
+            self.0.emit(event)
+        }
+        fn flush(&self) -> Result<()> {
+            self.0.flush()
+        }
+    }
+
+    /// A sink that accepts `fail_after` events and then refuses every one.
+    #[derive(Debug)]
+    struct BudgetedSink {
+        fail_after: std::sync::atomic::AtomicUsize,
+        durable: bool,
+    }
+
+    impl AuditSink for BudgetedSink {
+        fn emit(&self, _event: &AuditEvent) -> Result<()> {
+            use std::sync::atomic::Ordering;
+            if self.fail_after.load(Ordering::SeqCst) == 0 {
+                return Err(AuditError::Serialization("disk full".into()));
+            }
+            self.fail_after.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_durable(&self) -> bool {
+            self.durable
+        }
+    }
+
+    /// **An event that reaches no durable sink must not advance the chain.**
+    ///
+    /// It did, so an event the file never received still became the
+    /// `prev_hash` of the next one — and every later verification of that
+    /// file failed, reporting a full disk as *tampering*, for ever. The
+    /// dropped event is gone either way; what this decides is whether the
+    /// events after it stay checkable.
+    #[test]
+    fn a_dropped_event_does_not_break_the_chain_for_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        let logger = AuditLogger::new();
+        logger.add_sink(Box::new(FileSink::open(&path, true).unwrap()));
+        // Fails from the third event on, and it is the only *other* durable
+        // sink — so events 3.. reach the file but not this one, which is the
+        // partial-failure case the chain must survive.
+        let failing = Box::new(BudgetedSink {
+            fail_after: std::sync::atomic::AtomicUsize::new(2),
+            durable: false,
+        });
+        logger.add_sink(failing);
+
+        for i in 0..5 {
+            logger.log(
+                AuditEvent::new(
+                    "alice",
+                    AuditAction::Read,
+                    format!("m{i}"),
+                    AuditDecision::Allow,
+                )
+                .with_timestamp(1_700_000_000_000),
+            );
+        }
+        logger.flush();
+
+        let events = read_events(&path).unwrap();
+        assert_eq!(events.len(), 5, "the file sink accepted every event");
+        crate::audit::model::verify_hash_chain(&events)
+            .expect("a non-durable sink failing must not touch the chain");
+    }
+
+    /// The same question when **no** durable sink accepts the event.
+    #[test]
+    fn the_chain_skips_an_event_no_durable_sink_took() {
+        let logger = AuditLogger::new();
+        let memory = Arc::new(MemorySink::new(100));
+        logger.add_sink(Box::new(MemoryHandle(Arc::clone(&memory))));
+        logger.add_sink(Box::new(BudgetedSink {
+            fail_after: std::sync::atomic::AtomicUsize::new(2),
+            durable: true,
+        }));
+
+        for i in 0..5 {
+            logger.log(
+                AuditEvent::new(
+                    "alice",
+                    AuditAction::Read,
+                    format!("m{i}"),
+                    AuditDecision::Allow,
+                )
+                .with_timestamp(1_700_000_000_000),
+            );
+        }
+
+        // The memory sink saw all five, but the chain only links the two the
+        // durable sink accepted plus the ones after — so verifying the
+        // *durable* subset is what must hold. Here: events 0 and 1 landed,
+        // 2..5 did not, and each of those left the chain where it was.
+        let seen = memory.events();
+        assert_eq!(seen.len(), 5);
+        assert_eq!(
+            seen[2].prev_hash, seen[3].prev_hash,
+            "two events that reached no durable sink must hang from the same link"
+        );
+        assert_eq!(
+            seen[1].event_hash.as_deref(),
+            seen[2].prev_hash.as_deref(),
+            "the first dropped event still links to the last one that landed"
+        );
     }
 
     // ── MemorySink tests ────────
@@ -850,9 +1089,9 @@ mod tests {
         // Log both allow and deny
         logger.log(make_event(AuditAction::Write, AuditDecision::Allow));
         logger.log(make_event(AuditAction::Write, AuditDecision::Deny));
-        logger.log(make_event(AuditAction::LoginSuccess, AuditDecision::Allow));
+        logger.log(make_event(AuditAction::LoginFailure, AuditDecision::Allow));
         logger.log(make_event(AuditAction::LoginFailure, AuditDecision::Deny));
-        logger.log(make_event(AuditAction::KeyRotation, AuditDecision::Allow));
+        logger.log(make_event(AuditAction::ApiKeyCreate, AuditDecision::Allow));
 
         assert_eq!(mem.len(), 5);
         let denied = mem.query_by_decision(AuditDecision::Deny);

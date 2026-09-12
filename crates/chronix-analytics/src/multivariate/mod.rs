@@ -51,7 +51,7 @@ pub use correlation::{
 };
 pub use derived::{
     ArithOp, ArithmeticExpr, DerivedSeriesDefinition, DerivedSeriesEngine, DerivedSeriesExpr,
-    LazyDerivedSeries,
+    LazyDerivedSeries, LogReturnExpr, RollingStat, RollingStatExpr,
 };
 pub use error::MultivariateError;
 pub use mv_anomaly::{

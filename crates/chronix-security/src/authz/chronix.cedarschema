@@ -1,0 +1,86 @@
+// The Chronix authorization model, as a Cedar schema.
+//
+// It is compiled into the binary and loaded by `AuthzEngine::new()`, so every
+// policy `chronixd` accepts is validated against it and a policy that names
+// something this server never asks about is a **startup error** rather than a
+// rule that quietly never matches.
+//
+// That is not a hypothetical failure. The security guide shipped policies
+// written against `Action::"Query"`, `Group::"platform-team"` and an
+// unqualified `Namespace::"team-platform"` — none of which exists — and with
+// no schema loaded Cedar accepted every one of them. A `permit` that never
+// permits reads as a lockout; a `forbid` that never forbids reads as
+// protection.
+//
+// ── The unit of authorization is the namespace ──────────────────────────
+//
+// Chronix isolates tenants by namespace everywhere: points carry a
+// `__namespace__` tag, SQL sessions are built per namespace, quotas and usage
+// are counted per namespace, and a credential is bound to a set of them.
+// Policies are written against that same unit, so an authorization decision
+// and the storage that enforces it cannot disagree.
+//
+// There is deliberately no `Measurement` resource. Adding a second, finer
+// unit that only the policy layer understands means every one of the ~40
+// routes has to remember to ask about it, and the ones that forget read as
+// protected — which is the failure mode this whole file exists to prevent.
+// A measurement axis would need every read surface to name its measurements,
+// and two of them cannot today without new work: SQL would have to walk the
+// logical plan for table scans, and PromQL to resolve selector metric names.
+// Nobody has asked for it.
+
+namespace Chronix {
+    // A named role. Membership is a parent edge on `User`, so
+    // `principal in Chronix::Role::"..."` is the normal way to write a policy.
+    entity Role;
+
+    // An authenticated identity: an API key's name, a JWT subject, or an
+    // mTLS certificate CN. Roles come from the key's `roles` list or from the
+    // JWT claim named by `auth.jwt.role_claim`.
+    entity User in [Role] = {
+        "name": String,
+    };
+
+    // A tenant. `resource == Chronix::Namespace::"prod"` in a policy; the
+    // request carries the namespace the caller resolved to.
+    entity Namespace = {
+        "name": String,
+    };
+
+    // The server itself — the resource of every administrative action.
+    // A singleton: `Chronix::System::"chronix"`.
+    entity System = {
+        "name": String,
+    };
+
+    // ── Data-plane actions ──────────────────────────────────────────────
+    // Issued by the namespace gate, which every request that touches data
+    // passes through — HTTP, gRPC and Flight SQL alike. For HTTP the method
+    // decides: a read is `Read`, a `DELETE` is `Delete`, anything else is
+    // `Write`; each gRPC and Flight RPC names its own.
+    //
+    // Health, readiness, the metrics scrape, the OpenAPI document and the
+    // administrative routes are outside this gate: the first four carry no
+    // tenant rows, and an administrative request is governed by its
+    // capability below rather than by a namespace it does not have.
+    action Read, Write, Delete
+        appliesTo {
+            principal: [User],
+            resource: [Namespace],
+        };
+
+    // ── Administrative actions ──────────────────────────────────────────
+    // `Admin` is a **group**, never a request: no route asks for it, so a
+    // policy naming it has to say `action in Chronix::Action::"Admin"`, which
+    // is what grants every administrative capability at once. Granting one
+    // capability is `action == Chronix::Action::"ManageBackups"`.
+    action Admin;
+
+    action ManageKeys, ManageBackups, ManageConfig, ManageModels,
+           ManageNamespaces, ManageNodes, ManageRegions, ManageCluster,
+           ViewCluster in [Admin]
+        appliesTo {
+            principal: [User],
+            resource: [System],
+        };
+}

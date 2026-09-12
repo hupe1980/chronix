@@ -10,7 +10,7 @@ use parking_lot::{Condvar, Mutex};
 
 use chronix_core::{FsyncPolicy, WalConfig, WalError};
 
-use crate::wal::sink::WalSink;
+use crate::wal::sink::{DurableFile, WalSink};
 use crate::wal::{
     WalRecordType, WAL_HEADER_SIZE, WAL_MAGIC, WAL_PAYLOAD_VERSION, WAL_RECORD_HEADER_SIZE,
     WAL_VERSION,
@@ -829,7 +829,7 @@ impl WalWriter {
                 .write(true)
                 .create(false)
                 .open(&inner.current_path)?;
-            WalSink::set_len(&file, good)?;
+            DurableFile::set_len(&file, good)?;
             let mut w = BufWriter::with_capacity(WAL_BUF_CAPACITY, Self::sink(file));
             w.seek(io::SeekFrom::Start(good))?;
             Ok(w)
