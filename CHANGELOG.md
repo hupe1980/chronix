@@ -98,6 +98,13 @@ and no migration tooling for the on-disk format.
   Numerical Recipes' `gcf` with magnitude guards, pinned against
   `scipy.stats.chi2.sf` at 84 points across both branches;
   `f_distribution_sf` is pinned at 288 against `scipy.stats.f.sf` beside it.
+- **The nightly fuzz job had never run.** `fuzz/` is its own build — nightly,
+  sanitizer instrumentation, its own `RUSTFLAGS` — but its manifest declared
+  no `[workspace]` and the root listed it in neither `members` nor `exclude`,
+  which cargo refuses outright. Every scheduled run failed before compiling a
+  line. The three targets now build and run; `preflight.sh` builds them when
+  a nightly toolchain and `cargo-fuzz` are present, so the next such breakage
+  is caught before the schedule.
 - **ARIMA estimated mixed models wrongly.** `ArimaModel` held its
   autoregressive block at the Burg seed and optimised only the moving-average
   coefficients against it — and a Burg AR fitted to mixed ARMA data is biased,
