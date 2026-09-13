@@ -7,6 +7,16 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# Its own workspace, deliberately. `cargo fuzz` builds this package on
+# nightly with sanitizer instrumentation and its own `RUSTFLAGS`; folding it
+# into the root workspace would put `libfuzzer-sys` in `cargo build
+# --workspace` and make the product build need nightly.
+#
+# Without this table cargo refuses outright — "current package believes it's
+# in a workspace when it's not" — so every scheduled run of `fuzz.yml` failed
+# before it compiled anything.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 chronix-encoding = { path = "../crates/chronix-encoding" }

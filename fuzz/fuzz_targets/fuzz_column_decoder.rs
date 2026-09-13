@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use chronix_encoding::{ColumnDecoder, DecodedColumn, EncodedBlock, EncodingType};
+use chronix_encoding::{ColumnDecoder, EncodedBlock, EncodingType};
 
 fuzz_target!(|data: &[u8]| {
     // 1. Try `decode_bytes` on raw input.

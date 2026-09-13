@@ -45,6 +45,15 @@ step "unused dependencies"         cargo machete
 step "formatting"                  cargo fmt --all --check
 step "clippy"                      cargo clippy --all-targets -- -D warnings
 
+# The embedded build, without DataFusion. `sql` is on by default everywhere
+# else, so a `#[cfg(feature = "sql")]` that stops compiling — or a test that
+# reaches `chronix::sql` without declaring `required-features` — is invisible
+# to every step above. That is not hypothetical: it is how
+# `analytics_null_semantics` reached CI, where this is the line that caught
+# it. `--all-targets`, because the test targets are the half that broke.
+step "embedded build (no sql)"     cargo clippy -p chronix --no-default-features \
+                                       --all-targets -- -D warnings
+
 # `cargo doc` is its own gate: an intra-doc link resolves against the item
 # tree, which neither `check` nor `clippy` walks.
 step "rustdoc links"               env RUSTDOCFLAGS="-D warnings" \
@@ -70,6 +79,22 @@ if [ "$QUICK" -eq 0 ]; then
         for f in crates/chronix/examples/*.rs; do
             cargo run -q -p chronix --all-features --example "$(basename "$f" .rs)" >/dev/null
         done'
+
+    # `fuzz/` is its own workspace on nightly, so nothing else in this script
+    # or in the pull-request CI ever compiles it — and `fuzz.yml` runs on a
+    # schedule, where a failure blocks no one and is seen by no one. It had
+    # been failing every night before it compiled a line: the package
+    # declared no `[workspace]` and was in neither `members` nor `exclude`,
+    # which cargo refuses outright. Building is enough to catch that class;
+    # actually fuzzing stays on the schedule where it belongs.
+    step "fuzz targets build" bash -c '
+        if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
+            echo "   skipped: no nightly toolchain"; exit 0
+        fi
+        if ! command -v cargo-fuzz >/dev/null; then
+            echo "   skipped: cargo-fuzz not installed"; exit 0
+        fi
+        cargo +nightly fuzz build >/dev/null'
 fi
 
 printf '\n'

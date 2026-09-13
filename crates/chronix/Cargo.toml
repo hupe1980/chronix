@@ -184,6 +184,10 @@ name = "sql_analytics_functions"
 required-features = ["sql"]
 
 [[test]]
+name = "analytics_null_semantics"
+required-features = ["sql"]
+
+[[test]]
 name = "sql_scan_streaming"
 required-features = ["sql"]
 

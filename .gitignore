@@ -54,3 +54,9 @@ sdks/python/build/
 # Editor state is the developer's, not the project's.
 .vscode/
 .idea/
+
+# cargo-fuzz working state. `fuzz/Cargo.lock` is committed, because a fuzz
+# run is only reproducible if its dependency versions are.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
