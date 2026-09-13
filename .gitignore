@@ -51,6 +51,6 @@ sdks/python/dist/
 sdks/python/build/
 *.egg-info/
 
-# Isolated build directory for full verification runs, so a running
-# rust-analyzer cannot clobber them (see CONTRIBUTING.md).
-target-ci
+# Editor state is the developer's, not the project's.
+.vscode/
+.idea/

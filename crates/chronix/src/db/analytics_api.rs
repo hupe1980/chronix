@@ -64,7 +64,7 @@ impl Chronix {
                 Some(Ok(model)) => model,
                 Some(Err(e)) => return Err(DbError::Internal(e.to_string())),
                 None => {
-                    return Err(DbError::Internal(format!(
+                    return Err(DbError::InvalidRequest(format!(
                         "forecast: unknown model {name:?}; expected one of \"ses\", \"holt\", \
                          \"holt_winters\", \"arima\", \"sarima\", \"linear_regression\", \
                          or a name registered with the model registry"
@@ -155,7 +155,20 @@ impl Chronix {
             ));
         }
 
+        // The name is refused if it is not one this database has, exactly as
+        // `forecast` refuses an unknown model one function above. It used to
+        // fall through to a z-score and say nothing, so `"modified-zscore"` —
+        // a plausible typo for the *median/MAD* detector, which is chosen
+        // precisely because it is robust to the outliers a mean and standard
+        // deviation are not — returned mean-based scores under
+        // `method: ZScore`.
+        //
+        // `"zscore"` needs a branch of its own now. It never had one: it is
+        // the first name in `AnomalyConfig::method`'s documented list and it
+        // reached its detector only by falling through the same arm that
+        // swallowed the typos, which is why nobody noticed the arm.
         let mut detector: Box<dyn AnomalyDetector> = match cfg.method.as_deref() {
+            Some("zscore") | None => Box::new(ZScoreDetector::new(Some(cfg.threshold))),
             Some("iqr") => Box::new(IqrDetector::new(Some(cfg.threshold))),
             Some("modified_zscore") => Box::new(ModifiedZScoreDetector::new(Some(cfg.threshold))),
             Some("dynamic_threshold") => Box::new(DynamicThresholdDetector::new(
@@ -174,9 +187,15 @@ impl Chronix {
             {
                 Some(Ok(det)) => det,
                 Some(Err(e)) => return Err(DbError::Internal(e.to_string())),
-                None => Box::new(ZScoreDetector::new(Some(cfg.threshold))),
+                None => {
+                    return Err(DbError::InvalidRequest(format!(
+                        "detect_anomalies: unknown detector {name:?}; expected one of \
+                         \"zscore\", \"modified_zscore\", \"iqr\", \"dynamic_threshold\", \
+                         \"forecast_residual\", \"moving_average\", or a name registered \
+                         with the detector registry"
+                    )))
+                }
             },
-            None => Box::new(ZScoreDetector::new(Some(cfg.threshold))),
         };
 
         detector

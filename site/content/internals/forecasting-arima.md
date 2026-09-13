@@ -131,16 +131,23 @@ For the model to be valid:
 - **Stationarity**: all roots of $\Phi(B) = 0$ must lie outside the unit circle
 - **Invertibility**: all roots of $\Theta(B) = 0$ must lie outside the unit circle
 
-The Burg algorithm guarantees a stable AR polynomial by construction, which is
-why it is used to seed the search.
+Both hold **by construction**, through the parameterisation rather than
+through bounds. The optimiser searches unconstrained reals; `tanh` maps each
+to a partial autocorrelation in \((-1, 1)\), and the Levinson–Durbin
+recursion turns a sequence of those into a polynomial whose roots all lie
+outside the unit circle — for any order. This is Jones (1980), and it is what
+`statsmodels`' `enforce_stationarity` and `enforce_invertibility` do.
 
-Invertibility is enforced by the **objective**, not the bounds. The ±0.99 box
-on each MA coefficient is sufficient only for \(q = 1\) — \(\theta = (0.99,
--0.99)\) is inside it and \(1 + 0.99z - 0.99z^2\) has a root at \(|z| \approx
-0.62\) — but the CSS error recursion diverges outside the invertible region,
-so the optimiser does not go there. Measured across 612 fits at \(q \ge 2\):
-none non-invertible, closest \(|z| = 1.069\), unchanged when the bounds are
-widened to ±5.0. Checked by `a_fitted_ma_polynomial_is_invertible`.
+Bounding each coefficient instead would be neither sufficient nor necessary:
+\(\varphi = (0.99, 0.012)\) lies inside ±0.99 and \(1 - 0.99z - 0.012z^2\) has a
+root at \(|z| = 0.9985\), while \(\varphi = (1.2, -0.4)\) is stationary and
+outside it.
+
+Burg seeds the AR block — it returns a stable polynomial and behaves well on
+short series — and the search then moves every block. Checked by
+`every_fitted_polynomial_is_stable` with the Schur–Cohn criterion rather than
+root-finding, because the interesting fits sit within \(10^{-4}\) of the
+boundary.
 
 ---
 
@@ -209,4 +216,4 @@ Chronix mitigates this through:
 | Sensitive to outliers | Pre-process with anomaly detection |
 | Expensive for large *s* | Limit seasonal period; use Fourier terms |
 | Requires ≥ 2 full seasons | Fall back to Holt or SES for short series |
-| CSS is less efficient than exact likelihood on short series | Accepted; a Kalman-filter likelihood is post-1.0 |
+| CSS is less efficient than exact likelihood on short series | Seed with Burg, which behaves well when observations are few |

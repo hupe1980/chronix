@@ -52,6 +52,9 @@ toml = { workspace = true }
 serde_json = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# Test-only: the config structs are `deny_unknown_fields`, and that is only a
+# guarantee if something parses a file that sets a key they do not have.
+toml = { workspace = true }
 
 [lints]
 workspace = true

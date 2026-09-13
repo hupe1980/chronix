@@ -473,3 +473,79 @@ async fn auto_forecast_selects_a_better_model_than_ses_and_is_layout_independent
         );
     }
 }
+
+/// `stl_*` takes an optional `robust` flag, and it does what it says.
+///
+/// A metrics database sees spikes as a matter of course — a restart, a scrape
+/// backfilled as one enormous sample, a sensor returning its error sentinel —
+/// and without robustness weights the cycle-subseries smoother spreads one of
+/// them across every cycle, because it lands in the same season of each.
+#[tokio::test]
+async fn stl_robust_keeps_a_spike_out_of_the_seasonal_component() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ChronixConfig::builder()
+        .data_dir(dir.path())
+        .build()
+        .unwrap();
+    let db = Arc::new(Chronix::open(config).unwrap());
+    let key = SeriesKey::new("m", tags! { "host" => "a" }).unwrap();
+    let n = 240usize;
+    let mut points = Vec::new();
+    let mut seed = 9u64;
+    let mut noise = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        ((seed >> 33) as f64 / f64::from(u32::MAX >> 1)) - 1.0
+    };
+    for i in 0..n {
+        let mut v = 100.0
+            + 0.5 * i as f64
+            + 10.0 * (i as f64 * std::f64::consts::TAU / 12.0).sin()
+            + noise();
+        if i == 120 {
+            v += 200.0;
+        }
+        points
+            .push(Point::new(key.clone(), fields! { "v" => v }, i as i64 * 1_000_000_000).unwrap());
+    }
+    let _ = db.insert_batch(&points).unwrap();
+    db.flush().unwrap();
+    let ctx = chronix::sql::create_session_context(db);
+
+    let amplitude = |s: &[Option<f64>]| {
+        let mid: Vec<f64> = s[n / 4..3 * n / 4].iter().filter_map(|v| *v).collect();
+        (mid.iter().copied().fold(f64::MIN, f64::max)
+            - mid.iter().copied().fold(f64::MAX, f64::min))
+            / 2.0
+    };
+
+    let plain = f64s(
+        &ctx,
+        "SELECT stl_seasonal(v, 12) OVER (PARTITION BY host ORDER BY _time) FROM m",
+    )
+    .await;
+    let robust = f64s(
+        &ctx,
+        "SELECT stl_seasonal(v, 12, true) OVER (PARTITION BY host ORDER BY _time) FROM m",
+    )
+    .await;
+
+    // The true seasonal amplitude is 10. One spike inflates the plain
+    // estimate threefold; the robust fit is close to the truth.
+    let (p, r) = (amplitude(&plain), amplitude(&robust));
+    assert!(
+        p > 20.0,
+        "the spike should distort the plain fit, got {p:.3}"
+    );
+    assert!(
+        (r - 10.0).abs() < 2.0,
+        "robust amplitude {r:.3}, expected close to 10 (plain was {p:.3})"
+    );
+
+    // The flag is optional and defaults to off.
+    let default_off = f64s(
+        &ctx,
+        "SELECT stl_seasonal(v, 12, false) OVER (PARTITION BY host ORDER BY _time) FROM m",
+    )
+    .await;
+    assert_eq!(plain, default_off);
+}

@@ -55,6 +55,15 @@
 //! Within 0.x none of this is frozen; a breaking change bumps the minor
 //! (`CONTRIBUTING.md`). `public_api` pins the tier-1 surface so that a change
 //! to it is a deliberate edit rather than a side effect.
+//!
+//! What actually changed in a release is in the
+//! [changelog](https://github.com/hupe1980/chronix/blob/main/CHANGELOG.md).
+//! The link is absolute and it is *here*, on the crate's own front page,
+//! because this is the page a reader lands on after `cargo update` moved
+//! them a minor version. There is one changelog and it lives at the
+//! repository root: `cargo package` includes nothing from outside a package
+//! directory, so a copy inside this crate would be a second changelog to
+//! keep true rather than a copy that stays true.
 
 #![warn(missing_docs)]
 #![deny(unsafe_code)]

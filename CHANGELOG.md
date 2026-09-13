@@ -6,6 +6,178 @@ per [CONTRIBUTING.md](CONTRIBUTING.md), a breaking change bumps the minor
 version and a fix bumps the patch — there is no stability promise before 1.0,
 and no migration tooling for the on-disk format.
 
+## [0.6.0] - 2026-09-13
+
+### Added
+
+- **`scripts/check-docs.sh` checks that every `pub` field of a config struct
+  is read.** The existing check asks the question from the documentation's
+  side — of the keys a TOML block shows, which does no code read? — and a
+  field can be absent from the documentation and still be accepted from a
+  file, which is exactly how the four settings above survived. The
+  discriminator is field *access*, so a setting translated into an engine
+  value inside its own config module still counts as read.
+- **`Chronix::rollup_where(name, start, end, tags)`** — the rollup view
+  restricted to the series matching `tags`, asked for by the `hems` design
+  partner: without it a caller reads every tag group and discards all but one,
+  which is bounded for a handful of measurement points and a whole-group-set
+  materialisation for anyone with real cardinality. `rollup()` is unchanged
+  and delegates to it.
+
+  Every key must be one of the rollup's `group_by_tags`, and anything else is
+  refused by name. The target measurement carries only the tags the rollup
+  grouped by, so a filter on any other key would narrow the live half — read
+  from the source, which still has every tag — and match nothing in the
+  materialised half, giving an answer short on one side of the watermark and
+  whole on the other.
+- **Robust STL** — `StlConfig::robust()`, and an optional `robust` flag on
+  `stl_trend`, `stl_seasonal`, `stl_residual` and `stl_decompose` in SQL. It
+  runs Cleveland et al. (1990) §4.3's outer loop, reweighting each point by a
+  bisquare of its residual so an outlier stops pulling on the fit. The case
+  for it is ordinary in a metrics database: a restart, a scrape backfilled as
+  one enormous sample, a sensor returning its error sentinel. Without it one
+  such point is spread across the *whole* seasonal component — the
+  cycle-subseries smoother sees it in the same season of one cycle — and took
+  the seasonal amplitude of a 10-unit cycle to 33.7. Default off, as in R's
+  `stl` and statsmodels' `STL`; it costs about eleven times the iterations.
+  `StlConfig::low_pass_window` and `with_outer_iterations` are new beside it.
+- **`chronix/tests/analytics_null_semantics.rs`** — every analytics window
+  function driven with a gap mid-partition, with the list taken from the
+  session's own registry, so a new kernel cannot be added without saying what
+  it answers across one.
+
+### Fixed
+
+- **STL decomposition lost 11–22 % of the seasonal amplitude, and invented a
+  seasonal component for a straight line.** Three defects compounded.
+  `loess_smooth` returned the plain mean whenever its window covered the data
+  — a degree-1 local regression silently becoming degree-0. The seasonal
+  window defaulted to `max(7, period)`, reading a quantity measured in
+  **cycles** as if it were measured in samples: the cycle-subseries smoother
+  runs along one point per cycle, so seven days of hourly data with a daily
+  cycle asked for a 25-point smoother over a 7-point subseries. And the
+  low-pass filter padded by copying the first and last cycle, which is correct
+  only for a series that is already periodic. Consequences: any series with
+  fewer cycles than its period lost amplitude into the trend, and the straight
+  line `1000 + 37i` — whose seasonal component is exactly zero — came out with
+  a seasonal swing of 278, which the seasonal-strength measure read as 0.81
+  against a 0.64 threshold, so `auto_forecast` **seasonally differenced every
+  counter it was shown**.
+
+  Now Cleveland et al. (1990) as the paper specifies it: the cycle-subseries
+  smoother is extended one cycle beyond either end by evaluating its own loess
+  at `−1` and at `len`, and the low-pass is `MA(p) → MA(p) → MA(3) →
+  loess(n_l)` in valid mode, which consumes exactly the `2p` points the
+  extension added. `StlConfig::seasonal_window` is in **cycles** and defaults
+  to 7, matching R's `stl` and statsmodels' `STL`; `low_pass_window` is new.
+  Components match statsmodels' `STL` to three decimals.
+- **A NULL nulled the rest of its partition in every rolling analytics
+  function.** `rolling_mean`, `rolling_std`, `rolling_corr` and `ewm` folded
+  the missing value into a sliding accumulator, so one gap made every later
+  row NULL — and an exact recompute every 1024 steps then silently healed it,
+  which made the damage *length* depend on where the gap fell. `zscore`
+  nulled the whole partition from one gap. The `stl_*` kernels *removed* the
+  row, shifting every row after it into the previous season. And
+  `multivariate_anomaly` scored a row with no observation `0.0` — the
+  distribution's exact centre, the most normal answer it has.
+
+  One rule now: a NULL is a missing **sample**, not a missing row. It is
+  excluded from every statistic, and a row still gets an answer wherever one
+  can be computed from samples that exist — so `rolling_*`, `ewm`,
+  `correlation` and `cross_correlation` answer at a gap row from the samples
+  around it, exactly as `AVG(v) OVER (ROWS n PRECEDING)` does, while `diff`,
+  `pct_change`, `zscore`, `anomaly_score`, `multivariate_anomaly` and the
+  `stl_*` family are NULL there. All seven rolling and smoothing functions now
+  match pandas exactly on input containing NULLs.
+- **`ljung_box` reported a p-value 11 % wrong.** The Q statistic was exact;
+  the χ² survival function under it was not. `gamma_cf` carried the partial
+  numerators of the continued fraction for the incomplete *beta* function
+  against the incomplete *gamma*'s denominators, and guarded with
+  `x.max(tiny)`, which turns a legitimate negative denominator into `+1e-30`.
+  Only the tail branch was affected — the half where p-values live. Now
+  Numerical Recipes' `gcf` with magnitude guards, pinned against
+  `scipy.stats.chi2.sf` at 84 points across both branches;
+  `f_distribution_sf` is pinned at 288 against `scipy.stats.f.sf` beside it.
+- **ARIMA estimated mixed models wrongly.** `ArimaModel` held its
+  autoregressive block at the Burg seed and optimised only the moving-average
+  coefficients against it — and a Burg AR fitted to mixed ARMA data is biased,
+  because the MA term drags the lag-1 autocorrelation away from φ. On 2 000
+  points of `x = 0.6x[t-1] + e - 0.4e[t-1]` it returned φ = 0.22, θ = -0.02
+  where the maximum likelihood is 0.571 and -0.367. Pure AR and pure MA were
+  unaffected, which is why it went unnoticed: those are the two orders with
+  nothing to interact with, and `auto_forecast` searches the mixed ones.
+
+  Every block is now refined together, by the same `minimise_css` that
+  `SarimaModel` already used. Estimates match `statsmodels`' maximum
+  likelihood to four decimals on AR(1), MA(1), ARMA(1,1) and ARIMA(1,1,1).
+- **A fitted ARIMA could be non-stationary, and the forecast then diverged.**
+  What kept the AR polynomial stable was the Burg seed, not the ±0.99 box on
+  each coefficient — so once the optimiser could move that block, 21 of 80
+  fits on a random walk landed outside the stable region, `φ = (0.99, 0.012)`
+  with a root at 0.9985. The box was excluding legitimate models at the same
+  time: `φ = (1.2, -0.4)` is an ordinary stationary AR(2) it cannot represent.
+
+  Stationarity and invertibility now hold **by construction**: the optimiser
+  searches unconstrained reals and the Jones (1980) reparameterisation maps
+  them through partial autocorrelations to a polynomial whose roots lie
+  outside the unit circle for any order — as `statsmodels`'
+  `enforce_stationarity` does. Estimates are unchanged where the box was not
+  binding.
+- **Naming a rollup wrong was a `500`.** `create_rollup` collapsed every
+  `RollupError` into `DbError::Internal`, so `AlreadyExists` arrived as
+  `Internal("rollup registration failed: rollup 'x' already exists")` — a
+  redacted `500` on the wire, and a string match for anyone trying to tell
+  "already there" from "failed". Declaring a tier on every start is idempotent
+  by nature, because the registry is persisted and every run after the first
+  meets its own rollup, so the conflict is a *normal* path. Re-derived from
+  the report, the mirror case was the same: a rollup name that does not exist
+  was also `Internal`. `DbError::NotFound` and `DbError::Conflict` are new and
+  render `404` and `409`. Reported by the `hems` design partner.
+- **A malformed series key and an unknown model or detector were `500`s too.**
+  Found by asking the same question of the rest of the facade: `invalid series
+  key` on the query and delete paths, and `forecast: unknown model` /
+  `detect_anomalies: unknown detector`, were all `DbError::Internal`. They are
+  the caller's input and are now `InvalidRequest` — `400`, with the message
+  intact rather than redacted.
+- **An unknown anomaly detector name silently became a z-score.**
+  `detect_anomalies()` matched five detector names and fell through to
+  `ZScoreDetector` for anything else, so `method: Some("modified-zscore")` — a
+  plausible typo for the *median/MAD* detector, chosen precisely because it is
+  robust to the outliers a mean and standard deviation are not — returned
+  mean-based scores labelled `method: ZScore`, with no error. `forecast()`,
+  one function above, already refused an unknown model by name and listed the
+  valid ones; two implementations of one promise, and only one was checked.
+  Now both refuse.
+
+  The fallback was load-bearing, which is why it survived: `"zscore"` is the
+  first name in `AnomalyConfig::method`'s documented list and had no branch of
+  its own — it reached its detector only through the same arm that swallowed
+  the typos. `preprocess()` was already immune, taking enums rather than
+  strings.
+- **`rolling_std(v, 1)` returned `0.0`.** A *sample* standard deviation of one
+  observation divides by `n - 1 = 0` and is undefined; `0.0` asserts that a
+  single reading has been observed not to vary. Now NULL, as pandas'
+  `.rolling(1).std()` and `numpy.std(ddof=1)` both answer.
+
+### Removed
+
+- **Four `[analytics]` settings that were accepted from a config file and read
+  by nothing**: `default_forecast_model`, `default_anomaly_method`,
+  `default_confidence_level` and `default_anomaly_threshold`. Each had a serde
+  default and a validated type, so `default_confidence_level = 0.99` loaded,
+  validated and produced 0.95 for ever.
+
+  There was no surface for them to reach. The analytics API is the embedded
+  Rust one — `ForecastConfig { model, confidence, … }` and
+  `AnomalyConfig { method, threshold, … }`, passed per call — and `chronixd`
+  serves no forecasting or anomaly endpoint at all, while SQL splits the
+  choice across two named functions (`forecast()` is SES, `auto_forecast()`
+  chooses) and returns point values rather than intervals. A deployment-wide
+  default had nothing to default. Under `deny_unknown_fields` a file setting
+  one is now refused rather than silently ignored. **Breaking** for any config
+  file that sets them. `[analytics]` is `max_forecast_horizon` and
+  `max_training_points`, both enforced.
+
 ## [0.5.0] - 2026-09-12
 
 ### Added

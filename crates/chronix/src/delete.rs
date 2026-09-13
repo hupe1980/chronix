@@ -88,7 +88,7 @@ impl DeleteRequest {
         }
         let tags: BTreeMap<String, String> = self.tag_filters.iter().cloned().collect();
         let key = SeriesKey::new(&self.measurement, tags)
-            .map_err(|e| DbError::Internal(format!("Invalid series key: {e}")))?;
+            .map_err(|e| DbError::InvalidRequest(format!("invalid series key: {e}")))?;
         Ok(Some(key))
     }
 }

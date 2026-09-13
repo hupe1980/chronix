@@ -98,6 +98,17 @@ grep -qF 'blob/main/CHANGELOG.md' README.md \
   || note "README.md must link to CHANGELOG.md by absolute URL — a relative \
 link resolves on GitHub and 404s on crates.io and docs.rs, which is where a \
 consumer of the published crate reads it"
+# The README is the **crates.io** front page. docs.rs renders the crate's own
+# rustdoc, and that is where a reader lands after `cargo update` moved them a
+# minor version — so the link has to be in `lib.rs` too. The design partner
+# reported this as "the changelog is not in the published tarball", which is
+# true, deliberate and not the fixable part: `cargo package` includes nothing
+# from outside a package directory. What was fixable is that the crate's own
+# front page linked it nowhere. A guard's scope is part of its question, and
+# this one's scope was one file short.
+grep -qF 'blob/main/CHANGELOG.md' crates/chronix/src/lib.rs \
+  || note "crates/chronix/src/lib.rs must link CHANGELOG.md by absolute URL — \
+docs.rs renders this file, not the README"
 for extra in $(find crates -name CHANGELOG.md 2>/dev/null); do
   note "$extra: there is one changelog, at the repository root"
 done
@@ -291,6 +302,43 @@ for page in site/content/docs/*.md; do
             | { grep -vE 'src/config\.rs$' || true; })
     if [ -z "$users" ]; then
       note "$page documents setting '$key', which no code outside a config module reads"
+    fi
+  done
+done
+
+# ── 12. Every setting a config struct accepts must be read ──────────────
+# Check 11 asks the question from the documentation's side: of the keys a
+# TOML block shows, which does no code read? This asks it from the struct's
+# side, and the two are not the same set — a field can be absent from the
+# documentation and still be **accepted from a file**, because
+# `deny_unknown_fields` is what an operator reads as "this key works".
+#
+# `[analytics]` carried four of those: `default_forecast_model`,
+# `default_anomaly_method`, `default_confidence_level` and
+# `default_anomaly_threshold` each had a `#[serde(default)]`, a validated
+# type and no reader anywhere. A file could set
+# `default_confidence_level = 0.99`, be accepted, and get 0.95 for ever.
+# D132 had already decided to delete them and deleted seven of the eleven
+# settings it named — the four that survived are the four the compiler could
+# not miss, because an unused *struct field with a serde default* is no more
+# visible than an unused dependency (R53).
+#
+# The discriminator is **field access**, not mention. A field read only
+# inside its own config module — `self.database.shard_duration_secs`
+# converted to a `Duration` on the way to the engine builder — is read, and
+# check 11's "outside a config module" wording would call it dead. A field
+# nothing ever writes `.name` against is dead wherever it is declared.
+echo "checking that every configuration field is read…"
+for cfg in crates/*/src/config.rs; do
+  [ -f "$cfg" ] || continue
+  fields=$(grep -oE '^    pub [a-z_0-9]+:' "$cfg" | sed -E 's/^    pub //; s/:$//' | sort -u)
+  for field in $fields; do
+    # `|| true` inside the substitution, not after it: `grep` exits 1 when it
+    # finds nothing, which under `set -e` and `pipefail` ends the script —
+    # silently, and precisely on the field this check exists to report.
+    n=$({ grep -rhoE "\.${field}\b" crates/ --include='*.rs' 2>/dev/null || true; } | wc -l | tr -d ' ')
+    if [ "$n" -eq 0 ]; then
+      note "$cfg declares setting '$field', which nothing ever reads — a file may set it and be ignored"
     fi
   done
 done

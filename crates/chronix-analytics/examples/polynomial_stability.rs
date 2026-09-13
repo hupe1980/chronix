@@ -1,12 +1,24 @@
-//! Does a fitted MA polynomial ever land outside the invertible region?
+//! Does a fitted polynomial ever land outside the stable region?
 //!
-//! `estimate_ma` bounds each coefficient to ±0.99, which does **not** imply
-//! invertibility for `q > 1`: θ = (0.99, −0.99) is inside the box and
-//! `1 + 0.99B − 0.99B²` has a root at |z| ≈ 0.62. The question this answers
-//! is whether the optimiser ever *reaches* such a point — the CSS objective
-//! has its own reason not to, since the error recursion diverges there.
+//! It cannot: the optimiser searches unconstrained reals and the Jones (1980)
+//! reparameterisation maps them through partial autocorrelations in
+//! `(-1, 1)`, so every candidate is stationary and invertible by
+//! construction. This example is the **independent** check of that claim. It
+//! finds the roots directly, by Durand–Kerner, where
+//! `every_fitted_polynomial_is_stable` uses the Schur–Cohn criterion — two
+//! routes to the same verdict, which is worth more than one route run twice.
 //!
-//! Run with `cargo run -p chronix-analytics --example ma_invertibility`.
+//! It earns its keep on the inputs below rather than on the happy path: a
+//! constant series, an alternating ±1, one huge outlier, a pure trend, and
+//! over-differenced white noise — the textbook way to manufacture a
+//! non-invertible MA(1).
+//!
+//! A box on each coefficient is what this replaced, and it was neither
+//! sufficient nor necessary: θ = (0.99, −0.99) is inside ±0.99 while
+//! `1 + 0.99B − 0.99B²` has a root at |z| ≈ 0.62, and φ = (1.2, −0.4) is an
+//! ordinary stationary AR(2) the box cannot represent at all.
+//!
+//! Run with `cargo run -p chronix-analytics --example polynomial_stability`.
 use chronix_analytics::forecast::{ArimaModel, ForecastModel, ModelParams};
 
 /// Smallest |root| of `1 + θ₁z + … + θ_qz^q`, by Durand–Kerner.
@@ -80,7 +92,7 @@ fn min_root_modulus(theta: &[f64]) -> f64 {
 }
 
 fn main() {
-    // The claim in the header, checked directly.
+    // The two claims in the header, checked directly.
     let m = min_root_modulus(&[0.99, -0.99]);
     println!(
         "theta = (0.99, -0.99): min |root| = {m:.4}  (invertible: {})",
@@ -184,19 +196,28 @@ fn main() {
                 Err(e) => println!("  {name:<28} q={q}  fit refused: {e}"),
                 Ok(()) => {
                     if let ModelParams::Arima {
+                        ar_coeffs,
                         ma_coeffs,
                         residual_std,
                         ..
                     } = model.params()
                     {
                         let r = min_root_modulus(ma_coeffs);
-                        let verdict = if r > 1.0 {
-                            "invertible"
-                        } else {
+                        // The AR convention is `1 - Σφⱼzʲ`, the MA one is
+                        // `1 + Σθⱼzʲ`, so the same root finder answers for
+                        // both once the AR coefficients are negated.
+                        let negated: Vec<f64> = ar_coeffs.iter().map(|v| -v).collect();
+                        let a = min_root_modulus(&negated);
+                        let verdict = if r > 1.0 && a > 1.0 {
+                            "stable"
+                        } else if r <= 1.0 {
                             "NON-INVERTIBLE"
+                        } else {
+                            "NON-STATIONARY"
                         };
                         println!(
-                            "  {name:<28} q={q}  min|root|={r:>8.4}  sigma={residual_std:>10.3e}  {verdict}"
+                            "  {name:<28} q={q}  min|MA root|={r:>8.4}  min|AR root|={a:>8.4}  \
+                             sigma={residual_std:>9.3e}  {verdict}"
                         );
                     }
                 }

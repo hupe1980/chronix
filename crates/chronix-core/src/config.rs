@@ -130,49 +130,37 @@ impl Default for WalConfig {
 
 // ─── Analytics Configuration ────────────────────────────────────────
 
-/// Analytics engine configuration (forecasting, anomaly detection, preprocessing).
+/// Analytics engine configuration: the bounds on what one call may ask for.
 ///
 /// Configurable via TOML under the `[analytics]` section.
+///
+/// **Both fields are bounds, and that is the whole section on purpose.** The
+/// model, the detector, the confidence level and the threshold are arguments
+/// to the analytics API — `ForecastConfig` and `AnomalyConfig`, passed per
+/// call — and no deployment-wide default could reach them anyway: `chronixd`
+/// serves no forecasting or anomaly endpoint, and SQL splits the choice
+/// across two named functions.
+///
+/// Four `default_*` keys for exactly those once sat here with a serde
+/// default, a validated type and no reader. Their absence is load-bearing
+/// rather than tidy: `deny_unknown_fields` is the same mechanism that refuses
+/// a typo, so a key that parses reads as a key that works.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyticsConfig {
-    /// Default forecast model name (one of: ses, holt, `holt_winters`, arima, sarima, `linear_regression`).
-    #[serde(default = "default_forecast_model")]
-    pub default_forecast_model: String,
-    /// Default anomaly detection method (one of: zscore, `modified_zscore`, iqr, `forecast_residual`, `moving_average`, `dynamic_threshold`).
-    #[serde(default = "default_anomaly_method")]
-    pub default_anomaly_method: String,
-    /// Default confidence level for prediction intervals.
-    #[serde(default = "default_confidence")]
-    pub default_confidence_level: f64,
     /// Maximum forecast horizon in data points.
     #[serde(default = "default_max_horizon")]
     pub max_forecast_horizon: usize,
     /// Maximum number of training points fed to a model.
     #[serde(default = "default_max_training")]
     pub max_training_points: usize,
-    /// Default anomaly detection threshold (standard deviations).
-    #[serde(default = "default_anomaly_threshold")]
-    pub default_anomaly_threshold: f64,
 }
 
-fn default_forecast_model() -> String {
-    "ses".into()
-}
-fn default_anomaly_method() -> String {
-    "zscore".into()
-}
-fn default_confidence() -> f64 {
-    0.95
-}
 fn default_max_horizon() -> usize {
     8760
 }
 fn default_max_training() -> usize {
     1_000_000
-}
-fn default_anomaly_threshold() -> f64 {
-    3.0
 }
 fn default_max_query_result_bytes() -> usize {
     256 * 1024 * 1024 // 256 MB
@@ -190,12 +178,8 @@ fn default_future_write_tolerance() -> Duration {
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
-            default_forecast_model: default_forecast_model(),
-            default_anomaly_method: default_anomaly_method(),
-            default_confidence_level: default_confidence(),
             max_forecast_horizon: default_max_horizon(),
             max_training_points: default_max_training(),
-            default_anomaly_threshold: default_anomaly_threshold(),
         }
     }
 }
@@ -1015,6 +999,36 @@ impl ChronixConfigBuilder {
 
 #[cfg(test)]
 mod tests {
+    /// A setting the section does not act on is not a setting it accepts.
+    ///
+    /// `scripts/check-docs.sh` asks the same question of every config struct
+    /// in the tree — a `pub` field nothing ever writes `.name` against is a
+    /// key a file may set and be ignored on. This pins the consequence for
+    /// the four that were found that way.
+    #[test]
+    fn the_section_refuses_a_key_it_would_not_act_on() {
+        let ok: AnalyticsConfig =
+            toml::from_str("max_forecast_horizon = 100\nmax_training_points = 500\n")
+                .expect("the documented keys must load");
+        assert_eq!(ok.max_forecast_horizon, 100);
+        assert_eq!(ok.max_training_points, 500);
+
+        for key in [
+            "default_forecast_model = \"holt\"",
+            "default_anomaly_method = \"iqr\"",
+            "default_confidence_level = 0.99",
+            "default_anomaly_threshold = 4.0",
+        ] {
+            let err = toml::from_str::<AnalyticsConfig>(key)
+                .expect_err("a key the section does not act on must be refused")
+                .to_string();
+            assert!(
+                err.contains("unknown field"),
+                "`{key}` was refused for the wrong reason: {err}"
+            );
+        }
+    }
+
     use super::*;
 
     /// A TOML file may set only what it changes.

@@ -66,6 +66,8 @@ impl SeasonalDecomposer for StlDecomposer {
             n_iter: self.n_iter,
             trend_window: self.trend_window,
             seasonal_window: None,
+            low_pass_window: None,
+            outer_iter: 0,
         };
         stl_decompose(values, &config)
     }
@@ -98,11 +100,30 @@ pub struct StlConfig {
     /// Trend smoother window length — must be odd, ≥ 3.
     /// Default: `period + 1` (rounded up to next odd).
     pub trend_window: Option<usize>,
-    /// Seasonal subseries smoother window length — must be odd, ≥ 3.
-    /// Default: `max(7, period)` (rounded up to next odd).
-    /// R's STL defaults to at least 7; the previous hardcoded value of 3
-    /// was too small and allowed noise into the seasonal component.
+    /// Seasonal subseries smoother window length, in **cycles** — must be
+    /// odd, ≥ 7. Default: 7, as in Cleveland et al. (1990), R's `stl` and
+    /// statsmodels' `STL`.
     pub seasonal_window: Option<usize>,
+    /// Low-pass smoother window length — must be odd, ≥ 3.
+    /// Default: the smallest odd integer ≥ `period`.
+    pub low_pass_window: Option<usize>,
+    /// Number of **outer** iterations, which is what makes the fit robust to
+    /// outliers. `0` (the default) is the plain inner loop.
+    ///
+    /// Each outer pass reweights every point by Cleveland's bisquare of its
+    /// residual against six times the median absolute residual, so a point
+    /// far from the fit stops pulling on the next one. In a metrics database
+    /// the case for it is ordinary rather than exotic: a restart, a scrape
+    /// that timed out and was backfilled as a spike, a sensor returning its
+    /// error sentinel. Without it one such point is spread across the whole
+    /// seasonal component by the cycle-subseries smoother — it lands in the
+    /// same season of every cycle.
+    ///
+    /// Cleveland et al. (1990) §4.3 suggests 5–10 when robustness is wanted
+    /// and 0 when it is not; statsmodels' `STL(robust=True)` uses 15 with an
+    /// early exit, which is the same bargain. Default 0, so the cost is paid
+    /// only where it is asked for.
+    pub outer_iter: usize,
 }
 
 impl StlConfig {
@@ -113,6 +134,8 @@ impl StlConfig {
             n_iter: 2,
             trend_window: None,
             seasonal_window: None,
+            low_pass_window: None,
+            outer_iter: 0,
         }
     }
 
@@ -128,31 +151,75 @@ impl StlConfig {
         self
     }
 
-    /// Sets the seasonal subseries smoother window length.
+    /// Sets the seasonal subseries smoother window length, in **cycles**.
     pub fn with_seasonal_window(mut self, w: usize) -> Self {
         self.seasonal_window = Some(w);
         self
     }
 
-    fn effective_trend_window(&self) -> usize {
-        let w = self.trend_window.unwrap_or(self.period + 1);
-        // must be odd and ≥ 3
-        let w = w.max(3);
-        if w.is_multiple_of(2) {
-            w + 1
-        } else {
-            w
-        }
+    /// Sets the low-pass smoother window length.
+    pub fn with_low_pass_window(mut self, w: usize) -> Self {
+        self.low_pass_window = Some(w);
+        self
     }
 
+    /// Makes the fit robust to outliers, with Cleveland's suggested ten
+    /// outer iterations.
+    pub fn robust(mut self) -> Self {
+        self.outer_iter = 10;
+        self
+    }
+
+    /// Sets the number of outer (robustness) iterations explicitly.
+    pub fn with_outer_iterations(mut self, n: usize) -> Self {
+        self.outer_iter = n;
+        self
+    }
+
+    /// Cleveland et al. (1990) §3.4: `n_t` is the smallest odd integer at
+    /// least `1.5 * period / (1 - 1.5 / n_s)`. The ratio to `n_s` is the
+    /// point — a trend smoother chosen independently of the seasonal one
+    /// lets the two compete for the same variation, and the paper's rule is
+    /// what keeps the trend from absorbing the seasonal cycle.
+    fn effective_trend_window(&self) -> usize {
+        let w = self.trend_window.unwrap_or_else(|| {
+            let n_s = self.effective_seasonal_window() as f64;
+            let raw = 1.5 * self.period as f64 / (1.0 - 1.5 / n_s);
+            raw.ceil() as usize
+        });
+        next_odd_at_least(w, 3)
+    }
+
+    /// Cleveland et al. (1990) §3.3: `n_s` is in units of **cycles**, not of
+    /// samples — the seasonal smoother runs along a cycle-subseries, which
+    /// holds one point per cycle, so a series of `n` points offers it only
+    /// `n / period` of them. The paper's fixed default of 7 is what R's
+    /// `stl(s.window = "periodic")` and statsmodels' `STL(seasonal = 7)`
+    /// both use.
+    ///
+    /// This used to default to `max(7, period)`, which reads the window in
+    /// the *series'* units: for hourly data with a daily cycle it asked for
+    /// a 25-point smoother over a subseries holding one point per day, so
+    /// every deployment with fewer than `period` cycles of history got a
+    /// smoother wider than its own data.
     fn effective_seasonal_window(&self) -> usize {
-        let w = self.seasonal_window.unwrap_or(self.period.max(7));
-        let w = w.max(3);
-        if w.is_multiple_of(2) {
-            w + 1
-        } else {
-            w
-        }
+        next_odd_at_least(self.seasonal_window.unwrap_or(7), 7)
+    }
+
+    /// Cleveland et al. (1990) §3.5: `n_l` is the smallest odd integer at
+    /// least `period`.
+    fn effective_low_pass_window(&self) -> usize {
+        next_odd_at_least(self.low_pass_window.unwrap_or(self.period), 3)
+    }
+}
+
+/// The smallest odd integer that is at least `w` and at least `floor`.
+fn next_odd_at_least(w: usize, floor: usize) -> usize {
+    let w = w.max(floor);
+    if w.is_multiple_of(2) {
+        w + 1
+    } else {
+        w
     }
 }
 
@@ -173,58 +240,92 @@ pub fn stl_decompose(
 
     let trend_w = config.effective_trend_window();
     let seasonal_w = config.effective_seasonal_window();
+    let low_pass_w = config.effective_low_pass_window();
 
     let mut seasonal = vec![0.0; n];
     let mut trend = vec![0.0; n];
+    // Robustness weights, all 1.0 until an outer pass computes them. `None`
+    // is the plain inner loop and costs nothing.
+    let mut weights: Option<Vec<f64>> = None;
 
-    // The inner loop of Cleveland et al. (1990), steps 1–6, without the
-    // robustness weights. The step that matters is the low-pass filter: the
-    // cycle-subseries smoother produces a nearly periodic series `C`, and
-    // the seasonal component is `C` minus the *low-frequency* part of `C`,
-    // so that any drift the subseries smoother absorbed goes back to the
-    // trend. What stood here before centred each subseries on its own mean
-    // across cycles — which is zero for exactly the series STL exists for,
-    // a stable seasonal pattern — and printed a seasonal component of 1e-16
-    // for a clean 24-period sine.
-    for _ in 0..config.n_iter {
-        // Step 1: detrend.
-        let detrended: Vec<f64> = values
-            .iter()
-            .zip(trend.iter())
-            .map(|(y, t)| y - t)
-            .collect();
+    // The inner loop of Cleveland et al. (1990), steps 1–6, wrapped in the
+    // outer loop of §4.3 when `outer_iter > 0`.
+    //
+    // Step 2 is the one that carries the algorithm's shape: each
+    // cycle-subseries is smoothed *and extended one cycle beyond either
+    // end*, so the low-pass filter in step 3 can run in valid mode and
+    // still produce a value for every input point. The extension is the
+    // loess fit evaluated at −1 and at `len`, which continues the local
+    // trend. Padding by repeating the first and last cycle instead — which
+    // is what stood here — is correct only for a series that is already
+    // periodic: on a ramp the copy meets the original at a discontinuity
+    // the moving averages then smear across the first and last period. A
+    // straight line, whose seasonal component is exactly zero, came out of
+    // it with a seasonal swing of 278 on values running 1_000 to 11_619,
+    // and `seasonal_strength` read that as a seasonal series.
+    for outer in 0..=config.outer_iter {
+        for _ in 0..config.n_iter {
+            // Step 1: detrend.
+            let detrended: Vec<f64> = values
+                .iter()
+                .zip(trend.iter())
+                .map(|(y, t)| y - t)
+                .collect();
 
-        // Step 2: cycle-subseries smoothing. Each season offset is smoothed
-        // across its cycles, and the result is scattered back in place.
-        let mut cycle = vec![0.0; n];
-        for s in 0..period {
-            let indices: Vec<usize> = (s..n).step_by(period).collect();
-            let sub: Vec<f64> = indices.iter().map(|&i| detrended[i]).collect();
-            let smoothed = loess_smooth(&sub, seasonal_w);
-            for (&i, &v) in indices.iter().zip(smoothed.iter()) {
-                cycle[i] = v;
+            // Step 2: cycle-subseries smoothing, extended by one cycle at
+            // each end. `cycle_ext[period + i]` is the smoothed value for
+            // `i`. A robustness weight travels with its point into the
+            // subseries, which is the whole mechanism: an outlier lands in
+            // the same season of one cycle, so down-weighting it there is
+            // what stops it being spread across every cycle.
+            let mut cycle_ext = vec![0.0; n + 2 * period];
+            for s in 0..period {
+                let idx: Vec<usize> = (s..n).step_by(period).collect();
+                let sub: Vec<f64> = idx.iter().map(|&i| detrended[i]).collect();
+                let sub_w = weights
+                    .as_ref()
+                    .map(|w| idx.iter().map(|&i| w[i]).collect::<Vec<f64>>());
+                // `extended[0]` is the fit at −1, `extended[k + 1]` at `k`.
+                let extended = loess_extended(&sub, seasonal_w, sub_w.as_deref());
+                for (k, &v) in extended.iter().enumerate() {
+                    // Subseries position `k - 1` sits at series index
+                    // `s + (k - 1) * period`, i.e. `s + k * period` once the
+                    // frame is shifted by one cycle.
+                    let at = s + k * period;
+                    if at < cycle_ext.len() {
+                        cycle_ext[at] = v;
+                    }
+                }
             }
+
+            // Step 3: low-pass filter — MA(period), MA(period), MA(3), then
+            // a loess of width `n_l`. Each moving average runs in valid
+            // mode, so the three together consume exactly the `2 * period`
+            // points the extension added and the result is `n` long by
+            // construction.
+            let low_pass = low_pass_filter(&cycle_ext, period, low_pass_w);
+            debug_assert_eq!(low_pass.len(), n);
+
+            // Step 4: the seasonal is what the low-pass filter removed.
+            for i in 0..n {
+                seasonal[i] = cycle_ext[period + i] - low_pass[i];
+            }
+
+            // Steps 5–6: deseasonalise and smooth the trend.
+            let deseasoned: Vec<f64> = values
+                .iter()
+                .zip(seasonal.iter())
+                .map(|(y, s)| y - s)
+                .collect();
+            trend = loess_smooth_weighted(&deseasoned, trend_w, weights.as_deref());
         }
 
-        // Step 3: low-pass filter of the cycle-subseries — a centred moving
-        // average of one period (two, for an even period, to stay centred)
-        // and one of three. The full algorithm extends each subseries by a
-        // cycle at either end before filtering; padding with the adjacent
-        // cycle is the same idea for a series that is nearly periodic.
-        let low_pass = low_pass_filter(&cycle, period);
-
-        // Step 4: the seasonal is what the low-pass filter removed.
-        for i in 0..n {
-            seasonal[i] = cycle[i] - low_pass[i];
+        // The outer loop of §4.3: reweight by how far each point fell from
+        // the fit, then run the inner loop again. Skipped after the last
+        // pass, whose weights nothing would use.
+        if outer < config.outer_iter {
+            weights = Some(robustness_weights(values, &trend, &seasonal));
         }
-
-        // Steps 5–6: deseasonalise and smooth the trend.
-        let deseasoned: Vec<f64> = values
-            .iter()
-            .zip(seasonal.iter())
-            .map(|(y, s)| y - s)
-            .collect();
-        trend = loess_smooth(&deseasoned, trend_w);
     }
 
     // Residual
@@ -364,96 +465,206 @@ fn detrend(values: &[f64]) -> Vec<f64> {
 /// behaviour and outlier resistance than a uniform moving average.
 /// The low-pass filter of STL step 3: pad by one cycle at each end with the
 /// adjacent cycle, apply a `period`-point centred moving average (a 2×MA for
-/// an even period), then a 3-point one, and cut the padding off again.
-fn low_pass_filter(cycle: &[f64], period: usize) -> Vec<f64> {
-    let n = cycle.len();
-    let mut padded = Vec::with_capacity(n + 2 * period);
-    padded.extend_from_slice(&cycle[..period]);
-    padded.extend_from_slice(cycle);
-    padded.extend_from_slice(&cycle[n - period..]);
-
-    let mut filtered = centered_moving_average(&padded, period);
-    if period.is_multiple_of(2) {
-        filtered = centered_moving_average(&filtered, 2);
-    }
-    let filtered = centered_moving_average(&filtered, 3);
-    filtered[period..period + n].to_vec()
+/// The low-pass filter of STL step 3: `MA(period)`, `MA(period)`, `MA(3)`,
+/// then a degree-1 loess of width `n_l`.
+///
+/// Every moving average runs in **valid** mode — an output point only where
+/// the whole window lies inside the input — so the three of them consume
+/// exactly `(period - 1) + (period - 1) + 2 = 2 * period` points. That is
+/// precisely what the cycle-subseries extension added, which is why the
+/// result is `n` long without any edge special-casing. A partial window at
+/// the ends, which is what `centered_moving_average` used to supply, is an
+/// average of fewer points presented as if it were an average of the whole
+/// window.
+fn low_pass_filter(cycle_ext: &[f64], period: usize, low_pass_window: usize) -> Vec<f64> {
+    let a = moving_average_valid(cycle_ext, period);
+    let b = moving_average_valid(&a, period);
+    let c = moving_average_valid(&b, 3);
+    loess_smooth(&c, low_pass_window)
 }
 
-/// A centred moving average of `w` points. For an even `w` the window is
-/// `[i - w/2, i + w/2 - 1]`, so two passes (`w`, then `2`) give the classic
-/// `2×m`-MA; the window shrinks symmetrically at the ends.
-fn centered_moving_average(x: &[f64], w: usize) -> Vec<f64> {
-    let n = x.len();
-    if w <= 1 || n == 0 {
+/// A moving average of `w` points, valid mode: the output is
+/// `x.len() - w + 1` long and each point averages a full window.
+fn moving_average_valid(x: &[f64], w: usize) -> Vec<f64> {
+    if w <= 1 {
         return x.to_vec();
     }
-    let before = w / 2;
-    let after = if w.is_multiple_of(2) {
-        w / 2 - 1
-    } else {
-        w / 2
-    };
-    (0..n)
-        .map(|i| {
-            let lo = i.saturating_sub(before);
-            let hi = (i + after).min(n - 1);
-            let slice = &x[lo..=hi];
-            slice.iter().sum::<f64>() / slice.len() as f64
-        })
-        .collect()
-}
-
-fn loess_smooth(values: &[f64], window: usize) -> Vec<f64> {
-    let n = values.len();
-    if window == 0 {
-        return values.to_vec();
+    if x.len() < w {
+        return Vec::new();
     }
-    if window >= n {
-        let mean = values.iter().sum::<f64>() / n as f64;
-        return vec![mean; n];
-    }
-    let half = window / 2;
-    let mut out = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let lo = i.saturating_sub(half);
-        let hi = (i + half).min(n - 1);
-        let max_dist = (half.max(1)) as f64;
-
-        let (mut sw, mut swx, mut swy, mut swxx, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        for j in lo..=hi {
-            let u = ((j as f64 - i as f64) / max_dist).abs().min(1.0);
-            let u3 = u * u * u;
-            let w = (1.0 - u3) * (1.0 - u3) * (1.0 - u3); // tricube
-            let x = j as f64;
-            let y = values[j];
-            sw += w;
-            swx += w * x;
-            swy += w * y;
-            swxx += w * x * x;
-            swxy += w * x * y;
-        }
-        let det = sw * swxx - swx * swx;
-        let fitted = if det.abs() < 1e-15 {
-            if sw > 0.0 {
-                swy / sw
-            } else {
-                values[i]
-            }
-        } else {
-            let a = (swxx * swy - swx * swxy) / det;
-            let b = (sw * swxy - swx * swy) / det;
-            a + b * i as f64
-        };
-        out.push(fitted);
+    let wf = w as f64;
+    let mut out = Vec::with_capacity(x.len() - w + 1);
+    let mut sum: f64 = x[..w].iter().sum();
+    out.push(sum / wf);
+    for i in w..x.len() {
+        sum += x[i] - x[i - w];
+        out.push(sum / wf);
     }
     out
 }
 
-// -----------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------
+/// Degree-1 loess evaluated at one point `x`, which may lie outside
+/// `0..values.len()`.
+///
+/// The neighbourhood is the `q = min(window, n)` nearest points and the
+/// bandwidth is the distance to the farthest of them, scaled by `window / n`
+/// when the window is wider than the data — Cleveland's rule for `q > n`,
+/// which is what lets a smoother wider than its series still express a
+/// slope instead of collapsing to the mean.
+fn loess_at(values: &[f64], window: usize, x: f64, robust: Option<&[f64]>) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n == 1 {
+        return values[0];
+    }
+    let q = window.max(2).min(n);
+    // On a regular grid the `q` nearest points are contiguous.
+    let lo = (x - (q as f64 - 1.0) / 2.0)
+        .round()
+        .clamp(0.0, (n - q) as f64) as usize;
+    let hi = lo + q - 1;
+
+    let mut lambda = ((lo as f64 - x).abs()).max((hi as f64 - x).abs());
+    if window > n {
+        lambda *= window as f64 / n as f64;
+    }
+
+    let (mut sw, mut swx, mut swy, mut swxx, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for j in lo..=hi {
+        let d = (j as f64 - x).abs();
+        let mut w = if lambda <= 0.0 {
+            f64::from(u8::from(d == 0.0))
+        } else {
+            let u = (d / lambda).min(1.0);
+            let t = 1.0 - u * u * u;
+            t * t * t
+        };
+        // The robustness weight multiplies the neighbourhood weight, which
+        // is exactly how Cleveland et al. (1990) §4.3 fold the outer loop
+        // into the same smoother rather than adding a second one.
+        if let Some(rw) = robust {
+            w *= rw[j];
+        }
+        if w <= 0.0 {
+            continue;
+        }
+        let (xj, yj) = (j as f64, values[j]);
+        sw += w;
+        swx += w * xj;
+        swy += w * yj;
+        swxx += w * xj * xj;
+        swxy += w * xj * yj;
+    }
+    if sw <= 0.0 {
+        // Every weight in the neighbourhood vanished. With robustness
+        // weights that is a real situation — a run of points next to a spike
+        // can all be down-weighted at once — and the answer must not be the
+        // raw observation: at the outlier itself that returns the outlier,
+        // which is the least robust value available and made the fit
+        // oscillate between absorbing the spike and rejecting it. The
+        // unweighted fit is the best estimate that remains.
+        if robust.is_some() {
+            return loess_at(values, window, x, None);
+        }
+        return values[(x.round().clamp(0.0, (n - 1) as f64)) as usize];
+    }
+    let det = sw * swxx - swx * swx;
+    if det.abs() < 1e-12 * sw * sw.max(1.0) {
+        // A single distinct abscissa carries no slope; the weighted mean is
+        // the degree-0 fit, which is the right answer only here.
+        return swy / sw;
+    }
+    let a = (swxx * swy - swx * swxy) / det;
+    let b = (sw * swxy - swx * swy) / det;
+    a + b * x
+}
+
+/// Degree-1 loess at every point of `values`.
+fn loess_smooth(values: &[f64], window: usize) -> Vec<f64> {
+    loess_smooth_weighted(values, window, None)
+}
+
+/// [`loess_smooth`] with an additional per-point robustness weight.
+fn loess_smooth_weighted(values: &[f64], window: usize, robust: Option<&[f64]>) -> Vec<f64> {
+    if window == 0 {
+        return values.to_vec();
+    }
+    (0..values.len())
+        .map(|i| loess_at(values, window, i as f64, robust))
+        .collect()
+}
+
+/// Cleveland's bisquare weights: `(1 - (r / 6m)^2)^2` clamped to `[0, 1]`,
+/// where `r` is a point's absolute residual and `m` their median.
+///
+/// Six times the median absolute residual is the paper's cut-off, and it is
+/// the reason a single spike cannot survive an outer pass: its weight goes to
+/// zero while an ordinary point's stays near one.
+///
+/// The cut-off is **floored at a thousandth of the series' range**, which the
+/// paper does not need to say and an implementation does. `6m` describes the
+/// spread of the residuals and means nothing when they have none: a series
+/// the inner loop fits almost exactly leaves rounding error, so `m` is
+/// rounding error too and everything above it counts as an outlier — on a
+/// clean sine with one spike, a median of 0.0047 against a 99th percentile of
+/// 47 gave 101 of 240 points weight zero.
+///
+/// The floor asks what the median cannot: is this residual large *relative to
+/// the series*? It sits far below any real noise level, so `6m` stays in
+/// charge wherever the residuals carry noise — measured at noise 0.5, 2 and 5
+/// on a series of range 260, where it never binds.
+fn robustness_weights(values: &[f64], trend: &[f64], seasonal: &[f64]) -> Vec<f64> {
+    let resid: Vec<f64> = values
+        .iter()
+        .zip(trend)
+        .zip(seasonal)
+        .map(|((y, t), s)| (y - t - s).abs())
+        .collect();
+
+    let mut sorted = resid.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    let median = if sorted.is_empty() {
+        0.0
+    } else if sorted.len().is_multiple_of(2) {
+        f64::midpoint(sorted[mid - 1], sorted[mid])
+    } else {
+        sorted[mid]
+    };
+
+    let (lo, hi) = values
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+    let scale_floor = if hi > lo { (hi - lo) * 1e-3 } else { 0.0 };
+    let cutoff = (6.0 * median).max(scale_floor);
+    if cutoff <= 0.0 {
+        return vec![1.0; resid.len()];
+    }
+    resid
+        .iter()
+        .map(|r| {
+            let u = (r / cutoff).min(1.0);
+            let t = 1.0 - u * u;
+            t * t
+        })
+        .collect()
+}
+
+/// Degree-1 loess at `-1 ..= values.len()`, so the result is `len + 2` long.
+///
+/// STL step 2 needs the smoother to say what the cycle before the first and
+/// the cycle after the last would have been; a loess can answer that because
+/// it is a local *fit*, and evaluating it one step outside its data is the
+/// extension Cleveland et al. (1990) specify.
+fn loess_extended(values: &[f64], window: usize, robust: Option<&[f64]>) -> Vec<f64> {
+    let n = values.len();
+    (0..n + 2)
+        .map(|k| loess_at(values, window, k as f64 - 1.0, robust))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +743,209 @@ mod tests {
         }
         let max_residual = dec.residual.iter().map(|r| r.abs()).fold(0.0_f64, f64::max);
         assert!(max_residual < 0.8, "residual too large: {max_residual}");
+    }
+
+    /// A straight line has no seasonal component, and STL has to say so.
+    ///
+    /// This is the cheapest test in the file and the one that would have
+    /// caught the padding defect: the old low-pass filter padded by copying
+    /// the first and last cycle, which on a ramp butts the copy against the
+    /// original at a discontinuity, and the moving averages smeared it into
+    /// the first and last period. The seasonal component of `1000 + 37 i`
+    /// swung by 278.
+    ///
+    /// A monotonic counter is the commonest series in a metrics database, so
+    /// this is not a corner: `seasonal_strength` read that swing as 0.81
+    /// against a 0.64 threshold and auto-ARIMA seasonally differenced every
+    /// counter it was shown.
+    #[test]
+    fn a_straight_line_has_no_seasonal_component() {
+        for period in [4usize, 7, 12, 24] {
+            for cycles in [2usize, 3, 7, 12, 30] {
+                let n = period * cycles;
+                let y: Vec<f64> = (0..n).map(|i| 1000.0 + 37.0 * i as f64).collect();
+                let d = stl_decompose(&y, &StlConfig::new(period)).unwrap();
+                let swing = d.seasonal.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+                assert!(
+                    swing < 1e-6,
+                    "period {period}, {cycles} cycles: seasonal swing {swing} on a straight line"
+                );
+                let resid = d.residual.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+                assert!(
+                    resid < 1e-6,
+                    "period {period}, {cycles} cycles: residual {resid}"
+                );
+            }
+        }
+    }
+
+    /// The seasonal amplitude that comes out is the one that went in.
+    ///
+    /// Checked across the number of *cycles*, which is the axis that broke:
+    /// the seasonal smoother runs along a cycle-subseries holding one point
+    /// per cycle, and its window used to default to `max(7, period)` — read
+    /// in the series' units rather than in cycles. Seven days of hourly data
+    /// with a daily cycle therefore asked for a 25-point smoother over a
+    /// 7-point subseries, whereupon `loess_smooth` returned the subseries
+    /// mean and 22 % of the amplitude went into the trend.
+    ///
+    /// The values match statsmodels' `STL` to three decimals on every row of
+    /// this table; where a genuine edge effect remains — `period = 7` over
+    /// 10 cycles — statsmodels reports the same 11.699.
+    #[test]
+    fn stl_recovers_the_seasonal_amplitude_from_few_cycles() {
+        use std::f64::consts::TAU;
+        for &(period, n, expected) in &[
+            (12usize, 96usize, 12.000f64),
+            (12, 240, 12.000),
+            (24, 168, 12.000),
+            (24, 720, 12.000),
+            (7, 70, 11.699),
+        ] {
+            let y: Vec<f64> = (0..n)
+                .map(|i| 100.0 + 0.7 * i as f64 + 12.0 * (i as f64 * TAU / period as f64).sin())
+                .collect();
+            let d = stl_decompose(&y, &StlConfig::new(period)).unwrap();
+            let mid = &d.seasonal[n / 4..3 * n / 4];
+            let amp = (mid.iter().copied().fold(f64::MIN, f64::max)
+                - mid.iter().copied().fold(f64::MAX, f64::min))
+                / 2.0;
+            assert!(
+                (amp - expected).abs() < 0.01,
+                "period {period}, n {n}: amplitude {amp:.4}, expected {expected}"
+            );
+        }
+    }
+
+    /// A seasonal pattern whose amplitude grows is the reason to run STL
+    /// rather than subtract per-season means, so it is asserted rather than
+    /// assumed.
+    #[test]
+    fn stl_follows_a_seasonal_pattern_that_changes() {
+        use std::f64::consts::TAU;
+        let (period, n) = (12usize, 240usize);
+        let y: Vec<f64> = (0..n)
+            .map(|i| {
+                let amp = 5.0 + 15.0 * i as f64 / n as f64;
+                100.0 + amp * (i as f64 * TAU / period as f64).sin()
+            })
+            .collect();
+        let d = stl_decompose(&y, &StlConfig::new(period)).unwrap();
+        let amp_of = |s: &[f64]| {
+            (s.iter().copied().fold(f64::MIN, f64::max)
+                - s.iter().copied().fold(f64::MAX, f64::min))
+                / 2.0
+        };
+        let early = amp_of(&d.seasonal[12..36]);
+        let late = amp_of(&d.seasonal[n - 36..n - 12]);
+        assert!(
+            (early - 6.5).abs() < 0.6,
+            "early amplitude {early}, expected ~6.5"
+        );
+        assert!(
+            (late - 18.5).abs() < 0.6,
+            "late amplitude {late}, expected ~18.5"
+        );
+        assert!(
+            late > early * 2.0,
+            "the growth was not followed: {early} → {late}"
+        );
+    }
+
+    /// An outlier is left in the residual instead of being spread across the
+    /// seasonal component.
+    ///
+    /// This is the case for having the outer loop at all, and it is ordinary
+    /// rather than exotic in a metrics database: a restart, a scrape that
+    /// timed out and was backfilled as one enormous sample, a sensor
+    /// returning its error sentinel. Without robustness weights the
+    /// cycle-subseries smoother spreads that one point across **every** cycle
+    /// — it lands in the same season of each — and the seasonal amplitude of
+    /// a 10-unit sine came back as 33.7.
+    ///
+    /// Checked at three noise levels and at none, because the two regimes
+    /// exercise different halves of the weighting: with noise the median
+    /// absolute residual is a real scale and Cleveland's `6m` governs; with
+    /// none it is rounding error and the floor in `robustness_weights` does.
+    #[test]
+    fn a_robust_fit_leaves_a_spike_in_the_residual() {
+        use std::f64::consts::TAU;
+        let (period, n) = (12usize, 240usize);
+        let mut seed = 4u64;
+        let mut gauss = || {
+            let mut u = || {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+            };
+            let (a, b) = (u(), u());
+            (-2.0 * a.ln()).sqrt() * (TAU * b).cos()
+        };
+
+        for noise in [0.0f64, 0.5, 2.0, 5.0] {
+            let clean: Vec<f64> = (0..n)
+                .map(|i| {
+                    100.0
+                        + 0.5 * i as f64
+                        + 10.0 * (i as f64 * TAU / period as f64).sin()
+                        + gauss() * noise
+                })
+                .collect();
+            let base = stl_decompose(&clean, &StlConfig::new(period)).unwrap();
+
+            let mut spiked = clean.clone();
+            spiked[120] += 200.0;
+            let plain = stl_decompose(&spiked, &StlConfig::new(period)).unwrap();
+            let robust = stl_decompose(&spiked, &StlConfig::new(period).robust()).unwrap();
+
+            let deviation = |d: &Decomposition| {
+                (0..n)
+                    .filter(|&i| i != 120)
+                    .map(|i| (d.seasonal[i] - base.seasonal[i]).abs())
+                    .fold(0.0f64, f64::max)
+            };
+            let (p, r) = (deviation(&plain), deviation(&robust));
+            assert!(
+                r < p / 4.0,
+                "noise {noise}: robust deviation {r:.3} is not much better than plain {p:.3}"
+            );
+            // The spike belongs to the residual, which is where an
+            // unexplained observation goes.
+            assert!(
+                robust.residual[120] > 150.0,
+                "noise {noise}: the spike was absorbed — residual {:.3} of 200",
+                robust.residual[120]
+            );
+        }
+    }
+
+    /// With no outliers to down-weight, the robust fit is the plain fit.
+    ///
+    /// Not a formality: the first version of the weighting zeroed 101 of 240
+    /// points on a series it fitted exactly, because the median absolute
+    /// residual was rounding error and everything above it counted as an
+    /// outlier, and the seasonal component moved by 3.7 on an amplitude of
+    /// 10.
+    ///
+    /// The tolerance is not zero because the outer loop runs the inner loop
+    /// eleven times rather than once, so an all-ones weighting still
+    /// converges a little further; the difference is at 1e-13 on values near
+    /// 200, which is the arithmetic and not the weights.
+    #[test]
+    fn robustness_changes_nothing_without_outliers() {
+        use std::f64::consts::TAU;
+        let (period, n) = (12usize, 240usize);
+        let y: Vec<f64> = (0..n)
+            .map(|i| 100.0 + 0.5 * i as f64 + 10.0 * (i as f64 * TAU / period as f64).sin())
+            .collect();
+        let plain = stl_decompose(&y, &StlConfig::new(period)).unwrap();
+        let robust = stl_decompose(&y, &StlConfig::new(period).robust()).unwrap();
+        let worst = (0..n)
+            .map(|i| (plain.seasonal[i] - robust.seasonal[i]).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst < 1e-9,
+            "robustness moved the seasonal component by {worst:e} with nothing to down-weight"
+        );
     }
 
     #[test]

@@ -93,6 +93,38 @@ pub enum DbError {
     #[error("{0}")]
     InvalidRequest(String),
 
+    /// A named object the caller asked for does not exist.
+    ///
+    /// Distinct from [`InvalidRequest`](Self::InvalidRequest) because the
+    /// request was well formed and the answer is about the *database's*
+    /// contents: `chronixd` renders it `404`, which is what tells a client
+    /// that retrying the same call unchanged will keep failing while a
+    /// different name might not.
+    #[error("no {kind} named {name:?}")]
+    NotFound {
+        /// What kind of object — `"rollup"`, and whatever follows it.
+        kind: &'static str,
+        /// The name the caller gave.
+        name: String,
+    },
+
+    /// A named object the caller asked to create already exists.
+    ///
+    /// The mirror of [`NotFound`](Self::NotFound), and `409` on the wire.
+    /// Declaring the same rollup on every start is idempotent by nature —
+    /// the registry is persisted, so every run after the first meets its own
+    /// tier — and a caller has to be able to tell "already there" from
+    /// "failed" without matching on a message. It used to arrive as
+    /// `Internal("rollup registration failed: rollup 'x' already exists")`,
+    /// which is a redacted `500`.
+    #[error("{kind} {name:?} already exists")]
+    Conflict {
+        /// What kind of object already exists.
+        kind: &'static str,
+        /// The name the caller gave.
+        name: String,
+    },
+
     /// Series cardinality limit exceeded.
     #[error(
         "Series cardinality limit exceeded: {current} unique series \

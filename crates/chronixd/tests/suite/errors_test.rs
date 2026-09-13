@@ -390,3 +390,75 @@ async fn a_refused_restore_names_its_reason() {
 
     drop(tmp);
 }
+
+/// Naming a thing wrong is the caller's mistake, not the server's fault.
+///
+/// Reported by the design partner for one edge — `create_rollup` erasing
+/// `RollupError::AlreadyExists` into `Internal`, so telling "already there"
+/// from "failed" meant matching on a message. Re-derived, the whole rollup
+/// API mapped *every* error to `Internal`, including the mirror case: a
+/// rollup name that does not exist. Both are a redacted `500` with the body
+/// `an internal error occurred`, which is the one answer that tells a client
+/// nothing and an operator to look at the server logs.
+///
+/// Declaring a tier on every start is idempotent by nature — the registry is
+/// persisted, so every run after the first meets its own rollup — which is
+/// what makes the conflict a *normal* path rather than an exceptional one.
+#[tokio::test]
+async fn naming_a_rollup_wrong_is_the_callers_error_not_a_500() {
+    let (base, tmp) = server().await;
+    let client = super::integration::client();
+
+    let body = serde_json::json!({
+        "name": "quarter_hour",
+        "source_measurement": "meter",
+        "target_measurement": "meter_15m",
+        "every": "15m",
+        "timezone": "Europe/Berlin",
+        "aggregations": ["avg"],
+    });
+
+    // First declaration succeeds.
+    let resp = client
+        .post(format!("{base}/api/v1/rollups"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 201, "{:?}", resp.text().await);
+
+    // Declaring it again is a conflict the caller can branch on, not a fault.
+    let resp = client
+        .post(format!("{base}/api/v1/rollups"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        409,
+        "a second declaration must be a conflict"
+    );
+    let out: Value = resp.json().await.expect("json");
+    assert_eq!(out["code"], "CONFLICT");
+    assert!(
+        out["error"].as_str().unwrap().contains("quarter_hour"),
+        "the name has to survive to the client: {out}"
+    );
+
+    // And the mirror: a name that does not exist is a 404, not a 500.
+    let resp = client
+        .delete(format!("{base}/api/v1/rollups/no_such_tier"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 404, "an unknown rollup must be NOT_FOUND");
+    let out: Value = resp.json().await.expect("json");
+    assert_eq!(out["code"], "NOT_FOUND");
+    assert!(
+        out["error"].as_str().unwrap().contains("no_such_tier"),
+        "{out}"
+    );
+
+    drop(tmp);
+}

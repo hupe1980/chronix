@@ -175,19 +175,34 @@ to partition **fails to plan** rather than answering wrongly.
 | `zscore(value)` | Standardised against the partition |
 | `ewm(value, alpha)` | Exponentially weighted mean, `alpha ∈ (0, 1]` |
 | `anomaly_score(value, threshold)` | Z-score anomaly score |
-| `stl_trend(value, period)` | STL trend component |
-| `stl_seasonal(value, period)` | STL seasonal component |
-| `stl_residual(value, period)` | STL residual component |
-| `stl_decompose(value, period)` | All three at once, as `STRUCT{trend, seasonal, residual}` |
+| `stl_trend(value, period [, robust])` | STL trend component |
+| `stl_seasonal(value, period [, robust])` | STL seasonal component |
+| `stl_residual(value, period [, robust])` | STL residual component |
+| `stl_decompose(value, period [, robust])` | All three at once, as `STRUCT{trend, seasonal, residual}` |
 | `correlation(a, b)` | Pearson correlation over the partition |
 | `cross_correlation(a, b, lag)` | Correlation at one lag |
 | `multivariate_anomaly(a, b, threshold)` | Mahalanobis distance |
 
 Every window kernel consumes the whole partition, so a `ROWS BETWEEN` frame
 would be ignored — the rolling functions take their window length as an
-argument instead. A row whose input was NULL gets a NULL result, and the
-warm-up rows a rolling window cannot reach are NULL rather than `NaN`, so
-`IS NULL` and `avg()` behave.
+argument instead. The warm-up rows a rolling window cannot reach are NULL
+rather than `NaN`, so `IS NULL` and `avg()` behave.
+
+`robust` (default `false`) runs Cleveland's outer loop, reweighting each point
+by how far it fell from the fit. Pass it when the series carries outliers — a
+restart, a backfilled scrape, a sensor returning its error sentinel. Without
+it one such point reaches the *whole* seasonal component, because the
+cycle-subseries smoother sees it in the same season of every cycle: one spike
+takes a 10-unit seasonal amplitude to 33.7. Costs about eleven times the
+iterations.
+
+A NULL is a missing sample, not a missing row. It is excluded from every
+statistic; a gap nulls its own rows and no others. A function of the window
+(`rolling_*`, `ewm`, `correlation`, `cross_correlation`) still answers at a
+gap row from the samples around it, exactly as `AVG(v) OVER (ROWS n
+PRECEDING)` does; one that reads the row's own value (`diff`, `pct_change`,
+`zscore`, `anomaly_score`, `multivariate_anomaly`, `stl_*`) is NULL there.
+See [Null handling](@/reference/indexing-and-query.md#custom-sql-functions).
 
 #### Aggregate
 

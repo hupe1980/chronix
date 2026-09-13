@@ -266,7 +266,7 @@ Each claim below is pinned by a test; the depth is in the
 **Analytics** — [guide](https://hupe1980.github.io/chronix/docs/analytics/)
 
 - **Forecasting**: SES, Holt (damped), Holt-Winters, ARIMA, SARIMA, linear
-  regression, with auto-ARIMA by AIC, `O(1)` online updates and persistence.
+  regression, with auto-ARIMA by AICc, `O(1)` online updates and persistence.
   `auto_forecast` picks the model by cross-validation and reports why.
 - **Quantile forecasting** builds prediction intervals from the empirical
   distribution of walk-forward residuals, bucketed per horizon step, so

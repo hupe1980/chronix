@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code may unwrap
-//! `[analytics]` is configuration that is read.
+//! Every key `[analytics]` accepts is a key it acts on.
 //!
 //! The whole section — `default_forecast_model`, `default_anomaly_method`,
+//! `default_confidence_level`, `default_anomaly_threshold`,
 //! `max_forecast_horizon`, `max_training_points` and the per-measurement
 //! overrides — was accepted, validated, documented in the configuration table
 //! and **read nowhere**: `ChronixConfig::effective_analytics` had no callers
@@ -9,6 +10,16 @@
 //! bound nothing enforces is not a bound: `SELECT forecast(v, _time, 2000000)`
 //! was answered against a configured limit of 8 760, returning a
 //! two-million-element list from one cell.
+//!
+//! The two bounds were wired up then and the other four were not, which is
+//! how a rule gets applied to exactly the members that produced the bug. Each
+//! of those four names a *default for a per-call argument*, and the
+//! configuration reference already says the model, the detector, the
+//! confidence level and the threshold are arguments rather than settings.
+//! They are gone, so that sentence is now true by construction; under
+//! `deny_unknown_fields` a file that sets one is refused instead of accepted
+//! and ignored, which `chronix_core::config`'s
+//! `the_section_refuses_a_key_it_would_not_act_on` pins.
 
 use std::sync::Arc;
 

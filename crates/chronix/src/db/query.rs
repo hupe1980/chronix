@@ -613,7 +613,7 @@ impl super::Chronix {
         self.check_open()?;
 
         let key = SeriesKey::new(measurement.to_string(), tags.clone())
-            .map_err(|e| DbError::Internal(format!("Invalid series key: {e}")))?;
+            .map_err(|e| DbError::InvalidRequest(format!("invalid series key: {e}")))?;
 
         // Tombstones are checked per timestamp, below, against every candidate
         // this function considers. A series-level check used to stand here
@@ -813,7 +813,7 @@ impl super::Chronix {
         let timestamp = ts_col.value(row);
 
         let key = SeriesKey::new(measurement.to_string(), tags.clone())
-            .map_err(|e| DbError::Internal(format!("Invalid series key: {e}")))?;
+            .map_err(|e| DbError::InvalidRequest(format!("invalid series key: {e}")))?;
 
         let mut fields = BTreeMap::new();
         for field_ref in schema.fields() {

@@ -40,12 +40,17 @@ impl CorrelationMethod for PearsonCorrelation {
 impl PearsonCorrelation {
     /// Compute Pearson correlation between two equal-length slices.
     ///
-    /// `NaN` pairs are deleted pairwise. When either series has **zero
-    /// variance** the correlation is undefined and the result is `NaN`, not
-    /// `0.0` — the convention `RollingCorrelation` and
-    /// `rolling_corr`, applied here for the same reason: `0.0` asserts "these
+    /// `NaN` pairs are deleted pairwise — `rolling_corr` does the same within
+    /// each window. When either series has **zero variance** the correlation
+    /// is undefined and the result is `NaN`, not `0.0`: `0.0` asserts "these
     /// series are uncorrelated" where the truth is "there is nothing to
     /// correlate", and a caller acts on the first.
+    ///
+    /// That sentence used to claim `rolling_corr` shared this convention
+    /// while `rolling_corr` folded a `NaN` into a sliding accumulator and
+    /// nulled the rest of its partition. A doc comment asserting that two
+    /// implementations agree is worth a test that they do; see
+    /// `chronix/tests/analytics_null_semantics.rs`.
     ///
     /// # Errors
     ///

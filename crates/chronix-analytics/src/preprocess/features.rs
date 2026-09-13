@@ -52,12 +52,87 @@ pub fn pct_change(values: &[f64]) -> Vec<f64> {
     out
 }
 
-/// Rolling arithmetic mean over a trailing window.
+/// Sliding first and second moments of the **non-NULL** values in a window,
+/// maintained by Welford add/remove.
 ///
-/// Outputs NAN for the first `window - 1` rows, matching [`rolling_std`] so
-/// the two line up column-for-column. Kahan compensated summation keeps the
-/// sliding sum from drifting over a long series, which a plain
-/// add-the-new-subtract-the-old loop does not.
+/// Welford rather than running sums of `x` and `x²`, because a metrics
+/// database's commonest series is a counter: values near 1e9 with a variance
+/// near 1 leave `Σx² − (Σx)²/n` with no significant digits at all. Welford
+/// never forms either square.
+///
+/// `NULL` — a NaN in the caller's slice — is simply not an observation:
+/// nothing is added for it and nothing removed. That is what makes the whole
+/// family agree with `AVG(v) OVER (ROWS n PRECEDING)` sitting beside it in
+/// the same `SELECT`, and it is what the previous incremental form could not
+/// do. There, one NULL made `mean` and `m2` NaN, and every later row of the
+/// partition came out NULL too — until an exact recompute every 1024 steps
+/// silently healed it, so the damage ran to the next multiple of 1024 and a
+/// NULL at row 5 and one at row 1500 broke a different number of rows.
+#[derive(Debug, Default, Clone, Copy)]
+struct Moments {
+    n: usize,
+    mean: f64,
+    m2: f64,
+}
+
+impl Moments {
+    fn add(&mut self, x: f64) {
+        if !x.is_finite() {
+            return;
+        }
+        self.n += 1;
+        let d = x - self.mean;
+        self.mean += d / self.n as f64;
+        self.m2 += d * (x - self.mean);
+    }
+
+    fn remove(&mut self, x: f64) {
+        if !x.is_finite() {
+            return;
+        }
+        if self.n <= 1 {
+            *self = Self::default();
+            return;
+        }
+        let prev_mean = self.mean;
+        self.n -= 1;
+        self.mean -= (x - prev_mean) / self.n as f64;
+        self.m2 -= (x - prev_mean) * (x - self.mean);
+        // Cancellation can leave a sum of squares just below zero.
+        if self.m2 < 0.0 {
+            self.m2 = 0.0;
+        }
+    }
+
+    fn from_slice(xs: &[f64]) -> Self {
+        let mut m = Self::default();
+        for &x in xs {
+            m.add(x);
+        }
+        m
+    }
+
+    /// Sample standard deviation, `NaN` with fewer than two observations.
+    fn sample_std(&self) -> f64 {
+        if self.n < 2 {
+            return f64::NAN;
+        }
+        (self.m2 / (self.n - 1) as f64).sqrt()
+    }
+}
+
+/// How often the sliding moments are rebuilt from the window exactly.
+///
+/// Welford's add/remove pair is self-correcting for the mean but not for
+/// `m2`, and a long series subtracts a great many times.
+const RECOMPUTE_INTERVAL: usize = 1024;
+
+/// Rolling arithmetic mean of the non-NULL values in a trailing window.
+///
+/// Outputs NAN for the first `window - 1` rows — there is no full window yet
+/// — and thereafter the mean of whatever the window holds, which is NAN only
+/// if the window holds nothing. `AVG(v) OVER (ROWS window - 1 PRECEDING)`
+/// answers the same question with the same NULL rule.
 #[must_use]
 pub fn rolling_mean(values: &[f64], window: usize) -> Vec<f64> {
     let n = values.len();
@@ -65,194 +140,213 @@ pub fn rolling_mean(values: &[f64], window: usize) -> Vec<f64> {
         return vec![f64::NAN; n];
     }
     let mut out = vec![f64::NAN; n];
-    let w = window as f64;
-    let mut sum: f64 = values[..window].iter().sum();
-    out[window - 1] = sum / w;
+    let mut m = Moments::from_slice(&values[..window]);
+    out[window - 1] = if m.n == 0 { f64::NAN } else { m.mean };
     for i in window..n {
-        sum += values[i] - values[i - window];
-        // Periodic exact recompute, for the same reason `rolling_std` does it:
-        // the incremental form is O(1) but accumulates error.
-        if (i - window + 1).is_multiple_of(1024) {
-            sum = values[i + 1 - window..=i].iter().sum();
+        m.remove(values[i - window]);
+        m.add(values[i]);
+        if (i - window + 1).is_multiple_of(RECOMPUTE_INTERVAL) {
+            m = Moments::from_slice(&values[i + 1 - window..=i]);
         }
-        out[i] = sum / w;
+        out[i] = if m.n == 0 { f64::NAN } else { m.mean };
     }
     out
 }
 
-/// Rolling standard deviation using Welford's online algorithm.
+/// Rolling sample standard deviation of the non-NULL values in a trailing
+/// window, by Welford's algorithm.
 ///
-/// Outputs NAN for the first `window - 1` rows.
+/// Outputs NAN for the first `window - 1` rows and wherever the window holds
+/// fewer than two values — including `window == 1`, where a sample standard
+/// deviation divides by zero. Returning `0.0` there, which this used to do,
+/// asserts that a single reading has no spread; it has no *measurable*
+/// spread, which is what NULL says.
+#[must_use]
 pub fn rolling_std(values: &[f64], window: usize) -> Vec<f64> {
     let n = values.len();
     if window == 0 || window > n {
         return vec![f64::NAN; n];
     }
-    // Single-observation window: std dev is 0 by definition (no variance).
-    if window == 1 {
-        return vec![0.0; n];
-    }
     let mut out = vec![f64::NAN; n];
-    let w = window as f64;
-
-    // Welford's online algorithm for initial window
-    let mut mean = 0.0_f64;
-    let mut m2 = 0.0_f64;
-    for (count_0, &v) in values.iter().enumerate().take(window) {
-        let count = (count_0 + 1) as f64;
-        let delta = v - mean;
-        mean += delta / count;
-        let delta2 = v - mean;
-        m2 += delta * delta2;
-    }
-    out[window - 1] = (m2 / (w - 1.0)).sqrt();
-
-    // Sliding window: update Welford sums incrementally — O(1) per step.
-    // Periodically recompute from scratch every 1024 steps to prevent drift.
+    let mut m = Moments::from_slice(&values[..window]);
+    out[window - 1] = m.sample_std();
     for i in window..n {
-        let old = values[i - window];
-        let new = values[i];
-
-        // Remove old, add new using Welford-update formulas
-        let old_mean = mean;
-        mean += (new - old) / w;
-        m2 += (new - old) * (new - mean + old - old_mean);
-        // Guard against floating-point underflow
-        if m2 < 0.0 {
-            m2 = 0.0;
+        m.remove(values[i - window]);
+        m.add(values[i]);
+        if (i - window + 1).is_multiple_of(RECOMPUTE_INTERVAL) {
+            m = Moments::from_slice(&values[i + 1 - window..=i]);
         }
-
-        // Periodic exact recompute for numerical stability
-        if (i - window + 1).is_multiple_of(1024) {
-            let start = i + 1 - window;
-            let slice = &values[start..=i];
-            mean = slice.iter().sum::<f64>() / w;
-            m2 = slice.iter().map(|v| (v - mean).powi(2)).sum::<f64>();
-        }
-
-        out[i] = (m2 / (w - 1.0)).sqrt();
+        out[i] = m.sample_std();
     }
     out
 }
 
-/// Rolling Pearson correlation between two columns.
+/// Sliding co-moments of the pairs in a window where **both** sides are
+/// non-NULL — pairwise-complete, as `PearsonCorrelation::compute` is over a
+/// whole partition.
+#[derive(Debug, Default, Clone, Copy)]
+struct CoMoments {
+    n: usize,
+    mx: f64,
+    my: f64,
+    m2x: f64,
+    m2y: f64,
+    cxy: f64,
+}
+
+impl CoMoments {
+    fn add(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        self.n += 1;
+        let nf = self.n as f64;
+        let dx = x - self.mx;
+        let dy = y - self.my;
+        self.mx += dx / nf;
+        self.my += dy / nf;
+        self.m2x += dx * (x - self.mx);
+        self.m2y += dy * (y - self.my);
+        self.cxy += dx * (y - self.my);
+    }
+
+    fn remove(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() {
+            return;
+        }
+        if self.n <= 1 {
+            *self = Self::default();
+            return;
+        }
+        let (px, py) = (self.mx, self.my);
+        self.n -= 1;
+        let nf = self.n as f64;
+        self.mx -= (x - px) / nf;
+        self.my -= (y - py) / nf;
+        self.m2x -= (x - px) * (x - self.mx);
+        self.m2y -= (y - py) * (y - self.my);
+        self.cxy -= (x - px) * (y - self.my);
+        if self.m2x < 0.0 {
+            self.m2x = 0.0;
+        }
+        if self.m2y < 0.0 {
+            self.m2y = 0.0;
+        }
+    }
+
+    fn from_slices(xs: &[f64], ys: &[f64]) -> Self {
+        let mut c = Self::default();
+        for (&x, &y) in xs.iter().zip(ys) {
+            c.add(x, y);
+        }
+        c
+    }
+
+    /// Pearson correlation, `NaN` with fewer than two pairs or when either
+    /// side has no spread — `0.0` there would assert "uncorrelated" where
+    /// the truth is "there is nothing to correlate".
+    fn correlation(&self) -> f64 {
+        if self.n < 2 {
+            return f64::NAN;
+        }
+        let denom = (self.m2x * self.m2y).sqrt();
+        if denom < f64::EPSILON {
+            return f64::NAN;
+        }
+        self.cxy / denom
+    }
+}
+
+/// Rolling Pearson correlation over a trailing window, pairwise-complete.
 ///
-/// Outputs NAN for the first `window - 1` rows or when variance is zero.
-/// Uses running sums for O(n) total complexity.
+/// Outputs NAN for the first `window - 1` rows and wherever the window holds
+/// fewer than two complete pairs.
+#[must_use]
 pub fn rolling_corr(a: &[f64], b: &[f64], window: usize) -> Vec<f64> {
     let n = a.len().min(b.len());
     if window < 2 || window > n {
         return vec![f64::NAN; n];
     }
     let mut out = vec![f64::NAN; n];
-    let w = window as f64;
-
-    // Initialize running sums for first window
-    let mut sum_a = 0.0_f64;
-    let mut sum_b = 0.0_f64;
-    let mut sum_ab = 0.0_f64;
-    let mut sum_a2 = 0.0_f64;
-    let mut sum_b2 = 0.0_f64;
-    for j in 0..window {
-        sum_a += a[j];
-        sum_b += b[j];
-        sum_ab += a[j] * b[j];
-        sum_a2 += a[j] * a[j];
-        sum_b2 += b[j] * b[j];
-    }
-    let cov = sum_ab - sum_a * sum_b / w;
-    let va = (sum_a2 - sum_a * sum_a / w).max(0.0);
-    let vb = (sum_b2 - sum_b * sum_b / w).max(0.0);
-    let denom = (va * vb).sqrt();
-    out[window - 1] = if denom < f64::EPSILON {
-        f64::NAN
-    } else {
-        cov / denom
-    };
-
-    // Slide window: O(1) per step, with periodic recomputation every 1024
-    // steps to bound floating-point drift in running sums.
-    const RECOMPUTE_INTERVAL: usize = 1024;
+    let mut c = CoMoments::from_slices(&a[..window], &b[..window]);
+    out[window - 1] = c.correlation();
     for i in window..n {
-        if (i - window).is_multiple_of(RECOMPUTE_INTERVAL) && i > window {
-            // Recompute running sums from scratch to reset drift
-            sum_a = 0.0;
-            sum_b = 0.0;
-            sum_ab = 0.0;
-            sum_a2 = 0.0;
-            sum_b2 = 0.0;
-            for j in (i - window + 1)..=i {
-                sum_a += a[j];
-                sum_b += b[j];
-                sum_ab += a[j] * b[j];
-                sum_a2 += a[j] * a[j];
-                sum_b2 += b[j] * b[j];
-            }
-        } else {
-            let old_a = a[i - window];
-            let old_b = b[i - window];
-            let new_a = a[i];
-            let new_b = b[i];
-            sum_a += new_a - old_a;
-            sum_b += new_b - old_b;
-            sum_ab += new_a * new_b - old_a * old_b;
-            sum_a2 += new_a * new_a - old_a * old_a;
-            sum_b2 += new_b * new_b - old_b * old_b;
+        c.remove(a[i - window], b[i - window]);
+        c.add(a[i], b[i]);
+        if (i - window + 1).is_multiple_of(RECOMPUTE_INTERVAL) {
+            c = CoMoments::from_slices(&a[i + 1 - window..=i], &b[i + 1 - window..=i]);
         }
-
-        let cov = sum_ab - sum_a * sum_b / w;
-        let va = (sum_a2 - sum_a * sum_a / w).max(0.0);
-        let vb = (sum_b2 - sum_b * sum_b / w).max(0.0);
-        let denom = (va * vb).sqrt();
-        out[i] = if denom < f64::EPSILON {
-            f64::NAN
-        } else {
-            cov / denom
-        };
+        out[i] = c.correlation();
     }
     out
 }
 
-/// Z-score normalization: `(value - mean) / std_dev`.
+/// Z-score normalisation against the partition's own mean and sample
+/// standard deviation.
 ///
-/// Uses sample standard deviation (Bessel's correction, divides by `n-1`)
-/// for consistency with `crate::compute::simd_std_dev`.
-/// Returns NAN when `std_dev ≈ 0` or `n < 2`.
+/// The statistics are taken over the non-NULL values; a NULL row stays NULL
+/// and does not make the rest of the partition NULL, which is what summing a
+/// slice containing one NaN used to do. Returns all-NAN when fewer than two
+/// values are present or the spread is zero.
+///
+/// Uses the sample standard deviation (Bessel's correction, `n-1`) for
+/// consistency with `crate::compute::simd_std_dev`.
+#[must_use]
 pub fn zscore(values: &[f64]) -> Vec<f64> {
     let n = values.len();
-    if n < 2 {
+    let m = Moments::from_slice(values);
+    let std = m.sample_std();
+    if !std.is_finite() || std < f64::EPSILON {
         return vec![f64::NAN; n];
     }
-    let mean = values.iter().sum::<f64>() / n as f64;
-    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
-    let std = var.sqrt();
-    if std < f64::EPSILON {
-        return vec![f64::NAN; n];
-    }
-    values.iter().map(|v| (v - mean) / std).collect()
+    values
+        .iter()
+        .map(|v| {
+            if v.is_finite() {
+                (v - m.mean) / std
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
 }
 
-/// Exponentially weighted mean with configurable `alpha ∈ (0, 1]`.
+/// Exponentially weighted mean with smoothing factor `alpha ∈ (0, 1]`.
 ///
-/// `ewm[0] = values[0]`; `ewm[i] = alpha * values[i] + (1 - alpha) * ewm[i-1]`.
+/// `ewm[i] = alpha * values[i] + (1 - alpha) * ewm[i-1]`, seeded with the
+/// first non-NULL value — pandas' `ewm(alpha=…, adjust=False).mean()`.
+///
+/// A NULL contributes no observation: the state carries across it unchanged
+/// and is what the row reports, exactly as `rolling_mean` still reports its
+/// window's mean at a NULL row. The statistic is a property of the samples
+/// seen so far, and a row with no sample does not undefine it. Folding the
+/// NaN into the recurrence, which is what this used to do, made every row
+/// after the first NULL NULL as well.
+///
+/// Matches pandas' `ewm(alpha=…, adjust=False, ignore_na=True).mean()`.
+#[must_use]
 pub fn ewm(values: &[f64], alpha: f64) -> Vec<f64> {
     let n = values.len();
-    if n == 0 {
-        return vec![];
-    }
     let alpha = alpha.clamp(f64::EPSILON, 1.0);
-    let mut out = Vec::with_capacity(n);
-    out.push(values[0]);
-    for i in 1..n {
-        let prev = out[i - 1];
-        out.push(alpha * values[i] + (1.0 - alpha) * prev);
+    let mut out = vec![f64::NAN; n];
+    let mut state: Option<f64> = None;
+    for i in 0..n {
+        let v = values[i];
+        if v.is_finite() {
+            state = Some(match state {
+                None => v,
+                Some(prev) => alpha * v + (1.0 - alpha) * prev,
+            });
+        }
+        // Before the first sample there is no state and the row is NULL;
+        // after it, a NULL row reports the state unchanged.
+        if let Some(cur) = state {
+            out[i] = cur;
+        }
     }
     out
 }
 
-// -----------------------------------------------------------------------
-// Tests
-// -----------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,12 +435,20 @@ mod tests {
 
     #[test]
     fn test_rolling_std_window_one() {
-        // Window of 1 has zero variance — should return 0, not NaN.
+        // A *sample* standard deviation of one observation divides by
+        // `n - 1 = 0`: it is undefined, not zero. This used to return 0.0
+        // under the comment "window of 1 has zero variance", which asserts
+        // that a single reading has been observed not to vary. pandas'
+        // `.rolling(1).std()` and `numpy.std(ddof=1)` both answer NaN, and
+        // every other member of this family uses the sample form.
         let v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let r = rolling_std(&v, 1);
         assert_eq!(r.len(), v.len());
         for val in &r {
-            assert_eq!(*val, 0.0, "rolling_std with window=1 must be 0");
+            assert!(
+                val.is_nan(),
+                "rolling_std with window=1 is undefined, got {val}"
+            );
         }
     }
 

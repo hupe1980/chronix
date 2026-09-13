@@ -47,13 +47,14 @@ use crate::config::{ClusterTlsConfig, TlsConfig};
 /// been installed, it cannot choose and panics — taking the server down at the
 /// first TLS setup rather than returning an error.
 ///
-/// That is not hypothetical: `axum-server`'s `tls-rustls` feature enables
-/// `rustls/aws-lc-rs` while this workspace asks for `ring`, so every TLS
-/// deployment of `chronixd` aborted with "Could not automatically determine
-/// the process-level CryptoProvider". The features are now unambiguous
-///, and this call is the belt to that pair of braces: a future
-/// dependency that re-enables a second provider cannot silently bring the
-/// panic back. Installing is idempotent and losing the race is not an error.
+/// That is not hypothetical: two dependencies once asked for different
+/// providers and every TLS deployment of `chronixd` aborted with "Could not
+/// automatically determine the process-level CryptoProvider". The manifest
+/// now names one — `aws-lc-rs` — and the default build carries only that one,
+/// but `--all-features` still pulls `ring` in through `object_store`. This
+/// call is what makes that a non-event, and what stops a future dependency
+/// re-enabling a second provider from bringing the panic back. Installing is
+/// idempotent and losing the race is not an error.
 ///
 /// Called at process start rather than only from the TLS path: `reqwest` is
 /// built with `rustls-no-provider` and resolves the process-level provider

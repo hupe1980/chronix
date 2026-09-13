@@ -724,3 +724,77 @@ fn a_rollup_reports_the_field_columns_it_cannot_aggregate() {
         points.first().map(|p| p.field_keys().collect::<Vec<_>>())
     );
 }
+
+/// `rollup_where` filters both halves of the view, and refuses a tag the
+/// rollup does not group by.
+///
+/// Asked for by the design partner: without it a caller reads every tag group
+/// and discards all but one, which is bounded for a handful of measurement
+/// points and a whole-group-set materialisation for anyone with real
+/// cardinality.
+///
+/// The window deliberately straddles the watermark, because that is where the
+/// interesting mistake lives: the **target** measurement carries only the
+/// tags the rollup grouped by, so a filter on any other key would narrow the
+/// live half — read from the source, which still has every tag — and match
+/// nothing in the materialised half. The answer would be short on one side of
+/// the watermark and whole on the other. Refusing the key is what makes that
+/// unrepresentable.
+#[test]
+fn rollup_where_filters_both_sides_of_the_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Chronix::open(config(dir.path())).unwrap();
+    rollup(&db, "raw_to_1m", "raw", "raw_1m", MINUTE);
+
+    // Two hosts, five hours each; two hours become materialised.
+    for hour in 0..5 {
+        write_minute_values(&db, "a", hour * HOUR, 60);
+        write_minute_values(&db, "b", hour * HOUR, 60);
+    }
+    db.flush().unwrap();
+    db.materialise_rollups().unwrap();
+
+    // Unfiltered: both hosts, every minute of five hours.
+    let all = db.rollup("raw_to_1m", 0, 5 * HOUR - 1).unwrap();
+    assert_eq!(all.num_rows(), 600, "two hosts × 300 minutes");
+
+    // Filtered to one host, across the watermark: exactly half.
+    let one = db
+        .rollup_where("raw_to_1m", 0, 5 * HOUR - 1, &[("h", "a")])
+        .unwrap();
+    assert_eq!(
+        one.num_rows(),
+        300,
+        "one host over the same window, materialised half included"
+    );
+
+    // Both halves individually, so a filter that worked on only one side
+    // cannot pass: hour 0 is materialised, hour 4 is live.
+    let early = db
+        .rollup_where("raw_to_1m", 0, HOUR - 1, &[("h", "a")])
+        .unwrap();
+    assert_eq!(early.num_rows(), 60, "materialised half");
+    let late = db
+        .rollup_where("raw_to_1m", 4 * HOUR, 5 * HOUR - 1, &[("h", "a")])
+        .unwrap();
+    assert_eq!(late.num_rows(), 60, "live half");
+
+    // A tag the rollup does not group by is refused by name, rather than
+    // filtering the live half and nothing else.
+    let err = db
+        .rollup_where("raw_to_1m", 0, 5 * HOUR - 1, &[("region", "eu")])
+        .expect_err("a tag outside group_by must be refused")
+        .to_string();
+    assert!(
+        err.contains("region") && err.contains("group"),
+        "unhelpful error: {err}"
+    );
+
+    // A name that is not a rollup is NotFound, not an internal fault.
+    assert!(matches!(
+        db.rollup_where("nope", 0, 1, &[]).unwrap_err(),
+        chronix::DbError::NotFound { .. }
+    ));
+
+    db.close().unwrap();
+}

@@ -13,13 +13,15 @@ use arrow::datatypes::{DataType, Field};
 use datafusion::common::Result as DFResult;
 
 use super::window::{
-    column_f64, constant_f64, constant_usize, exec_err, f64_array, on_dense, PartitionKernel,
+    column_f64, constant_f64, constant_usize, exec_err, f64_array, on_positional,
+    on_positional_multi, optional_bool, PartitionKernel,
 };
 
 macro_rules! kernel {
     (
         $(#[$meta:meta])*
         $name:ident, $sql:literal, [$($ty:expr),* $(,)?]
+        $(, optional: [$($opt:expr),* $(,)?])?
         $(, returns: $ret:expr)?
         , |$args:ident, $rows:ident| $body:block
     ) => {
@@ -33,6 +35,12 @@ macro_rules! kernel {
             fn arg_types() -> Vec<DataType> {
                 vec![$($ty),*]
             }
+
+            $(fn optional_arg_types() -> Vec<Vec<DataType>> {
+                let mut with_extra = Self::arg_types();
+                with_extra.extend([$($opt),*]);
+                vec![with_extra]
+            })?
 
             $(fn return_type() -> DataType { $ret })?
 
@@ -140,14 +148,33 @@ enum StlPart {
     Residual,
 }
 
+/// The decomposition settings, with the optional `robust` flag applied.
+fn stl_config(
+    period: usize,
+    args: &[ArrayRef],
+    robust_at: usize,
+) -> DFResult<chronix_analytics::preprocess::StlConfig> {
+    use chronix_analytics::preprocess::StlConfig;
+    let cfg = StlConfig::new(period);
+    Ok(if optional_bool(args, robust_at, "stl robust")? {
+        cfg.robust()
+    } else {
+        cfg
+    })
+}
+
 /// Decompose a partition and pull out one component.
 fn stl_component(args: &[ArrayRef], part: StlPart) -> DFResult<ArrayRef> {
-    use chronix_analytics::preprocess::{stl_decompose, StlConfig};
+    use chronix_analytics::preprocess::stl_decompose;
 
     let values = column_f64(args, 0)?;
     let period = constant_usize(args, 1, "stl period")?;
-    let out = on_dense(&values, |dense| {
-        let d = stl_decompose(dense, &StlConfig::new(period)).map_err(exec_err)?;
+    let cfg = stl_config(period, args, 2)?;
+    // `on_positional`, not `on_dense`: a decomposition is defined by where
+    // each row sits in the cycle, and closing a gap moves every row after it
+    // into the previous season.
+    let out = on_positional(&values, |dense| {
+        let d = stl_decompose(dense, &cfg).map_err(exec_err)?;
         Ok(match part {
             StlPart::Trend => d.trend,
             StlPart::Seasonal => d.seasonal,
@@ -161,18 +188,21 @@ kernel! {
     /// `stl_trend(values, period)` — the trend component of an STL
     /// decomposition of the partition.
     StlTrendKernel, "stl_trend", [DataType::Float64, DataType::Int64],
+    optional: [DataType::Boolean],
     |args, _rows| { stl_component(args, StlPart::Trend) }
 }
 
 kernel! {
     /// `stl_seasonal(values, period)` — the seasonal component.
     StlSeasonalKernel, "stl_seasonal", [DataType::Float64, DataType::Int64],
+    optional: [DataType::Boolean],
     |args, _rows| { stl_component(args, StlPart::Seasonal) }
 }
 
 kernel! {
     /// `stl_residual(values, period)` — what the trend and season leave over.
     StlResidualKernel, "stl_residual", [DataType::Float64, DataType::Int64],
+    optional: [DataType::Boolean],
     |args, _rows| { stl_component(args, StlPart::Residual) }
 }
 
@@ -194,12 +224,13 @@ kernel! {
     /// whole split: `stl_decompose(v, 24) OVER (…)` then `.trend`, `.seasonal`
     /// and `.residual`.
     StlDecomposeKernel, "stl_decompose", [DataType::Float64, DataType::Int64],
+    optional: [DataType::Boolean],
     returns: DataType::Struct(stl_struct_fields()),
     |args, _rows| {
         use std::sync::Arc;
 
         use arrow::array::StructArray;
-        use chronix_analytics::preprocess::{stl_decompose, StlConfig};
+        use chronix_analytics::preprocess::stl_decompose;
 
         let values = column_f64(args, 0)?;
         let period = constant_usize(args, 1, "stl period")?;
@@ -211,34 +242,35 @@ kernel! {
 
         // One decomposition, three projections — computing it three times is
         // what the separate component functions cost, and this is the reason
-        // to prefer this one.
-        let dense: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-        if dense.len() < period * 2 {
-            return Err(datafusion::common::DataFusionError::Plan(format!(
-                "stl_decompose: need at least 2*period ({}) non-null rows, got {}",
-                period * 2,
-                dense.len()
-            )));
-        }
-        let d = stl_decompose(&dense, &StlConfig::new(period)).map_err(exec_err)?;
-
-        let spread = |src: &[f64]| {
-            let mut out = vec![f64::NAN; values.len()];
-            let mut k = 0;
-            for (i, v) in values.iter().enumerate() {
-                if v.is_finite() {
-                    if let Some(c) = src.get(k) {
-                        out[i] = *c;
-                    }
-                    k += 1;
-                }
+        // to prefer this one. Each projection goes back on its rows through
+        // the same `on_positional` the component kernels use; this used to
+        // carry its own copy of that logic, which was the `on_dense` one.
+        // One decomposition, three projections — computing it three times is
+        // what the separate component functions cost, and this is the reason
+        // to prefer this one. The projections go back on their rows through
+        // the same `on_positional` the component kernels use; this used to
+        // carry its own copy of that logic, which was the `on_dense` one and
+        // therefore shifted the phase at every gap.
+        let cfg = stl_config(period, args, 2)?;
+        let mut parts = on_positional_multi(&values, |dense| {
+            if dense.len() < period * 2 {
+                return Err(datafusion::common::DataFusionError::Plan(format!(
+                    "stl_decompose: need at least 2*period ({}) rows between the first \
+                     and last non-null value, got {}",
+                    period * 2,
+                    dense.len()
+                )));
             }
-            f64_array(out)
-        };
+            let d = stl_decompose(dense, &cfg).map_err(exec_err)?;
+            Ok(vec![d.trend, d.seasonal, d.residual])
+        })?;
+        let residual = parts.pop().expect("three components");
+        let seasonal = parts.pop().expect("three components");
+        let trend = parts.pop().expect("three components");
 
         let arr = StructArray::try_new(
             stl_struct_fields(),
-            vec![spread(&d.trend), spread(&d.seasonal), spread(&d.residual)],
+            vec![f64_array(trend), f64_array(seasonal), f64_array(residual)],
             None,
         )
         .map_err(exec_err)?;

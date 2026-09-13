@@ -147,16 +147,41 @@ kernel! {
             ));
         }
 
+        // A Mahalanobis distance is a property of one row's *pair*, so a row
+        // missing either side has no distance — and the detector answered
+        // `0.0` for one, which is the distribution's exact centre and so the
+        // single most "normal" score it can return. Rows with a missing side
+        // are dropped from the fit and reported NULL, the same convention
+        // `PearsonCorrelation` states for a pair it cannot use.
+        let complete: Vec<usize> = (0..rows)
+            .filter(|&i| a[i].is_finite() && b[i].is_finite())
+            .collect();
+        if complete.len() < 3 {
+            return Err(DataFusionError::Plan(format!(
+                "multivariate_anomaly: need at least 3 rows where both columns are \
+                 non-null, got {}",
+                complete.len()
+            )));
+        }
+
         let ctx = MultiSeriesContext {
             matrix: ColumnarMatrix {
-                data: vec![a, b],
-                timestamps: positional_timestamps(rows),
+                data: vec![
+                    complete.iter().map(|&i| a[i]).collect(),
+                    complete.iter().map(|&i| b[i]).collect(),
+                ],
+                timestamps: positional_timestamps(complete.len()),
                 series_ids: vec!["a".into(), "b".into()],
             },
         };
         let mut detector = MahalanobisDetector::new(Some(threshold), None);
         detector.fit(&ctx).map_err(exec_err)?;
         let scores = detector.detect(&ctx).map_err(exec_err)?;
-        Ok(f64_array(scores.iter().map(|s| s.score).collect()))
+
+        let mut out = vec![f64::NAN; rows];
+        for (slot, score) in complete.iter().zip(scores.iter()) {
+            out[*slot] = score.score;
+        }
+        Ok(f64_array(out))
     }
 }

@@ -289,9 +289,10 @@ impl super::Chronix {
         self.check_open()?;
         let config = {
             let reg = self.rollup_registry.read();
-            reg.get(name)
-                .cloned()
-                .ok_or_else(|| DbError::Internal(format!("no rollup named {name}")))?
+            reg.get(name).cloned().ok_or_else(|| DbError::NotFound {
+                kind: "rollup",
+                name: name.to_string(),
+            })?
         };
         // `next`, not `+ width`: the bucket holding `end` is a month long
         // when the tier is monthly and 25 hours long on a fall-back day.
@@ -419,27 +420,69 @@ impl super::Chronix {
     /// Returns an error if `name` is not a rollup, the database is closed,
     /// or the scan fails.
     pub fn rollup(&self, name: &str, start: i64, end: i64) -> Result<RecordBatch> {
+        self.rollup_where(name, start, end, &[])
+    }
+
+    /// [`rollup`](Self::rollup) restricted to the series matching `tags`.
+    ///
+    /// Every key must be one of the rollup's `group_by_tags`, and anything
+    /// else is refused by name. That is not a convenience check: a rollup's
+    /// **target** measurement carries only the tags it grouped by, so a
+    /// filter on any other key would narrow the live half — read from the
+    /// source, which still has every tag — and match nothing in the
+    /// materialised half. The answer would be silently short on one side of
+    /// the watermark and whole on the other, which is the worst shape a
+    /// time-series answer can take.
+    ///
+    /// Without this the caller reads every tag group and discards all but
+    /// one. That is bounded for a handful of measurement points and is a
+    /// whole-group-set materialisation for anyone with real cardinality.
+    ///
+    /// # Errors
+    ///
+    /// As [`rollup`](Self::rollup), plus [`DbError::InvalidRequest`] if a tag
+    /// key is not one the rollup groups by.
+    pub fn rollup_where(
+        &self,
+        name: &str,
+        start: i64,
+        end: i64,
+        tags: &[(&str, &str)],
+    ) -> Result<RecordBatch> {
         self.check_open()?;
         let (config, watermark) = {
             let reg = self.rollup_registry.read();
-            let config = reg
-                .get(name)
-                .cloned()
-                .ok_or_else(|| DbError::Internal(format!("no rollup named {name}")))?;
+            let config = reg.get(name).cloned().ok_or_else(|| DbError::NotFound {
+                kind: "rollup",
+                name: name.to_string(),
+            })?;
             (
                 config,
                 reg.state(name).materialised_until.unwrap_or(i64::MIN),
             )
         };
 
+        for (key, _) in tags {
+            if !config.group_by_tags.iter().any(|g| g == key) {
+                return Err(DbError::InvalidRequest(format!(
+                    "rollup {name:?} does not group by tag {key:?}; it groups by {:?}",
+                    config.group_by_tags
+                )));
+            }
+        }
+
         let mut points: Vec<Point> = Vec::new();
 
         // Materialised half: the target measurement below the watermark.
         if start < watermark {
-            let plan = self
+            let mut q = self
                 .query()
                 .measurement(&config.target_measurement)
-                .range(start, end.min(watermark.saturating_sub(1)))
+                .range(start, end.min(watermark.saturating_sub(1)));
+            for (k, v) in tags {
+                q = q.tag(*k, *v);
+            }
+            let plan = q
                 .build()
                 .map_err(|e| DbError::Internal(format!("rollup view plan: {e}")))?;
             for batch in self.execute_iter(&plan)? {
@@ -453,10 +496,14 @@ impl super::Chronix {
         // Live half: the source above the watermark, aggregated now.
         if end >= watermark {
             let live_from = config.bucket.start_of(start.max(watermark));
-            let plan = self
+            let mut q = self
                 .query()
                 .measurement(&config.source_measurement)
-                .range(live_from, end)
+                .range(live_from, end);
+            for (k, v) in tags {
+                q = q.tag(*k, *v);
+            }
+            let plan = q
                 .build()
                 .map_err(|e| DbError::Internal(format!("rollup view plan: {e}")))?;
             let mut acc = crate::rollup::RollupAccumulator::new(&config);
@@ -549,7 +596,17 @@ impl super::Chronix {
             }
             registry
                 .add(config)
-                .map_err(|e| DbError::Internal(format!("rollup registration failed: {e}")))?;
+                // `AlreadyExists` is the caller's answer, not a fault:
+                // declaring a tier on every start is idempotent by nature,
+                // because the registry is persisted and every run after the
+                // first meets its own rollup. Collapsing it into `Internal`
+                // made the common path a string match on a redacted 500.
+                .map_err(|e| match e {
+                    crate::rollup::RollupError::AlreadyExists(name) => {
+                        DbError::Conflict { kind: "rollup", name }
+                    }
+                    other => DbError::Internal(format!("rollup registration failed: {other}")),
+                })?;
         }
         self.catalog
             .write()

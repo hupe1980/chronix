@@ -419,15 +419,26 @@ db.register_udaf(Arc::new(my_aggregate_udaf));
 Runtime-registered UDFs are included when `create_session_context()` builds a
 new DataFusion session, alongside the built-in functions above.
 
-**Null handling:** every function respects Arrow's null bitmap. Inside a
-window kernel a NULL becomes `NaN` so positional alignment survives — row `i`
-of the output belongs to row `i` of the input, and dropping a NULL would shift
-everything after it — and `NaN` becomes NULL again on the way out, so
-`IS NULL` and `avg()` behave. The routines that are not defined on `NaN`
-(STL, the anomaly detectors) run over the dense series and their results are
-placed back on the rows they came from, so a row whose input was missing gets a
-missing output. Constant arguments (`window`, `period`, `alpha`, `horizon`) are
-validated with descriptive errors rather than panicking.
+**Null handling:** every function respects Arrow's null bitmap. A NULL is a
+**missing sample, not a missing row**: it is excluded from every statistic,
+and a row still gets an answer wherever that answer can be computed from
+samples that do exist. Two groups follow from that:
+
+| Group | Functions | At a NULL row |
+|---|---|---|
+| Reads the window | `rolling_mean`, `rolling_std`, `rolling_corr`, `ewm`, `correlation`, `cross_correlation` | Answers, from the real samples around it — as `AVG(v) OVER (ROWS n PRECEDING)` does |
+| Reads that row's own value | `diff`, `pct_change`, `zscore`, `anomaly_score`, `multivariate_anomaly`, `stl_trend`, `stl_seasonal`, `stl_residual`, `stl_decompose` | NULL |
+
+Either way a gap nulls its own rows and no others. The rolling statistics
+match pandas' `rolling(...).mean()/.std()/.corr()` and
+`ewm(adjust=False, ignore_na=True).mean()` exactly on the same input.
+
+Positional alignment survives throughout: row `i` of the output belongs to row
+`i` of the input. The seasonal routines need that most — dropping a NULL row
+would move every row after it into the previous season — so `stl_*`
+interpolates interior gaps to keep the spacing even and then reports NULL on
+the rows that had no sample. Constant arguments (`window`, `period`, `alpha`,
+`horizon`) are validated with descriptive errors rather than panicking.
 
 ### Window Functions
 

@@ -379,6 +379,16 @@ and watermarks live in the **catalog**, fsynced before the call that changed it
 returns and carried forward by every snapshot, so a rollup cannot be lost to a
 half-written file beside the data directory.
 
+`db.rollup(name, start, end)` reads the tier as a view: the materialised
+buckets below the watermark spliced onto the unfinished ones above it,
+aggregated from the source with the same accumulator. Reading the target
+measurement directly instead ends a chart short by however much has not been
+materialised yet. `db.rollup_where(name, start, end, &[("host", "a")])` is the
+same view restricted to matching series; every key must be one of the rollup's
+`group_by_tags`, because the target measurement carries only those and a
+filter on any other key would narrow the live half and match nothing in the
+materialised one.
+
 **Late writes are repaired, not ignored.** A `backfill` or a delete into a
 range a rollup has already aggregated records an *invalidation*; the next
 pass deletes the stale aggregates over that range, recomputes them, and

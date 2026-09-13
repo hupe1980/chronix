@@ -172,7 +172,7 @@ impl super::Chronix {
         // canonical form cannot represent is a bad request whether or not
         // anybody is subscribed.
         let key = SeriesKey::new(measurement.to_string(), tags.clone())
-            .map_err(|e| DbError::Internal(format!("Invalid series key: {e}")))?;
+            .map_err(|e| DbError::InvalidRequest(format!("invalid series key: {e}")))?;
         #[cfg(not(feature = "streaming"))]
         let _ = &key;
 

@@ -384,6 +384,12 @@ fn classify_db(err: &chronix::DbError) -> Outcome {
         // named. Redacting it was how a refused restore reached an operator
         // as `DATABASE_ERROR: an internal error occurred`, which says
         // nothing about which of four reasons it was.
+        E::NotFound { .. } => {
+            Outcome::new(StatusCode::NOT_FOUND, "NOT_FOUND", tonic::Code::NotFound)
+        }
+        E::Conflict { .. } => {
+            Outcome::new(StatusCode::CONFLICT, "CONFLICT", tonic::Code::AlreadyExists)
+        }
         E::InvalidRequest(_) => Outcome::new(
             StatusCode::BAD_REQUEST,
             "INVALID_REQUEST",

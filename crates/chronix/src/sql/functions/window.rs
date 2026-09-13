@@ -56,6 +56,12 @@ pub(super) trait PartitionKernel: std::fmt::Debug + Send + Sync + 'static {
     /// Exact argument types, in order.
     fn arg_types() -> Vec<DataType>;
 
+    /// Further argument lists the function also accepts, for a kernel with an
+    /// optional trailing argument. Empty for all but the STL family.
+    fn optional_arg_types() -> Vec<Vec<DataType>> {
+        Vec::new()
+    }
+
     /// Result type. Defaults to `Float64`, which all but one kernel returns.
     fn return_type() -> DataType {
         DataType::Float64
@@ -102,7 +108,19 @@ impl<K: PartitionKernel> PartitionWindowUdf<K> {
     fn new() -> Self {
         Self {
             signature: Signature::new(
-                TypeSignature::Exact(K::arg_types()),
+                {
+                    let mut forms = vec![TypeSignature::Exact(K::arg_types())];
+                    forms.extend(
+                        K::optional_arg_types()
+                            .into_iter()
+                            .map(TypeSignature::Exact),
+                    );
+                    if forms.len() == 1 {
+                        forms.pop().expect("just built one")
+                    } else {
+                        TypeSignature::OneOf(forms)
+                    }
+                },
                 // The value depends on the partition, not only on the row, so
                 // the planner must not constant-fold or cache across calls.
                 Volatility::Volatile,
@@ -234,13 +252,35 @@ pub(super) fn f64_array(values: Vec<f64>) -> ArrayRef {
     )
 }
 
-/// Run a kernel over a series with the non-finite entries removed, then place
-/// the results back on the rows they came from.
+/// Run a kernel over a series with the missing entries **removed**, then
+/// place the results back on the rows they came from.
 ///
-/// Several analytics routines (STL, the anomaly detectors) are not defined on
-/// `NaN` and would otherwise poison a whole partition from one gap. The
-/// contract is that a row whose input was missing gets a missing output, and
-/// every other row gets the value computed from the dense series.
+/// Only for routines whose answer does not depend on *where* a value sits —
+/// the anomaly detectors score each point against the partition's mean and
+/// spread, so closing the gaps changes nothing. For anything positional use
+/// [`on_positional`]: removing a row shifts every later row by one, and a
+/// seasonal routine reads that as a change of phase.
+///
+/// The contract either way is that a row whose input was missing gets a
+/// missing output.
+/// Read an optional trailing boolean argument, defaulting to `false`.
+///
+/// A literal is broadcast to the partition length before the kernel is
+/// called, so row 0 carries it.
+pub(super) fn optional_bool(args: &[ArrayRef], idx: usize, what: &str) -> DFResult<bool> {
+    let Some(arr) = args.get(idx) else {
+        return Ok(false);
+    };
+    let col = arr
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .ok_or_else(|| DataFusionError::Plan(format!("{what} must be a boolean")))?;
+    if col.is_empty() || col.is_null(0) {
+        return Err(DataFusionError::Plan(format!("{what} must not be NULL")));
+    }
+    Ok(col.value(0))
+}
+
 pub(super) fn on_dense<F>(values: &[f64], f: F) -> DFResult<Vec<f64>>
 where
     F: FnOnce(&[f64]) -> DFResult<Vec<f64>>,
@@ -258,6 +298,72 @@ where
         }
     }
     Ok(out)
+}
+
+/// Run a kernel over a series whose **row positions matter**, with interior
+/// gaps linearly interpolated so that every row keeps its index.
+///
+/// [`on_dense`] closes the gaps instead, and for a seasonal routine that is
+/// a phase error: drop one row from a period-12 series and every row after
+/// it moves to the season before its own. A single NULL in the middle of a
+/// clean sine moved `stl_seasonal`'s output from -0.866 to -0.943 at that
+/// row and kept it wrong to the end of the partition.
+///
+/// Leading and trailing gaps are not extrapolated — those rows are outside
+/// the data and stay NULL. Interior gaps are filled only so the kernel sees
+/// an evenly spaced series; the rows that were missing still report NULL,
+/// because an answer there would be computed from a value nobody wrote.
+pub(super) fn on_positional<F>(values: &[f64], f: F) -> DFResult<Vec<f64>>
+where
+    F: FnOnce(&[f64]) -> DFResult<Vec<f64>>,
+{
+    let mut out = on_positional_multi(values, |dense| Ok(vec![f(dense)?]))?;
+    Ok(out.pop().unwrap_or_else(|| vec![f64::NAN; values.len()]))
+}
+
+/// [`on_positional`] for a kernel that produces several series from one pass,
+/// so a decomposition is computed once rather than once per component.
+pub(super) fn on_positional_multi<F>(values: &[f64], f: F) -> DFResult<Vec<Vec<f64>>>
+where
+    F: FnOnce(&[f64]) -> DFResult<Vec<Vec<f64>>>,
+{
+    let n = values.len();
+    let Some(first) = values.iter().position(|v| v.is_finite()) else {
+        return f(&[]).map(|outs| outs.iter().map(|_| vec![f64::NAN; n]).collect());
+    };
+    let last = values.iter().rposition(|v| v.is_finite()).unwrap_or(first);
+
+    let mut filled: Vec<f64> = values[first..=last].to_vec();
+    let mut anchor = 0usize;
+    for i in 1..filled.len() {
+        if !filled[i].is_finite() {
+            continue;
+        }
+        if i > anchor + 1 {
+            let (lo, hi) = (filled[anchor], filled[i]);
+            let span = (i - anchor) as f64;
+            for (k, slot) in filled[anchor + 1..i].iter_mut().enumerate() {
+                *slot = (hi - lo).mul_add((k + 1) as f64 / span, lo);
+            }
+        }
+        anchor = i;
+    }
+
+    let computed = f(&filled)?;
+    Ok(computed
+        .into_iter()
+        .map(|series| {
+            let mut out = vec![f64::NAN; n];
+            for i in first..=last {
+                if values[i].is_finite() {
+                    if let Some(c) = series.get(i - first) {
+                        out[i] = *c;
+                    }
+                }
+            }
+            out
+        })
+        .collect())
 }
 
 /// Map an analytics-crate error into a DataFusion execution error.

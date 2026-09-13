@@ -193,3 +193,62 @@ fn too_short_a_window_is_reported_rather_than_guessed() {
         .auto_forecast("m", "v", &[("host", "a")], 0, 12 * SEC, 10, None)
         .is_err());
 }
+
+/// The same question of the sibling: an unknown **detector** name.
+///
+/// `forecast()` names the models it accepts and refuses anything else, one
+/// function above `detect_anomalies()`, which silently substituted a z-score.
+/// Two implementations of one promise, and only one of them had a test —
+/// which is the single most productive thing to look for in this tree.
+///
+/// The silent fallback was load-bearing, which is why it survived: `"zscore"`
+/// — the documented default and the first name in `AnomalyConfig::method`'s
+/// own list — is not a branch of the match. It reached the z-score detector
+/// only by falling through the same arm that swallowed the typos.
+#[test]
+fn an_unknown_detector_name_is_an_error_not_a_silent_fallback() {
+    use chronix::AnomalyConfig;
+    // 150 points: `dynamic_threshold` wants at least 100.
+    let (_dir, db) = db_with(&(0..150).map(f64::from).collect::<Vec<_>>());
+
+    // Every documented name still resolves.
+    for method in [
+        "zscore",
+        "modified_zscore",
+        "iqr",
+        "dynamic_threshold",
+        "forecast_residual",
+        "moving_average",
+    ] {
+        db.detect_anomalies(
+            "m",
+            "v",
+            &[("host", "a")],
+            0,
+            150 * SEC,
+            Some(AnomalyConfig {
+                method: Some(method.into()),
+                ..Default::default()
+            }),
+        )
+        .unwrap_or_else(|e| panic!("documented method {method:?} was rejected: {e}"));
+    }
+
+    // A plausible typo for "modified_zscore" is not quietly a z-score.
+    let err = db.detect_anomalies(
+        "m",
+        "v",
+        &[("host", "a")],
+        0,
+        150 * SEC,
+        Some(AnomalyConfig {
+            method: Some("modified-zscore".into()),
+            ..Default::default()
+        }),
+    );
+    let message = err.expect_err("unknown detector was accepted").to_string();
+    assert!(
+        message.contains("unknown detector") && message.contains("modified_zscore"),
+        "unhelpful error: {message}"
+    );
+}

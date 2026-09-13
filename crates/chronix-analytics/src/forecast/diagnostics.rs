@@ -388,38 +388,54 @@ fn gamma_series(a: f64, z: f64) -> f64 {
     log_val.exp().min(1.0)
 }
 
-/// Q(a, z) via Lentz continued fraction.
+/// Q(a, z) via the modified Lentz evaluation of Legendre's continued
+/// fraction, as in Numerical Recipes §6.2 `gcf`.
+///
+/// ```text
+/// Q(a,z) = e^-z z^a / Γ(a) × 1/(z+1-a - 1(1-a)/(z+3-a - 2(2-a)/(z+5-a - …)))
+/// ```
+///
+/// so the `n`-th partial numerator is `-n(n-a)` against the denominator
+/// `z + (2n+1) - a`. What stood here paired those denominators with the
+/// numerators of the continued fraction for the incomplete *beta* function —
+/// `k(a-k)` and `-(a-1+k)k` on alternating terms — and the two do not belong
+/// to the same fraction. `ljung_box` computed its Q statistic exactly and
+/// then reported p = 0.0722 where the true value is 0.0648, an 11 % error in
+/// the only number anybody reads: the series branch covers `z < a + 1`, so
+/// every p-value in the tail came from here.
+///
+/// The guard is also a magnitude one. `x.max(tiny)` turns a legitimate
+/// negative denominator into `+1e-30`, and Legendre's fraction has them.
 fn gamma_cf(a: f64, z: f64) -> f64 {
+    const TINY: f64 = 1e-300;
     let ln_gamma_a = ln_gamma(a);
-    let tiny = 1e-30_f64;
 
-    // b_0 = z + 1 - a, a_0 = 1
-    let b0 = z + 1.0 - a;
-    let mut d = 1.0 / b0.max(tiny);
-    let mut f = d;
-    let mut c = b0.max(tiny);
+    let mut b = z + 1.0 - a;
+    let mut c = 1.0 / TINY;
+    let mut d = 1.0 / if b.abs() < TINY { TINY } else { b };
+    let mut h = d;
 
-    for n in 1..200 {
-        let an = if n % 2 == 1 {
-            let k = (n + 1) / 2;
-            k as f64 * (a - k as f64)
-        } else {
-            let k = n / 2;
-            -(a - 1.0 + k as f64) * (k as f64)
-        };
-        let bn = z + (2 * n + 1) as f64 - a;
-        d = (bn + an * d).max(tiny);
+    for i in 1..300 {
+        let an = -(i as f64) * (i as f64 - a);
+        b += 2.0;
+        d = an.mul_add(d, b);
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = b + an / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
         d = 1.0 / d;
-        c = (bn + an / c).max(tiny);
-        let delta = c * d;
-        f *= delta;
-        if (delta - 1.0).abs() < 1e-14 {
+        let delta = d * c;
+        h *= delta;
+        if (delta - 1.0).abs() < 1e-15 {
             break;
         }
     }
 
-    let log_val = a * z.ln() - z - ln_gamma_a + f.ln();
-    log_val.exp().min(1.0)
+    let log_val = a.mul_add(z.ln(), -z) - ln_gamma_a + h.ln();
+    log_val.exp().clamp(0.0, 1.0)
 }
 
 /// Lanczos approximation for ln(Γ(x)).
@@ -623,13 +639,131 @@ mod tests {
 
     #[test]
     fn chi_squared_survival_known() {
-        // For χ²(2), P(X > 0) = 1
-        let p = chi_squared_survival(0.0, 2);
-        assert!((p - 1.0).abs() < 1e-6, "p = {p}");
+        // `scipy.stats.chi2.sf`, across both branches of
+        // `regularized_upper_gamma` and well into the tail — which is the
+        // half that was wrong. The series covers `z < a + 1`, i.e. small `x`
+        // for large `df`, and everything else went through the continued
+        // fraction; that one carried the partial numerators of the
+        // incomplete *beta* function, so `ljung_box` reported p = 0.0722
+        // where the answer is 0.0648.
+        //
+        // Two examples alone would not have caught it: the previous version
+        // of this test used χ²(2) at x = 0 and x = 4, both of which take the
+        // series branch, and it passed throughout.
+        #[rustfmt::skip]
+        const REFERENCE: &[(f64, usize, f64)] = &[
+            (0.1_f64, 1, 0.7518296340458492),
+            (0.5_f64, 1, 0.47950012218695337),
+            (1.0_f64, 1, 0.31731050786291115),
+            (2.0_f64, 1, 0.15729920705028105),
+            (3.84_f64, 1, 0.050043521248705085),
+            (5.0_f64, 1, 0.025347318677468252),
+            (10.0_f64, 1, 0.0015654022580025482),
+            (15.0_f64, 1, 0.00010751117672950056),
+            (25.0_f64, 1, 5.733031437583878e-07),
+            (40.0_f64, 1, 2.5396285894708634e-10),
+            (60.0_f64, 1, 9.485737571073854e-15),
+            (100.0_f64, 1, 1.5239706048320995e-23),
+            (0.1_f64, 2, 0.951229424500714),
+            (0.5_f64, 2, 0.7788007830714049),
+            (1.0_f64, 2, 0.6065306597126334),
+            (2.0_f64, 2, 0.36787944117144245),
+            (3.84_f64, 2, 0.14660696213035015),
+            (5.0_f64, 2, 0.0820849986238988),
+            (10.0_f64, 2, 0.006737946999085468),
+            (15.0_f64, 2, 0.0005530843701478337),
+            (25.0_f64, 2, 3.7266531720786718e-06),
+            (40.0_f64, 2, 2.0611536224385566e-09),
+            (60.0_f64, 2, 9.357622968840163e-14),
+            (100.0_f64, 2, 1.9287498479639183e-22),
+            (0.1_f64, 3, 0.9918374237318764),
+            (0.5_f64, 3, 0.9188914116546758),
+            (1.0_f64, 3, 0.8012519569012009),
+            (2.0_f64, 3, 0.5724067044708798),
+            (3.84_f64, 3, 0.2792676171186097),
+            (5.0_f64, 3, 0.17179714429673323),
+            (10.0_f64, 3, 0.01856613546304323),
+            (15.0_f64, 3, 0.0018166489665723223),
+            (25.0_f64, 3, 1.544049829110137e-05),
+            (40.0_f64, 3, 1.0655090334255846e-08),
+            (60.0_f64, 3, 5.878230727906919e-13),
+            (100.0_f64, 3, 1.5541594313896026e-21),
+            (0.1_f64, 5, 0.9998376833880774),
+            (0.5_f64, 5, 0.9921232932326296),
+            (1.0_f64, 5, 0.9625657732472964),
+            (2.0_f64, 5, 0.8491450360846096),
+            (3.84_f64, 5, 0.5726744598320888),
+            (5.0_f64, 5, 0.41588018699550783),
+            (10.0_f64, 5, 0.07523524614651216),
+            (15.0_f64, 5, 0.010362337915786436),
+            (25.0_f64, 5, 0.0001393337911856263),
+            (40.0_f64, 5, 1.493367900050396e-07),
+            (60.0_f64, 5, 1.2154569777183006e-11),
+            (100.0_f64, 5, 5.285148360943219e-20),
+            (0.1_f64, 10, 0.9999999975020487),
+            (0.5_f64, 10, 0.999993388289439),
+            (1.0_f64, 10, 0.9998278843700441),
+            (2.0_f64, 10, 0.9963401531726563),
+            (3.84_f64, 10, 0.9542763043207358),
+            (5.0_f64, 10, 0.8911780189141513),
+            (10.0_f64, 10, 0.44049328506521246),
+            (15.0_f64, 10, 0.13206185628772055),
+            (25.0_f64, 10, 0.005345505487134069),
+            (40.0_f64, 10, 1.694474393006737e-05),
+            (60.0_f64, 10, 3.6243009520614924e-09),
+            (100.0_f64, 10, 5.4497019829205215e-17),
+            (0.1_f64, 20, 1.0),
+            (0.5_f64, 20, 0.9999999999997906),
+            (1.0_f64, 20, 0.999999999829033),
+            (2.0_f64, 20, 0.9999998885745217),
+            (3.84_f64, 20, 0.9999667953164147),
+            (5.0_f64, 20, 0.9997226479053791),
+            (10.0_f64, 20, 0.9681719426937951),
+            (15.0_f64, 20, 0.7764076130197146),
+            (25.0_f64, 20, 0.20143110494553587),
+            (40.0_f64, 20, 0.0049954123083075785),
+            (60.0_f64, 20, 7.12175086281558e-06),
+            (100.0_f64, 20, 1.2596084591660936e-12),
+            (0.1_f64, 50, 1.0),
+            (0.5_f64, 50, 1.0),
+            (1.0_f64, 50, 1.0),
+            (2.0_f64, 50, 1.0),
+            (3.84_f64, 50, 1.0),
+            (5.0_f64, 50, 1.0),
+            (10.0_f64, 50, 0.9999999998400414),
+            (15.0_f64, 50, 0.999999625021075),
+            (25.0_f64, 50, 0.9988075511517683),
+            (40.0_f64, 50, 0.8432273781737623),
+            (60.0_f64, 50, 0.1572420272383916),
+            (100.0_f64, 50, 3.4549313829848465e-05),
+        ];
 
-        // For χ²(2), P(X > x) = e^{-x/2}
-        // P(X > 4) = e^{-2} ≈ 0.1353
-        let p = chi_squared_survival(4.0, 2);
-        assert!((p - (-2.0_f64).exp()).abs() < 0.01, "p = {p}");
+        for &(x, df, expected) in REFERENCE {
+            let got = chi_squared_survival(x, df);
+            let err = if expected > 1e-12 {
+                (got - expected).abs() / expected
+            } else {
+                (got - expected).abs()
+            };
+            assert!(
+                err < 1e-10,
+                "sf({x}, {df}) = {got}, expected {expected} (relative error {err:.3e})"
+            );
+        }
+
+        // P(X > 0) = 1 for every df, and the function is monotone falling.
+        for df in 1..40 {
+            assert!((chi_squared_survival(0.0, df) - 1.0).abs() < 1e-12);
+            let mut prev = 1.0;
+            for k in 1..80 {
+                let p = chi_squared_survival(f64::from(k), df);
+                assert!(p <= prev + 1e-12, "sf is not monotone at x={k}, df={df}");
+                assert!(
+                    (0.0..=1.0).contains(&p),
+                    "sf({k}, {df}) = {p} is not a probability"
+                );
+                prev = p;
+            }
+        }
     }
 }

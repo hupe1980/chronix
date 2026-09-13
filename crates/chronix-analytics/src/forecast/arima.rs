@@ -7,14 +7,26 @@
 //!
 //! 1. The series is differenced — seasonally first (`D` times at lag `m`),
 //!    then regularly (`d` times).
-//! 2. The autoregressive part is seeded by the **Burg** algorithm, which
+//! 2. The autoregressive part is **seeded** by the Burg algorithm, which
 //!    always returns a stable AR polynomial and behaves well on short series.
-//! 3. The remaining parameters are refined by minimising the sum of squared
-//!    one-step innovations. `ArimaModel` optimises the moving-average
-//!    coefficients with the AR part held at its Burg estimate; `SarimaModel`
-//!    optimises all four blocks (φ, Φ, θ, Θ) jointly, because the seasonal
-//!    and non-seasonal AR parts interact multiplicatively and cannot be
-//!    estimated independently.
+//! 3. Every block is then refined **together** by minimising the sum of
+//!    squared one-step innovations — φ and θ for `ArimaModel`, φ, Φ, θ and Θ
+//!    for `SarimaModel`. Jointly, because the blocks interact: the seasonal
+//!    and non-seasonal AR parts multiply, and an MA term drags the lag-1
+//!    autocorrelation away from φ, so a Burg AR fitted to mixed data answers
+//!    a different number and an MA optimised against it fits the residue of
+//!    the wrong model. `ArimaModel` used to do exactly that and returned
+//!    φ = 0.22, θ = -0.02 on 2 000 points of an ARMA(1,1) whose maximum
+//!    likelihood is 0.571 and -0.367.
+//! 4. The search runs over **unconstrained** reals, mapped to coefficients by
+//!    the Jones (1980) reparameterisation: `tanh` gives partial
+//!    autocorrelations in `(-1, 1)`, and the Levinson–Durbin recursion turns
+//!    those into a polynomial whose roots lie outside the unit circle for any
+//!    order. Stationarity and invertibility therefore hold **by
+//!    construction** rather than by a box on each coefficient, which is
+//!    neither sufficient (`φ = (0.99, 0.012)` has a root at 0.9985) nor
+//!    necessary (`φ = (1.2, -0.4)` is an ordinary stationary AR(2) outside
+//!    it).
 //!
 //! The first `max(deg φ*, deg θ*)` innovations are **conditioned away**: they
 //! are computed from pre-sample history the model does not have, and for
@@ -277,6 +289,121 @@ pub(crate) fn conditioning_warmup(ar_len: usize, ma_len: usize) -> usize {
 }
 
 /// Conditional sum of squares: the CSS objective.
+/// Map unconstrained reals onto a **stationary** AR coefficient vector.
+///
+/// Jones (1980) / Monahan (1984): `tanh` puts each value in `(-1, 1)`, where
+/// it is a partial autocorrelation, and the Levinson–Durbin recursion turns a
+/// sequence of PACFs in that open interval into a polynomial `1 - Σφⱼzʲ`
+/// whose every root lies strictly outside the unit circle — for any order,
+/// by construction. It is what `statsmodels`' `enforce_stationarity` does.
+///
+/// The alternative, and what stood here, is a box: bound every coefficient to
+/// ±0.99 and hope. That is neither sufficient nor necessary. Not sufficient,
+/// because `φ = (0.99, 0.012)` is inside the box and has a root at 0.9985, so
+/// the forecast recursion **diverges** — 21 of 80 fits on a random walk
+/// landed there. Not necessary, because a perfectly ordinary stationary AR(2)
+/// such as `φ = (1.2, -0.4)` is outside it and cannot be reached at all.
+fn constrain_stationary(unconstrained: &[f64]) -> Vec<f64> {
+    let p = unconstrained.len();
+    let mut phi = vec![0.0; p];
+    let mut next = vec![0.0; p];
+    for k in 0..p {
+        let r = unconstrained[k].tanh();
+        next[k] = r;
+        for j in 0..k {
+            next[j] = phi[j] - r * phi[k - 1 - j];
+        }
+        phi[..=k].copy_from_slice(&next[..=k]);
+    }
+    phi
+}
+
+/// The inverse of [`constrain_stationary`], used to start the optimiser from
+/// a Burg estimate rather than from zero.
+///
+/// Burg always returns a stationary polynomial, so the peel below stays
+/// inside `(-1, 1)`; the clamp is for the boundary case where it lands
+/// exactly on it.
+fn unconstrain_stationary(phi: &[f64]) -> Vec<f64> {
+    let p = phi.len();
+    let mut cur = phi.to_vec();
+    let mut out = vec![0.0; p];
+    for k in (0..p).rev() {
+        let r = cur[k].clamp(-0.999_999, 0.999_999);
+        out[k] = r.atanh();
+        if k == 0 {
+            break;
+        }
+        let denom = 1.0 - r * r;
+        let prev: Vec<f64> = (0..k)
+            .map(|j| r.mul_add(cur[k - 1 - j], cur[j]) / denom)
+            .collect();
+        cur[..k].copy_from_slice(&prev);
+    }
+    out
+}
+
+/// Map unconstrained reals onto an **invertible** MA coefficient vector.
+///
+/// The same recursion, negated. `constrain_stationary` produces the
+/// coefficients of `1 - Σψⱼzʲ`; this crate's MA convention is
+/// `xₜ = … + Σθⱼεₜ₋ⱼ + εₜ`, whose polynomial is `1 + Σθⱼzʲ`, so `θ = -ψ`
+/// gives the identical polynomial and therefore the identical roots.
+fn constrain_invertible(unconstrained: &[f64]) -> Vec<f64> {
+    constrain_stationary(unconstrained)
+        .iter()
+        .map(|v| -v)
+        .collect()
+}
+
+/// Minimise the conditional sum of squares over **every** AR and MA block at
+/// once, and return the parameter vector.
+///
+/// `expand` maps a parameter vector to the `(AR, MA)` polynomials the
+/// innovations recursion runs over: the identity for ARIMA, the
+/// multiplicative expansion for SARIMA. Brent below two parameters,
+/// Nelder–Mead above, over the unconstrained parameters.
+///
+/// **Jointly is the whole point.** `ArimaModel` used to fix the AR part at its
+/// Burg estimate and optimise only the MA coefficients against it, and a Burg
+/// AR fitted to mixed ARMA data is biased — the moving-average term drags the
+/// lag-1 autocorrelation away from φ, so Burg answers a different number and
+/// the MA search then fits the residue of the wrong model. On 2 000 points of
+/// `x = 0.6x[t-1] + e - 0.4e[t-1]` it returned φ = 0.22, θ = -0.02 where
+/// `SarimaModel` — the sibling, which had always optimised its blocks
+/// together — returned 0.571 and -0.367, matching statsmodels' maximum
+/// likelihood to four decimals. Pure AR and pure MA were unaffected, which is
+/// why the defect survived: the two orders anybody tests by hand are the two
+/// that have nothing to interact with.
+fn minimise_css<F>(w: &[f64], x0: &[f64], expand: F) -> Vec<f64>
+where
+    F: Fn(&[f64]) -> (Vec<f64>, Vec<f64>),
+{
+    let n_params = x0.len();
+    if n_params == 0 {
+        return Vec::new();
+    }
+    let objective = |x: &[f64]| {
+        let (ar, ma) = expand(x);
+        css(w, &ar, &ma)
+    };
+    // The search runs in the **unconstrained** space: `expand` puts every
+    // candidate through `constrain_stationary` / `constrain_invertible`
+    // first, so there is no region to keep the optimiser out of and no box to
+    // choose. `tanh` saturates long before ±12, which is only here so the
+    // simplex cannot wander to infinity on a flat objective.
+    if n_params == 1 {
+        let opt =
+            crate::forecast::optimizer::minimize_brent(|v| objective(&[v]), -12.0, 12.0, 1e-9, 300);
+        vec![opt.params[0]]
+    } else {
+        let bounds: Vec<crate::forecast::optimizer::Bound> = (0..n_params)
+            .map(|_| crate::forecast::optimizer::Bound::new(-12.0, 12.0))
+            .collect();
+        crate::forecast::optimizer::minimize_nelder_mead(objective, x0, &bounds, 2000, 1e-10).params
+    }
+}
+
 fn css(values: &[f64], ar: &[f64], ma: &[f64]) -> f64 {
     let warmup = conditioning_warmup(ar.len(), ma.len());
     if values.len() <= warmup {
@@ -483,37 +610,6 @@ impl ArimaModel {
         }
     }
 
-    /// Estimate MA coefficients by conditional sum of squares, with the AR
-    /// part held at its Burg estimate.
-    ///
-    /// Brent's method for `q == 1`, Nelder–Mead above it. The objective skips
-    /// the conditioning warm-up, so the first observations — which for `d = 0`
-    /// carry the *level* of the series rather than its noise — do not steer
-    /// the optimiser.
-    fn estimate_ma(values: &[f64], ar: &[f64], q: usize) -> Vec<f64> {
-        if q == 0 {
-            return Vec::new();
-        }
-        let objective = |theta: &[f64]| css(values, ar, theta);
-        if q == 1 {
-            let opt = crate::forecast::optimizer::minimize_brent(
-                |x| objective(&[x]),
-                -0.99,
-                0.99,
-                1e-8,
-                200,
-            );
-            vec![opt.params[0]]
-        } else {
-            let bounds: Vec<crate::forecast::optimizer::Bound> = (0..q)
-                .map(|_| crate::forecast::optimizer::Bound::new(-0.99, 0.99))
-                .collect();
-            let x0 = vec![0.0; q];
-            crate::forecast::optimizer::minimize_nelder_mead(objective, &x0, &bounds, 500, 1e-8)
-                .params
-        }
-    }
-
     /// Free parameters, counting the innovation variance and the constant if
     /// the model carries one. This is the `k` of every information criterion
     /// below; counting a constant that is not there is a quiet way to make
@@ -615,8 +711,21 @@ impl ForecastModel for ArimaModel {
         };
         let centered: Vec<f64> = diffed.iter().map(|v| v - self.constant).collect();
 
-        let (ar_coeffs, effective_ar_order) = estimate_ar_burg(&centered, self.p)?;
-        let ma_coeffs = Self::estimate_ma(&centered, &ar_coeffs, self.q);
+        // Burg seeds the AR block; the optimiser then moves **both** blocks
+        // together. Holding the AR part at Burg and fitting only the MA
+        // against it is biased for any mixed model — see `minimise_css`.
+        let (seed_ar, effective_ar_order) = estimate_ar_burg(&centered, self.p)?;
+        let ar_len = seed_ar.len();
+        let mut x0 = vec![0.0; ar_len + self.q];
+        x0[..ar_len].copy_from_slice(&unconstrain_stationary(&seed_ar));
+        let best = minimise_css(&centered, &x0, |x| {
+            (
+                constrain_stationary(&x[..ar_len]),
+                constrain_invertible(&x[ar_len..]),
+            )
+        });
+        let ar_coeffs = constrain_stationary(&best[..ar_len]);
+        let ma_coeffs = constrain_invertible(&best[ar_len..]);
         let residuals = innovations(&centered, &ar_coeffs, &ma_coeffs);
 
         // Emit the effective order so a dashboard can see silent degradation.
@@ -910,11 +1019,29 @@ impl SarimaModel {
 
     /// The expanded polynomials implied by a packed parameter vector
     /// `[φ₁…φ_p, Φ₁…Φ_P, θ₁…θ_q, Θ₁…Θ_Q]`.
-    fn expand(&self, x: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    /// Split an **unconstrained** parameter vector into the four blocks, put
+    /// each through its stationarity or invertibility transformation, and
+    /// return the four constrained blocks.
+    ///
+    /// Each block is constrained on its own, which is what the multiplicative
+    /// form asks for: `φ(B)·Φ(Bᵐ)` is stable exactly when both factors are.
+    fn blocks(&self, x: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
         let (p, sp, q) = (self.cfg_p, self.sp, self.cfg_q);
-        let ar = expand_ar(&x[..p], &x[p..p + sp], self.m);
-        let ma = expand_ma(&x[p + sp..p + sp + q], &x[p + sp + q..], self.m);
-        (ar, ma)
+        (
+            constrain_stationary(&x[..p]),
+            constrain_stationary(&x[p..p + sp]),
+            constrain_invertible(&x[p + sp..p + sp + q]),
+            constrain_invertible(&x[p + sp + q..]),
+        )
+    }
+
+    /// The expanded `(AR, MA)` polynomials for an unconstrained vector.
+    fn expand(&self, x: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        let (phi, sphi, theta, stheta) = self.blocks(x);
+        (
+            expand_ar(&phi, &sphi, self.m),
+            expand_ma(&theta, &stheta, self.m),
+        )
     }
 }
 
@@ -955,36 +1082,14 @@ impl ForecastModel for SarimaModel {
         let mut x0 = vec![0.0; n_params];
         if self.cfg_p > 0 {
             let (phi, _) = estimate_ar_burg(&w, self.cfg_p)?;
-            x0[..self.cfg_p].copy_from_slice(&phi);
+            if phi.len() == self.cfg_p {
+                x0[..self.cfg_p].copy_from_slice(&unconstrain_stationary(&phi));
+            }
         }
 
-        let best = if n_params == 0 {
-            x0
-        } else {
-            let objective = |x: &[f64]| {
-                let (ar, ma) = self.expand(x);
-                css(&w, &ar, &ma)
-            };
-            if n_params == 1 {
-                let opt = crate::forecast::optimizer::minimize_brent(
-                    |v| objective(&[v]),
-                    -0.99,
-                    0.99,
-                    1e-8,
-                    200,
-                );
-                vec![opt.params[0]]
-            } else {
-                let bounds: Vec<crate::forecast::optimizer::Bound> = (0..n_params)
-                    .map(|_| crate::forecast::optimizer::Bound::new(-0.99, 0.99))
-                    .collect();
-                crate::forecast::optimizer::minimize_nelder_mead(
-                    objective, &x0, &bounds, 1000, 1e-9,
-                )
-                .params
-            }
-        };
+        let best = minimise_css(&w, &x0, |x| self.expand(x));
 
+        let (phi, sphi, theta, stheta) = self.blocks(&best);
         let (ar_expanded, ma_expanded) = self.expand(&best);
         let residuals = innovations(&w, &ar_expanded, &ma_expanded);
         self.warmup = conditioning_warmup(ar_expanded.len(), ma_expanded.len());
@@ -999,10 +1104,10 @@ impl ForecastModel for SarimaModel {
             sd: self.sd,
             sq: self.sq,
             m: self.m,
-            ar_coeffs: best[..p].to_vec(),
-            ma_coeffs: best[p + sp..p + sp + q].to_vec(),
-            sar_coeffs: best[p..p + sp].to_vec(),
-            sma_coeffs: best[p + sp + q..].to_vec(),
+            ar_coeffs: phi,
+            ma_coeffs: theta,
+            sar_coeffs: sphi,
+            sma_coeffs: stheta,
             constant: self.constant,
             residual_std: sigma,
         };
@@ -2278,7 +2383,18 @@ mod tests {
     }
 
     #[test]
-    fn the_strength_measure_is_blind_to_a_stochastic_seasonal_level() {
+    fn a_stochastic_seasonal_level_is_differenced() {
+        // Each season's level is a random walk across cycles, so the series
+        // has a seasonal unit root and `D = 1` is the textbook answer.
+        //
+        // This used to assert `0`, under the name "the strength measure is
+        // blind to a stochastic seasonal level", with a note asking whoever
+        // saw it change to check which test was being used before calling it
+        // an improvement. It was not the measure that changed: the STL under
+        // it padded the low-pass filter by repeating the first and last
+        // cycle, which is right only for a series that is already periodic,
+        // and a seasonal level that wanders is exactly the series that is
+        // not.
         let m = 24usize;
         let mut values = vec![0.0f64; 12 * m];
         let mut season_level = vec![0.0f64; m];
@@ -2295,12 +2411,49 @@ mod tests {
                 values[cycle * m + season] = season_level[season] + next() * 0.1;
             }
         }
-        assert_eq!(
-            select_seasonal_differencing_order(&values, m, 1),
-            0,
-            "if this starts returning 1 the measure has changed — check which \
-             test is being used before assuming it is an improvement",
-        );
+        assert_eq!(select_seasonal_differencing_order(&values, m, 1), 1);
+    }
+
+    #[test]
+    fn a_counter_is_never_seasonally_differenced() {
+        // The other direction, and the one that matters here: a monotonic
+        // counter is the commonest series in a metrics database and has no
+        // seasonal component at all. The seasonal strength measure is a
+        // ratio of the remainder's variance to the seasonal-plus-remainder
+        // variance, so it says nothing useful unless the decomposition
+        // underneath it is sound — and a straight line came out of the old
+        // STL with a seasonal swing of 278 on values running 1_000 to
+        // 11_619, which read as strength 0.81 against a 0.64 threshold.
+        //
+        // Asserted for a clean ramp and for two noise levels, because the
+        // clean one alone would also pass under a guard that merely refuses
+        // to divide by something small.
+        let m = 24usize;
+        let n = 12 * m;
+        let clean: Vec<f64> = (0..n).map(|i| 1000.0 + i as f64 * 37.0).collect();
+        assert_eq!(select_seasonal_differencing_order(&clean, m, 1), 0);
+
+        let mut rng_state = 3u64;
+        let mut next = || {
+            rng_state = rng_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((rng_state >> 33) as f64 / f64::from(u32::MAX >> 1)) - 1.0
+        };
+        for jitter in [0.5f64, 15.0] {
+            let mut acc = 1000.0;
+            let noisy: Vec<f64> = (0..n)
+                .map(|_| {
+                    acc += 37.0 + next() * jitter;
+                    acc
+                })
+                .collect();
+            assert_eq!(
+                select_seasonal_differencing_order(&noisy, m, 1),
+                0,
+                "a counter with jitter {jitter} was seasonally differenced"
+            );
+        }
     }
 
     #[test]
@@ -2562,9 +2715,28 @@ mod tests {
         assert!(after.timestamps[0] > before.timestamps[0]);
     }
 
+    /// A prediction interval widens with the horizon, strictly.
+    ///
+    /// The series carries **noise** on purpose. A noiseless seasonal sine is
+    /// fitted so well that `residual_std` is ~1e-10, every width is ~1e-9,
+    /// and "strictly wider" becomes a question about the last bits of a
+    /// float rather than about the ψ-weights: the assertion passed only
+    /// while the fit was poor enough to leave something to measure. It
+    /// started failing the moment the estimator got better, which is the
+    /// wrong direction for a test to point.
     #[test]
     fn sarima_intervals_widen_with_horizon() {
-        let vals = seasonal(240, 12, 5.0, 50.0);
+        let mut state = 31u64;
+        let mut noise = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (((state >> 33) as f64 / f64::from(u32::MAX >> 1)) - 1.0) * 0.5
+        };
+        let vals: Vec<f64> = seasonal(240, 12, 5.0, 50.0)
+            .into_iter()
+            .map(|v| v + noise())
+            .collect();
         let mut model = SarimaModel::new(1, 0, 1, 1, 0, 1, 12);
         model.fit(&ts(240), &vals).unwrap();
         let r = model.predict(24).unwrap();

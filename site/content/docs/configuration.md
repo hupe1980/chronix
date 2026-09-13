@@ -76,9 +76,11 @@ let config = ChronixConfig::builder()
 
 ### Analytics
 
-Two bounds, both enforced by the SQL forecast aggregates. The model, the
-detector and the confidence level are arguments to the analytics API rather
-than settings, so a per-call choice stays a per-call choice.
+Two bounds, both enforced by the SQL forecast aggregates — and that is the
+whole section. The model, the detector, the confidence level and the anomaly
+threshold are arguments to the analytics API rather than settings, so a
+per-call choice stays a per-call choice; the section has no key for them and
+refuses a file that sets one.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|

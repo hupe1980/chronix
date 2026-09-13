@@ -68,6 +68,16 @@ searches an ARIMA order, and scores every eligible candidate by rolling-origin
 cross-validation **at the horizon asked for** — the only comparison that
 transfers across model families. The winner is refitted on the whole window.
 
+`stl_trend`, `stl_seasonal`, `stl_residual` and `stl_decompose` take an
+optional `robust` flag, and `StlConfig::robust()` is the same thing in Rust:
+it runs Cleveland's outer loop so that an outlier is left in the residual
+rather than spread across every cycle.
+
+The decomposition under that measure is Cleveland et al. (1990) STL with the
+paper's defaults: a seasonal smoother of 7 **cycles**, a trend smoother of
+`1.5·period / (1 − 1.5/7)` and a low-pass of `period`, each rounded up to the
+next odd number. Components match statsmodels' `STL` to three decimals.
+
 The candidate set is deliberately small: a wider search lets a candidate win
 the folds and lose out of sample, which measures worse. See
 [Model Selection](/internals/forecasting-selection/) for the numbers.
@@ -373,22 +383,25 @@ pool rather than by a fixed batch:
 - **z_score** — independent chunks; mean and standard deviation are computed
   over the whole input first
 
-### Rolling Correlation Conventions
+### Rolling Statistic Conventions
 
-`multivariate::RollingCorrelation` and `preprocess::rolling_corr` compute the
-same statistic and follow the same conventions, which match pandas
-`rolling(window).corr()`:
+`rolling_mean`, `rolling_std` and `rolling_corr` — in Rust and in SQL — match
+pandas' `rolling(window)` exactly, on the same input, NULLs included:
 
 | Situation | Result |
 |---|---|
-| Fewer than `window` observations so far | `NaN` |
+| Fewer than `window` rows so far | `NaN` |
+| Missing samples inside the window | Excluded; the statistic uses the rest |
+| Fewer values than the statistic needs (1 for the mean, 2 for the rest) | `NaN` |
 | Either series has zero variance in the window | `NaN` |
-| Otherwise | Pearson *r* over the trailing `window` |
+| Otherwise | The statistic over the trailing `window` |
 
-`NaN` — not `0.0` — is the correct value for an undefined correlation: `0.0`
-asserts "these series are uncorrelated" when the truth is "there is not enough
-information to say". `RollingCorrelation` and the SQL function follow the same
-rule, and a test pins them to the same output.
+`NaN` — not `0.0` — is the correct value for an undefined correlation or
+spread: `0.0` asserts "these series are uncorrelated" or "this reading does
+not vary" when the truth is "there is not enough information to say".
+`PearsonCorrelation`, `RollingCorrelation` and the SQL functions follow one
+rule, and `chronix/tests/analytics_null_semantics.rs` pins every window
+function in the session to it.
 
 ## Multivariate Analysis
 
