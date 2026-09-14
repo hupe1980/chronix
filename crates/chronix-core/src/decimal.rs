@@ -619,7 +619,7 @@ struct DecimalRepr {
 /// ```
 #[cfg(feature = "rust_decimal")]
 mod rust_decimal_interop {
-    use super::{Decimal, DecimalError, DECIMAL_PRECISION, MAX_DECIMAL_SCALE};
+    use super::{DECIMAL_PRECISION, Decimal, DecimalError, MAX_DECIMAL_SCALE};
 
     impl TryFrom<rust_decimal::Decimal> for Decimal {
         type Error = DecimalError;
@@ -860,10 +860,12 @@ mod tests {
         let rendered: Vec<String> = values.iter().map(ToString::to_string).collect();
         assert_eq!(
             rendered,
-            ["-2", "-1.5", "-1.50", "0", "0.000", "0.5", "1", "1.0000", "1.5", "2"]
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
+            [
+                "-2", "-1.5", "-1.50", "0", "0.000", "0.5", "1", "1.0000", "1.5", "2"
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
         );
     }
 

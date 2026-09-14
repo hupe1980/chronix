@@ -1240,8 +1240,8 @@ mod tests {
     use super::*;
     use crate::signal::model::Severity;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn test_signal(trigger_id: &str, measurement: &str, severity: Severity) -> SignalEvent {
         SignalEvent {

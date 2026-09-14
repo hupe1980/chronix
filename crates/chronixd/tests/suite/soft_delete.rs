@@ -18,8 +18,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 use chronixd::config::ServerConfig;
 use chronixd::http::{AppState, SharedState};
 use chronixd::server::build_router;

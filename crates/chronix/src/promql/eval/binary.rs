@@ -110,12 +110,12 @@ impl PromQLEvaluator {
                         let mut matched_left: Option<usize> = None;
                         for &li in left_matches {
                             let ls = &left[li];
-                            if let Some(prev) = matched_left {
-                                if prev != li {
-                                    return Err(EvalError(
+                            if let Some(prev) = matched_left
+                                && prev != li
+                            {
+                                return Err(EvalError(
                                         "many-to-many matching not allowed: matching labels must be unique on one side".into(),
                                     ));
-                                }
                             }
                             matched_left = Some(li);
                             let mut merged = rs.clone();
@@ -243,19 +243,17 @@ impl PromQLEvaluator {
                             });
 
                             // For group_left, copy extra labels from the "one" side (right)
-                            if let Some(m) = matching {
-                                if m.card == VectorMatchingCardinality::ManyToOne {
-                                    for inc in &m.include {
-                                        if let Some((_, v)) =
-                                            rs.labels.iter().find(|(k, _)| k == inc)
+                            if let Some(m) = matching
+                                && m.card == VectorMatchingCardinality::ManyToOne
+                            {
+                                for inc in &m.include {
+                                    if let Some((_, v)) = rs.labels.iter().find(|(k, _)| k == inc) {
+                                        if let Some(pos) =
+                                            merged.labels.iter().position(|(k, _)| k == inc)
                                         {
-                                            if let Some(pos) =
-                                                merged.labels.iter().position(|(k, _)| k == inc)
-                                            {
-                                                merged.labels[pos].1 = v.clone();
-                                            } else {
-                                                merged.labels.push((inc.clone(), v.clone()));
-                                            }
+                                            merged.labels[pos].1 = v.clone();
+                                        } else {
+                                            merged.labels.push((inc.clone(), v.clone()));
                                         }
                                     }
                                 }
@@ -643,6 +641,7 @@ mod tests {
                     timestamp: 0,
                     value: 1.0,
                 }],
+                histograms: Vec::new(),
             },
             Series {
                 labels: vec![("host".into(), "b".into()), ("region".into(), "eu".into())],
@@ -650,6 +649,7 @@ mod tests {
                     timestamp: 0,
                     value: 2.0,
                 }],
+                histograms: Vec::new(),
             },
         ];
         let right = vec![Series {
@@ -658,6 +658,7 @@ mod tests {
                 timestamp: 0,
                 value: 3.0,
             }],
+            histograms: Vec::new(),
         }];
         // Without matching: "a,us" ≠ "a,eu" → AND returns empty
         let result_no_match = apply_set_op(BinaryOp::And, &left, &right, None);

@@ -5,7 +5,7 @@
 //! lifecycle to verify crash recovery, schema persistence, and query pruning.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, DbError};
+use chronix::{Chronix, DbError, fields, tags};
 use tempfile::TempDir;
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -213,8 +213,7 @@ fn flush_persists_to_catalog() {
 
     // Catalog should have the segment
     {
-        let catalog = db.catalog().read();
-        assert!(catalog.segment_count() > 0);
+        assert!(db.segment_count() > 0);
     }
 
     db.close().unwrap();
@@ -318,12 +317,10 @@ fn flush_then_crash_data_in_segments() {
     {
         let db = Chronix::open(default_config(&path)).unwrap();
 
-        let catalog = db.catalog().read();
         assert!(
-            catalog.segment_count() >= 1,
+            db.segment_count() >= 1,
             "Catalog should contain at least 1 segment after flush"
         );
-        drop(catalog);
 
         db.close().unwrap();
     }
@@ -1486,7 +1483,7 @@ fn downsample_negative_timestamps() {
 
 #[test]
 fn count_on_empty_returns_zero() {
-    use chronix_query::aggregate::{aggregate_batch, AggFn};
+    use chronix_query::aggregate::{AggFn, aggregate_batch};
 
     use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1551,8 +1548,8 @@ fn schema_tag_and_field_names() {
 /// workload completes.
 #[test]
 fn concurrent_write_flush_compact_query_stress() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     let tmp = TempDir::new().unwrap();

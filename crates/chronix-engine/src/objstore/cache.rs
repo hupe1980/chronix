@@ -143,14 +143,8 @@ impl DiskCache {
                 let key = Self::path_to_key(&filename);
                 let size = metadata.len();
                 // Assign a unique generation for LRU ordering
-                let gen = LRU_GENERATION.fetch_add(1, Ordering::Relaxed);
-                state.upsert(
-                    key,
-                    CacheEntry {
-                        size,
-                        generation: gen,
-                    },
-                );
+                let generation = LRU_GENERATION.fetch_add(1, Ordering::Relaxed);
+                state.upsert(key, CacheEntry { size, generation });
             }
         }
 

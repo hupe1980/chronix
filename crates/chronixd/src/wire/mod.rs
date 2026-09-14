@@ -7,6 +7,7 @@
 //! [`value`] is the other direction: the single Arrow → JSON encoding used by
 //! every surface that answers a query in JSON or protobuf.
 
+pub mod histogram;
 pub mod otlp;
 pub mod prometheus;
 pub mod value;

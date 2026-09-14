@@ -37,6 +37,10 @@ mod integration;
 mod partial_answers;
 #[path = "suite/prom_discovery.rs"]
 mod prom_discovery;
+
+/// Native histograms over the wire a real Prometheus or OTel collector uses.
+#[path = "suite/native_histogram_wire.rs"]
+mod native_histogram_wire;
 #[path = "suite/tenancy_test.rs"]
 mod tenancy_test;
 #[path = "suite/tls_test.rs"]

@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;

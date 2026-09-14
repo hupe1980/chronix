@@ -56,7 +56,7 @@ use crate::segment::compression::{
 };
 use crate::segment::error::{Result, SegmentError};
 use crate::segment::header::{SegmentFooter, SegmentHeader, VERSION};
-use crate::segment::metadata::{data_types, roles, ColumnBlockMeta, ColumnMeta, SegmentMetadata};
+use crate::segment::metadata::{ColumnBlockMeta, ColumnMeta, SegmentMetadata, data_types, roles};
 use crate::segment::stats::ColumnStats;
 use crate::segment::validity::ValidityBuilder;
 
@@ -1051,13 +1051,14 @@ fn discover_schema(points: &[Point]) -> Vec<ColumnDef> {
                     FieldValue::Bool(_) => data_types::BOOL,
                     FieldValue::String(_) => data_types::STRING,
                     FieldValue::Decimal(_) => data_types::DECIMAL,
+                    FieldValue::Histogram(_) => data_types::HISTOGRAM,
                 };
                 (dt, None)
             });
-            if let FieldValue::Decimal(d) = val {
-                if entry.0 == data_types::DECIMAL {
-                    entry.1 = Some(entry.1.unwrap_or(0).max(d.scale()));
-                }
+            if let FieldValue::Decimal(d) = val
+                && entry.0 == data_types::DECIMAL
+            {
+                entry.1 = Some(entry.1.unwrap_or(0).max(d.scale()));
             }
         }
     }
@@ -1239,7 +1240,7 @@ fn encode_column(
                                     col.name,
                                     d.scale()
                                 ),
-                            })
+                            });
                         }
                     },
                     _ => {
@@ -1271,6 +1272,43 @@ fn encode_column(
             // value_count should reflect non-null entries (null_count already tracked).
             stats.value_count = (values.len() as u64).saturating_sub(stats.null_count);
             let block = ColumnEncoder::encode_string(&values)?;
+            Ok(EncodedColumn::new(block, stats, validity))
+        }
+        (_, data_types::HISTOGRAM) => {
+            // The value is already encoded — `postcard`, by the histogram
+            // itself — so this path frames the blobs and records presence.
+            // No statistics: min/max of a distribution is not a number, and a
+            // zone map over one would be a comparison nothing can make.
+            let mut owned: Vec<Vec<u8>> = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                match points[idx].field(&col.name) {
+                    Some(FieldValue::Histogram(h)) => match postcard::to_allocvec(h.as_ref()) {
+                        Ok(bytes) => {
+                            owned.push(bytes);
+                            validity.push(true);
+                        }
+                        Err(e) => {
+                            return Err(SegmentError::CorruptFile {
+                                detail: format!(
+                                    "histogram column '{}' could not be encoded: {e}",
+                                    col.name
+                                ),
+                            });
+                        }
+                    },
+                    _ => {
+                        owned.push(Vec::new());
+                        stats.record_null();
+                        validity.push(false);
+                    }
+                }
+            }
+            stats.value_count = (owned.len() as u64).saturating_sub(stats.null_count);
+            let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+            let block = chronix_encoding::EncodedBlock {
+                encoding: chronix_encoding::EncodingType::Bytes,
+                payload: chronix_encoding::PlainEncoder::encode_bytes(&refs)?,
+            };
             Ok(EncodedColumn::new(block, stats, validity))
         }
         _ => Err(SegmentError::CorruptFile {
@@ -1430,6 +1468,14 @@ fn discover_schema_from_batch(
                 data_types::DECIMAL,
                 chronix_encoding::EncodingType::DecimalI128.tag(),
             ),
+            // A native histogram: a composite value carried as its own
+            // encoding. There is nothing numeric to zone-map or delta, so
+            // the framing is a length prefix and the block compression
+            // underneath does the rest.
+            DataType::Binary | DataType::LargeBinary => (
+                data_types::HISTOGRAM,
+                chronix_encoding::EncodingType::Bytes.tag(),
+            ),
             other => {
                 return Err(SegmentError::CorruptFile {
                     detail: format!(
@@ -1486,16 +1532,16 @@ fn series_keys_from_batch(
     for row in 0..num_rows {
         let mut tags = BTreeMap::new();
         for (i, tag_name) in tag_columns.iter().enumerate() {
-            if let Some(arr) = tag_arrays[i] {
-                if !arr.is_null(row) {
-                    tags.insert(tag_name.clone(), arr.value(row).to_string());
-                }
+            if let Some(arr) = tag_arrays[i]
+                && !arr.is_null(row)
+            {
+                tags.insert(tag_name.clone(), arr.value(row).to_string());
             }
         }
-        if let Ok(key) = chronix_core::SeriesKey::new(measurement, tags) {
-            if seen.insert(key.canonical_form().to_string()) {
-                keys.push(key);
-            }
+        if let Ok(key) = chronix_core::SeriesKey::new(measurement, tags)
+            && seen.insert(key.canonical_form().to_string())
+        {
+            keys.push(key);
         }
     }
     keys
@@ -1708,32 +1754,32 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
 
         // Build per-row-group bloom filters for tag columns (batch path).
         for (col_idx, col) in schema.iter().enumerate() {
-            if col.role == roles::TAG && !column_metas[col_idx].encrypted {
-                if let Some(arr) = batch
+            if col.role == roles::TAG
+                && !column_metas[col_idx].encrypted
+                && let Some(arr) = batch
                     .column_by_name(&col.name)
                     .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                {
-                    let mut distinct: std::collections::HashSet<&str> =
-                        std::collections::HashSet::new();
-                    for i in chunk_start..chunk_end {
-                        if !arr.is_null(i) {
-                            let val = arr.value(i);
-                            if !val.is_empty() {
-                                distinct.insert(val);
-                            }
+            {
+                let mut distinct: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for i in chunk_start..chunk_end {
+                    if !arr.is_null(i) {
+                        let val = arr.value(i);
+                        if !val.is_empty() {
+                            distinct.insert(val);
                         }
                     }
-                    let bloom = if distinct.is_empty() {
-                        Vec::new()
-                    } else {
-                        let vals: Vec<&str> = distinct.into_iter().collect();
-                        crate::segment::bloom::bloom_filter_build(&vals, config.bloom_fpr)
-                    };
-                    column_metas[col_idx]
-                        .row_group_blooms
-                        .get_or_insert_with(Vec::new)
-                        .push(bloom);
                 }
+                let bloom = if distinct.is_empty() {
+                    Vec::new()
+                } else {
+                    let vals: Vec<&str> = distinct.into_iter().collect();
+                    crate::segment::bloom::bloom_filter_build(&vals, config.bloom_fpr)
+                };
+                column_metas[col_idx]
+                    .row_group_blooms
+                    .get_or_insert_with(Vec::new)
+                    .push(bloom);
             }
         }
 
@@ -1757,27 +1803,26 @@ fn encode_row_groups_from_batch_streaming<W: Write>(
     // Build bloom filters for tag columns from Arrow arrays.
     // Skip bloom filter for encrypted columns to prevent information leakage.
     for (col_idx, col) in schema.iter().enumerate() {
-        if col.role == roles::TAG && !column_metas[col_idx].encrypted {
-            if let Some(arr) = batch
+        if col.role == roles::TAG
+            && !column_metas[col_idx].encrypted
+            && let Some(arr) = batch
                 .column_by_name(&col.name)
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            {
-                let mut distinct: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
-                for i in 0..arr.len() {
-                    if !arr.is_null(i) {
-                        let val = arr.value(i);
-                        if !val.is_empty() {
-                            distinct.insert(val);
-                        }
+        {
+            let mut distinct: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    let val = arr.value(i);
+                    if !val.is_empty() {
+                        distinct.insert(val);
                     }
                 }
-                if !distinct.is_empty() {
-                    let values: Vec<&str> = distinct.into_iter().collect();
-                    column_metas[col_idx].bloom_filter = Some(
-                        crate::segment::bloom::bloom_filter_build(&values, config.bloom_fpr),
-                    );
-                }
+            }
+            if !distinct.is_empty() {
+                let values: Vec<&str> = distinct.into_iter().collect();
+                column_metas[col_idx].bloom_filter = Some(
+                    crate::segment::bloom::bloom_filter_build(&values, config.bloom_fpr),
+                );
             }
         }
     }
@@ -1973,6 +2018,34 @@ fn encode_column_from_batch(
                 }
             }
             let block = ColumnEncoder::encode_bool(&values)?;
+            Ok(EncodedColumn::new(block, stats, validity))
+        }
+        (_, data_types::HISTOGRAM) => {
+            // The batch path — what a flush and a compaction take. The values
+            // arrive already encoded, because a histogram column is `Binary`
+            // in Arrow and the memtable put the `postcard` bytes there.
+            let arr = batch
+                .column_by_name(&col.name)
+                .and_then(|c| c.as_any().downcast_ref::<arrow::array::BinaryArray>())
+                .ok_or_else(|| SegmentError::CorruptFile {
+                    detail: format!("missing histogram column '{}'", col.name),
+                })?;
+            let mut owned: Vec<&[u8]> = Vec::with_capacity(end - start);
+            for i in start..end {
+                if arr.is_null(i) {
+                    owned.push(&[]);
+                    stats.record_null();
+                    validity.push(false);
+                } else {
+                    owned.push(arr.value(i));
+                    validity.push(true);
+                }
+            }
+            stats.value_count = (owned.len() as u64).saturating_sub(stats.null_count);
+            let block = chronix_encoding::EncodedBlock {
+                encoding: chronix_encoding::EncodingType::Bytes,
+                payload: chronix_encoding::PlainEncoder::encode_bytes(&owned)?,
+            };
             Ok(EncodedColumn::new(block, stats, validity))
         }
         _ => Err(SegmentError::CorruptFile {

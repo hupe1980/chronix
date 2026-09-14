@@ -152,12 +152,12 @@ impl MtlsValidator {
         self.validate_identity(cn, "CN")?;
 
         // Enforce allowlist when configured.
-        if let Some(ref allowed) = self.config.allowed_cns {
-            if !allowed.iter().any(|a| a == cn) {
-                return Err(AuthError::InvalidCertificate(format!(
-                    "CN \"{cn}\" is not in the allowed list"
-                )));
-            }
+        if let Some(ref allowed) = self.config.allowed_cns
+            && !allowed.iter().any(|a| a == cn)
+        {
+            return Err(AuthError::InvalidCertificate(format!(
+                "CN \"{cn}\" is not in the allowed list"
+            )));
         }
 
         Ok(CertificateIdentity {
@@ -410,11 +410,15 @@ mod tests {
         });
 
         assert!(validator.extract_identity_from_san_email("").is_err());
-        assert!(validator
-            .extract_identity_from_san_email("user\0@evil.com")
-            .is_err());
-        assert!(validator
-            .extract_identity_from_san_email("admin@chronix.io")
-            .is_ok());
+        assert!(
+            validator
+                .extract_identity_from_san_email("user\0@evil.com")
+                .is_err()
+        );
+        assert!(
+            validator
+                .extract_identity_from_san_email("admin@chronix.io")
+                .is_ok()
+        );
     }
 }

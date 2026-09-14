@@ -24,7 +24,7 @@
 use crate::compute::simd_mean;
 
 use crate::anomaly::error::AnomalyError;
-use crate::anomaly::traits::{validate_lengths, AnomalyDetector, AnomalyScore, DetectorType};
+use crate::anomaly::traits::{AnomalyDetector, AnomalyScore, DetectorType, validate_lengths};
 
 /// Two-sided tabular CUSUM detector.
 ///

@@ -191,10 +191,10 @@ impl AlertEngine {
 
             // Check cooldown
             let key = (config.id.clone(), series_key.clone());
-            if let Some(last) = self.last_fired.get(&key) {
-                if now.duration_since(*last) < config.cooldown {
-                    continue;
-                }
+            if let Some(last) = self.last_fired.get(&key)
+                && now.duration_since(*last) < config.cooldown
+            {
+                continue;
             }
 
             // Fire!

@@ -187,7 +187,7 @@ impl SegmentFile {
                     return Err(SchemaError::InvalidName {
                         name: "segment file".to_owned(),
                         reason: format!("not a plain relative path: {}", path.display()),
-                    })
+                    });
                 }
             }
         }
@@ -523,6 +523,18 @@ pub enum FieldValue {
     Bool(bool),
     /// UTF-8 string value.
     String(String),
+    /// A whole distribution as one sample — a Prometheus **native histogram**.
+    ///
+    /// Boxed because it is the only variant with heap of its own in more than
+    /// one place, and a `FieldValue` sits in every point: inlining three
+    /// `Vec`s here would grow every `F64` sample by the same amount.
+    ///
+    /// See [`Histogram`](crate::histogram::Histogram) for the model. Unlike
+    /// every other variant this one is a *composite*: it carries its own
+    /// count, sum and buckets, and the functions that read it are the
+    /// `histogram_*` family rather than arithmetic.
+    Histogram(Box<crate::histogram::Histogram>),
+
     /// Exact fixed-point decimal — `mantissa × 10⁻ˢᶜᵃˡᵉ`.
     ///
     /// The scale is a property of the *column*, not of the point: the first
@@ -545,6 +557,7 @@ impl FieldValue {
             Self::Bool(_) => "bool",
             Self::String(_) => "string",
             Self::Decimal(_) => "decimal",
+            Self::Histogram(_) => "histogram",
         }
     }
 
@@ -583,7 +596,12 @@ impl FieldValue {
             Self::I64(v) => Some(*v as f64),
             Self::U64(v) => Some(*v as f64),
             Self::Decimal(d) => Some(d.to_f64_lossy()),
-            Self::Bool(_) | Self::String(_) => None,
+            // A histogram is a distribution, not a magnitude. There is no
+            // single float it "is": `histogram_sum` and `histogram_count`
+            // are the questions with answers, and collapsing it to one of
+            // them here would make every caller that forgot to ask look
+            // like it had asked.
+            Self::Bool(_) | Self::String(_) | Self::Histogram(_) => None,
         }
     }
 }
@@ -595,6 +613,11 @@ impl fmt::Display for FieldValue {
             Self::I64(v) => write!(f, "{v}i"),
             Self::U64(v) => write!(f, "{v}u"),
             Self::Bool(v) => write!(f, "{v}"),
+            Self::Histogram(h) => write!(
+                f,
+                "histogram{{count={},sum={},schema={}}}",
+                h.count, h.sum, h.schema
+            ),
             Self::String(v) => {
                 // Escape backslashes and double-quotes inside string values.
                 let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
@@ -1459,27 +1482,45 @@ impl Point {
 
             // Reject non-finite f64 values (NaN, Infinity).
             // NaN breaks dedup (NaN ≠ NaN), sorting, and equality checks.
-            if let FieldValue::F64(v) = value {
-                if !v.is_finite() {
-                    return Err(SchemaError::InvalidFieldValue {
-                        field: key.clone(),
-                        reason: format!("non-finite f64 value: {v}"),
-                    });
-                }
+            if let FieldValue::F64(v) = value
+                && !v.is_finite()
+            {
+                return Err(SchemaError::InvalidFieldValue {
+                    field: key.clone(),
+                    reason: format!("non-finite f64 value: {v}"),
+                });
+            }
+
+            // Refuse a malformed histogram here, where the value enters.
+            //
+            // Every other check in this loop exists because the bad value
+            // would produce a *wrong answer* rather than an error — a NaN
+            // breaks dedup, an oversized string cannot be encoded. A
+            // histogram with unsorted buckets is the same shape: it
+            // interpolates to a quantile that is plausible and wrong, and
+            // nothing downstream would notice. Read time is too late,
+            // because by then the bytes are durable.
+            if let FieldValue::Histogram(h) = value
+                && let Err(e) = h.validate()
+            {
+                return Err(SchemaError::InvalidFieldValue {
+                    field: key.clone(),
+                    reason: e.to_string(),
+                });
             }
 
             // Reject oversized string field values.
-            if let FieldValue::String(s) = value {
-                if s.len() > MAX_STRING_FIELD_LENGTH {
-                    return Err(SchemaError::InvalidFieldValue {
-                        field: key.clone(),
-                        reason: format!(
-                            "string value too long: {} bytes (max {})",
-                            s.len(),
-                            MAX_STRING_FIELD_LENGTH,
-                        ),
-                    });
-                }
+            if let FieldValue::String(s) = value
+                && s.len() > MAX_STRING_FIELD_LENGTH
+            {
+                return Err(SchemaError::InvalidFieldValue {
+                    field: key.clone(),
+                    reason: format!(
+                        "string value too long: {} bytes (max {})",
+                        s.len(),
+                        MAX_STRING_FIELD_LENGTH,
+                    ),
+                });
             }
         }
         // BTreeMap iterates in sorted order, so the resulting Vec is sorted.

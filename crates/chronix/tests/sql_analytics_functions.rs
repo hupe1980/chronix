@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow::array::Array;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use datafusion::prelude::SessionContext;
 
 /// Write `hosts × per_host` points, split across `flushes` segments.

@@ -13,7 +13,7 @@
 //! upgrade, it is because the comparison moved into binary floating point.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::sync::Arc;
 
 fn open(dir: &tempfile::TempDir) -> Arc<Chronix> {

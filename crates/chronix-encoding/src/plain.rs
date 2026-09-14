@@ -130,6 +130,37 @@ impl PlainEncoder {
         }
         Ok(buf)
     }
+
+    /// Encode a byte-string column.
+    ///
+    /// The same wire shape as [`encode_string`](Self::encode_string) — a
+    /// count, then a `u32` length and that many bytes per value — without the
+    /// UTF-8 constraint. It exists for native histograms, whose values are
+    /// composite objects with no numeric representation to compress.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodingError::EmptyInput`] for no values, or
+    /// [`EncodingError::CorruptData`] for a value longer than `u32::MAX`.
+    pub fn encode_bytes(values: &[&[u8]]) -> Result<Vec<u8>> {
+        if values.is_empty() {
+            return Err(EncodingError::EmptyInput {
+                context: "plain bytes",
+            });
+        }
+        let count = checked_count(values.len())?;
+        let total_bytes: usize = values.iter().map(|b| 4 + b.len()).sum();
+        let mut buf = Vec::with_capacity(4 + total_bytes);
+        buf.extend_from_slice(&count.to_le_bytes());
+        for &b in values {
+            let len = u32::try_from(b.len()).map_err(|_| EncodingError::CorruptData {
+                detail: format!("byte string length {} exceeds u32::MAX", b.len()),
+            })?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        Ok(buf)
+    }
 }
 
 impl PlainDecoder {
@@ -154,6 +185,57 @@ impl PlainDecoder {
                     })?;
             values.push(f64::from_le_bytes(bytes));
         }
+        Ok(values)
+    }
+
+    /// Decode a byte-string column.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodingError::CorruptData`] if a length prefix runs past the end of
+    /// the payload, or if the declared total would exceed the decode ceiling.
+    /// Both are reachable from one flipped bit in a stored block, which is why
+    /// the bound is checked before the allocation rather than after it.
+    pub fn decode_bytes(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let count = Self::read_count(data, "bytes")?;
+        let mut offset = 4;
+        let mut values = Vec::with_capacity(count.min(1024));
+        let mut decoded_total = 0usize;
+
+        for _ in 0..count {
+            if offset + 4 > data.len() {
+                return Err(EncodingError::CorruptData {
+                    detail: "plain bytes data truncated at length prefix".to_string(),
+                });
+            }
+            let len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            if offset + len > data.len() {
+                return Err(EncodingError::CorruptData {
+                    detail: "plain bytes data truncated".to_string(),
+                });
+            }
+            // Bound the running total, not just the per-value length: a
+            // payload can declare many short values whose sum is large.
+            decoded_total = decoded_total.saturating_add(len);
+            if decoded_total > crate::coding::MAX_DECODED_BYTES {
+                return Err(EncodingError::CorruptData {
+                    detail: format!(
+                        "plain bytes would decode to {decoded_total} bytes, above the                          {} byte ceiling",
+                        crate::coding::MAX_DECODED_BYTES
+                    ),
+                });
+            }
+            values.push(data[offset..offset + len].to_vec());
+            offset += len;
+        }
+
         Ok(values)
     }
 

@@ -583,6 +583,51 @@ struct FieldStats {
     last_value: f64,
     /// The exact track, allocated only for a decimal column.
     decimal: Option<Box<chronix_query::DecimalTrack>>,
+    /// The distribution track, allocated only for a histogram column.
+    ///
+    /// The same shape as `decimal` above and for the same reason: a column
+    /// whose aggregate is not an `f64` needs somewhere to accumulate that is
+    /// not `sum`/`min`/`max`. A rollup of a latency histogram has to *be* a
+    /// histogram — a tier holding the mean of a distribution has thrown away
+    /// the thing anybody asks a histogram for.
+    histogram: Option<Box<HistogramTrack>>,
+}
+
+/// Running state for a histogram column in one bucket.
+#[derive(Debug, Clone)]
+struct HistogramTrack {
+    /// Every sample in the bucket, merged.
+    merged: chronix_core::histogram::Histogram,
+    /// The first and last sample, for those aggregations.
+    first: Option<chronix_core::histogram::Histogram>,
+    last: Option<chronix_core::histogram::Histogram>,
+    /// Set when two samples in one bucket had different schemas.
+    ///
+    /// Merging them would mean re-bucketing to the coarser, which changes
+    /// the resolution of data somebody chose — so the bucket reports the
+    /// conflict instead and the materialiser refuses. Silently picking one
+    /// is the plausible-wrong-answer failure this engine is built to avoid.
+    schema_conflict: bool,
+}
+
+impl HistogramTrack {
+    fn push(
+        &mut self,
+        h: &chronix_core::histogram::Histogram,
+        ts: i64,
+        first_ts: i64,
+        last_ts: i64,
+    ) {
+        if self.first.is_none() || ts <= first_ts {
+            self.first = Some(h.clone());
+        }
+        if ts >= last_ts {
+            self.last = Some(h.clone());
+        }
+        if self.merged.merge(h).is_err() {
+            self.schema_conflict = true;
+        }
+    }
 }
 
 impl FieldStats {
@@ -594,6 +639,7 @@ impl FieldStats {
             count: 0,
             first_ts: i64::MAX,
             first_value: 0.0,
+            histogram: None,
             last_ts: i64::MIN,
             last_value: 0.0,
             decimal: None,
@@ -683,6 +729,39 @@ impl BucketAccumulator {
             .update_decimal(value.mantissa(), value.scale(), timestamp);
     }
 
+    /// Accumulate a native histogram for a field, merging rather than
+    /// reducing it to a number.
+    pub fn accumulate_histogram(
+        &mut self,
+        field: &str,
+        value: &chronix_core::histogram::Histogram,
+        timestamp: i64,
+    ) {
+        let stats = self
+            .stats
+            .entry(field.to_string())
+            .or_insert_with(FieldStats::new);
+        let (first_ts, last_ts) = (stats.first_ts, stats.last_ts);
+        let track = stats.histogram.get_or_insert_with(|| {
+            Box::new(HistogramTrack {
+                merged: chronix_core::histogram::Histogram::empty(value.schema),
+                first: None,
+                last: None,
+                schema_conflict: false,
+            })
+        });
+        track.push(value, timestamp, first_ts, last_ts);
+        // The scalar track still counts the samples, so `count` answers and
+        // `first_ts`/`last_ts` stay meaningful for the next row.
+        stats.count += 1;
+        if timestamp <= stats.first_ts {
+            stats.first_ts = timestamp;
+        }
+        if timestamp >= stats.last_ts {
+            stats.last_ts = timestamp;
+        }
+    }
+
     /// Emit aggregated values for the requested functions.
     ///
     /// Fields where every value was NaN (count == 0) are silently omitted
@@ -707,6 +786,49 @@ impl BucketAccumulator {
                 #[allow(clippy::cast_precision_loss)]
                 let value = if agg_fn == RollupAggFn::Count {
                     AggResult::F64(stats.count as f64)
+                } else if let Some(track) = stats.histogram.as_deref() {
+                    // A distribution's aggregate is a distribution. `sum` is
+                    // the merge; `avg` is the merge scaled by 1/n, which is
+                    // what Prometheus's own `avg()` over native histograms
+                    // does. `min` and `max` are **not defined** over
+                    // distributions — there is no ordering — so they produce
+                    // NULL rather than a number that would look like an
+                    // answer.
+                    if track.schema_conflict {
+                        // Two resolutions in one bucket. Merging them means
+                        // re-bucketing to the coarser, which silently changes
+                        // the resolution somebody chose.
+                        AggResult::Null
+                    } else {
+                        match agg_fn {
+                            RollupAggFn::Sum => {
+                                AggResult::Histogram(Box::new(track.merged.clone()))
+                            }
+                            RollupAggFn::Avg => {
+                                let mut h = track.merged.clone();
+                                let n = stats.count as f64;
+                                if n > 0.0 {
+                                    h.count /= n;
+                                    h.sum /= n;
+                                    h.zero_count /= n;
+                                    for b in h.positive.iter_mut().chain(h.negative.iter_mut()) {
+                                        b.count /= n;
+                                    }
+                                }
+                                AggResult::Histogram(Box::new(h))
+                            }
+                            RollupAggFn::First => track
+                                .first
+                                .clone()
+                                .map_or(AggResult::Null, |h| AggResult::Histogram(Box::new(h))),
+                            RollupAggFn::Last => track
+                                .last
+                                .clone()
+                                .map_or(AggResult::Null, |h| AggResult::Histogram(Box::new(h))),
+                            RollupAggFn::Min | RollupAggFn::Max => AggResult::Null,
+                            RollupAggFn::Count => unreachable!("handled above"),
+                        }
+                    }
                 } else if let Some(track) = stats.decimal.as_deref() {
                     match agg_fn {
                         RollupAggFn::Avg => track.avg_result(stats.count),
@@ -843,12 +965,16 @@ impl<'a> RollupAccumulator<'a> {
                 && f.name() != "series_key_hash"
                 && !self.config.group_by_tags.contains(f.name())
                 && f.metadata().get("role").map(String::as_str) != Some("tag");
+            // "Aggregatable", not "numeric": a histogram column has a
+            // defined aggregate — merge — and skipping it would be the third
+            // time a column type was quietly omitted from this list.
             let is_numeric = matches!(
                 f.data_type(),
                 arrow::datatypes::DataType::Float64
                     | arrow::datatypes::DataType::Int64
                     | arrow::datatypes::DataType::UInt64
                     | arrow::datatypes::DataType::Decimal128(_, _)
+                    | arrow::datatypes::DataType::Binary
             );
             if is_candidate && !is_numeric {
                 self.skipped_columns.insert(f.name().clone());
@@ -867,6 +993,7 @@ impl<'a> RollupAccumulator<'a> {
                         arrow::datatypes::DataType::Float64
                             | arrow::datatypes::DataType::Int64
                             | arrow::datatypes::DataType::UInt64
+                            | arrow::datatypes::DataType::Binary
                             // A decimal column is the one a rollup matters
                             // most for — a daily total of quarter-hour
                             // settlement registers — and leaving it off this
@@ -895,10 +1022,10 @@ impl<'a> RollupAccumulator<'a> {
 
             let mut tag_group = BTreeMap::new();
             for (idx, name) in &tag_indices {
-                if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<StringArray>() {
-                    if arr.is_valid(row) {
-                        tag_group.insert(name.clone(), arr.value(row).to_string());
-                    }
+                if let Some(arr) = batch.column(*idx).as_any().downcast_ref::<StringArray>()
+                    && arr.is_valid(row)
+                {
+                    tag_group.insert(name.clone(), arr.value(row).to_string());
                 }
             }
             let acc = self
@@ -911,12 +1038,23 @@ impl<'a> RollupAccumulator<'a> {
                 // A decimal column takes the exact path; nothing else can,
                 // and nothing else needs to.
                 if let Some(a) = col.as_any().downcast_ref::<Decimal128Array>() {
-                    if a.is_valid(row) {
-                        if let Ok(scale) = u8::try_from(a.scale()) {
-                            if let Ok(d) = chronix_core::Decimal::new(a.value(row), scale) {
-                                acc.accumulate_decimal(name, d, ts);
-                            }
-                        }
+                    if a.is_valid(row)
+                        && let Ok(scale) = u8::try_from(a.scale())
+                        && let Ok(d) = chronix_core::Decimal::new(a.value(row), scale)
+                    {
+                        acc.accumulate_decimal(name, d, ts);
+                    }
+                    continue;
+                }
+                // A histogram column: merge rather than average a number
+                // derived from it. The bytes are the histogram's own
+                // encoding, which is what the storage layer wrote.
+                if let Some(a) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+                    if a.is_valid(row)
+                        && let Ok(h) =
+                            postcard::from_bytes::<chronix_core::histogram::Histogram>(a.value(row))
+                    {
+                        acc.accumulate_histogram(name, &h, ts);
                     }
                     continue;
                 }
@@ -987,7 +1125,7 @@ impl<'a> RollupAccumulator<'a> {
                 // exact, and a total that went through an `f64` on the way
                 // into the rollup is one nobody can reconcile against the
                 // raw rows it came from.
-                let Some(field_value) = agg_result_to_field(*value) else {
+                let Some(field_value) = agg_result_to_field(value.clone()) else {
                     continue;
                 };
                 fields.insert(format!("{field_name}_{agg_fn}"), field_value);
@@ -1013,6 +1151,11 @@ fn agg_result_to_field(value: chronix_query::AggResult) -> Option<chronix_core::
                 .ok()
                 .map(chronix_core::FieldValue::Decimal)
         }
+        // A rollup of a distribution is a distribution. Writing back the
+        // merged histogram is what makes a tier answer `histogram_quantile`
+        // the way its source would — a tier holding the *mean* of a latency
+        // distribution has discarded the only thing anybody asks one for.
+        chronix_query::AggResult::Histogram(h) => Some(chronix_core::FieldValue::Histogram(h)),
     }
 }
 
@@ -1090,6 +1233,8 @@ pub fn record_batch_to_points(
     enum FieldCol<'a> {
         F64(&'a Float64Array),
         Decimal(&'a Decimal128Array, u8),
+        /// A merged native histogram, still in its own encoding.
+        Histogram(&'a arrow::array::BinaryArray),
     }
     let fields: Vec<(&str, FieldCol<'_>)> = schema
         .fields()
@@ -1099,6 +1244,9 @@ pub fn record_batch_to_points(
             let col = batch.column(i);
             if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
                 return Some((f.name().as_str(), FieldCol::F64(a)));
+            }
+            if let Some(a) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
+                return Some((f.name().as_str(), FieldCol::Histogram(a)));
             }
             let a = col.as_any().downcast_ref::<Decimal128Array>()?;
             let scale = u8::try_from(a.scale()).ok()?;
@@ -1127,6 +1275,11 @@ pub fn record_batch_to_points(
                             .ok()
                             .map(chronix_core::FieldValue::Decimal)
                     })?,
+                    FieldCol::Histogram(a) => a.is_valid(row).then(|| {
+                        postcard::from_bytes::<chronix_core::histogram::Histogram>(a.value(row))
+                            .ok()
+                            .map(|h| chronix_core::FieldValue::Histogram(Box::new(h)))
+                    })?,
                 }?;
                 Some(((*k).to_string(), value))
             })
@@ -1134,10 +1287,10 @@ pub fn record_batch_to_points(
         if field_map.is_empty() {
             continue;
         }
-        if let Ok(key) = chronix_core::SeriesKey::new(measurement, tag_map) {
-            if let Ok(p) = chronix_core::Point::new(key, field_map, ts.value(row)) {
-                out.push(p);
-            }
+        if let Ok(key) = chronix_core::SeriesKey::new(measurement, tag_map)
+            && let Ok(p) = chronix_core::Point::new(key, field_map, ts.value(row))
+        {
+            out.push(p);
         }
     }
     out
@@ -1350,12 +1503,24 @@ mod tests {
         ]);
 
         let field_aggs = aggs.get("value").unwrap();
-        assert!((field_aggs[&RollupAggFn::Avg].as_f64().unwrap() - 20.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Min].as_f64().unwrap() - 10.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Max].as_f64().unwrap() - 30.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Sum].as_f64().unwrap() - 60.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Count].as_f64().unwrap() - 3.0).abs() < f64::EPSILON);
-        assert!((field_aggs[&RollupAggFn::Last].as_f64().unwrap() - 30.0).abs() < f64::EPSILON);
+        assert!(
+            (field_aggs[&RollupAggFn::Avg].clone().as_f64().unwrap() - 20.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (field_aggs[&RollupAggFn::Min].clone().as_f64().unwrap() - 10.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (field_aggs[&RollupAggFn::Max].clone().as_f64().unwrap() - 30.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (field_aggs[&RollupAggFn::Sum].clone().as_f64().unwrap() - 60.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (field_aggs[&RollupAggFn::Count].clone().as_f64().unwrap() - 3.0).abs() < f64::EPSILON
+        );
+        assert!(
+            (field_aggs[&RollupAggFn::Last].clone().as_f64().unwrap() - 30.0).abs() < f64::EPSILON
+        );
     }
 
     #[test]
@@ -1367,7 +1532,9 @@ mod tests {
 
         let aggs = acc.emit(&[RollupAggFn::Last]);
         let field_aggs = aggs.get("value").unwrap();
-        assert!((field_aggs[&RollupAggFn::Last].as_f64().unwrap() - 300.0).abs() < f64::EPSILON);
+        assert!(
+            (field_aggs[&RollupAggFn::Last].clone().as_f64().unwrap() - 300.0).abs() < f64::EPSILON
+        );
     }
 
     #[test]
@@ -1590,14 +1757,16 @@ mod tests {
         // The builder already refuses source == target, so a self-edge
         // cannot even be constructed; `would_cycle` covers it too for the
         // deserialised path.
-        assert!(RollupBuilder::new()
-            .name("self")
-            .source("a")
-            .target("a")
-            .bucket(chronix_core::timebucket::TimeBucket::fixed_ns(60))
-            .aggregation(RollupAggFn::Avg)
-            .build()
-            .is_err());
+        assert!(
+            RollupBuilder::new()
+                .name("self")
+                .source("a")
+                .target("a")
+                .bucket(chronix_core::timebucket::TimeBucket::fixed_ns(60))
+                .aggregation(RollupAggFn::Avg)
+                .build()
+                .is_err()
+        );
         assert_eq!(registry.rollups_rooted_at("a").len(), 2);
     }
 }

@@ -58,8 +58,8 @@ use chronix_engine::objstore::{
 };
 use tracing::{info, warn};
 
-use crate::error::{DbError, Result};
 use crate::Chronix;
+use crate::error::{DbError, Result};
 
 /// Policy for [`Chronix::archive_cold_segments`].
 #[derive(Debug, Clone)]

@@ -9,8 +9,8 @@
 //! ```
 
 use chronix_analytics::lifecycle::{
-    ABTestConfig, ABTestEvaluator, AccuracyMetrics, AccuracyTracker, AccuracyTrackerConfig,
-    DriftDetector, DriftMonitor, ModelRegistry, ModelTag, PromotionCriteria,
+    ABTestConfig, ABTestEvaluator, AccuracyTracker, AccuracyTrackerConfig, DriftDetector,
+    DriftMonitor, ModelRegistry, ModelTag, PromotionCriteria, VersionAccuracy,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -72,7 +72,7 @@ fn main() {
     }
 
     // Add metrics to v1
-    let metrics_v1 = AccuracyMetrics {
+    let metrics_v1 = VersionAccuracy {
         mape: 0.08,
         rmse: 2.5,
         mae: 1.8,
@@ -246,10 +246,10 @@ fn main() {
     println!("  Is stale (after 8 days): {is_stale}");
 
     // ── 6. Compute Accuracy Metrics ───────────────────────────────
-    println!("\n--- AccuracyMetrics::compute ---");
+    println!("\n--- VersionAccuracy::compute ---");
     let actuals_check: Vec<f64> = (0..20).map(|i| 100.0 + i as f64).collect();
     let preds_check: Vec<f64> = actuals_check.iter().map(|v| v + 1.5).collect();
-    let metrics = AccuracyMetrics::compute(&actuals_check, &preds_check);
+    let metrics = VersionAccuracy::compute(&actuals_check, &preds_check);
     println!(
         "  MAE={:.4}, RMSE={:.4}, MAPE={:.4}, R²={:.4}",
         metrics.mae, metrics.rmse, metrics.mape, metrics.r_squared

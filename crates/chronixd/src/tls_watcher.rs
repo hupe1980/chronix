@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::{debug, error, info};
 
 /// Metadata snapshot of a watched file (path + last-modified time).

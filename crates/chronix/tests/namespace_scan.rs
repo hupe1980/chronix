@@ -8,7 +8,7 @@
 //! they build plans without a namespace.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::sync::Arc;
 
 const NS_TAG: &str = "__namespace__";

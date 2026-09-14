@@ -29,5 +29,5 @@ pub use catalog::{CatalogColumnStats, SegmentCatalog, SegmentCatalogEntry};
 pub use error::IndexError;
 pub use inverted::TagInvertedIndex;
 pub use zone_map::{
-    prune_row_groups, segment_overlaps_range, ZoneMapOp, ZoneMapPredicate, ZoneMapResult,
+    ZoneMapOp, ZoneMapPredicate, ZoneMapResult, prune_row_groups, segment_overlaps_range,
 };

@@ -242,7 +242,7 @@ impl AdaptiveSelector {
         use crate::gorilla::GorillaEncoder;
         use crate::patas::PatasEncoder;
         use crate::plain::PlainEncoder;
-        use crate::unified::{should_use_specialized, EncodingType};
+        use crate::unified::{EncodingType, should_use_specialized};
 
         let pattern = self.analyze_floats(values);
 
@@ -368,7 +368,7 @@ impl AdaptiveSelector {
         use crate::gorilla::GorillaEncoder;
         use crate::patas::PatasEncoder;
         use crate::plain::PlainEncoder;
-        use crate::unified::{should_use_specialized, EncodedBlock, EncodingType};
+        use crate::unified::{EncodedBlock, EncodingType, should_use_specialized};
 
         let raw_size = values.len() * 8;
         match pattern {

@@ -7,19 +7,19 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use arrow_flight::FlightDescriptor;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::{
     Any, CommandGetCatalogs, CommandGetTableTypes, CommandGetTables, CommandStatementQuery,
     ProstMessageExt,
 };
 use arrow_flight::utils::flight_data_to_batches;
-use arrow_flight::FlightDescriptor;
 use prost::Message;
 use tempfile::TempDir;
 use tonic::transport::Channel;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 use chronixd::flight::ChronixFlightSqlService;
 
@@ -470,10 +470,12 @@ async fn get_flight_info_enforces_read_only() {
         query: "SELECT * FROM cpu".to_string(),
         transaction_id: None,
     };
-    assert!(client
-        .get_flight_info(FlightDescriptor::new_cmd(pack_any(&cmd)))
-        .await
-        .is_ok());
+    assert!(
+        client
+            .get_flight_info(FlightDescriptor::new_cmd(pack_any(&cmd)))
+            .await
+            .is_ok()
+    );
 }
 
 /// A statement handle is bytes the client sends, so it cannot be trusted to

@@ -12,12 +12,12 @@
 //! The invariant is the one a user has: **a point that was acknowledged and
 //! not deleted is readable, and a point that was deleted stays deleted.**
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const SEC: i64 = 1_000_000_000;
 

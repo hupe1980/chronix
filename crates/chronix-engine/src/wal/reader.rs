@@ -82,11 +82,12 @@ impl WalReader {
             })?;
         let file_version = u16::from_le_bytes(version_bytes);
 
-        if file_version != WAL_VERSION {
-            return Err(WalError::InvalidHeader {
-                path,
-                detail: format!("Unsupported WAL version: {file_version} (expected {WAL_VERSION})"),
-            });
+        if let Some(detail) = crate::format::check(
+            "this write-ahead log",
+            u64::from(file_version),
+            u64::from(WAL_VERSION),
+        ) {
+            return Err(WalError::UnsupportedVersion { path, detail });
         }
 
         Ok(Self {
@@ -767,17 +768,41 @@ mod tests {
         assert!(matches!(result, Err(WalError::InvalidHeader { .. })));
     }
 
+    /// A log from another format generation is its own error, and says what
+    /// to do about it.
+    ///
+    /// This used to assert `InvalidHeader`, which lumped "the magic bytes are
+    /// wrong" together with "this log is from a different version of
+    /// chronix" — two facts with different remedies. The header here is
+    /// perfectly well formed. See `crate::format`.
     #[test]
-    fn invalid_header_version() {
+    fn a_log_from_another_generation_is_not_an_invalid_header() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bad.cxwl");
         let mut data = Vec::new();
         data.extend_from_slice(WAL_MAGIC);
-        data.extend_from_slice(&99u16.to_le_bytes()); // Bad version
+        data.extend_from_slice(&99u16.to_le_bytes());
         std::fs::write(&path, &data).unwrap();
 
-        let result = WalReader::open(&path);
-        assert!(matches!(result, Err(WalError::InvalidHeader { .. })));
+        let err = match WalReader::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a foreign format generation must be refused"),
+        };
+        assert!(
+            matches!(err, WalError::UnsupportedVersion { .. }),
+            "a foreign format generation must not be reported as a malformed \
+             header or as corruption, which send an operator looking for a \
+             failing disk: got {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("99"),
+            "the message names what was found: {msg}"
+        );
+        assert!(
+            msg.contains("re-ingest") || msg.contains("new data directory"),
+            "the message names the remedy: {msg}"
+        );
     }
 
     #[test]

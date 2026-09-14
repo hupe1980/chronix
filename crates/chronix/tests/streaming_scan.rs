@@ -9,7 +9,7 @@
 use arrow::array::{Array, Float64Array, Int64Array};
 use arrow::record_batch::RecordBatch;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const HOUR_NS: i64 = 3_600_000_000_000;
 

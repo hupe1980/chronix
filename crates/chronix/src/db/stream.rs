@@ -44,13 +44,13 @@ use arrow::array::{Array, Int64Array, RecordBatch};
 use chronix_engine::index::SegmentCatalogEntry;
 use chronix_engine::segment::FieldPredicate;
 use chronix_query::plan::{
-    extract_field_predicates, extract_scan, QueryPlan, TagFilter, TimeRange,
+    QueryPlan, TagFilter, TimeRange, extract_field_predicates, extract_scan,
 };
 
 use crate::error::{DbError, Result};
 
-use super::query::SegmentFilterCtx;
 use super::Chronix;
+use super::query::SegmentFilterCtx;
 
 /// Rows per emitted `RecordBatch`.
 pub(super) const CHUNK_ROWS: usize = 65_536;
@@ -265,26 +265,26 @@ impl BatchStream<'_> {
         }
 
         // Memtable last → highest write order → wins dedup.
-        if let Some(mem) = bucket.memtable {
-            if mem.num_rows() > 0 {
-                let filtered = chronix_query::filter::filter_batch(
-                    &mem,
-                    self.time_range.start,
-                    self.time_range.end,
-                    &tag_filter_refs,
-                )?;
-                let filtered = Chronix::apply_projection_and_tombstone(
-                    &filtered,
-                    &self.measurement,
-                    &self.projection,
-                    &self.plan,
-                    &tombs,
-                    tag_refs.as_deref(),
-                    None,
-                )?;
-                if filtered.num_rows() > 0 {
-                    sources.push(filtered);
-                }
+        if let Some(mem) = bucket.memtable
+            && mem.num_rows() > 0
+        {
+            let filtered = chronix_query::filter::filter_batch(
+                &mem,
+                self.time_range.start,
+                self.time_range.end,
+                &tag_filter_refs,
+            )?;
+            let filtered = Chronix::apply_projection_and_tombstone(
+                &filtered,
+                &self.measurement,
+                &self.projection,
+                &self.plan,
+                &tombs,
+                tag_refs.as_deref(),
+                None,
+            )?;
+            if filtered.num_rows() > 0 {
+                sources.push(filtered);
             }
         }
 
@@ -342,11 +342,11 @@ impl Iterator for BatchStream<'_> {
             let bucket = self.buckets.pop_front()?;
             // Before the I/O, not after it: a bucket read is the unit of work
             // this deadline exists to stop.
-            if let Some((expiry, budget)) = self.deadline {
-                if std::time::Instant::now() >= expiry {
-                    self.done = true;
-                    return Some(Err(DbError::QueryTimeout(budget)));
-                }
+            if let Some((expiry, budget)) = self.deadline
+                && std::time::Instant::now() >= expiry
+            {
+                self.done = true;
+                return Some(Err(DbError::QueryTimeout(budget)));
             }
             match self.materialise(bucket) {
                 Ok(chunks) => self.pending.extend(chunks),
@@ -408,10 +408,9 @@ impl Chronix {
             limit,
             offset,
         } = plan
+            && matches!(source.as_ref(), QueryPlan::Scan { .. })
         {
-            if matches!(source.as_ref(), QueryPlan::Scan { .. }) {
-                return Ok(self.execute_iter(source)?.with_limit(*limit, *offset));
-            }
+            return Ok(self.execute_iter(source)?.with_limit(*limit, *offset));
         }
 
         if !matches!(plan, QueryPlan::Scan { .. }) {

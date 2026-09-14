@@ -135,7 +135,7 @@ impl MetaAdminService for MetaAdminServer {
         let req = request.into_inner();
         debug!(
             node_id = req.node_id,
-            gen = req.generation,
+            generation = req.generation,
             "admin: heartbeat (out-of-band)"
         );
 

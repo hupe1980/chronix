@@ -384,13 +384,11 @@ impl super::Chronix {
             for row in 0..filtered.num_rows() {
                 let mut tags = BTreeMap::new();
                 for col_name in &tags_col_names {
-                    if let Some(col) = filtered.column_by_name(col_name) {
-                        if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>()
-                        {
-                            if arr.is_valid(row) {
-                                tags.insert(col_name.clone(), arr.value(row).to_string());
-                            }
-                        }
+                    if let Some(col) = filtered.column_by_name(col_name)
+                        && let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>()
+                        && arr.is_valid(row)
+                    {
+                        tags.insert(col_name.clone(), arr.value(row).to_string());
                     }
                 }
                 let Ok(key) = SeriesKey::new(measurement.clone(), tags) else {

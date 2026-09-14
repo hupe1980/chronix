@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 use tonic::service::Interceptor;
 use tracing::{debug, info, warn};
 
-use chronix_security::auth::middleware::{AuthConfig as MiddlewareAuthConfig, AuthMiddleware};
 use chronix_security::auth::ApiKeyStore;
+use chronix_security::auth::middleware::{AuthConfig as MiddlewareAuthConfig, AuthMiddleware};
 
 use crate::config::AuthConfig;
 use crate::http::AppState;
@@ -156,7 +156,7 @@ impl AuthState {
             None => {
                 return Err(chronix_security::auth::error::AuthError::Config(
                     "JWKS must be attached before the auth state is shared".into(),
-                ))
+                ));
             }
         }
         Ok(())
@@ -1096,7 +1096,7 @@ mod tests {
 
     #[test]
     fn auth_state_with_jwt() {
-        use jsonwebtoken::{encode, EncodingKey, Header};
+        use jsonwebtoken::{EncodingKey, Header, encode};
 
         let secret = "test-jwt-secret-256-bits-long!!!!"; // 32 bytes
         let config = AuthConfig {
@@ -1308,15 +1308,21 @@ mod tests {
         );
     }
 
-    fn make_test_db() -> std::sync::Arc<chronix::prelude::Chronix> {
+    /// A database, with the temporary directory that owns it.
+    ///
+    /// The directory is **returned**, not leaked. This used to end in
+    /// `std::mem::forget(dir)` under a comment saying "so it lives long
+    /// enough" — which is true, and leaves a directory of database files
+    /// behind on every run, on every machine that runs the suite. Returning
+    /// it makes the lifetime the caller's, which is where it belongs.
+    fn make_test_db() -> (tempfile::TempDir, std::sync::Arc<chronix::prelude::Chronix>) {
         let dir = tempfile::tempdir().unwrap();
         let config = chronix::prelude::ChronixConfig::builder()
             .data_dir(dir.path())
             .build()
             .unwrap();
-        // Leak the tempdir so it lives long enough.
-        std::mem::forget(dir);
-        std::sync::Arc::new(chronix::prelude::Chronix::open(config).unwrap())
+        let db = std::sync::Arc::new(chronix::prelude::Chronix::open(config).unwrap());
+        (dir, db)
     }
 
     #[test]
@@ -1324,7 +1330,7 @@ mod tests {
         // No policy engine is the default deployment, and it used to mean
         // "permit" — so any authenticated key could restore a backup over
         // the live data directory. The capability lives on the credential.
-        let db = make_test_db();
+        let (_dir, db) = make_test_db();
         let sql_contexts = crate::namespace::SqlContexts::new(db.clone());
         let state = crate::http::SharedState {
             db,
@@ -1379,7 +1385,7 @@ mod tests {
     #[test]
     fn no_credential_and_no_auth_configured_is_open() {
         // With no auth context, require_capability permits (open mode).
-        let db = make_test_db();
+        let (_dir, db) = make_test_db();
         let sql_contexts = crate::namespace::SqlContexts::new(db.clone());
         let state = crate::http::SharedState {
             db,
@@ -1403,19 +1409,21 @@ mod tests {
             openapi_json: std::sync::OnceLock::new(),
             write_timeout: std::time::Duration::ZERO,
         };
-        assert!(super::require_capability(
-            &state,
-            None,
-            chronix_security::authz::ChronixAction::ManageKeys
-        )
-        .is_ok());
+        assert!(
+            super::require_capability(
+                &state,
+                None,
+                chronix_security::authz::ChronixAction::ManageKeys
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn an_engine_cannot_widen_what_the_credential_carries() {
         // When authz engine is configured with no policies (default-deny),
         // non-admin users are rejected.
-        let db = make_test_db();
+        let (_dir, db) = make_test_db();
         let sql_contexts = crate::namespace::SqlContexts::new(db.clone());
         let engine = chronix_security::authz::AuthzEngine::new();
         let state = crate::http::SharedState {

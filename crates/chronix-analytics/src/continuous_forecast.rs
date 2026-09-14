@@ -245,13 +245,14 @@ impl ContinuousForecastEngine {
         let mut state = state_arc.lock();
 
         // Record 1-step-ahead forecast error if we had a prediction.
-        if let Some(predicted) = state.last_prediction.take() {
-            if value.is_finite() && predicted.is_finite() {
-                let error = (predicted - value).abs();
-                state.recent_errors.push_back(error);
-                if state.recent_errors.len() > 50 {
-                    state.recent_errors.pop_front();
-                }
+        if let Some(predicted) = state.last_prediction.take()
+            && value.is_finite()
+            && predicted.is_finite()
+        {
+            let error = (predicted - value).abs();
+            state.recent_errors.push_back(error);
+            if state.recent_errors.len() > 50 {
+                state.recent_errors.pop_front();
             }
         }
 
@@ -342,7 +343,7 @@ impl ContinuousForecastEngine {
                         state.last_fit_time = Some(Instant::now());
                         state.recent_errors.clear();
                         state.baseline_mae = None; // will be rebuilt from new errors
-                                                   // Store 1-step-ahead prediction for next error calculation.
+                        // Store 1-step-ahead prediction for next error calculation.
                         state.last_prediction = state
                             .model
                             .predict(1)

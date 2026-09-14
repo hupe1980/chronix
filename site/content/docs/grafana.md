@@ -55,8 +55,31 @@ gives the measurement name alone, which is how Prometheus remote write and
 OTLP store a sample, so scraped metrics keep their names.
 
 So `cpu,host=a usage=42,load=0.7` is queried as `cpu_usage` and `cpu_load`,
-not as `cpu`. The metric browser lists exactly the names that answer, and
-adding a field to a measurement never renames the metrics already there.
+not as `cpu`. Adding a field to a measurement never renames the metrics
+already there.
+
+The metric browser lists every stored metric. The one exception is a
+histogram's classic names — `foo_bucket`, `foo_count`, `foo_sum` — which
+answer when typed but are not listed, so that `{__name__=~".+"}` cannot return
+the same observations three times over.
+
+### Histogram panels
+
+A native histogram is one metric, not a family, so a percentile needs no
+`rate()` over a bucket series:
+
+```promql
+histogram_quantile(0.99, http_latency)    # native
+histogram_avg(http_latency)
+histogram_fraction(0, 0.25, http_latency) # share under 250 ms
+```
+
+For a **heatmap** panel, query the classic view and set *Format* to
+`Heatmap` — Grafana reads the `le` labels as it always has:
+
+```promql
+http_latency_bucket
+```
 
 ### PromQL Examples
 

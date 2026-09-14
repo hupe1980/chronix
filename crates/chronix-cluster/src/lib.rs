@@ -63,15 +63,15 @@ pub mod write_router;
 pub(crate) mod test_util;
 
 pub use autoscale::{
-    build_leader_map, estimate_disk_usage, AutoScaleConfig, AutoScaler, ClusterSnapshot,
-    NodeDiskUsage, PeriodicRebalancer, RebalanceResult, RegionMetrics, ScaleAssessment, SplitPhase,
-    SplitPlan, SplitReason, SplitResult,
+    AutoScaleConfig, AutoScaler, ClusterSnapshot, NodeDiskUsage, PeriodicRebalancer,
+    RebalanceResult, RegionMetrics, ScaleAssessment, SplitPhase, SplitPlan, SplitReason,
+    SplitResult, build_leader_map, estimate_disk_usage,
 };
 pub use client::{GrpcMetaClientAdapter, InProcessMetaClient, MetaClient};
 pub use coordinator::{ClusterCoordinator, HealthCheckResult, RegionMigration};
 pub use data_client::DataGrpcClient;
 pub use data_service::{
-    core_to_proto_point, proto_to_core_point, DataGrpcServer, RegionQuery, RegionStorage,
+    DataGrpcServer, RegionQuery, RegionStorage, core_to_proto_point, proto_to_core_point,
 };
 pub use distributed_analytics::{
     DistributedAnalytics, DistributedAnomalyRequest, DistributedAnomalyResult,
@@ -80,11 +80,11 @@ pub use distributed_analytics::{
 pub use error::{ClusterError, Result};
 pub use failover::{FailoverCheckResult, FailoverConfig, FailoverManager, UnderReplicatedRegion};
 pub use metrics::{
+    CIRCUIT_BREAKER_OPEN_TOTAL, HEARTBEAT_LATENCY, LEADER_CHANGES, NODES_TOTAL, QUERY_LATENCY,
+    REGIONS_TOTAL, REPLICATION_LAG, UNDER_REPLICATED, WRITE_LATENCY,
     increment_circuit_breaker_open, increment_leader_changes, record_heartbeat_latency,
     record_query_latency, record_replication_lag, record_write_latency, set_nodes_total,
-    set_regions_total, set_under_replicated, CIRCUIT_BREAKER_OPEN_TOTAL, HEARTBEAT_LATENCY,
-    LEADER_CHANGES, NODES_TOTAL, QUERY_LATENCY, REGIONS_TOTAL, REPLICATION_LAG, UNDER_REPLICATED,
-    WRITE_LATENCY,
+    set_regions_total, set_under_replicated,
 };
 pub use node::DataNodeManager;
 pub use placement::PlacementPolicy;

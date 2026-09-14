@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const HOUR_NS: i64 = 3_600_000_000_000;
 
@@ -118,15 +118,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // catalog records each segment *relative* to `segments/`, which is what
     // makes a data directory movable at all.
     {
-        let catalog = recovered.catalog().read();
-        let outside = catalog
-            .all_segments()
+        let outside = recovered
+            .segments()
             .iter()
-            .filter(|e| {
-                !e.file
-                    .resolve(&restored.join("segments"))
-                    .starts_with(&restored)
-            })
+            .filter(|s| !s.path.starts_with(&restored))
             .count();
         println!("  paths outside the restored directory: {outside}");
         assert_eq!(outside, 0);

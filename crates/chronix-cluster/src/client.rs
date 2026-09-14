@@ -299,8 +299,8 @@ mod tests {
 
         // Heartbeats bypass Raft and go to the out-of-band heartbeat store.
         let hb_data = store.state_machine().heartbeat_data();
-        let (gen, _ts) = hb_data.get(&10).expect("heartbeat should be recorded");
-        assert_eq!(*gen, 5);
+        let (generation, _ts) = hb_data.get(&10).expect("heartbeat should be recorded");
+        assert_eq!(*generation, 5);
     }
 
     #[tokio::test]

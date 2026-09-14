@@ -13,8 +13,8 @@ use arrow::datatypes::{DataType, Field};
 use datafusion::common::Result as DFResult;
 
 use super::window::{
-    column_f64, constant_f64, constant_usize, exec_err, f64_array, on_positional,
-    on_positional_multi, optional_bool, PartitionKernel,
+    PartitionKernel, column_f64, constant_f64, constant_usize, exec_err, f64_array, on_positional,
+    on_positional_multi, optional_bool,
 };
 
 macro_rules! kernel {

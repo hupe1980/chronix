@@ -19,8 +19,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 /// A database whose every read is already out of time, holding `points`
 /// points of one series spread over `points` seconds.

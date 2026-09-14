@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, RollupAggFn, RollupBuilder};
+use chronix::{Chronix, RollupAggFn, RollupBuilder, fields, tags};
 
 const DAY_NS: i64 = 86_400_000_000_000;
 const DAYS: i64 = 400;
@@ -124,11 +124,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if day % 50 == 0 || day == DAYS - 1 {
             let stats = db.statistics();
             let (raw, rollup) = {
-                let catalog = db.catalog().read();
-                let all = catalog.all_segments();
                 (
-                    all.iter().filter(|e| e.measurement == "power").count(),
-                    all.iter().filter(|e| e.measurement == "power_1h").count(),
+                    db.segments_of("power").len(),
+                    db.segments_of("power_1h").len(),
                 )
             };
             println!(
@@ -149,14 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEVICES * 2,
         "the cardinality budget must hold the live series, not every series ever written"
     );
-    let raw_segments = {
-        let catalog = db.catalog().read();
-        catalog
-            .all_segments()
-            .iter()
-            .filter(|e| e.measurement == "power")
-            .count()
-    };
+    let raw_segments = { db.segments_of("power").len() };
     assert!(
         raw_segments <= 10,
         "raw data must plateau at the retention window, not accumulate ({raw_segments} segments)"

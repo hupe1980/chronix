@@ -8,8 +8,8 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{

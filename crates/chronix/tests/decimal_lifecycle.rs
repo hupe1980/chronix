@@ -13,9 +13,9 @@
 //! deterministically, which is the worst failure this database can have.
 
 use arrow::array::Array;
-use chronix::chronix_query::{self, plan::FieldPredicate, plan::ZoneMapOp};
+use chronix::chronix_query::{self, plan::FieldPredicate, plan::StatsOp};
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, ParquetExportConfig};
+use chronix::{Chronix, ParquetExportConfig, fields, tags};
 use std::sync::Arc;
 
 fn open(dir: &tempfile::TempDir) -> Arc<Chronix> {
@@ -141,10 +141,10 @@ fn a_predicate_on_a_decimal_column_never_prunes_a_matching_row() {
     // Every row: 1000.0000 … 1000.0039. A bound *inside* that range is the
     // interesting one — it is where a zone map has to decide per row group.
     for (op, name, at_least) in [
-        (ZoneMapOp::GtEq, ">=", 40_usize),
-        (ZoneMapOp::Gt, ">", 39),
-        (ZoneMapOp::LtEq, "<=", 1),
-        (ZoneMapOp::Eq, "=", 1),
+        (StatsOp::GtEq, ">=", 40_usize),
+        (StatsOp::Gt, ">", 39),
+        (StatsOp::LtEq, "<=", 1),
+        (StatsOp::Eq, "=", 1),
     ] {
         let mut plan = db
             .query()
@@ -190,7 +190,7 @@ fn a_predicate_far_outside_the_range_still_prunes() {
         &mut plan,
         vec![FieldPredicate {
             column: "z1nb".into(),
-            op: ZoneMapOp::Gt,
+            op: StatsOp::Gt,
             value: 9_999_999.0,
         }],
     );

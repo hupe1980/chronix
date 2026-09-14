@@ -25,7 +25,7 @@ pub enum DriftAction {
 
 /// Complete drift analysis report.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DriftReport {
+pub struct ModelDriftReport {
     /// Detector that produced this report.
     pub detector_name: String,
     /// Drift score (PSI value, KS statistic, or ADWIN `epsilon`).
@@ -68,7 +68,7 @@ impl DriftDetector {
     ///
     /// - `training`: the reference distribution the model was trained on.
     /// - `current`: the current/production data.
-    pub fn detect(&self, training: &[f64], current: &[f64]) -> DriftReport {
+    pub fn detect(&self, training: &[f64], current: &[f64]) -> ModelDriftReport {
         let report = match self {
             Self::Psi { threshold } => psi_detect(training, current, *threshold),
             Self::KolmogorovSmirnov { p_value } => ks_detect(training, current, *p_value),
@@ -85,7 +85,7 @@ impl DriftDetector {
 
 // ── PSI ─────────────────────────────────────────────────────────────────
 
-fn psi_detect(training: &[f64], current: &[f64], threshold: f64) -> DriftReport {
+fn psi_detect(training: &[f64], current: &[f64], threshold: f64) -> ModelDriftReport {
     let n_bins = 10;
     let psi = compute_psi(training, current, n_bins);
     let drift_detected = psi >= threshold;
@@ -97,7 +97,7 @@ fn psi_detect(training: &[f64], current: &[f64], threshold: f64) -> DriftReport 
         DriftAction::NoAction
     };
 
-    DriftReport {
+    ModelDriftReport {
         detector_name: "PSI".into(),
         score: psi,
         drift_detected,
@@ -210,9 +210,9 @@ fn bin_counts_by_edges(data: &[f64], edges: &[f64]) -> Vec<f64> {
 
 // ── Kolmogorov–Smirnov ──────────────────────────────────────────────────
 
-fn ks_detect(training: &[f64], current: &[f64], p_threshold: f64) -> DriftReport {
+fn ks_detect(training: &[f64], current: &[f64], p_threshold: f64) -> ModelDriftReport {
     if training.is_empty() || current.is_empty() {
-        return DriftReport {
+        return ModelDriftReport {
             detector_name: "KolmogorovSmirnov".into(),
             score: 0.0,
             drift_detected: false,
@@ -235,7 +235,7 @@ fn ks_detect(training: &[f64], current: &[f64], p_threshold: f64) -> DriftReport
         DriftAction::NoAction
     };
 
-    DriftReport {
+    ModelDriftReport {
         detector_name: "KolmogorovSmirnov".into(),
         score: ks_stat,
         drift_detected,
@@ -375,11 +375,11 @@ fn adwin_epsilon_cut(training: &[f64], current: &[f64], delta: f64) -> f64 {
     ((2.0 / m) * variance * ln_term).sqrt() + (2.0 / (3.0 * m)) * ln_term
 }
 
-fn adwin_detect(training: &[f64], current: &[f64], delta: f64) -> DriftReport {
+fn adwin_detect(training: &[f64], current: &[f64], delta: f64) -> ModelDriftReport {
     // `training` is the reference window, `current` the test window; drift is
     // a difference of means larger than the ADWIN2 cut allows.
     if training.is_empty() || current.is_empty() {
-        return DriftReport {
+        return ModelDriftReport {
             detector_name: "ADWIN".into(),
             score: 0.0,
             drift_detected: false,
@@ -400,7 +400,7 @@ fn adwin_detect(training: &[f64], current: &[f64], delta: f64) -> DriftReport {
         DriftAction::NoAction
     };
 
-    DriftReport {
+    ModelDriftReport {
         detector_name: "ADWIN".into(),
         score: diff,
         drift_detected,
@@ -411,7 +411,7 @@ fn adwin_detect(training: &[f64], current: &[f64], delta: f64) -> DriftReport {
 // ── DriftMonitor ────────────────────────────────────────────────────────
 
 /// Callback invoked when drift is detected on a model.
-pub type DriftCallback = Box<dyn Fn(&str, &DriftReport) + Send + Sync>;
+pub type DriftCallback = Box<dyn Fn(&str, &ModelDriftReport) + Send + Sync>;
 
 /// Background monitor that periodically checks registered models for data drift.
 ///
@@ -512,11 +512,11 @@ impl DriftMonitor {
 
     /// Runs a single check cycle — evaluates all registered models for drift.
     /// Returns a list of drift reports for models where drift was detected.
-    pub fn check_all(&self) -> Vec<(String, DriftReport)> {
+    pub fn check_all(&self) -> Vec<(String, ModelDriftReport)> {
         // Collect reports under the lock, then release before invoking
         // callbacks. This prevents deadlocks if a callback tries to call
         // register() or update_current(), which also take the lock.
-        let reports: Vec<(String, DriftReport)> = {
+        let reports: Vec<(String, ModelDriftReport)> = {
             let models = self.models.lock();
             models
                 .iter()

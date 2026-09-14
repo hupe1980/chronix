@@ -14,15 +14,15 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use parking_lot::RwLock;
 use tracing::warn;
 
@@ -344,58 +344,55 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Response {
 
     // --- Per-namespace rate limit ---
     let ns_limiter = request.extensions().get::<NamespaceRateLimiter>().cloned();
-    if let Some(ns_limiter) = ns_limiter {
-        if let Some(ctx) = request.extensions().get::<NamespaceContext>() {
-            if let Err(retry_after) = ns_limiter.check(&ctx.namespace) {
-                warn!(
-                    namespace = %ctx.namespace,
-                    retry_after_secs = retry_after,
-                    "Per-namespace rate limit exceeded, returning 429"
-                );
-                metrics::counter!("chronix_rate_limited_total", "namespace" => ctx.namespace.clone())
-                    .increment(1);
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("Retry-After", retry_after.to_string())],
-                    Json(crate::error::ErrorResponse {
-                        error: format!("Too Many Requests (namespace: {})", ctx.namespace),
-                        code: "RATE_LIMITED",
-                    }),
-                )
-                    .into_response();
-            }
-        }
+    if let Some(ns_limiter) = ns_limiter
+        && let Some(ctx) = request.extensions().get::<NamespaceContext>()
+        && let Err(retry_after) = ns_limiter.check(&ctx.namespace)
+    {
+        warn!(
+            namespace = %ctx.namespace,
+            retry_after_secs = retry_after,
+            "Per-namespace rate limit exceeded, returning 429"
+        );
+        metrics::counter!("chronix_rate_limited_total", "namespace" => ctx.namespace.clone())
+            .increment(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", retry_after.to_string())],
+            Json(crate::error::ErrorResponse {
+                error: format!("Too Many Requests (namespace: {})", ctx.namespace),
+                code: "RATE_LIMITED",
+            }),
+        )
+            .into_response();
     }
 
     // --- Per-user (per-principal) rate limit ---
     let user_limiter = request.extensions().get::<UserRateLimiter>().cloned();
-    if let Some(user_limiter) = user_limiter {
-        if let Some(auth_ctx) = request
+    if let Some(user_limiter) = user_limiter
+        && let Some(auth_ctx) = request
             .extensions()
             .get::<chronix_security::auth::AuthContext>()
-        {
-            if let Err(retry_after) = user_limiter.check(&auth_ctx.principal) {
-                warn!(
-                    principal = %auth_ctx.principal,
-                    retry_after_secs = retry_after,
-                    "Per-user rate limit exceeded, returning 429"
-                );
-                metrics::counter!(
-                    "chronix_rate_limited_total",
-                    "principal" => auth_ctx.principal.clone()
-                )
-                .increment(1);
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [("Retry-After", retry_after.to_string())],
-                    Json(crate::error::ErrorResponse {
-                        error: format!("Too Many Requests (user: {})", auth_ctx.principal),
-                        code: "RATE_LIMITED",
-                    }),
-                )
-                    .into_response();
-            }
-        }
+        && let Err(retry_after) = user_limiter.check(&auth_ctx.principal)
+    {
+        warn!(
+            principal = %auth_ctx.principal,
+            retry_after_secs = retry_after,
+            "Per-user rate limit exceeded, returning 429"
+        );
+        metrics::counter!(
+            "chronix_rate_limited_total",
+            "principal" => auth_ctx.principal.clone()
+        )
+        .increment(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", retry_after.to_string())],
+            Json(crate::error::ErrorResponse {
+                error: format!("Too Many Requests (user: {})", auth_ctx.principal),
+                code: "RATE_LIMITED",
+            }),
+        )
+            .into_response();
     }
 
     next.run(request).await

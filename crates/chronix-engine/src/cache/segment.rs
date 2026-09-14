@@ -12,8 +12,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::ArrayRef;
 use parking_lot::{Mutex, RwLock};
@@ -285,10 +285,10 @@ impl SegmentCache {
     /// in `entries` but must NOT be linked in the list.
     fn push_head(inner: &mut CacheInner, key: &SegmentCacheKey) {
         let old_head = inner.lru_head.take();
-        if let Some(ref old_head_key) = old_head {
-            if let Some(old_entry) = inner.entries.get_mut(old_head_key) {
-                old_entry.prev = Some(key.clone());
-            }
+        if let Some(ref old_head_key) = old_head
+            && let Some(old_entry) = inner.entries.get_mut(old_head_key)
+        {
+            old_entry.prev = Some(key.clone());
         }
         if let Some(entry) = inner.entries.get_mut(key) {
             entry.prev = None;

@@ -381,7 +381,7 @@ impl TimeBucket {
                             "the local time '{text}' does not exist in {} — \
                              it falls in a daylight-saving gap",
                             tz.name()
-                        )))
+                        )));
                     }
                 },
             }
@@ -1156,13 +1156,17 @@ mod tests {
             assert!(err.0.contains("missing from some months"), "{}", err.0);
         }
         // 28 is fine — every month has one.
-        assert!(TimeBucket::utc(BucketWidth::Months(1))
-            .with_origin(ts("2020-01-28T00:00:00Z"))
-            .is_ok());
+        assert!(
+            TimeBucket::utc(BucketWidth::Months(1))
+                .with_origin(ts("2020-01-28T00:00:00Z"))
+                .is_ok()
+        );
         // And a day width has no such restriction.
-        assert!(TimeBucket::utc(BucketWidth::Days(1))
-            .with_origin(ts("2020-01-31T00:00:00Z"))
-            .is_ok());
+        assert!(
+            TimeBucket::utc(BucketWidth::Days(1))
+                .with_origin(ts("2020-01-31T00:00:00Z"))
+                .is_ok()
+        );
     }
 
     /// For a multi-unit width the origin picks *which* unit opens a bucket,

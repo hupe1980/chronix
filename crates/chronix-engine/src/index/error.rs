@@ -20,6 +20,19 @@ pub enum IndexError {
         detail: String,
     },
 
+    /// The on-disk data belongs to a different format generation.
+    ///
+    /// Deliberately distinct from [`Corrupt`](Self::Corrupt): the bytes are
+    /// intact and the reader is from another generation, so the remedy is to
+    /// match the versions up rather than to restore from a backup. The two
+    /// used to be one variant, which sent an operator who had upgraded
+    /// looking for a failing disk.
+    #[error("{detail}")]
+    UnsupportedVersion {
+        /// What was read, what this build expects, and what to do.
+        detail: String,
+    },
+
     /// Binary (postcard) serialization error.
     #[error("Binary serialization error: {0}")]
     BinarySerialization(String),

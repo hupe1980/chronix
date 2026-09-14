@@ -348,7 +348,7 @@ impl AuthzEngine {
         let entities = match Entities::from_entities(all, Some(&SCHEMA)) {
             Ok(e) => e,
             Err(e) => {
-                return Self::internal_deny(&AuthzError::Internal(format!("entity set: {e}")))
+                return Self::internal_deny(&AuthzError::Internal(format!("entity set: {e}")));
             }
         };
 
@@ -514,12 +514,16 @@ mod tests {
     #[test]
     fn default_deny() {
         let engine = AuthzEngine::new();
-        assert!(engine
-            .authorize_namespace(&alice("reader"), ChronixAction::Read, &prod())
-            .is_denied());
-        assert!(engine
-            .authorize_system(&alice("reader"), ChronixAction::ManageKeys)
-            .is_denied());
+        assert!(
+            engine
+                .authorize_namespace(&alice("reader"), ChronixAction::Read, &prod())
+                .is_denied()
+        );
+        assert!(
+            engine
+                .authorize_system(&alice("reader"), ChronixAction::ManageKeys)
+                .is_denied()
+        );
     }
 
     #[test]
@@ -537,15 +541,21 @@ mod tests {
             )
             .unwrap();
         let p = alice("prod_reader");
-        assert!(engine
-            .authorize_namespace(&p, ChronixAction::Read, &prod())
-            .is_allowed());
-        assert!(engine
-            .authorize_namespace(&p, ChronixAction::Read, &ChronixNamespace::new("staging"))
-            .is_denied());
-        assert!(engine
-            .authorize_namespace(&p, ChronixAction::Write, &prod())
-            .is_denied());
+        assert!(
+            engine
+                .authorize_namespace(&p, ChronixAction::Read, &prod())
+                .is_allowed()
+        );
+        assert!(
+            engine
+                .authorize_namespace(&p, ChronixAction::Read, &ChronixNamespace::new("staging"))
+                .is_denied()
+        );
+        assert!(
+            engine
+                .authorize_namespace(&p, ChronixAction::Write, &prod())
+                .is_denied()
+        );
     }
 
     #[test]
@@ -557,12 +567,16 @@ mod tests {
                           action == Chronix::Action::"Write", resource);"#,
             )
             .unwrap();
-        assert!(engine
-            .authorize_namespace(&alice("reader"), ChronixAction::Write, &prod())
-            .is_denied());
-        assert!(engine
-            .authorize_namespace(&alice("writer"), ChronixAction::Write, &prod())
-            .is_allowed());
+        assert!(
+            engine
+                .authorize_namespace(&alice("reader"), ChronixAction::Write, &prod())
+                .is_denied()
+        );
+        assert!(
+            engine
+                .authorize_namespace(&alice("writer"), ChronixAction::Write, &prod())
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -601,15 +615,21 @@ mod tests {
         // nothing else. Every administrative route asked for `Admin` before
         // this, so a backup credential could mint API keys.
         let backup = alice("backup_operator");
-        assert!(engine
-            .authorize_system(&backup, ChronixAction::ManageBackups)
-            .is_allowed());
-        assert!(engine
-            .authorize_system(&backup, ChronixAction::ManageKeys)
-            .is_denied());
-        assert!(engine
-            .authorize_system(&backup, ChronixAction::ManageNamespaces)
-            .is_denied());
+        assert!(
+            engine
+                .authorize_system(&backup, ChronixAction::ManageBackups)
+                .is_allowed()
+        );
+        assert!(
+            engine
+                .authorize_system(&backup, ChronixAction::ManageKeys)
+                .is_denied()
+        );
+        assert!(
+            engine
+                .authorize_system(&backup, ChronixAction::ManageNamespaces)
+                .is_denied()
+        );
     }
 
     #[test]
@@ -623,16 +643,20 @@ mod tests {
                 "#,
             )
             .unwrap();
-        assert!(engine
-            .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
-            .is_allowed());
-        assert!(engine
-            .authorize_namespace(
-                &alice("any"),
-                ChronixAction::Read,
-                &ChronixNamespace::new("secret")
-            )
-            .is_denied());
+        assert!(
+            engine
+                .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
+                .is_allowed()
+        );
+        assert!(
+            engine
+                .authorize_namespace(
+                    &alice("any"),
+                    ChronixAction::Read,
+                    &ChronixNamespace::new("secret")
+                )
+                .is_denied()
+        );
     }
 
     #[test]
@@ -644,20 +668,24 @@ mod tests {
                           action == Chronix::Action::"Write", resource);"#,
             )
             .unwrap();
-        assert!(engine
-            .authorize_namespace(
-                &ChronixPrincipal::new("ingest-key"),
-                ChronixAction::Write,
-                &prod()
-            )
-            .is_allowed());
-        assert!(engine
-            .authorize_namespace(
-                &ChronixPrincipal::new("other-key"),
-                ChronixAction::Write,
-                &prod()
-            )
-            .is_denied());
+        assert!(
+            engine
+                .authorize_namespace(
+                    &ChronixPrincipal::new("ingest-key"),
+                    ChronixAction::Write,
+                    &prod()
+                )
+                .is_allowed()
+        );
+        assert!(
+            engine
+                .authorize_namespace(
+                    &ChronixPrincipal::new("other-key"),
+                    ChronixAction::Write,
+                    &prod()
+                )
+                .is_denied()
+        );
     }
 
     #[test]
@@ -667,16 +695,20 @@ mod tests {
             .load_policies(r#"permit(principal, action == Chronix::Action::"Read", resource);"#)
             .unwrap();
         assert_eq!(engine.policy_count(), 1);
-        assert!(engine
-            .add_policy(
-                "bad",
-                r#"permit(principal, action == Chronix::Action::"Query", resource);"#
-            )
-            .is_err());
+        assert!(
+            engine
+                .add_policy(
+                    "bad",
+                    r#"permit(principal, action == Chronix::Action::"Query", resource);"#
+                )
+                .is_err()
+        );
         assert_eq!(engine.policy_count(), 1);
-        assert!(engine
-            .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
-            .is_allowed());
+        assert!(
+            engine
+                .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -711,9 +743,11 @@ mod tests {
 
         let engine = AuthzEngine::new();
         assert_eq!(engine.load_policies_from_dir(dir.path()).unwrap(), 2);
-        assert!(engine
-            .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
-            .is_allowed());
+        assert!(
+            engine
+                .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -721,8 +755,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = AuthzEngine::new();
         assert_eq!(engine.load_policies_from_dir(dir.path()).unwrap(), 0);
-        assert!(engine
-            .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
-            .is_denied());
+        assert!(
+            engine
+                .authorize_namespace(&alice("any"), ChronixAction::Read, &prod())
+                .is_denied()
+        );
     }
 }

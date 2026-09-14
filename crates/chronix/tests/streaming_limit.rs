@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 fn db_with(rows: usize, flushes: usize) -> (tempfile::TempDir, Arc<Chronix>) {
     let dir = tempfile::tempdir().unwrap();

@@ -237,9 +237,11 @@ mod tests {
         let resource = ChronixNamespace::new("namespace_50");
 
         // Verify authz works
-        assert!(engine
-            .authorize_namespace(&principal, ChronixAction::Read, &resource)
-            .is_allowed());
+        assert!(
+            engine
+                .authorize_namespace(&principal, ChronixAction::Read, &resource)
+                .is_allowed()
+        );
 
         let iterations = 5_000;
         let start = Instant::now();

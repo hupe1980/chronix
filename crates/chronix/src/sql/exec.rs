@@ -20,8 +20,8 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, ScalarValue};
-use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -38,8 +38,8 @@ use futures::Stream;
 use chronix_engine::segment::metadata::data_types;
 use chronix_engine::segment::stats::ordered_i64_to_f64;
 
-use crate::sql::batch::{align_batch_to_schema, convert_timestamp_column};
 use crate::Chronix;
+use crate::sql::batch::{align_batch_to_schema, convert_timestamp_column};
 
 /// A `DataFusion` `ExecutionPlan` that scans a Chronix measurement.
 ///
@@ -318,7 +318,7 @@ impl ExecutionPlan for ChronixExec {
         _input_stats: &[Arc<Statistics>],
         _args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>, DataFusionError> {
-        let catalog = self.db.catalog().read();
+        let catalog = self.db.catalog.read();
         let segments = catalog.active_segments_for_measurement(&self.measurement);
 
         if segments.is_empty() {

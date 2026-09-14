@@ -15,7 +15,7 @@
 
 use arrow::array::Array;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::sync::Arc;
 
 fn open(dir: &tempfile::TempDir) -> Arc<Chronix> {
@@ -205,9 +205,10 @@ fn declaring_the_same_column_twice_is_fine_and_a_different_type_is_not() {
         .unwrap();
     db.declare_field("meter", "z1nb", ColumnType::Decimal { scale: 4 })
         .unwrap();
-    assert!(db
-        .declare_field("meter", "z1nb", ColumnType::Decimal { scale: 6 })
-        .is_err());
+    assert!(
+        db.declare_field("meter", "z1nb", ColumnType::Decimal { scale: 6 })
+            .is_err()
+    );
     assert!(db.declare_field("meter", "z1nb", ColumnType::F64).is_err());
 }
 
@@ -462,7 +463,7 @@ fn sql_compares_a_decimal_without_going_through_a_double() {
 
 #[test]
 fn a_rollup_of_a_decimal_column_stays_exact() {
-    use chronix::rollup::{compute_rollup_points, RollupAggFn, RollupBuilder};
+    use chronix::rollup::{RollupAggFn, RollupBuilder, compute_rollup_points};
 
     let dir = tempfile::tempdir().unwrap();
     let db = open(&dir);
@@ -531,7 +532,8 @@ fn a_decimal_and_a_float_are_different_types() {
         .unwrap();
     // Writing an f64 into a decimal column is a type conflict, not a
     // silent conversion — the whole point of having asked for exactness.
-    assert!(db
-        .insert(&Point::new(key, fields! { "v" => 1.5_f64 }, 2).unwrap())
-        .is_err());
+    assert!(
+        db.insert(&Point::new(key, fields! { "v" => 1.5_f64 }, 2).unwrap())
+            .is_err()
+    );
 }

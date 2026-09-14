@@ -229,15 +229,15 @@ impl Pipeline {
             let Ok(stmt) = chronix_streaming::signal::parse_trigger_sql(&entry.sql) else {
                 continue;
             };
-            if let chronix_streaming::signal::TriggerStatement::Create(create) = stmt {
-                if let Err(e) = self.register_delivery_channels(&create.deliver) {
-                    tracing::warn!(
-                        trigger = %entry.name,
-                        error = %e,
-                        "restored trigger's delivery channel could not be registered — \
-                         it will fire and go nowhere until the configuration is fixed"
-                    );
-                }
+            if let chronix_streaming::signal::TriggerStatement::Create(create) = stmt
+                && let Err(e) = self.register_delivery_channels(&create.deliver)
+            {
+                tracing::warn!(
+                    trigger = %entry.name,
+                    error = %e,
+                    "restored trigger's delivery channel could not be registered — \
+                     it will fire and go nowhere until the configuration is fixed"
+                );
             }
         }
     }
@@ -427,19 +427,16 @@ impl Pipeline {
                     update,
                     chronix_analytics::ForecastUpdate::InitialFit
                         | chronix_analytics::ForecastUpdate::ReFit
-                ) {
-                    if let Ok(result) = self.forecast_engine.predict(
+                ) && let Ok(result) =
+                    self.forecast_engine
+                        .predict(measurement, tags, self.config.forecast_horizon)
+                {
+                    self.forecast_cache.store(
                         measurement,
                         tags,
+                        result,
                         self.config.forecast_horizon,
-                    ) {
-                        self.forecast_cache.store(
-                            measurement,
-                            tags,
-                            result,
-                            self.config.forecast_horizon,
-                        );
-                    }
+                    );
                 }
             }
         }
@@ -767,8 +764,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use chronix_analytics::anomaly::DetectorType;
     use chronix_analytics::StreamingAnomalyConfig;
+    use chronix_analytics::anomaly::DetectorType;
     use chronix_core::FieldValue;
     use chronix_security::audit::{AuditAction, AuditDecision};
     use chronix_streaming::signal::{EventTrigger, ThresholdOp, TriggerCondition};

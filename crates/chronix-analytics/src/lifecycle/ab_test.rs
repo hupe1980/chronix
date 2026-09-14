@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 
 use parking_lot::Mutex;
 
-use crate::lifecycle::registry::AccuracyMetrics;
+use crate::lifecycle::registry::VersionAccuracy;
 
 /// Relative+absolute tolerance comparison for float metrics.
 ///
@@ -161,8 +161,8 @@ impl ABTestEvaluator {
         let champ_preds: Vec<f64> = recent.clone().map(|r| r.champion_prediction).collect();
         let chal_preds: Vec<f64> = recent.map(|r| r.challenger_prediction).collect();
 
-        let champ_metrics = AccuracyMetrics::compute(&actuals, &champ_preds);
-        let chal_metrics = AccuracyMetrics::compute(&actuals, &chal_preds);
+        let champ_metrics = VersionAccuracy::compute(&actuals, &champ_preds);
+        let chal_metrics = VersionAccuracy::compute(&actuals, &chal_preds);
 
         metrics::gauge!("chronix_model_ab_test_champion_mape").set(champ_metrics.mape);
         metrics::gauge!("chronix_model_ab_test_challenger_mape").set(chal_metrics.mape);
@@ -238,7 +238,7 @@ impl ABTestEvaluator {
     }
 
     /// Champion accuracy from logged data.
-    pub fn champion_metrics(&self) -> Option<AccuracyMetrics> {
+    pub fn champion_metrics(&self) -> Option<VersionAccuracy> {
         let inner = self.inner.lock();
         if inner.records.is_empty() {
             return None;
@@ -249,11 +249,11 @@ impl ABTestEvaluator {
             .iter()
             .map(|r| r.champion_prediction)
             .collect();
-        Some(AccuracyMetrics::compute(&actuals, &preds))
+        Some(VersionAccuracy::compute(&actuals, &preds))
     }
 
     /// Challenger accuracy from logged data.
-    pub fn challenger_metrics(&self) -> Option<AccuracyMetrics> {
+    pub fn challenger_metrics(&self) -> Option<VersionAccuracy> {
         let inner = self.inner.lock();
         if inner.records.is_empty() {
             return None;
@@ -264,7 +264,7 @@ impl ABTestEvaluator {
             .iter()
             .map(|r| r.challenger_prediction)
             .collect();
-        Some(AccuracyMetrics::compute(&actuals, &preds))
+        Some(VersionAccuracy::compute(&actuals, &preds))
     }
 
     /// Number of logged records.

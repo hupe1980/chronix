@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 /// A database holding `rows` points of `cpu`, flushed into segments, with a
 /// per-query memory budget of `budget` bytes.
@@ -58,7 +58,7 @@ fn db_with(dir: &tempfile::TempDir, rows: i64, budget: usize) -> Arc<Chronix> {
 /// number that distinguishes "read ten rows" from "read two hundred thousand
 /// and kept ten", which is exactly what a stopwatch cannot do reliably.
 async fn scan_cost(ctx: &datafusion::prelude::SessionContext, sql: &str) -> (usize, usize) {
-    use datafusion::physical_plan::{collect, ExecutionPlan};
+    use datafusion::physical_plan::{ExecutionPlan, collect};
 
     let plan = ctx
         .sql(sql)

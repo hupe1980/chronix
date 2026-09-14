@@ -19,7 +19,7 @@
 
 use crate::anomaly::error::AnomalyError;
 use crate::anomaly::traits::{
-    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+    AnomalyDetector, AnomalyScore, DetectorType, scale_floor, validate_lengths,
 };
 
 /// Detector that compares values against their moving average.

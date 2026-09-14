@@ -14,7 +14,7 @@ mod tests {
     use chronix_core::FieldValue;
 
     use crate::signal::engine::{
-        anomaly_threshold_trigger, ma_crossover_trigger, rate_of_change_trigger, TriggerEngine,
+        TriggerEngine, anomaly_threshold_trigger, ma_crossover_trigger, rate_of_change_trigger,
     };
     use crate::signal::model::{EventTrigger, ThresholdOp, TriggerCondition};
     use crate::signal::sql::parse_trigger_sql;
@@ -239,8 +239,7 @@ mod tests {
     #[test]
     #[ignore = "perf benchmark — run with --ignored"]
     fn sql_parse_under_1ms() {
-        let sql =
-            "CREATE TRIGGER alert_cpu ON cpu_usage WHEN anomaly_score > 3.0 DELIVER webhook('https://example.com/hook') COOLDOWN INTERVAL '5m'";
+        let sql = "CREATE TRIGGER alert_cpu ON cpu_usage WHEN anomaly_score > 3.0 DELIVER webhook('https://example.com/hook') COOLDOWN INTERVAL '5m'";
 
         // Warm up
         for _ in 0..100 {

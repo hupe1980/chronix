@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-encoding"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chronix-core",
  "pco",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "arrow",

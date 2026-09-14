@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use chronix::prelude::*;
 use chronix::sql::create_session_context;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

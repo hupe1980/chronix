@@ -162,12 +162,13 @@ pub fn auto_features(
     names.push("lag_2".into());
     columns.push(lag2);
 
-    if let Some(period) = config.period {
-        if period > 0 && period < n {
-            let lag_p = features::lag(vals, period);
-            names.push(format!("lag_{period}"));
-            columns.push(lag_p);
-        }
+    if let Some(period) = config.period
+        && period > 0
+        && period < n
+    {
+        let lag_p = features::lag(vals, period);
+        names.push(format!("lag_{period}"));
+        columns.push(lag_p);
     }
 
     // --- Build row-major matrix ---
@@ -231,7 +232,7 @@ fn prune_low_variance(matrix: &mut FeatureMatrix, threshold: f64) {
         .names
         .iter()
         .zip(keep.iter())
-        .filter(|(_, &k)| k)
+        .filter(|&(_, &k)| k)
         .map(|(n, _)| n.clone())
         .collect();
 

@@ -45,7 +45,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::{
-    new_null_array, Array, ArrayRef, Int64Array, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, Int64Array, StringArray, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -657,13 +657,13 @@ fn compute_series_hashes(
         hasher.write(measurement.as_bytes());
 
         for (tag_idx, &(_, tag_name)) in sorted_tags.iter().enumerate() {
-            if let Some(arr) = tag_arrays[tag_idx] {
-                if !arr.is_null(row) {
-                    hasher.write_u8(0);
-                    hasher.write(tag_name.as_bytes());
-                    hasher.write_u8(b'=');
-                    hasher.write(arr.value(row).as_bytes());
-                }
+            if let Some(arr) = tag_arrays[tag_idx]
+                && !arr.is_null(row)
+            {
+                hasher.write_u8(0);
+                hasher.write(tag_name.as_bytes());
+                hasher.write_u8(b'=');
+                hasher.write(arr.value(row).as_bytes());
             }
         }
 

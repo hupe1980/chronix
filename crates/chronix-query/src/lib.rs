@@ -39,7 +39,7 @@ pub use convert::points_to_record_batch;
 pub use encoded_pushdown::{ColumnPredicate, EncodedDomainEvaluator, RowGroupVerdict};
 pub use error::QueryError;
 pub use memory::MemoryTracker;
-pub use plan::{FieldPredicate, QueryBuilder, QueryPlan, ZoneMapOp};
+pub use plan::{FieldPredicate, QueryBuilder, QueryPlan, StatsOp};
 pub use window::WindowFn;
 
 /// The Arrow type a schema column decodes to — one answer, in one place.
@@ -63,6 +63,11 @@ pub fn column_type_to_arrow(ct: chronix_core::ColumnType) -> arrow::datatypes::D
         ColumnType::F64 => DataType::Float64,
         ColumnType::Bool => DataType::Boolean,
         ColumnType::String => DataType::Utf8,
+        // A native histogram is a composite sample with no Arrow equivalent:
+        // the value is a `postcard` blob the `histogram_*` functions decode.
+        // `Binary` keeps the column's Arrow type stable regardless of the
+        // histogram's resolution, which a struct-of-lists encoding would not.
+        ColumnType::Histogram => DataType::Binary,
         ColumnType::Decimal { scale } => DataType::Decimal128(
             chronix_core::DECIMAL_PRECISION,
             i8::try_from(scale).unwrap_or(0),

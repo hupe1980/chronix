@@ -385,9 +385,19 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 .tag("Prometheus")
                 .summary(Some("Prometheus remote write"))
                 .description(Some(
-                    "Accepts Prometheus remote write v1 protocol (Snappy-compressed protobuf).",
+                    "Accepts Prometheus remote write 1.0 and 2.0 (Snappy-compressed \
+                     protobuf), chosen by the Content-Type `proto=` parameter: \
+                     `prometheus.WriteRequest` or `io.prometheus.write.v2.Request`. \
+                     Both carry native histograms. A 2.0 write answers with \
+                     X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written.",
                 ))
                 .response("204", ok_empty("Write successful"))
+                .response(
+                    "415",
+                    ok_empty(
+                        "Unsupported remote write message set; the body names the supported ones",
+                    ),
+                )
                 .build(),
         ),
     );

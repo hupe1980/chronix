@@ -2,7 +2,7 @@
 
 use crate::anomaly::error::AnomalyError;
 use crate::anomaly::traits::{
-    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+    AnomalyDetector, AnomalyScore, DetectorType, scale_floor, validate_lengths,
 };
 
 /// Flags points outside the fences Q1 − k·IQR .. Q3 + k·IQR.

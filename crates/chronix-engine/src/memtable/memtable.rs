@@ -13,12 +13,12 @@
 //! [`AtomicU64`] values track the WAL sequence range for flush coordination.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_skiplist::SkipMap;
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 use chronix_core::types::{Point, SeriesKey, Timestamp};
 
@@ -250,13 +250,11 @@ impl Memtable {
             let cur_ts = point.timestamp();
             let may_overwrite = cur_hash == prev_hash && cur_ts == prev_ts;
 
-            if may_overwrite {
-                if let Some(existing) = self.data.get(&key) {
-                    let old_size = existing.value().estimated_size()
-                        + std::mem::size_of::<MemtableKey>()
-                        + NODE_OVERHEAD;
-                    total_size_delta -= old_size.min(i64::MAX as usize) as i64;
-                }
+            if may_overwrite && let Some(existing) = self.data.get(&key) {
+                let old_size = existing.value().estimated_size()
+                    + std::mem::size_of::<MemtableKey>()
+                    + NODE_OVERHEAD;
+                total_size_delta -= old_size.min(i64::MAX as usize) as i64;
             }
 
             prev_hash = cur_hash;
@@ -571,11 +569,7 @@ impl Memtable {
     #[must_use]
     pub fn min_wal_seq(&self) -> Option<u64> {
         let val = self.min_wal_seq.load(Ordering::Acquire);
-        if val == u64::MAX {
-            None
-        } else {
-            Some(val)
-        }
+        if val == u64::MAX { None } else { Some(val) }
     }
 
     /// Returns the maximum WAL sequence number tracked.
@@ -716,9 +710,11 @@ mod tests {
 
         let points = mt.scan(&key_a, 0, 300);
         assert_eq!(points.len(), 2);
-        assert!(points
-            .iter()
-            .all(|p| p.series_key().tag("host") == Some("a")));
+        assert!(
+            points
+                .iter()
+                .all(|p| p.series_key().tag("host") == Some("a"))
+        );
     }
 
     #[test]
@@ -1231,6 +1227,15 @@ enum FieldBuilder {
     /// every value to the schema's declared scale before it reaches the
     /// memtable — so the first value's scale is the column's scale.
     Decimal(arrow::array::Decimal128Builder, u8),
+    /// A native histogram column.
+    ///
+    /// Arrow has no composite-sample type, so each value is a `postcard`
+    /// blob in a `Binary` column and the query layer decodes it. That is the
+    /// same shape Prometheus uses — a histogram is read through the
+    /// `histogram_*` family, never through arithmetic — and it keeps the
+    /// Arrow schema of a histogram column stable regardless of resolution,
+    /// which a struct-of-lists encoding would not.
+    Histogram(arrow::array::BinaryBuilder),
 }
 
 impl FieldBuilder {
@@ -1256,6 +1261,7 @@ impl FieldBuilder {
                 ),
                 d.scale(),
             ),
+            V::Histogram(_) => Self::Histogram(arrow::array::BinaryBuilder::new()),
         };
         for _ in 0..rows_before {
             b.append_null();
@@ -1271,6 +1277,7 @@ impl FieldBuilder {
             Self::Bool(b) => b.append_null(),
             Self::Str(b) => b.append_null(),
             Self::Decimal(b, _) => b.append_null(),
+            Self::Histogram(b) => b.append_null(),
         }
     }
 
@@ -1293,6 +1300,16 @@ impl FieldBuilder {
                 Ok(v) => b.append_value(v.mantissa()),
                 Err(_) => b.append_null(),
             },
+            // A histogram that cannot be encoded is a null rather than a
+            // panic, for the same reason a mistyped value is: the schema
+            // registry refused it at write time and this is the last line of
+            // defence. `postcard` on an owned struct with no borrowed data
+            // has no failure mode in practice, so this arm is unreachable
+            // rather than lossy.
+            (Self::Histogram(b), V::Histogram(h)) => match postcard::to_allocvec(h.as_ref()) {
+                Ok(bytes) => b.append_value(bytes),
+                Err(_) => b.append_null(),
+            },
             (this, _) => this.append_null(),
         }
     }
@@ -1300,6 +1317,7 @@ impl FieldBuilder {
     fn finish(self) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
         use arrow::datatypes::DataType;
         match self {
+            Self::Histogram(mut b) => (DataType::Binary, Arc::new(b.finish())),
             Self::F64(mut b) => (DataType::Float64, Arc::new(b.finish())),
             Self::I64(mut b) => (DataType::Int64, Arc::new(b.finish())),
             Self::U64(mut b) => (DataType::UInt64, Arc::new(b.finish())),

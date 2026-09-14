@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, DbError};
+use chronix::{Chronix, DbError, fields, tags};
 use tempfile::TempDir;
 
 const HOUR: i64 = 3_600_000_000_000;
@@ -35,9 +35,8 @@ fn count_rows(db: &Chronix, measurement: &str) -> usize {
 }
 
 fn rows_on_disk(db: &Chronix, measurement: &str) -> (usize, u64) {
-    let cat = db.catalog().read();
-    let segs = cat.active_segments_for_measurement(measurement);
-    (segs.len(), segs.iter().map(|e| e.row_count).sum())
+    let segs = db.segments_of(measurement);
+    (segs.len(), segs.iter().map(|s| s.rows).sum())
 }
 
 /// A graceful close leaves nothing to replay, so a reopen must not

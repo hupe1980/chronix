@@ -360,7 +360,7 @@ mod tests {
 
     // ── Mock meta client — uses shared test utility ────────────────
     use crate::test_util::{
-        make_routing_snapshot, make_routing_snapshot_with_replicas, MockSnapshotMetaClient,
+        MockSnapshotMetaClient, make_routing_snapshot, make_routing_snapshot_with_replicas,
     };
 
     fn make_failover_manager(snapshot: RoutingSnapshot, config: FailoverConfig) -> FailoverManager {
@@ -434,14 +434,18 @@ mod tests {
         // Each region has 1 replica (leader only, no replica_addrs),
         // but target is 3 → both are under-replicated
         assert_eq!(result.under_replicated.len(), 2);
-        assert!(result
-            .under_replicated
-            .iter()
-            .all(|r| r.current_replicas == 1));
-        assert!(result
-            .under_replicated
-            .iter()
-            .all(|r| r.target_replicas == 3));
+        assert!(
+            result
+                .under_replicated
+                .iter()
+                .all(|r| r.current_replicas == 1)
+        );
+        assert!(
+            result
+                .under_replicated
+                .iter()
+                .all(|r| r.target_replicas == 3)
+        );
     }
 
     #[tokio::test]

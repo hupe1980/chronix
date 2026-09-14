@@ -16,7 +16,7 @@
 //! one is closed by this measurement rather than by an implementation.
 //!
 //! Run with `cargo run -p chronix-analytics --example seasonal_differencing`.
-use chronix_analytics::forecast::{auto_forecast, AutoForecastOptions, ForecastModel, SarimaModel};
+use chronix_analytics::forecast::{AutoForecastOptions, ForecastModel, SarimaModel, auto_forecast};
 
 /// A seasonal random walk: each season's level drifts by its own noise.
 fn seasonal_random_walk(cycles: usize, m: usize, seed: u64, drift: f64) -> Vec<f64> {
@@ -83,10 +83,10 @@ fn run(m: usize, cycles: usize, drift: f64) {
         let mut row = [f64::NAN; 2];
         for (i, sd) in [0usize, 1].into_iter().enumerate() {
             let mut model = SarimaModel::new(1, 0, 0, 1, sd, 0, m);
-            if model.fit(&ts, train).is_ok() {
-                if let Ok(f) = model.predict(horizon) {
-                    row[i] = mase(test, &f.values, train, m);
-                }
+            if model.fit(&ts, train).is_ok()
+                && let Ok(f) = model.predict(horizon)
+            {
+                row[i] = mase(test, &f.values, train, m);
             }
         }
 

@@ -1,6 +1,5 @@
 //! Accessor methods (getters / setters) for [`Chronix`].
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,16 +9,53 @@ use crate::error::{DbError, Result};
 use metrics::gauge;
 
 use chronix_core::{ChronixConfig, MeasurementSchema, SchemaRegistry};
-use chronix_engine::index::{SegmentCatalog, SeriesBloomFilter, TagInvertedIndex};
-use chronix_engine::memtable::ShardRouter;
-use chronix_engine::wal::WalWriter;
 #[cfg(feature = "streaming")]
 use chronix_streaming::cdc::{EventBus, FilteredSubscription, SubscriptionFilter};
 
-use crate::lock_order::{BloomsLock, CatalogLock, RollupRegistryLock};
-use crate::rollup::RollupRegistry;
-
 use super::{Chronix, DatabaseStatistics};
+
+/// A read-only snapshot of one active segment.
+///
+/// Returned by [`Chronix::segments`] and [`Chronix::segments_of`]. It is an
+/// owned copy taken under the catalog lock and handed back after it is
+/// released, so holding one cannot block a flush, a compaction or a
+/// retention pass — and cannot deadlock against them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SegmentInfo {
+    /// The measurement whose rows this segment holds.
+    pub measurement: String,
+    /// Absolute path to the `.csx` file.
+    pub path: std::path::PathBuf,
+    /// Rows in the segment, before deduplication and tombstones.
+    ///
+    /// A query may return fewer: a later segment can overwrite a point
+    /// (last-write-wins) and a tombstone can mask one. This is what the
+    /// file holds, not what a `SELECT count(*)` answers.
+    pub rows: u64,
+    /// Distinct series in the segment.
+    pub series: u32,
+    /// Oldest timestamp held, inclusive (nanoseconds since the epoch).
+    pub min_time: i64,
+    /// Newest timestamp held, inclusive (nanoseconds since the epoch).
+    pub max_time: i64,
+    /// Size of the file on disk, in bytes.
+    pub bytes: u64,
+}
+
+impl SegmentInfo {
+    fn from_entry(e: &chronix_engine::index::SegmentCatalogEntry, segments_dir: &Path) -> Self {
+        Self {
+            measurement: e.measurement.clone(),
+            path: e.file.resolve(segments_dir),
+            rows: e.row_count,
+            series: e.series_count,
+            min_time: e.min_timestamp,
+            max_time: e.max_timestamp,
+            bytes: e.byte_size,
+        }
+    }
+}
 
 impl Chronix {
     #[cfg(feature = "sql")]
@@ -214,17 +250,6 @@ impl Chronix {
         &self.schema
     }
 
-    /// Return a reference to the segment catalog.
-    pub fn catalog(&self) -> &Arc<CatalogLock<SegmentCatalog>> {
-        &self.catalog
-    }
-
-    /// Return the shard router.
-    #[must_use]
-    pub fn shards(&self) -> &Arc<ShardRouter> {
-        &self.shards
-    }
-
     /// Return the database configuration.
     #[must_use]
     pub fn config(&self) -> &ChronixConfig {
@@ -302,10 +327,10 @@ impl Chronix {
 
         {
             let cached = self.disk_usage.read();
-            if let Some((measured_at, bytes)) = *cached {
-                if measured_at.elapsed() < TTL {
-                    return bytes;
-                }
+            if let Some((measured_at, bytes)) = *cached
+                && measured_at.elapsed() < TTL
+            {
+                return bytes;
             }
         }
 
@@ -376,16 +401,72 @@ impl Chronix {
         }
     }
 
-    /// Return the WAL writer.
-    #[must_use]
-    pub fn wal(&self) -> &Arc<WalWriter> {
-        &self.wal
-    }
-
     /// Return the path to the data directory.
     #[must_use]
     pub fn data_dir(&self) -> &Path {
         &self.config.data_dir
+    }
+
+    // ── Segment inspection ──────────────────────────────────────────
+    //
+    // These replace a `catalog()` accessor that handed callers the
+    // `RwLock` the engine's own lock hierarchy is built on. Three things
+    // were wrong with that and only the third is obvious. The lock's type
+    // lives in a `pub(crate)` module, so a caller could call the method and
+    // could not name what it returned. The hierarchy is documented as "an
+    // invariant of this crate's own implementation, not a contract with
+    // callers" — and was then enforced on callers by a debug-build panic
+    // naming levels they had no way to read. And in release the assertions
+    // compile away, so the same two reads deadlock against the maintenance
+    // thread instead.
+    //
+    // Every caller in this repository wanted one of three facts. They get
+    // exactly those, as owned values, with the lock taken and released
+    // inside.
+
+    /// How many active segments the database holds.
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.catalog.read().segment_count()
+    }
+
+    /// A snapshot of every active segment.
+    ///
+    /// Ordered by measurement, then by start time, so two calls on an
+    /// unchanged database compare equal. The paths are absolute and
+    /// resolved against this database's directory.
+    #[must_use]
+    pub fn segments(&self) -> Vec<SegmentInfo> {
+        let dir = self.config.data_dir.join("segments");
+        let mut out: Vec<SegmentInfo> = self
+            .catalog
+            .read()
+            .all_segments()
+            .iter()
+            .map(|e| SegmentInfo::from_entry(e, &dir))
+            .collect();
+        out.sort_by(|a, b| {
+            a.measurement
+                .cmp(&b.measurement)
+                .then(a.min_time.cmp(&b.min_time))
+                .then(a.path.cmp(&b.path))
+        });
+        out
+    }
+
+    /// A snapshot of the active segments holding data for `measurement`.
+    #[must_use]
+    pub fn segments_of(&self, measurement: &str) -> Vec<SegmentInfo> {
+        let dir = self.config.data_dir.join("segments");
+        let mut out: Vec<SegmentInfo> = self
+            .catalog
+            .read()
+            .active_segments_for_measurement(measurement)
+            .iter()
+            .map(|e| SegmentInfo::from_entry(e, &dir))
+            .collect();
+        out.sort_by(|a, b| a.min_time.cmp(&b.min_time).then(a.path.cmp(&b.path)));
+        out
     }
 
     /// Refuse to write an encrypted column's plaintext outside the segment
@@ -480,18 +561,6 @@ impl Chronix {
         self.wal.current_sequence()
     }
 
-    /// Return a reference to the bloom filter map for query pruning.
-    pub fn bloom_filters(&self) -> &Arc<BloomsLock<BTreeMap<u64, SeriesBloomFilter>>> {
-        &self.blooms
-    }
-
-    /// Return a reference to the tag inverted index.
-    ///
-    /// Used for enumerating tag keys and values (e.g. PromQL `label_values`).
-    pub fn tag_index(&self) -> &Arc<TagInvertedIndex> {
-        &self.tag_index
-    }
-
     /// Every distinct tag key this database holds.
     ///
     /// **Both halves.** The inverted index is built at flush, so it knows
@@ -559,11 +628,6 @@ impl Chronix {
     #[cfg(feature = "streaming")]
     pub fn subscribe(&self, filter: SubscriptionFilter) -> FilteredSubscription {
         FilteredSubscription::new(&self.cdc_bus, filter)
-    }
-
-    /// Return a reference to the rollup registry.
-    pub fn rollup_registry(&self) -> &Arc<RollupRegistryLock<RollupRegistry>> {
-        &self.rollup_registry
     }
 }
 

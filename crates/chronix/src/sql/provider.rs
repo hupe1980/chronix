@@ -198,10 +198,9 @@ fn extract_from_expr(expr: &Expr, result: &mut PushdownPredicates, ms: Option<&M
         // Literal op Column (reversed)
         else if let (Some(scalar), Some(col_name)) =
             (scalar_value(&be.left), column_name(&be.right))
+            && let Some(rop) = reverse_op(be.op)
         {
-            if let Some(rop) = reverse_op(be.op) {
-                apply_predicate(&col_name, rop, &scalar, result, ms);
-            }
+            apply_predicate(&col_name, rop, &scalar, result, ms);
         }
     }
 }
@@ -322,10 +321,10 @@ fn plan_predicate(
     if column.role == ColumnRole::Tag {
         // Tag equality against a string literal, and nothing else: the
         // engine's tag filter is an exact string match.
-        if op == Operator::Eq {
-            if let ScalarValue::Utf8(Some(val)) = scalar {
-                return Pushdown::Exact(PushdownTerm::Tag(col_name.to_string(), val.clone()));
-            }
+        if op == Operator::Eq
+            && let ScalarValue::Utf8(Some(val)) = scalar
+        {
+            return Pushdown::Exact(PushdownTerm::Tag(col_name.to_string(), val.clone()));
         }
         return Pushdown::None;
     }
@@ -339,11 +338,11 @@ fn plan_predicate(
             _ => return Pushdown::None,
         };
         let zm_op = match op {
-            Operator::Eq => chronix_engine::segment::ZoneMapOp::Eq,
-            Operator::Gt => chronix_engine::segment::ZoneMapOp::Gt,
-            Operator::GtEq => chronix_engine::segment::ZoneMapOp::GtEq,
-            Operator::Lt => chronix_engine::segment::ZoneMapOp::Lt,
-            Operator::LtEq => chronix_engine::segment::ZoneMapOp::LtEq,
+            Operator::Eq => chronix_engine::segment::StatsOp::Eq,
+            Operator::Gt => chronix_engine::segment::StatsOp::Gt,
+            Operator::GtEq => chronix_engine::segment::StatsOp::GtEq,
+            Operator::Lt => chronix_engine::segment::StatsOp::Lt,
+            Operator::LtEq => chronix_engine::segment::StatsOp::LtEq,
             _ => return Pushdown::None,
         };
         // A zone map prunes row groups; it does not filter rows, so the

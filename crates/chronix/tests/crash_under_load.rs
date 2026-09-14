@@ -11,12 +11,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may unwrap
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const HOUR: i64 = 3_600_000_000_000;
 const MINUTE: i64 = 60_000_000_000;

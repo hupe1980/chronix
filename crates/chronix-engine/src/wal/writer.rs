@@ -3,8 +3,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -12,8 +12,8 @@ use chronix_core::{FsyncPolicy, WalConfig, WalError};
 
 use crate::wal::sink::{DurableFile, WalSink};
 use crate::wal::{
-    WalRecordType, WAL_HEADER_SIZE, WAL_MAGIC, WAL_PAYLOAD_VERSION, WAL_RECORD_HEADER_SIZE,
-    WAL_VERSION,
+    WAL_HEADER_SIZE, WAL_MAGIC, WAL_PAYLOAD_VERSION, WAL_RECORD_HEADER_SIZE, WAL_VERSION,
+    WalRecordType,
 };
 
 /// The buffered file the WAL appends to.
@@ -911,18 +911,18 @@ impl WalWriter {
         writer.get_ref().sync_data()?;
 
         // Fsync parent directory so the new file's directory entry is durable.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                dir.sync_all().map_err(|e| {
-                    WalError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to fsync WAL parent directory {}: {e}",
-                            parent.display()
-                        ),
-                    ))
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            dir.sync_all().map_err(|e| {
+                WalError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to fsync WAL parent directory {}: {e}",
+                        parent.display()
+                    ),
+                ))
+            })?;
         }
 
         Ok((writer, WAL_HEADER_SIZE as u64))
@@ -1144,21 +1144,17 @@ pub(crate) fn list_wal_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("wal_")
-                && path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("cxwl"))
-            {
-                if let Some(seq_str) = name
-                    .strip_prefix("wal_")
-                    .and_then(|s| s.strip_suffix(".cxwl"))
-                {
-                    if let Ok(seq) = seq_str.parse::<u64>() {
-                        files.push((seq, path));
-                    }
-                }
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with("wal_")
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cxwl"))
+            && let Some(seq_str) = name
+                .strip_prefix("wal_")
+                .and_then(|s| s.strip_suffix(".cxwl"))
+            && let Ok(seq) = seq_str.parse::<u64>()
+        {
+            files.push((seq, path));
         }
     }
 

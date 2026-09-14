@@ -242,10 +242,10 @@ impl FileSink {
     /// created or opened.
     pub fn open(path: impl AsRef<std::path::Path>, sync_each: bool) -> Result<Self> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)

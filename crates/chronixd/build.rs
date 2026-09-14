@@ -9,11 +9,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prometheus remote write/read protobuf types (no gRPC service — HTTP only)
     prost_build::Config::new().compile_protos(&["proto/prometheus.proto"], &["proto"])?;
 
+    // Prometheus Remote Write 2.0 — a distinct message set, compiled
+    // separately so the two versions cannot be confused for one another.
+    prost_build::Config::new().compile_protos(&["proto/prometheus_v2.proto"], &["proto"])?;
+
     // OpenTelemetry OTLP metrics protobuf types (HTTP only)
     prost_build::Config::new().compile_protos(&["proto/otlp.proto"], &["proto"])?;
 
     println!("cargo:rerun-if-changed=proto/chronix.proto");
     println!("cargo:rerun-if-changed=proto/prometheus.proto");
+    println!("cargo:rerun-if-changed=proto/prometheus_v2.proto");
     println!("cargo:rerun-if-changed=proto/otlp.proto");
     Ok(())
 }

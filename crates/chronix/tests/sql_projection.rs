@@ -10,7 +10,7 @@
 //! returned a different column's data under the requested name.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::sync::Arc;
 
 fn open(dir: &tempfile::TempDir) -> Arc<Chronix> {

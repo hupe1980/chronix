@@ -308,97 +308,95 @@ pub async fn namespace_layer(
     if let Some(ctx) = req
         .extensions()
         .get::<chronix_security::auth::AuthContext>()
+        && !ctx.allows_namespace(&namespace)
     {
-        if !ctx.allows_namespace(&namespace) {
-            tracing::warn!(
-                principal = %ctx.principal,
-                %namespace,
-                "principal is not authorised for this namespace"
-            );
-            metrics::counter!("chronix_namespace_denied_total").increment(1);
-            crate::audit::record(
-                &state,
-                &ctx.principal,
-                chronix_security::audit::AuditAction::Admin,
-                format!("namespace:{namespace}"),
-                chronix_security::audit::AuditDecision::Deny,
-                &[("reason", "credential not bound to namespace".to_string())],
-            );
-            // 403, not 404: the caller authenticated, and hiding existence
-            // here would contradict the 400 above, which already tells an
-            // unauthenticated caller whether a namespace exists.
-            return (
-                StatusCode::FORBIDDEN,
-                format!("credential is not authorised for namespace: {namespace}"),
-            )
-                .into_response();
-        }
+        tracing::warn!(
+            principal = %ctx.principal,
+            %namespace,
+            "principal is not authorised for this namespace"
+        );
+        metrics::counter!("chronix_namespace_denied_total").increment(1);
+        crate::audit::record(
+            &state,
+            &ctx.principal,
+            chronix_security::audit::AuditAction::Admin,
+            format!("namespace:{namespace}"),
+            chronix_security::audit::AuditDecision::Deny,
+            &[("reason", "credential not bound to namespace".to_string())],
+        );
+        // 403, not 404: the caller authenticated, and hiding existence
+        // here would contradict the 400 above, which already tells an
+        // unauthenticated caller whether a namespace exists.
+        return (
+            StatusCode::FORBIDDEN,
+            format!("credential is not authorised for namespace: {namespace}"),
+        )
+            .into_response();
     }
 
     // Namespace-level Cedar authorization.
-    if let Some(engine) = state.authz_engine.as_ref() {
-        if let Some(ctx) = req
+    if let Some(engine) = state.authz_engine.as_ref()
+        && let Some(ctx) = req
             .extensions()
             .get::<chronix_security::auth::AuthContext>()
-        {
-            // The **matched route**, so `/api/v1/measurements/{name}` is one
-            // arm whatever the measurement is called. A request that matched
-            // no route cannot reach a handler, so an unclassified one is a
-            // refusal rather than a guess.
-            let matched = req
-                .extensions()
-                .get::<axum::extract::MatchedPath>()
-                .map(|m| m.as_str().to_string());
-            let Some(action) = matched
-                .as_deref()
-                .and_then(|p| action_for_route(p, req.method()))
-            else {
-                tracing::warn!(
-                    path = %path,
-                    method = %req.method(),
-                    "no data action is classified for this route; refusing"
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    "this route has no authorization classification".to_string(),
-                )
-                    .into_response();
-            };
-            // `ctx.principal()` rather than a principal built here: roles
-            // come with the credential. This built a bare
-            // `ChronixPrincipal::new(&ctx.principal)` with no roles at all,
-            // so every `principal in Chronix::Role::"…"` policy — which is
-            // every policy in the guide — matched nothing on a data request
-            // while the same role worked on an administrative one.
-            let ns_resource = chronix_security::authz::ChronixNamespace::new(&namespace);
-            let decision = engine.authorize_namespace(&ctx.principal(), action, &ns_resource);
-            if decision.is_denied() {
-                tracing::warn!(
-                    principal = %ctx.principal,
-                    %namespace,
-                    %action,
-                    "namespace access denied by policy"
-                );
-                // **A refusal is the event the trail exists for.** The
-                // credential-binding denial above was recorded and this one
-                // was not, so a policy denial left a `warn!` in the process
-                // log — which does not survive a restart and cannot be shown
-                // to be unedited. One gate had the rule and the other did not.
-                crate::audit::record(
-                    &state,
-                    &ctx.principal,
-                    audit_action_for(action),
-                    namespace.clone(),
-                    chronix_security::audit::AuditDecision::Deny,
-                    &[("reason", "denied by policy".to_string())],
-                );
-                metrics::counter!("chronix_authz_denied_total").increment(1);
-                return (
-                    StatusCode::FORBIDDEN,
-                    format!("access denied: {action} on namespace {namespace}"),
-                )
-                    .into_response();
-            }
+    {
+        // The **matched route**, so `/api/v1/measurements/{name}` is one
+        // arm whatever the measurement is called. A request that matched
+        // no route cannot reach a handler, so an unclassified one is a
+        // refusal rather than a guess.
+        let matched = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|m| m.as_str().to_string());
+        let Some(action) = matched
+            .as_deref()
+            .and_then(|p| action_for_route(p, req.method()))
+        else {
+            tracing::warn!(
+                path = %path,
+                method = %req.method(),
+                "no data action is classified for this route; refusing"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "this route has no authorization classification".to_string(),
+            )
+                .into_response();
+        };
+        // `ctx.principal()` rather than a principal built here: roles
+        // come with the credential. This built a bare
+        // `ChronixPrincipal::new(&ctx.principal)` with no roles at all,
+        // so every `principal in Chronix::Role::"…"` policy — which is
+        // every policy in the guide — matched nothing on a data request
+        // while the same role worked on an administrative one.
+        let ns_resource = chronix_security::authz::ChronixNamespace::new(&namespace);
+        let decision = engine.authorize_namespace(&ctx.principal(), action, &ns_resource);
+        if decision.is_denied() {
+            tracing::warn!(
+                principal = %ctx.principal,
+                %namespace,
+                %action,
+                "namespace access denied by policy"
+            );
+            // **A refusal is the event the trail exists for.** The
+            // credential-binding denial above was recorded and this one
+            // was not, so a policy denial left a `warn!` in the process
+            // log — which does not survive a restart and cannot be shown
+            // to be unedited. One gate had the rule and the other did not.
+            crate::audit::record(
+                &state,
+                &ctx.principal,
+                audit_action_for(action),
+                namespace.clone(),
+                chronix_security::audit::AuditDecision::Deny,
+                &[("reason", "denied by policy".to_string())],
+            );
+            metrics::counter!("chronix_authz_denied_total").increment(1);
+            return (
+                StatusCode::FORBIDDEN,
+                format!("access denied: {action} on namespace {namespace}"),
+            )
+                .into_response();
         }
     }
 
@@ -875,18 +873,17 @@ pub fn scope_from_request<T>(
     if let Some(ctx) = request
         .extensions()
         .get::<chronix_security::auth::AuthContext>()
+        && !ctx.allows_namespace(&namespace)
     {
-        if !ctx.allows_namespace(&namespace) {
-            tracing::warn!(
-                principal = %ctx.principal,
-                %namespace,
-                "principal is not authorised for this namespace"
-            );
-            metrics::counter!("chronix_namespace_denied_total").increment(1);
-            return Err(tonic::Status::permission_denied(format!(
-                "credential is not authorised for namespace: {namespace}"
-            )));
-        }
+        tracing::warn!(
+            principal = %ctx.principal,
+            %namespace,
+            "principal is not authorised for this namespace"
+        );
+        metrics::counter!("chronix_namespace_denied_total").increment(1);
+        return Err(tonic::Status::permission_denied(format!(
+            "credential is not authorised for namespace: {namespace}"
+        )));
     }
     Ok(Some(namespace))
 }

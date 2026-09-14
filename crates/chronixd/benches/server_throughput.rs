@@ -13,13 +13,13 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use rand::RngExt;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 use chronixd::grpc::ChronixGrpcService;
 use chronixd::http::{AppState, SharedState};

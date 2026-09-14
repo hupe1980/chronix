@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 /// Cached SQL logical plans keyed by `(namespace, query)`, each with an
 /// insertion `Instant` (TTL) and last-access `Instant` (LRU).
@@ -145,10 +145,10 @@ impl WriteDedupCache {
             inner.order.pop_front();
             // Remove from map only if the timestamp matches (handles
             // re-inserts of the same key with a newer timestamp).
-            if let Some(&map_ts) = inner.map.get(&front_key) {
-                if map_ts == front_ts {
-                    inner.map.remove(&front_key);
-                }
+            if let Some(&map_ts) = inner.map.get(&front_key)
+                && map_ts == front_ts
+            {
+                inner.map.remove(&front_key);
             }
         }
 
@@ -158,12 +158,12 @@ impl WriteDedupCache {
             let mut evicted = 0;
             while evicted < to_evict {
                 if let Some((front_key, front_ts)) = inner.order.pop_front() {
-                    if let Some(&map_ts) = inner.map.get(&front_key) {
-                        if map_ts == front_ts {
-                            inner.map.remove(&front_key);
-                            evicted += 1;
-                            continue;
-                        }
+                    if let Some(&map_ts) = inner.map.get(&front_key)
+                        && map_ts == front_ts
+                    {
+                        inner.map.remove(&front_key);
+                        evicted += 1;
+                        continue;
                     }
                     // Stale deque entry — skip without counting.
                 } else {
@@ -173,13 +173,13 @@ impl WriteDedupCache {
         }
 
         // Check if key exists and is within the window.
-        if let Some(&ts) = inner.map.get(key) {
-            if now.duration_since(ts) < self.window {
-                return true; // duplicate
-            }
-            // Expired — re-insert below.  Stale deque entry cleaned
-            // up lazily on next eviction pass.
+        if let Some(&ts) = inner.map.get(key)
+            && now.duration_since(ts) < self.window
+        {
+            return true; // duplicate
         }
+        // Expired — re-insert below.  Stale deque entry cleaned
+        // up lazily on next eviction pass.
 
         inner.map.insert(key.to_string(), now);
         inner.order.push_back((key.to_string(), now));
@@ -512,7 +512,7 @@ mod tests {
         let cache = WriteDedupCache::new(1, 100).unwrap();
         assert!(!cache.check_duplicate("key-1")); // first insert
         assert!(cache.check_duplicate("key-1")); // duplicate within window
-                                                 // Sleep past the window
+        // Sleep past the window
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // Should no longer be a duplicate — expired.
         assert!(!cache.check_duplicate("key-1"));

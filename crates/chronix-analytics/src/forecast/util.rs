@@ -6,6 +6,21 @@ use crate::forecast::error::ForecastError;
 /// match values in length.
 #[inline]
 pub fn validate_input(timestamps: &[i64], values: &[f64]) -> Result<(), ForecastError> {
+    // Emptiness is checked here, in the one function every model calls,
+    // rather than in each model. It was checked in none of them: `SesModel`
+    // and `ArimaModel` survived an empty series by luck — their fitting loops
+    // are no-ops over it — and then answered `predict()` from an
+    // uninitialised level, which is a number with nothing behind it.
+    // `HoltWintersModel` indexed `values[0]` and **panicked**, which in an
+    // embedded database is the host process going down.
+    //
+    // A model fitted on no observations is not a model, so this is an error
+    // for all of them rather than a different accident in each.
+    if values.is_empty() {
+        return Err(ForecastError::InvalidInput(
+            "cannot fit a model to an empty series".to_string(),
+        ));
+    }
     if timestamps.len() != values.len() {
         return Err(ForecastError::InvalidInput(format!(
             "timestamps length ({}) != values length ({})",

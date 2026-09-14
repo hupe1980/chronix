@@ -53,7 +53,13 @@ pub(crate) const FUNCTIONS: &[&str] = &[
     "double_exponential_smoothing",
     "exp",
     "floor",
+    "histogram_avg",
+    "histogram_count",
+    "histogram_fraction",
     "histogram_quantile",
+    "histogram_stddev",
+    "histogram_stdvar",
+    "histogram_sum",
     "hour",
     "idelta",
     "increase",
@@ -332,6 +338,7 @@ impl PromQLEvaluator {
                             timestamp: params.time,
                             value: n,
                         }],
+                        histograms: Vec::new(),
                     }])),
                     other => Ok(other),
                 }
@@ -410,7 +417,7 @@ impl PromQLEvaluator {
                     _ => {
                         return Err(EvalError(
                             "quantile_over_time() first arg must be scalar".into(),
-                        ))
+                        ));
                     }
                 };
                 let matrix = self.eval(&args[1], params)?;
@@ -434,6 +441,7 @@ impl PromQLEvaluator {
                                         timestamp: params.time,
                                         value: compute_quantile(&vals, q),
                                     }],
+                                    histograms: Vec::new(),
                                 })
                             })
                             .collect(),
@@ -473,6 +481,7 @@ impl PromQLEvaluator {
                                 timestamp: params.time,
                                 value: 1.0,
                             }],
+                            histograms: Vec::new(),
                         }]))
                     }
                     PromQLValue::Vector(_) => Ok(PromQLValue::Vector(vec![])),
@@ -497,6 +506,7 @@ impl PromQLEvaluator {
                                 timestamp: params.time,
                                 value: 1.0,
                             }],
+                            histograms: Vec::new(),
                         }]))
                     }
                     _ => Ok(PromQLValue::Vector(vec![])),
@@ -563,7 +573,7 @@ impl PromQLEvaluator {
                     _ => {
                         return Err(EvalError(
                             "predict_linear() second arg must be scalar".into(),
-                        ))
+                        ));
                     }
                 };
                 let matrix = self.eval(&args[0], params)?;
@@ -616,6 +626,7 @@ impl PromQLEvaluator {
                                                 timestamp: eval_time,
                                                 value: f64::NAN,
                                             }],
+                                            histograms: Vec::new(),
                                         });
                                     }
                                     let slope = (n * sum_xy - sum_x * sum_y) / denom;
@@ -643,6 +654,7 @@ impl PromQLEvaluator {
                                             timestamp: eval_time,
                                             value,
                                         }],
+                                        histograms: Vec::new(),
                                     })
                                 })
                                 .collect(),
@@ -666,7 +678,7 @@ impl PromQLEvaluator {
                     _ => {
                         return Err(EvalError(
                             "label_replace() replacement must be string".into(),
-                        ))
+                        ));
                     }
                 };
                 let src_label = match &args[3] {
@@ -872,6 +884,7 @@ impl PromQLEvaluator {
                                         timestamp: params.time,
                                         value: smoothed,
                                     }],
+                                    histograms: Vec::new(),
                                 })
                             })
                             .collect(),
@@ -899,7 +912,7 @@ impl PromQLEvaluator {
                         _ => {
                             return Err(EvalError(format!(
                                 "{func}() label arguments must be string literals"
-                            )))
+                            )));
                         }
                     }
                 }
@@ -908,11 +921,7 @@ impl PromQLEvaluator {
                     PromQLValue::Vector(mut series) => {
                         series.sort_by(|a, b| {
                             let ord = compare_by_labels(a, b, &label_names);
-                            if descending {
-                                ord.reverse()
-                            } else {
-                                ord
-                            }
+                            if descending { ord.reverse() } else { ord }
                         });
                         Ok(PromQLValue::Vector(series))
                     }
@@ -938,6 +947,46 @@ impl PromQLEvaluator {
                     other => Ok(other),
                 }
             }
+            // ── the native-histogram family ─────────────────────────
+            //
+            // Each reads the distribution the sample *is*. They are errors on
+            // a float series rather than a best guess, which is upstream's
+            // behaviour and the honest one: `histogram_count` of a gauge is
+            // not the gauge.
+            "histogram_count" | "histogram_sum" | "histogram_avg" | "histogram_stddev"
+            | "histogram_stdvar" => {
+                let series = self.one_histogram_vector(func, args, params)?;
+                let f: fn(&chronix_core::histogram::Histogram) -> f64 = match func {
+                    "histogram_count" => |h| h.count,
+                    "histogram_sum" => |h| h.sum,
+                    "histogram_avg" => |h| h.avg(),
+                    "histogram_stddev" => |h| h.stddev(),
+                    "histogram_stdvar" => |h| h.variance(),
+                    _ => unreachable!("matched above"),
+                };
+                Ok(PromQLValue::Vector(native_histogram_map(&series, f)))
+            }
+            "histogram_fraction" => {
+                if args.len() != 3 {
+                    return Err(EvalError(
+                        "histogram_fraction() requires 3 arguments: lower, upper, vector".into(),
+                    ));
+                }
+                let lower = self.scalar_arg(func, &args[0], params)?;
+                let upper = self.scalar_arg(func, &args[1], params)?;
+                let series = match self.eval(&args[2], params)? {
+                    PromQLValue::Vector(v) => v,
+                    _ => {
+                        return Err(EvalError(
+                            "histogram_fraction() third arg must be an instant vector".into(),
+                        ));
+                    }
+                };
+                Self::require_histograms(func, &series)?;
+                Ok(PromQLValue::Vector(native_histogram_map(&series, |h| {
+                    h.fraction(lower, upper)
+                })))
+            }
             // ── histogram_quantile ──────────────────────────────────
             "histogram_quantile" => {
                 if args.len() != 2 {
@@ -950,10 +999,22 @@ impl PromQLEvaluator {
                     _ => {
                         return Err(EvalError(
                             "histogram_quantile() first arg must be scalar".into(),
-                        ))
+                        ));
                     }
                 };
                 let val = self.eval(&args[1], params)?;
+                // A series carrying native histograms answers directly: the
+                // distribution is the sample, so there is no `le` grouping to
+                // do and no monotonicity to repair. Mixed input is not
+                // possible — a series carries floats or histograms — so this
+                // is a dispatch, not a merge.
+                if let PromQLValue::Vector(series) = &val
+                    && series.iter().any(Series::is_histogram)
+                {
+                    return Ok(PromQLValue::Vector(native_histogram_map(series, |h| {
+                        h.quantile(q)
+                    })));
+                }
                 match val {
                     PromQLValue::Vector(series) => {
                         // Group by labels excluding "le"
@@ -1032,6 +1093,7 @@ impl PromQLEvaluator {
                                         timestamp: params.time,
                                         value: f64::NAN,
                                     }],
+                                    histograms: Vec::new(),
                                 });
                                 continue;
                             }
@@ -1046,6 +1108,7 @@ impl PromQLEvaluator {
                                         timestamp: params.time,
                                         value: f64::NAN,
                                     }],
+                                    histograms: Vec::new(),
                                 });
                                 continue;
                             }
@@ -1059,6 +1122,7 @@ impl PromQLEvaluator {
                                         timestamp: params.time,
                                         value: f64::NAN,
                                     }],
+                                    histograms: Vec::new(),
                                 });
                                 continue;
                             }
@@ -1071,6 +1135,7 @@ impl PromQLEvaluator {
                                         timestamp: params.time,
                                         value: f64::NEG_INFINITY,
                                     }],
+                                    histograms: Vec::new(),
                                 });
                                 continue;
                             }
@@ -1081,6 +1146,7 @@ impl PromQLEvaluator {
                                         timestamp: params.time,
                                         value: f64::INFINITY,
                                     }],
+                                    histograms: Vec::new(),
                                 });
                                 continue;
                             }
@@ -1129,6 +1195,7 @@ impl PromQLEvaluator {
                                     timestamp: params.time,
                                     value,
                                 }],
+                                histograms: Vec::new(),
                             });
                         }
                         Ok(PromQLValue::Vector(result))
@@ -1224,6 +1291,52 @@ impl PromQLEvaluator {
             other => Err(EvalError(format!("unknown function: {other}"))),
         }
     }
+
+    /// Evaluate a single argument that must be an instant vector of
+    /// histograms.
+    fn one_histogram_vector(
+        &self,
+        func: &str,
+        args: &[Expr],
+        params: &QueryParams,
+    ) -> Result<Vec<Series>, EvalError> {
+        if args.len() != 1 {
+            return Err(EvalError(format!("{func}() requires 1 argument")));
+        }
+        let series = match self.eval(&args[0], params)? {
+            PromQLValue::Vector(v) => v,
+            _ => {
+                return Err(EvalError(format!("{func}() expects an instant vector")));
+            }
+        };
+        Self::require_histograms(func, &series)?;
+        Ok(series)
+    }
+
+    /// Refuse a float series by name.
+    ///
+    /// Upstream errors rather than guessing, and so does this: the count of a
+    /// gauge is not the gauge, and returning the float would be a number that
+    /// looks like an answer. An empty vector is not an error — nothing
+    /// matched the selector, which is an ordinary result.
+    fn require_histograms(func: &str, series: &[Series]) -> Result<(), EvalError> {
+        if !series.is_empty() && !series.iter().any(Series::is_histogram) {
+            return Err(EvalError(format!(
+                "{func}() expects native histogram samples, but the input series \
+                 carry float samples — this function reads a distribution, and \
+                 a float has none"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Evaluate an argument that must be a scalar.
+    fn scalar_arg(&self, func: &str, arg: &Expr, params: &QueryParams) -> Result<f64, EvalError> {
+        match self.eval(arg, params)? {
+            PromQLValue::Scalar(n) => Ok(n),
+            _ => Err(EvalError(format!("{func}() expects a scalar argument"))),
+        }
+    }
 }
 
 /// Evaluate one of the eight PromQL date functions.
@@ -1262,6 +1375,7 @@ fn eval_date_fn(
                     timestamp: params.time,
                     value: n,
                 }],
+                histograms: Vec::new(),
             }],
             _ => return Err(EvalError(format!("{func}() requires an instant vector"))),
         }
@@ -1276,6 +1390,7 @@ fn eval_date_fn(
                 #[allow(clippy::cast_precision_loss)]
                 value: secs as f64 + frac as f64 / 1_000_000_000.0,
             }],
+            histograms: Vec::new(),
         }]
     };
 
@@ -1323,6 +1438,7 @@ fn eval_date_fn(
                         value: component(sm.value),
                     })
                     .collect(),
+                histograms: Vec::new(),
             })
             .collect(),
     ))
@@ -1389,11 +1505,7 @@ fn eval_over_time_fn(
                     .collect();
                 // All-NaN: the extremum of nothing is NaN, which is also what
                 // Prometheus reports.
-                if vals.is_empty() {
-                    f64::NAN
-                } else {
-                    f(&vals)
-                }
+                if vals.is_empty() { f64::NAN } else { f(&vals) }
             }
         }
     })
@@ -1473,6 +1585,7 @@ fn eval_over_time_fn_opt(
                             timestamp: params.time,
                             value,
                         }],
+                        histograms: Vec::new(),
                     })
                 })
                 .collect(),
@@ -1511,10 +1624,10 @@ pub(crate) fn extract_range_ns(expr: &Expr) -> Option<i64> {
 /// Extract the offset duration (in ns) from a MatrixSelector's inner
 /// VectorSelector.  Returns 0 when no offset is present.
 pub(crate) fn extract_offset_ns(expr: &Expr) -> i64 {
-    if let Expr::MatrixSelector { vector, .. } = expr {
-        if let Expr::VectorSelector { offset, .. } = vector.as_ref() {
-            return offset.map(|d| d.as_nanos()).unwrap_or(0);
-        }
+    if let Expr::MatrixSelector { vector, .. } = expr
+        && let Expr::VectorSelector { offset, .. } = vector.as_ref()
+    {
+        return offset.map(|d| d.as_nanos()).unwrap_or(0);
     }
     0
 }
@@ -1641,6 +1754,7 @@ pub(crate) fn compute_rate(
                     timestamp: output_ts,
                     value,
                 }],
+                histograms: Vec::new(),
             })
         })
         .collect()
@@ -1681,6 +1795,7 @@ pub(crate) fn compute_irate(series: &[Series], output_ts: i64) -> Vec<Series> {
                     timestamp: output_ts,
                     value: dv / dt,
                 }],
+                histograms: Vec::new(),
             })
         })
         .collect()
@@ -1737,6 +1852,7 @@ pub(crate) fn compute_delta(
                     timestamp: output_ts,
                     value: result_val,
                 }],
+                histograms: Vec::new(),
             })
         })
         .collect()
@@ -1923,6 +2039,37 @@ pub(crate) fn apply_scalar_fn(
     }
 }
 
+/// Apply `f` to each histogram sample, producing a float series.
+///
+/// The metric name is dropped, as it is for every function that changes what
+/// the value means — `histogram_count(http_latency)` is not `http_latency`.
+fn native_histogram_map(
+    series: &[Series],
+    f: impl Fn(&chronix_core::histogram::Histogram) -> f64,
+) -> Vec<Series> {
+    series
+        .iter()
+        .filter(|s| s.is_histogram())
+        .map(|s| {
+            let labels = s
+                .labels
+                .iter()
+                .filter(|(k, _)| k != "__name__")
+                .cloned()
+                .collect();
+            let samples = s
+                .histograms
+                .iter()
+                .map(|h| Sample {
+                    timestamp: h.timestamp,
+                    value: f(h.histogram.as_ref()),
+                })
+                .collect();
+            Series::floats(labels, samples)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     /// [`FUNCTIONS`] is the parser's view of what this dispatcher implements,
@@ -1978,6 +2125,7 @@ mod tests {
                     value: 100.0,
                 },
             ],
+            histograms: Vec::new(),
         }];
         let result = compute_rate(&series, false, None, 10_000_000_000, 10_000_000_000);
         assert_eq!(result.len(), 1);
@@ -2003,6 +2151,7 @@ mod tests {
                     value: 100.0 + f64::from(i as i32 - 1) * 10.0,
                 })
                 .collect(),
+            histograms: Vec::new(),
         }];
 
         let eval_time = 60 * SEC;
@@ -2043,6 +2192,7 @@ mod tests {
                     value: 60.0,
                 },
             ],
+            histograms: Vec::new(),
         }];
         let r = compute_rate(&series, false, Some(60 * SEC), 60 * SEC, 60 * SEC);
         assert!(
@@ -2066,6 +2216,7 @@ mod tests {
                     value: 50.0,
                 }, // reset
             ],
+            histograms: Vec::new(),
         }];
         let result = compute_rate(&series, false, None, 10_000_000_000, 10_000_000_000);
         assert_eq!(result.len(), 1);
@@ -2087,6 +2238,7 @@ mod tests {
                     value: 100.0,
                 },
             ],
+            histograms: Vec::new(),
         }];
         let result = compute_rate(&series, true, None, 10_000_000_000, 10_000_000_000);
         assert_eq!(result.len(), 1);
@@ -2111,6 +2263,7 @@ mod tests {
                     value: 100.0,
                 },
             ],
+            histograms: Vec::new(),
         }];
         let eval_time = 12_000_000_000;
         let result = compute_irate(&series, eval_time);
@@ -2137,6 +2290,7 @@ mod tests {
                     value: 30.0,
                 },
             ],
+            histograms: Vec::new(),
         }];
         // Without range: simple difference
         let result = compute_delta(&series, None, 10_000_000_000, 10_000_000_000);
@@ -2159,6 +2313,7 @@ mod tests {
                     value: 100.0,
                 }, // 15s
             ],
+            histograms: Vec::new(),
         }];
         let range_ns = Some(15_000_000_000_i64); // 15s range
         let result = compute_rate(&series, false, range_ns, 15_000_000_000, 15_000_000_000);
@@ -2234,6 +2389,7 @@ mod tests {
                     timestamp: 0,
                     value: 5.0,
                 }],
+                histograms: Vec::new(),
             },
             // le=+Inf, count=10 (5 samples fall in the 10..+Inf range)
             Series {
@@ -2242,6 +2398,7 @@ mod tests {
                     timestamp: 0,
                     value: 10.0,
                 }],
+                histograms: Vec::new(),
             },
         ];
         // q=0.75: rank = 0.75 * 10 = 7.5, which falls in the +Inf bucket
@@ -2369,6 +2526,7 @@ mod tests {
                     value: 30.0,
                 },
             ],
+            histograms: Vec::new(),
         }];
         let vals: Vec<f64> = series[0].samples.iter().map(|s| s.value).collect();
         let avg = vals.iter().sum::<f64>() / vals.len() as f64;
@@ -2472,6 +2630,7 @@ mod tests {
                     value: 2850.0,
                 },
             ],
+            histograms: Vec::new(),
         }];
 
         let result = compute_rate(&series, false, Some(range_ns), window_end, eval_time);

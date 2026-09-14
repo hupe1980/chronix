@@ -35,6 +35,8 @@ enum FieldType {
     String,
     /// An exact decimal, carrying the column's scale.
     Decimal(u8),
+    /// A native histogram — a composite sample, stored as an encoded blob.
+    Histogram,
 }
 
 /// A discovered column from point data.
@@ -164,6 +166,25 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
                         Field::new(&col.name, DataType::Boolean, true).with_metadata(meta.clone()),
                     );
                 }
+                FieldType::Histogram => {
+                    // A `postcard` blob per value. Encoding cannot fail for
+                    // an owned struct with no borrowed data, so a `None`
+                    // here means the point had no value for this column.
+                    let values: Vec<Option<Vec<u8>>> = points
+                        .iter()
+                        .map(|p| match p.field(&col.name) {
+                            Some(FieldValue::Histogram(h)) => {
+                                postcard::to_allocvec(h.as_ref()).ok()
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let refs: Vec<Option<&[u8]>> = values.iter().map(|v| v.as_deref()).collect();
+                    arrow_arrays.push(Arc::new(arrow::array::BinaryArray::from(refs)));
+                    fields.push(
+                        Field::new(&col.name, DataType::Binary, true).with_metadata(meta.clone()),
+                    );
+                }
                 FieldType::Decimal(scale) => {
                     // Mantissas at the column's scale. A value that arrived
                     // at a narrower scale is widened losslessly; one that
@@ -234,6 +255,7 @@ fn discover_columns(points: &[Point]) -> Vec<Column> {
                 FieldValue::Bool(_) => FieldType::Bool,
                 FieldValue::String(_) => FieldType::String,
                 FieldValue::Decimal(d) => FieldType::Decimal(d.scale()),
+                FieldValue::Histogram(_) => FieldType::Histogram,
             };
             // Detect type conflicts across points and widen
             // numeric types automatically (I64/U64 → F64) rather than

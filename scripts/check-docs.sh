@@ -28,6 +28,19 @@ note() { printf '  %s\n' "$1"; fail=1; }
 # ports, crates and subsystems that were removed. `specs/` holds third-party
 # protocol documents, which are not ours to keep current.
 PUBLISHED="site/content README.md CONTRIBUTING.md dashboards/README.md sdks/python/README.md"
+
+# `CHANGELOG.md` ships too — `publish-crate.sh` copies it into the crate
+# for the upload — but it is **not** in `PUBLISHED`, and the distinction is
+# the point. Most checks here ask "is this still true?", and a changelog
+# exists to record states that are deliberately no longer true: adding it
+# to `PUBLISHED` immediately flagged a 2024 entry describing the release
+# that *fixed* a wrong port, for naming the wrong port. A check that fails
+# for a benign reason is a check whose failures mean nothing.
+#
+# What does apply to it is **reachability** — a reader with the tarball and
+# no repository cannot open a gitignored note — so it joins those checks
+# and only those.
+PUBLISHED_REACHABLE="$PUBLISHED CHANGELOG.md"
 for f in $PUBLISHED; do
   [ -e "$f" ] || note "published document '$f' is missing"
 done
@@ -166,7 +179,7 @@ EOF
 
 echo "checking for internal references…"
 if grep -rn 'concepts/' \
-     site/content README.md CONTRIBUTING.md \
+     $PUBLISHED_REACHABLE \
      Cargo.toml crates .github 2>/dev/null; then
   note "a published artifact references the internal architecture notes"
 fi
@@ -342,6 +355,58 @@ for cfg in crates/*/src/config.rs; do
     fi
   done
 done
+
+# ── 13. One name, one meaning, within a crate ───────────────────────────
+# A crate exporting two public types with the same name is a question nobody
+# answered. Three pairs existed and each was locally sensible: two
+# `AccuracyMetrics` (a forecast scorecard and a model-version record), two
+# `DriftReport` (a sensor's clock drifting and a model's accuracy drifting),
+# and two `ZoneMapOp` with different operator sets at two levels of one
+# pruning ladder. Nothing breaks, so nothing surfaces it — until a caller
+# holds both and reads "expected `DriftReport`, found `DriftReport`".
+#
+# Scope is per crate, because two crates may legitimately name the same
+# concept, and the re-exporting facade is where that gets resolved.
+echo "checking for duplicate public type names within a crate…"
+for crate_src in crates/*/src; do
+  crate=$(basename "$(dirname "$crate_src")")
+  dupes=$(
+    { grep -rhoE '^pub (struct|enum|trait) [A-Z][A-Za-z0-9_]*' "$crate_src" --include='*.rs' 2>/dev/null || true; } \
+      | awk '{print $3}' | sort | uniq -d
+  )
+  for name in $dupes; do
+    where=$({ grep -rlE "^pub (struct|enum|trait) $name\b" "$crate_src" --include='*.rs' 2>/dev/null || true; } | tr '\n' ' ')
+    note "$crate declares two public types named '$name' ($where) — one name, two meanings"
+  done
+done
+
+# ── 14. No test leaks its temporary directory ───────────────────────────
+# `tempfile::TempDir` cleans up when it drops. A helper that opens a database
+# and returns only the handle has to keep the directory alive somehow, and the
+# tempting way is `std::mem::forget(dir)` — which works, and leaves a
+# directory of database files behind on **every run, on every machine**. Two
+# helpers did this; between them they filled a disk during the pass that found
+# it, which is the cheapest possible way to learn it.
+#
+# `into_path()` and `keep()` are the same thing by another name: both consume
+# the `TempDir` and disarm the cleanup.
+#
+# The fix is always the same shape — return the directory beside the handle and
+# let the caller own the lifetime — so this refuses the shortcut rather than
+# asking anyone to remember.
+echo "checking that no test leaks a temporary directory…"
+# Comment lines are stripped first. The first version of this check matched
+# the doc comments *explaining the fix* — a guard tripping over prose about
+# itself, which is the second time that has happened in this script.
+leaks=$(
+  { grep -rnE 'mem::forget\s*\(\s*[a-z_]*dir|TempDir[^;]*\.(into_path|keep)\(\)' \
+      crates --include='*.rs' 2>/dev/null || true; } \
+    | { grep -vE ':[0-9]+:\s*(//|/\*|\*)' || true; }
+)
+if [ -n "$leaks" ]; then
+  printf '%s\n' "$leaks" >&2
+  note "a test disarms a TempDir's cleanup — return the directory beside the handle instead"
+fi
 
 if [ "$fail" -eq 0 ]; then
   echo "documentation matches the tree"

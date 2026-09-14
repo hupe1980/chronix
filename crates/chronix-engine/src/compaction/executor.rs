@@ -469,14 +469,14 @@ impl CompactionExecutor {
             }
             Err(e) => {
                 // Clean up partial output file to prevent orphaned/corrupt segments.
-                if task.output_path().exists() {
-                    if let Err(rm_err) = std::fs::remove_file(task.output_path()) {
-                        tracing::warn!(
-                            path = %task.output_path().display(),
-                            error = %rm_err,
-                            "failed to clean up partial compaction output"
-                        );
-                    }
+                if task.output_path().exists()
+                    && let Err(rm_err) = std::fs::remove_file(task.output_path())
+                {
+                    tracing::warn!(
+                        path = %task.output_path().display(),
+                        error = %rm_err,
+                        "failed to clean up partial compaction output"
+                    );
                 }
                 Err(e)
             }
@@ -542,12 +542,11 @@ fn unify_schemas(batches: &[RecordBatch]) -> Result<Arc<Schema>> {
         let batch_names: std::collections::HashSet<&str> =
             schema.fields().iter().map(|f| f.name().as_str()).collect();
         for name in &all_names {
-            if !batch_names.contains(name.as_str()) {
-                if let Some(f) = fields.get_mut(name) {
-                    if !f.is_nullable() {
-                        *f = f.clone().with_nullable(true);
-                    }
-                }
+            if !batch_names.contains(name.as_str())
+                && let Some(f) = fields.get_mut(name)
+                && !f.is_nullable()
+            {
+                *f = f.clone().with_nullable(true);
             }
         }
     }
@@ -645,12 +644,12 @@ fn compute_row_hashes_and_canonicals(
         // Build a collision-free cache key from raw tag bytes.
         let mut cache_key = String::new();
         for (tag_idx, _) in sorted_tags.iter().enumerate() {
-            if let Some(arr) = tag_arrays[tag_idx] {
-                if !arr.is_null(row) {
-                    let val = arr.value(row);
-                    if !val.is_empty() {
-                        cache_key.push_str(val);
-                    }
+            if let Some(arr) = tag_arrays[tag_idx]
+                && !arr.is_null(row)
+            {
+                let val = arr.value(row);
+                if !val.is_empty() {
+                    cache_key.push_str(val);
                 }
             }
             cache_key.push('\0'); // separator
@@ -665,12 +664,12 @@ fn compute_row_hashes_and_canonicals(
         // Cache miss — build full SeriesKey
         let mut tags = BTreeMap::new();
         for (tag_idx, tag_name) in sorted_tags.iter().enumerate() {
-            if let Some(arr) = tag_arrays[tag_idx] {
-                if !arr.is_null(row) {
-                    let val = arr.value(row);
-                    if !val.is_empty() {
-                        tags.insert((*tag_name).to_string(), val.to_string());
-                    }
+            if let Some(arr) = tag_arrays[tag_idx]
+                && !arr.is_null(row)
+            {
+                let val = arr.value(row);
+                if !val.is_empty() {
+                    tags.insert((*tag_name).to_string(), val.to_string());
                 }
             }
         }
@@ -862,13 +861,12 @@ impl Iterator for KWayMergeIter<'_> {
 
             // Dedup: if the next heap entry has the same (hash, ts, canonical_id),
             // a newer version exists — skip this older one.
-            if let Some(Reverse(next)) = self.heap.peek() {
-                if entry.hash == next.hash
-                    && entry.ts == next.ts
-                    && entry.canonical_id == next.canonical_id
-                {
-                    continue;
-                }
+            if let Some(Reverse(next)) = self.heap.peek()
+                && entry.hash == next.hash
+                && entry.ts == next.ts
+                && entry.canonical_id == next.canonical_id
+            {
+                continue;
             }
 
             return Some(entry.global_idx);

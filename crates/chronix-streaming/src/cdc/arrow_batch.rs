@@ -43,9 +43,9 @@ use arrow::array::{Int64Builder, StringBuilder, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::cdc::EventBus;
 use crate::cdc::event::CdcEvent;
 use crate::cdc::subscription::{FilteredSubscription, SubscriptionFilter};
-use crate::cdc::EventBus;
 
 /// Maximum number of events to buffer before flushing a [`RecordBatch`].
 const DEFAULT_BATCH_SIZE: usize = 1024;

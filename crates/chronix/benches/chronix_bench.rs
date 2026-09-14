@@ -6,12 +6,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use tempfile::TempDir;
 
 use chronix::prelude::*;
-use chronix::{tags, Chronix};
+use chronix::{Chronix, tags};
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -868,7 +868,7 @@ criterion_main!(benches);
 // ── SQL Query Engine Benchmarks ────────────────────────────────────
 
 use chronix::promql::eval::QueryParams;
-use chronix::promql::{parse, PromQLEvaluator};
+use chronix::promql::{PromQLEvaluator, parse};
 use chronix::sql::create_session_context;
 
 /// Create a seeded DB with `n` points and return it wrapped in Arc, plus a

@@ -46,7 +46,7 @@ pub use field_encryption::{
 pub use header::{SegmentFooter, SegmentHeader};
 pub use metadata::{ColumnBlockMeta, ColumnMeta, SegmentMetadata};
 pub use reader::SegmentReader;
-pub use reader::{FieldPredicate, ZoneMapOp};
+pub use reader::{FieldPredicate, StatsOp};
 pub use stats::ColumnStats;
-pub use validity::{null_buffer_from_bytes, ValidityBuilder};
+pub use validity::{ValidityBuilder, null_buffer_from_bytes};
 pub use writer::{SegmentMeta, SegmentWriter, SegmentWriterConfig};

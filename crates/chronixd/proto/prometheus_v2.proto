@@ -1,0 +1,113 @@
+// Prometheus Remote Write 2.0.
+//
+// Based on https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/write/v2/types.proto
+//
+// What changed from 1.0, and why it is worth a second message set:
+//
+//   * **A symbol table.** Every label name and value in the request is
+//     interned once into `Request.symbols`, and a series refers to them by
+//     index. A scrape of a thousand series repeats `instance` a thousand
+//     times on the 1.0 wire and once here.
+//   * **Metadata travels with the series** — type, help and unit — instead of
+//     arriving through a separate channel that could be lost or reordered.
+//   * **Created timestamps**, so a counter that has just been created is
+//     distinguishable from one that has just reset.
+//
+// Native histograms are carried by both versions; 2.0 is simply the version
+// Prometheus 3 is configured to speak.
+
+syntax = "proto3";
+
+package io.prometheus.write.v2;
+
+// The top-level request.
+//
+// Fields 1–3 are reserved: they were the 1.0 layout, and reserving them means
+// a 1.0 payload decoded as a 2.0 one produces nothing rather than nonsense.
+message Request {
+  reserved 1 to 3;
+
+  // Interned strings. `symbols[0]` MUST be the empty string, so that a zero
+  // reference is unambiguously "absent" rather than "the first symbol".
+  repeated string symbols = 4;
+  repeated TimeSeries timeseries = 5;
+}
+
+message TimeSeries {
+  // Alternating name and value indices into `Request.symbols`, so the length
+  // is always even.
+  repeated uint32 label_refs = 1;
+  repeated Sample samples = 2;
+  repeated Histogram histograms = 3;
+  repeated Exemplar exemplars = 4;
+  Metadata metadata = 5;
+  // Milliseconds since epoch; 0 means "not provided".
+  int64 created_timestamp = 6;
+}
+
+message Exemplar {
+  repeated uint32 labels_refs = 1;
+  double value = 2;
+  int64 timestamp = 3;
+}
+
+message Sample {
+  double value = 1;
+  int64 timestamp = 2;
+}
+
+message Metadata {
+  enum MetricType {
+    METRIC_TYPE_UNSPECIFIED = 0;
+    COUNTER        = 1;
+    GAUGE          = 2;
+    HISTOGRAM      = 3;
+    GAUGEHISTOGRAM = 4;
+    SUMMARY        = 5;
+    INFO           = 6;
+    STATESET       = 7;
+  }
+  MetricType type = 1;
+  // References into `Request.symbols`.
+  uint32 help_ref = 3;
+  uint32 unit_ref = 4;
+}
+
+// Field-for-field identical to the 1.0 `Histogram`. The duplication is the
+// protocol's, not chronix's: one decoder in `wire::histogram` serves both.
+message Histogram {
+  enum ResetHint {
+    UNKNOWN = 0;
+    YES     = 1;
+    NO      = 2;
+    GAUGE   = 3;
+  }
+
+  oneof count {
+    uint64 count_int   = 1;
+    double count_float = 2;
+  }
+  double sum = 3;
+  sint32 schema         = 4;
+  double zero_threshold = 5;
+  oneof zero_count {
+    uint64 zero_count_int   = 6;
+    double zero_count_float = 7;
+  }
+
+  repeated BucketSpan negative_spans  =  8;
+  repeated sint64     negative_deltas =  9;
+  repeated double     negative_counts = 10;
+  repeated BucketSpan positive_spans  = 11;
+  repeated sint64     positive_deltas = 12;
+  repeated double     positive_counts = 13;
+
+  ResetHint reset_hint = 14;
+  int64 timestamp = 15;
+  repeated double custom_values = 16;
+}
+
+message BucketSpan {
+  sint32 offset = 1;
+  uint32 length = 2;
+}

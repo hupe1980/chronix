@@ -7,7 +7,7 @@
 //! flash.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 /// A day of 1 Hz meter readings for a handful of series, two decimal places —
 /// the hems workload in miniature.

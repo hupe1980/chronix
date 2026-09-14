@@ -4,9 +4,9 @@
 //! behind lose oldest events and a gap counter is incremented for diagnostics.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -145,10 +145,10 @@ impl EventBus {
         // Persist to durable log before broadcasting.
         // Durable log I/O happens outside the publish lock
         // so concurrent publishers are not blocked by fsync latency.
-        if let Some(ref durable_log) = self.durable_log {
-            if let Err(e) = durable_log.lock().append(&event) {
-                tracing::error!(seq, error = %e, "failed to persist CDC event to durable log");
-            }
+        if let Some(ref durable_log) = self.durable_log
+            && let Err(e) = durable_log.lock().append(&event)
+        {
+            tracing::error!(seq, error = %e, "failed to persist CDC event to durable log");
         }
 
         // Broadcast under lock to preserve sequence ordering for
@@ -187,14 +187,14 @@ impl EventBus {
         metrics::counter!("chronix_cdc_events_published_total").increment(events.len() as u64);
 
         // Batch-append with single flush to durable log.
-        if let Some(ref durable_log) = self.durable_log {
-            if let Err(e) = durable_log.lock().append_batch(events) {
-                tracing::error!(
-                    count = events.len(),
-                    error = %e,
-                    "failed to persist CDC event batch to durable log"
-                );
-            }
+        if let Some(ref durable_log) = self.durable_log
+            && let Err(e) = durable_log.lock().append_batch(events)
+        {
+            tracing::error!(
+                count = events.len(),
+                error = %e,
+                "failed to persist CDC event batch to durable log"
+            );
         }
 
         // Broadcast under lock to preserve sequence ordering.

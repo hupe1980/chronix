@@ -1,11 +1,12 @@
 #![allow(clippy::unwrap_used)] // benches may unwrap
 //! Benchmarks for the chronix-encoding crate.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use chronix_core::FloatEncoding;
 use chronix_encoding::{
+    ColumnEncoder,
     alp::{AlpDecoder, AlpEncoder},
     bitmap::{BitmapDecoder, BitmapEncoder},
     chimp::{ChimpDecoder, ChimpEncoder},
@@ -13,7 +14,6 @@ use chronix_encoding::{
     dictionary::{DictionaryDecoder, DictionaryEncoder},
     gorilla::{GorillaDecoder, GorillaEncoder},
     integer::{IntegerDecoder, IntegerEncoder},
-    ColumnEncoder,
 };
 
 const N: usize = 1_000_000;

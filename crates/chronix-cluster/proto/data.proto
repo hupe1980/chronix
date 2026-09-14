@@ -15,6 +15,15 @@ message FieldValue {
         /// every numeric proto scalar is binary, so `double` would lose the
         /// value and there is no 128-bit integer to carry a mantissa in.
         string decimal_value = 6;
+        /// A native histogram, `postcard`-encoded.
+        ///
+        /// Bytes rather than a structured message: the histogram's own
+        /// encoding is what the storage layer writes, so sending it verbatim
+        /// means there is one definition of the format rather than a proto
+        /// schema to keep in step with it. The frozen tier is not developed
+        /// (see the cluster notes), and a field type it cannot carry would be
+        /// a silent truncation rather than a gap.
+        bytes histogram_value = 7;
     }
 }
 

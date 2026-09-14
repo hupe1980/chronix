@@ -3,9 +3,9 @@
 //!
 //! Key target: feature functions < 10ms on 1M rows.
 
-use chronix_analytics::preprocess::decomposition::{stl_decompose, StlConfig};
+use chronix_analytics::preprocess::decomposition::{StlConfig, stl_decompose};
 use chronix_analytics::preprocess::{diff, ewm, pct_change, rolling_std, zscore};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 fn gen_data(n: usize) -> Vec<f64> {

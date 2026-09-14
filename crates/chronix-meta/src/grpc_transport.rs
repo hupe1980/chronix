@@ -637,7 +637,7 @@ mod tests {
 
     // ── Snapshot chunking tests ─────────────────────────────
 
-    use super::{assemble_snapshot_chunks, chunk_snapshot, SNAPSHOT_CHUNK_SIZE};
+    use super::{SNAPSHOT_CHUNK_SIZE, assemble_snapshot_chunks, chunk_snapshot};
 
     #[test]
     fn chunk_snapshot_round_trip() {

@@ -51,16 +51,16 @@ mod traits;
 pub mod util;
 
 pub use arima::{
-    auto_arima, kpss_statistic, select_differencing_order, select_seasonal_differencing_order,
-    ArimaModel, AutoArimaOptions, AutoArimaResult, SarimaConfig, SarimaModel, SearchStrategy,
-    KPSS_CRITICAL_5PCT, SEASONAL_STRENGTH_THRESHOLD,
+    ArimaModel, AutoArimaOptions, AutoArimaResult, KPSS_CRITICAL_5PCT, SEASONAL_STRENGTH_THRESHOLD,
+    SarimaConfig, SarimaModel, SearchStrategy, auto_arima, kpss_statistic,
+    select_differencing_order, select_seasonal_differencing_order,
 };
 pub use cross_validation::{
     CrossValidationMode, CrossValidationResult, CrossValidator, FoldResult,
 };
 pub use diagnostics::{
-    aic, aicc, bic, compute_diagnostics, ljung_box, mae, mape, residual_acf, rmse, smape,
-    LjungBoxResult, ModelDiagnostics,
+    LjungBoxResult, ModelDiagnostics, aic, aicc, bic, compute_diagnostics, ljung_box, mae, mape,
+    residual_acf, rmse, smape,
 };
 pub use error::ForecastError;
 pub use holt::HoltLinearModel;
@@ -70,8 +70,8 @@ pub use parallel::{parallel_fit, parallel_fit_predict, parallel_predict};
 pub use quantile::{CalibrationStrategy, QuantileConfig, QuantileForecast, QuantileForecaster};
 pub use result::{ForecastResult, ModelParams, ModelType};
 pub use selection::{
-    auto_forecast, select_model, AutoForecast, AutoForecastOptions, CandidateScore, ModelSelection,
-    SelectionMetric,
+    AutoForecast, AutoForecastOptions, CandidateScore, ModelSelection, SelectionMetric,
+    auto_forecast, select_model,
 };
 pub use ses::SesModel;
 pub use storage::{ModelCatalog, ModelMetadata, ModelStore, StorageError};

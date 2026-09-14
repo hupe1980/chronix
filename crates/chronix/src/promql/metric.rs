@@ -33,6 +33,45 @@ use chronix_core::schema::SchemaRegistry;
 /// field, so the metric name survives the round trip.
 pub const VALUE_FIELD: &str = "value";
 
+/// How a selector reads a histogram column.
+///
+/// A native histogram is one sample holding a whole distribution, and PromQL's
+/// `histogram_*` family reads it directly. But a dashboard written before
+/// native histograms existed queries `foo_bucket{le="0.5"}`, `foo_count` and
+/// `foo_sum` — three *families* of float series where the storage now holds
+/// one column. This enum is how a selector says which of those views it wants.
+///
+/// The conversion is a **view**, not a second stored form: nothing is written
+/// twice, and the cumulative counts are computed from the buckets at read
+/// time. That is also upstream's direction for composite samples.
+///
+/// The classic names are resolvable but **not listed**. `all_metrics` and
+/// `metrics_of` return only [`ClassicView::Native`], so `/api/v1/label/__name__/values`
+/// does not grow three entries per histogram and `{__name__=~".+"}` does not
+/// return the same observations three times over. A name you type works; a
+/// name you browse is the one the data is actually stored under.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClassicView {
+    /// The column itself — a float series, or a histogram the `histogram_*`
+    /// family reads.
+    #[default]
+    Native,
+    /// `<metric>_bucket`: one series per boundary, carrying an `le` label and
+    /// a **cumulative** count, ending at `le="+Inf"`.
+    Bucket,
+    /// `<metric>_count`: the observation count, as a float.
+    Count,
+    /// `<metric>_sum`: the sum of observations, as a float.
+    Sum,
+}
+
+/// The suffix each classic view answers to.
+const CLASSIC_SUFFIXES: [(&str, ClassicView); 3] = [
+    ("_bucket", ClassicView::Bucket),
+    ("_count", ClassicView::Count),
+    ("_sum", ClassicView::Sum),
+];
+
 /// One metric: the name PromQL addresses it by, and the column it reads.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MetricRef {
@@ -42,6 +81,8 @@ pub struct MetricRef {
     pub measurement: String,
     /// The field column carrying the value.
     pub field: String,
+    /// Which view of the column the name asked for.
+    pub view: ClassicView,
 }
 
 impl MetricRef {
@@ -52,6 +93,7 @@ impl MetricRef {
             name: metric_name(measurement, field),
             measurement: measurement.to_string(),
             field: field.to_string(),
+            view: ClassicView::Native,
         }
     }
 }
@@ -125,6 +167,7 @@ pub fn resolve(registry: &SchemaRegistry, name: &str) -> Vec<MetricRef> {
             name: name.to_string(),
             measurement: name.to_string(),
             field: VALUE_FIELD.to_string(),
+            view: ClassicView::Native,
         });
     }
 
@@ -144,7 +187,30 @@ pub fn resolve(registry: &SchemaRegistry, name: &str) -> Vec<MetricRef> {
                 name: name.to_string(),
                 measurement: measurement.to_string(),
                 field: field.to_string(),
+                view: ClassicView::Native,
             });
+        }
+    }
+
+    // `<metric>_bucket` / `_count` / `_sum` over a histogram column.
+    //
+    // Checked last and only for columns that really are histograms, so a
+    // measurement that genuinely has a field called `count` keeps it: the
+    // native resolution above already found it, and a float column produces no
+    // classic view at all. A name that resolves both ways — measurement `m`
+    // with a float field `sum`, and a histogram `m` — returns both, which is
+    // the same non-injectivity the `Vec` return already exists for.
+    for (suffix, view) in CLASSIC_SUFFIXES {
+        let Some(stem) = name.strip_suffix(suffix) else {
+            continue;
+        };
+        for mut base in resolve(registry, stem) {
+            if !is_histogram(registry, &base.measurement, &base.field) {
+                continue;
+            }
+            base.name = name.to_string();
+            base.view = view;
+            out.push(base);
         }
     }
 
@@ -153,11 +219,19 @@ pub fn resolve(registry: &SchemaRegistry, name: &str) -> Vec<MetricRef> {
     out
 }
 
+/// Is this column a native histogram?
+fn is_histogram(registry: &SchemaRegistry, measurement: &str, field: &str) -> bool {
+    registry.lookup(measurement).is_some_and(|s| {
+        s.column(field)
+            .is_some_and(|c| c.column_type == chronix_core::schema::ColumnType::Histogram)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronix_core::schema::MeasurementSchema;
     use chronix_core::FieldValue;
+    use chronix_core::schema::MeasurementSchema;
 
     fn registry(defs: &[(&str, &[&str])]) -> SchemaRegistry {
         let reg = SchemaRegistry::new();

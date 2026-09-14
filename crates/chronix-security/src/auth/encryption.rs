@@ -23,8 +23,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -283,16 +283,16 @@ impl KeyProvider for EnvKeyProvider {
             Err(_) => {
                 // Env var missing — fall back to cached key within grace period.
                 let guard = self.cache.lock();
-                if let Some((ref cached_key, fetched_at)) = *guard {
-                    if fetched_at.elapsed() < self.grace_period {
-                        tracing::warn!(
-                            env_var = %self.env_var,
-                            grace_remaining_secs = (self.grace_period.saturating_sub(fetched_at.elapsed())).as_secs(),
-                            "env var missing, using cached key within grace period"
-                        );
-                        metrics::counter!("chronix_auth_env_key_grace_hit").increment(1);
-                        return Ok((cached_key.clone(), self.key_id.clone()));
-                    }
+                if let Some((ref cached_key, fetched_at)) = *guard
+                    && fetched_at.elapsed() < self.grace_period
+                {
+                    tracing::warn!(
+                        env_var = %self.env_var,
+                        grace_remaining_secs = (self.grace_period.saturating_sub(fetched_at.elapsed())).as_secs(),
+                        "env var missing, using cached key within grace period"
+                    );
+                    metrics::counter!("chronix_auth_env_key_grace_hit").increment(1);
+                    return Ok((cached_key.clone(), self.key_id.clone()));
                 }
                 drop(guard);
                 Err(AuthError::Config(format!(

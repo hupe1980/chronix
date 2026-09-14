@@ -25,7 +25,7 @@ use chronix_meta::NodeId;
 
 use crate::data_client::DataGrpcClient;
 use crate::data_service::proto::{QueryRegionRequest, TagFilter};
-use crate::data_service::{proto_to_core_point, RegionQuery, RegionStorage};
+use crate::data_service::{RegionQuery, RegionStorage, proto_to_core_point};
 use crate::error::{ClusterError, Result};
 use crate::metrics::record_query_latency;
 use crate::routing_cache::RoutingCache;
@@ -634,7 +634,7 @@ mod tests {
 
     // ── Mock meta client — uses shared test utility ────────────────
     use crate::test_util::{
-        make_routing_snapshot, make_routing_snapshot_with_replicas, MockSnapshotMetaClient,
+        MockSnapshotMetaClient, make_routing_snapshot, make_routing_snapshot_with_replicas,
     };
 
     // ── Helpers ────────────────────────────────────────────────────
@@ -794,10 +794,12 @@ mod tests {
 
         let result = router.query(&dq).await.unwrap();
         assert_eq!(result.points.len(), 2);
-        assert!(result
-            .points
-            .iter()
-            .all(|p| p.series_key().tag("host") == Some("srv1")));
+        assert!(
+            result
+                .points
+                .iter()
+                .all(|p| p.series_key().tag("host") == Some("srv1"))
+        );
     }
 
     #[tokio::test]
@@ -1193,10 +1195,12 @@ mod tests {
         assert!(!ReadConsistency::Leader.allows_follower());
         assert!(ReadConsistency::Follower.allows_follower());
         assert!(ReadConsistency::Nearest.allows_follower());
-        assert!(ReadConsistency::BoundedStale {
-            max_staleness: Duration::from_secs(5)
-        }
-        .allows_follower());
+        assert!(
+            ReadConsistency::BoundedStale {
+                max_staleness: Duration::from_secs(5)
+            }
+            .allows_follower()
+        );
     }
 
     #[test]

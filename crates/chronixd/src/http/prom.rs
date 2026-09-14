@@ -433,11 +433,11 @@ pub async fn prom_labels_handler(
 
     // Upstream applies `limit` to the *label names* returned, not to the
     // series scanned to find them.
-    if let Some(n) = requested {
-        if labels.len() > n {
-            labels.truncate(n);
-            truncated = true;
-        }
+    if let Some(n) = requested
+        && labels.len() > n
+    {
+        labels.truncate(n);
+        truncated = true;
     }
 
     Ok(Json(PromListResponse::success(
@@ -493,11 +493,11 @@ pub async fn prom_label_values_handler(
         .await
         .map_err(|e| ServerError::Internal(e.to_string()))??;
 
-    if let Some(n) = requested {
-        if values.len() > n {
-            values.truncate(n);
-            truncated = true;
-        }
+    if let Some(n) = requested
+        && values.len() > n
+    {
+        values.truncate(n);
+        truncated = true;
     }
 
     Ok(Json(PromListResponse::success(
@@ -574,6 +574,13 @@ fn parse_selectors(
             name_filters.iter().all(|f| f.matches(&labels))
         });
 
+        // `le` is not a stored tag when the selector names a classic bucket
+        // view — it is invented from the histogram's boundaries — so pushing
+        // it into the scan matches no rows at all. It still applies, through
+        // `compiled`, once the label exists.
+        let bucket_view = targets
+            .iter()
+            .any(|t| t.view == chronix::promql::ClassicView::Bucket);
         out.push(Selector {
             targets,
             pushdown: matchers
@@ -582,6 +589,7 @@ fn parse_selectors(
                     m.name != "__name__"
                         && m.op == chronix::promql::MatchOp::Equal
                         && m.name != crate::namespace::NAMESPACE_TAG
+                        && !(bucket_view && m.name == "le")
                 })
                 .map(|m| (m.name.clone(), m.value.clone()))
                 .collect(),
@@ -708,14 +716,19 @@ fn observed_label_sets(
     // in the `__name__` they contribute.
     let mut groups: Vec<Scan<'_>> = Vec::new();
     for (target, selector) in targets {
-        let field = project_value.then_some(target.field.as_str());
+        // A bucket view needs the value column whatever the caller asked
+        // for: the `le` labels it contributes are read out of the histogram,
+        // so without the column `/labels` would offer `lat_bucket` with no
+        // `le` at all — a label set `/query` never produces.
+        let needs_value = project_value || target.view == chronix::promql::ClassicView::Bucket;
+        let field = needs_value.then_some(target.field.as_str());
         let key = (target.measurement.as_str(), field, selector);
         if let Some(existing) = groups.iter_mut().find(|g| g.key == key) {
-            existing.names.push(target.name.as_str());
+            existing.names.push((target.name.as_str(), target.view));
         } else {
             groups.push(Scan {
                 key,
-                names: vec![target.name.as_str()],
+                names: vec![(target.name.as_str(), target.view)],
             });
         }
     }
@@ -784,31 +797,52 @@ fn observed_label_sets(
                 // on this row exist at all.
                 let mut tags: Vec<(String, String)> = Vec::with_capacity(tag_names.len() + 1);
                 for (tag, arr) in &columns {
-                    if let Some(arr) = arr {
-                        if !arr.is_null(row) {
-                            tags.push(((*tag).clone(), arr.value(row).to_string()));
-                        }
+                    if let Some(arr) = arr
+                        && !arr.is_null(row)
+                    {
+                        tags.push(((*tag).clone(), arr.value(row).to_string()));
                     }
                 }
-                for name in &group.names {
-                    let mut pairs = tags.clone();
-                    pairs.push(("__name__".to_string(), (*name).to_string()));
-                    pairs.sort();
-                    if let Some(sel) = selector {
-                        if !chronix::promql::label_set_matches(&sel.compiled, &pairs) {
+                for (name, view) in &group.names {
+                    // A classic bucket name is one series *per boundary*. The
+                    // boundaries live in the value, so they are read out of it
+                    // here — which is what keeps `/series` and `/query` from
+                    // describing the same selector differently.
+                    let boundaries = if *view == chronix::promql::ClassicView::Bucket {
+                        let Some(le_values) = value_col.and_then(|c| classic_le_values(c, row))
+                        else {
+                            continue;
+                        };
+                        le_values
+                    } else {
+                        vec![None]
+                    };
+
+                    for le in boundaries {
+                        let mut pairs = tags.clone();
+                        if let Some(le) = le {
+                            pairs.retain(|(k, _)| k != "le");
+                            pairs.push(("le".to_string(), le));
+                        }
+                        pairs.push(("__name__".to_string(), (*name).to_string()));
+                        pairs.sort();
+                        if let Some(sel) = selector
+                            && !chronix::promql::label_set_matches(&sel.compiled, &pairs)
+                        {
                             continue;
                         }
-                    }
-                    out.insert(pairs);
-                    // Keep the smallest `limit` sets rather than stopping at
-                    // the first `limit` the scan meets, so a truncated answer
-                    // is the sorted **prefix** at every limit instead of
-                    // moving with the data's physical layout. Memory stays
-                    // bounded at `limit + 1`; the cost is the early exit, and
-                    // it is paid only in the truncating case.
-                    if out.len() > limit {
-                        out.pop_last();
-                        truncated = true;
+                        out.insert(pairs);
+                        // Keep the smallest `limit` sets rather than stopping
+                        // at the first `limit` the scan meets, so a truncated
+                        // answer is the sorted **prefix** at every limit
+                        // instead of moving with the data's physical layout.
+                        // Memory stays bounded at `limit + 1`; the cost is the
+                        // early exit, and it is paid only in the truncating
+                        // case.
+                        if out.len() > limit {
+                            out.pop_last();
+                            truncated = true;
+                        }
                     }
                 }
             }
@@ -816,6 +850,31 @@ fn observed_label_sets(
     }
 
     Ok((out.into_iter().collect(), truncated))
+}
+
+/// The `le` label values one stored histogram contributes.
+///
+/// `None` when the column is not a histogram or the blob cannot be decoded —
+/// the same "a gap, not a failure" rule the evaluator applies, so one
+/// unreadable sample costs a label value rather than the whole request.
+fn classic_le_values(column: &arrow::array::ArrayRef, row: usize) -> Option<Vec<Option<String>>> {
+    let bin = column
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryArray>()?;
+    let h =
+        postcard::from_bytes::<chronix::chronix_core::histogram::Histogram>(bin.value(row)).ok()?;
+    Some(
+        h.classic_buckets()
+            .into_iter()
+            .map(|(le, _)| {
+                Some(if le.is_infinite() {
+                    if le > 0.0 { "+Inf" } else { "-Inf" }.to_string()
+                } else {
+                    le.to_string()
+                })
+            })
+            .collect(),
+    )
 }
 
 /// The cardinality cap one request enumerates under, and its source.
@@ -837,8 +896,10 @@ struct Scan<'a> {
     /// Measurement, the value column when one is projected, and the index of
     /// the selector this scan answers.
     key: (&'a str, Option<&'a str>, Option<usize>),
-    /// The metric names every row of the scan is attributed to.
-    names: Vec<&'a str>,
+    /// The metric names every row of the scan is attributed to, each with the
+    /// view its name asked for — `lat` and `lat_bucket` read the same column
+    /// and contribute different label sets.
+    names: Vec<(&'a str, chronix::promql::ClassicView)>,
 }
 
 /// `GET /api/v1/prom/series` handler.

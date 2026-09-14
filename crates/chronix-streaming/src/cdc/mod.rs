@@ -58,7 +58,7 @@ pub mod event_log;
 mod perf;
 mod subscription;
 
-pub use bus::{EventBus, PersistentSubscription, Subscription, DEFAULT_CAPACITY};
+pub use bus::{DEFAULT_CAPACITY, EventBus, PersistentSubscription, Subscription};
 pub use error::StreamError;
 pub use event::{CdcEvent, SequenceNumber};
 pub use event_log::DurableEventLog;

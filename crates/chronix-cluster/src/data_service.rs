@@ -105,7 +105,7 @@ pub trait RegionStorage: Send + Sync + std::fmt::Debug {
     /// The `entries` are opaque serialized WAL records; the storage layer
     /// deserializes and applies them in sequence order.
     async fn replicate_wal(&self, region_id: RegionId, entries: Vec<(u64, Vec<u8>)>)
-        -> Result<u64>;
+    -> Result<u64>;
 
     /// Capture a serializable snapshot of the region's data.
     ///
@@ -157,6 +157,16 @@ pub fn proto_to_core_point(dp: &proto::DataPoint) -> Result<Point> {
                     ClusterError::Validation(format!("invalid decimal \"{v}\": {e}"))
                 })?)
             }
+            proto::field_value::Kind::HistogramValue(bytes) => {
+                let h: chronix_core::histogram::Histogram = postcard::from_bytes(bytes)
+                    .map_err(|e| ClusterError::Validation(format!("invalid histogram: {e}")))?;
+                // Validate on the way in, not only on the way out: a peer is
+                // not a trusted encoder, and an unsorted bucket list
+                // interpolates to a wrong quantile rather than failing.
+                h.validate()
+                    .map_err(|e| ClusterError::Validation(format!("invalid histogram: {e}")))?;
+                FieldValue::Histogram(Box::new(h))
+            }
         };
         fields.insert(entry.name.clone(), fv);
     }
@@ -179,6 +189,9 @@ pub fn core_to_proto_point(p: &Point) -> proto::DataPoint {
                 FieldValue::Bool(v) => proto::field_value::Kind::BoolValue(*v),
                 FieldValue::String(v) => proto::field_value::Kind::StringValue(v.clone()),
                 FieldValue::Decimal(d) => proto::field_value::Kind::DecimalValue(d.to_string()),
+                FieldValue::Histogram(h) => proto::field_value::Kind::HistogramValue(
+                    postcard::to_allocvec(h.as_ref()).unwrap_or_default(),
+                ),
             };
             proto::FieldEntry {
                 name: name.to_string(),

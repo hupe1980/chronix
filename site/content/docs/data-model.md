@@ -26,8 +26,9 @@ timestamp:    1700000000000000000                  ← i64, nanoseconds
   of distinct tag combinations is what determines how much memory the database
   needs.
 - **Fields** are what you are recording. They are not indexed, and each may be
-  `f64`, `i64`, `u64`, `bool`, `String` or an exact
-  [`Decimal`](#exact-decimals-for-money-and-meters).
+  `f64`, `i64`, `u64`, `bool`, `String`, an exact
+  [`Decimal`](#exact-decimals-for-money-and-meters), or a
+  [native `Histogram`](#native-histograms).
 - A **series** is one measurement plus one exact tag set. `power{meter=main,
   phase=L1}` and `power{meter=main, phase=L2}` are two series.
 
@@ -66,6 +67,129 @@ The question is whether you will ever *filter or group by* it.
 Putting a high-cardinality value in a tag — a request id, a timestamp, a user
 id — creates one series per distinct value. That is the single most common way
 to make a time-series database unusable, and it is not specific to Chronix.
+
+### Native histograms
+
+Every field type above answers with **one number**. A native histogram answers
+with a whole **distribution**, in one sample.
+
+A classic Prometheus histogram is a family of series — `foo_bucket` once per
+boundary, plus `foo_sum` and `foo_count` — with boundaries fixed by whoever
+instrumented the code. A native histogram implies its buckets from a *schema*,
+so the resolution is a number, the buckets are sparse, and nothing has to be
+guessed in advance.
+
+```rust
+use chronix::chronix_core::histogram::Histogram;
+
+let mut latency = Histogram::empty(3);   // 8 buckets per power of two
+latency.zero_threshold = 1e-6;           // [-1µs, +1µs] counts as zero
+for sample in observed_seconds {
+    latency.observe(sample);
+}
+
+let mut fields = BTreeMap::new();
+fields.insert("latency".into(), FieldValue::Histogram(Box::new(latency)));
+db.insert(&Point::new(key, fields, now)?)?;
+```
+
+Reading one back gives you the distribution, not a summary of it:
+
+```rust
+h.quantile(0.99);            // interpolated inside the bucket
+h.fraction(0.0, 0.250);      // what share was under 250 ms
+h.count(); h.sum(); h.avg(); h.stddev();
+h.classic_buckets();         // the `le`-bucketed view
+```
+
+Schemas −4 to 8 (exponential) and −53 (explicit boundaries); the zero bucket;
+positive and negative observations; merging two histograms of one schema. A
+histogram with unsorted buckets is refused when the point is built — an invalid
+one interpolates to a quantile that is plausible and wrong.
+
+#### Querying
+
+```promql
+histogram_quantile(0.99, http_latency)    # p99, from the native buckets
+histogram_count(http_latency)             # observations
+histogram_sum(http_latency)               # their sum
+histogram_avg(http_latency)               # sum / count
+histogram_stddev(http_latency)            # and stdvar
+histogram_fraction(0, 0.25, http_latency) # share under 250 ms
+```
+
+`histogram_quantile` dispatches on what the series holds — native buckets, or a
+classic `le`-bucketed series. The rest of the family **refuses a float series
+by name**: `histogram_count` of a gauge is not the gauge.
+
+A rollup tier over a histogram column **merges** its samples: `sum` is the
+merge, `avg` scales it by 1/n, `min` and `max` are NULL because distributions
+have no ordering, and two schemas in one bucket are refused rather than
+silently re-bucketed.
+
+#### Ingest
+
+```yaml
+scrape_configs:
+  - job_name: api
+    scrape_native_histograms: true
+
+remote_write:
+  - url: "http://chronix:8086/api/v1/prom/write"
+    send_native_histograms: true
+    # Optional. Omit for remote write 1.0, which also carries histograms.
+    protobuf_message: io.prometheus.write.v2.Request
+```
+
+Both remote-write versions are accepted, chosen by the `Content-Type`'s
+`proto=` parameter; an unrecognised one is a `415` naming the two that work. A
+2.0 write answers `X-Prometheus-Remote-Write-Samples-Written` and
+`-Histograms-Written`, so a sender can tell "stored" from "dropped" — both are
+`204`. Remote read returns histograms too.
+
+An OpenTelemetry Collector needs no special configuration:
+
+| OTel instrument | Stored as |
+|---|---|
+| Exponential histogram (base-2) | a native histogram at the matching schema |
+| Explicit-bucket histogram | a native histogram with custom boundaries (schema −53) |
+
+The histogram goes in the metric's **own** column, so the name you query is the
+name you exported.
+
+#### The classic names
+
+A stored histogram also answers `foo_bucket`, `foo_count` and `foo_sum`, so an
+existing panel needs no change:
+
+```promql
+http_latency_bucket                             # every boundary, ending at le="+Inf"
+http_latency_count
+http_latency_sum
+histogram_quantile(0.99, http_latency_bucket)   # same answer as the native form
+```
+
+This is a **view** — nothing is stored twice, and the cumulative counts are
+computed from the buckets on read. The names are resolvable but not *listed*,
+so `/api/v1/label/__name__/values` shows `http_latency` alone and
+`{__name__=~".+"}` does not return the same observations three times. A
+measurement with a real float field called `count` keeps it: the view applies
+only to histogram columns.
+
+The `le` values are the boundaries the histogram **has**:
+
+| Schema | Boundaries | A hand-written `le="0.5"` |
+|---|---|---|
+| −53, custom buckets — OTLP explicit-bucket, or a classic histogram | the ones the instrumentation chose | **matches** |
+| −4…8, exponential | powers of `2^(2^-schema)`: `…, 0.435, 0.475, 0.516, …` | matches nothing |
+
+So a dashboard migrating off classic histograms keeps working — its data
+arrives as custom buckets and its `le` literals are the boundaries. Against an
+exponential histogram, `http_latency_bucket` and a heatmap over it both work,
+but a query pinned to `le="0.5"` returns empty rather than the nearest bucket.
+
+Chronix stores no **exemplars**, and tells a 2.0 sender so with
+`X-Prometheus-Remote-Write-Exemplars-Written: 0`.
 
 ### Exact decimals, for money and meters
 

@@ -32,6 +32,15 @@ crate.
   register is exact too. It costs no compression: the mantissa *is* the
   integer ALP and pco spend their first stage recovering from a double, worth
   **475×** against 85× on noisy connection-point power.
+- **Native histograms, as a stored value** — a whole distribution in one
+  sample, with the Prometheus bucket schema (−4 to 8, plus custom boundaries),
+  exponentially-interpolated quantiles, fractions, moments and merge. Rollup
+  tiers merge them rather than dropping the column; PromQL reads them through
+  the full `histogram_*` family. Prometheus writes them over **remote write
+  1.0 or 2.0** and an OTel Collector over **OTLP** — exponential and
+  explicit-bucket alike — and remote read gives them back. Existing dashboards
+  keep working: `foo_bucket`, `foo_count` and `foo_sum` are a read-time view
+  over the same column, with no second copy stored.
 - **Analytics inside the engine** — statistical forecasting (SES, Holt,
   Holt-Winters, ARIMA/SARIMA), anomaly detection (Z-score, MAD, IQR,
   forecast-residual, CUSUM, seasonal thresholds), drift detection, and
@@ -118,7 +127,7 @@ Nine crates in the default build:
 | `chronix-analytics` | Preprocessing, six forecast models, seven anomaly detectors, multivariate analysis (correlation, VAR, Mahalanobis/Isolation Forest/PCA), model lifecycle (versioning, A/B, drift), streaming analytics, 5-tier SIMD compute |
 | `chronix-streaming` | CDC event bus, filtered/resumable subscriptions, trigger engine with webhook delivery |
 | `chronix-security` | API keys, JWT/OIDC, mTLS, an AES-256-GCM `EncryptionService` with key rotation, Cedar policies, a durable hash-chained audit trail, namespaces & quotas |
-| `chronix` | Public facade — embedded API, SQL (DataFusion), PromQL. `chronix-streaming` and `chronix-security` are behind the `streaming` and `security` features, off by default |
+| `chronix` | Public facade — embedded API, SQL (DataFusion), PromQL. `chronix-analytics` is behind `analytics` (on by default) and `chronix-streaming` / `chronix-security` behind `streaming` / `security` (off by default), so an embedded build carries only what it names |
 | `chronixd` | Server binary — HTTP, gRPC, Flight SQL, connectors, TLS |
 
 Additional workspace crates outside the default build: the **frozen**
@@ -381,6 +390,8 @@ cargo +nightly miri test -p chronix-core -- --skip proptests --skip config_toml_
 | `chronix-engine`, `chronix` | `field-encryption` | on | Per-column AES-256-GCM in the `.csx` format, declared by `[database.field_encryption]` |
 | `chronix-engine` | `object-store` | off | S3/GCS/Azure cold tier, Parquet archive writer |
 | `chronix` | `object-store` | off | `register_cold_tier()` — SQL over the Parquet archive |
+| `chronix` | `analytics` | **on** | Forecasting, anomaly detection, preprocessing, the model registry, and the SQL kernels over them — the largest sub-crate. Turn it **off** for a storage-only embedded build: it drops `chronix-analytics` and `sha2`. (`rayon` stays — the scan path parallelises segment reads itself) |
+| `chronix` | `sql` | **on** | SQL through DataFusion; implies `analytics` |
 | `chronix` | `streaming` | **off** | CDC bus, `db.subscribe()`, triggers and delivery — adds an HTTP client and a TLS stack for webhooks |
 | `chronix` | `security` | **off** | API keys, JWT, mTLS, Cedar, audit, namespaces — adds a JWT library, Argon2, `aes-gcm`, Cedar and a TLS stack |
 | `chronix` | `pipeline` | off | The real-time pipeline; implies `streaming` + `security` |
@@ -457,9 +468,19 @@ API documentation for the published crates is on
 
 ## Project Status
 
-**Pre-release.** The on-disk format and the public API are not yet stable;
-the first tagged release will declare both. There are no production
-deployments.
+**Pre-1.0.** The on-disk format and the public API are not yet stable, and the
+1.0 contract will declare both. Published through v0.6.0; no production
+deployments yet.
+
+**A data directory belongs to one format generation, and there is no
+migration.** Chronix reads exactly the generation it writes — segments, WAL,
+catalog and sidecar all carry the same version — and a directory from another
+generation is refused at `open()` with a message naming both versions and the
+remedy. The remaining format changes are **batched into one break** so this
+happens once; when a release moves the generation the changelog says so at the
+top, in bold. Then: re-create the directory and re-ingest, and export anything
+a rollup tier is the only copy of *before* upgrading. From 1.0 this stops;
+until then, pin your version and read the changelog before `cargo update`.
 
 The engine is hardened against the failures that matter: a property test on
 every codec, three fuzz targets run nightly, and crash-recovery tests that
@@ -476,10 +497,12 @@ procedure and version policy are in [CONTRIBUTING.md](CONTRIBUTING.md), and
 notable changes are in
 [CHANGELOG.md](https://github.com/hupe1980/chronix/blob/main/CHANGELOG.md) —
 an absolute link on purpose, because this README *is* the crate's front page
-on crates.io and docs.rs, where a relative one 404s. `cargo package` takes
-nothing from outside a package directory, so the changelog itself cannot
-travel with the crate; the link is how a consumer who already depends on a
-version finds out what moved. Chronix is pre-1.0 and a breaking change bumps
+on crates.io and docs.rs, where a relative one 404s. The link is
+absolute because `cargo package` takes nothing from outside a package
+directory, so a relative one 404s off GitHub; the changelog *itself* now
+travels with the crate too — the publish script copies it in for the duration
+of the upload, which is the one mechanism that works (`include` with a path
+outside the package root is silently dropped, with no error). Chronix is pre-1.0 and a breaking change bumps
 the minor version, so read it before a minor bump.
 
 ## License

@@ -5,6 +5,7 @@
 //! perspective; async I/O is used internally where beneficial.
 
 mod accessors;
+#[cfg(feature = "analytics")]
 mod analytics_api;
 mod backup;
 mod delete;
@@ -17,13 +18,14 @@ mod rollup;
 mod stream;
 mod write;
 
-pub use query::{role_metadata, ROLE_KEY};
+pub use accessors::SegmentInfo;
+pub use query::{ROLE_KEY, role_metadata};
 pub use stream::BatchStream;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::{DashMap, DashSet};
 use fs2::FileExt;
@@ -32,10 +34,10 @@ use tracing::{debug, error, info, warn};
 use crate::lock_order::{BloomsLock, CatalogLock, RollupRegistryLock, TombstonesLock};
 
 use chronix_core::{
-    wal_decode, ChronixConfig, SchemaRegistry, SegmentState, ShardId, TombstoneSet, WalEntry,
+    ChronixConfig, SchemaRegistry, SegmentState, ShardId, TombstoneSet, WalEntry, wal_decode,
 };
-use chronix_engine::cache::lvc::LastValueCache;
 use chronix_engine::cache::SegmentCache;
+use chronix_engine::cache::lvc::LastValueCache;
 use chronix_engine::index::{SegmentCatalog, SeriesBloomFilter, TagInvertedIndex};
 use chronix_engine::memtable::{FlushConfig, ShardRouter, ShardRouterConfig};
 use chronix_engine::segment::SegmentWriterConfig;
@@ -832,10 +834,10 @@ impl Chronix {
                 measurement,
                 "schema repaired from segment metadata — the manifest was missing columns the data carries"
             );
-            if let Some(ms) = schema.lookup(&measurement) {
-                if let Err(e) = catalog.set_schema((*ms).clone()) {
-                    warn!(error = %e, measurement, "failed to persist the repaired schema");
-                }
+            if let Some(ms) = schema.lookup(&measurement)
+                && let Err(e) = catalog.set_schema((*ms).clone())
+            {
+                warn!(error = %e, measurement, "failed to persist the repaired schema");
             }
         }
     }
@@ -938,7 +940,7 @@ mod tests {
         flusher.join().unwrap();
 
         assert!(
-            db.catalog().read().wal_floor() < seq,
+            db.catalog.read().wal_floor() < seq,
             "the floor passed a record that is only in memory"
         );
         db.close().unwrap();

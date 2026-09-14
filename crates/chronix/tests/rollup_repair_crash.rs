@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const SEC: i64 = 1_000_000_000;
 const MINUTE: i64 = 60 * SEC;

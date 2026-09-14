@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use chronix::chronix_analytics::forecast::{AutoForecastOptions, ModelType, SelectionMetric};
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, ForecastConfig};
+use chronix::{Chronix, ForecastConfig, fields, tags};
 
 const SEC: i64 = 1_000_000_000;
 
@@ -189,9 +189,10 @@ fn an_unknown_model_name_is_an_error_not_a_silent_fallback() {
 #[test]
 fn too_short_a_window_is_reported_rather_than_guessed() {
     let (_dir, db) = db_with(&(0..12).map(f64::from).collect::<Vec<_>>());
-    assert!(db
-        .auto_forecast("m", "v", &[("host", "a")], 0, 12 * SEC, 10, None)
-        .is_err());
+    assert!(
+        db.auto_forecast("m", "v", &[("host", "a")], 0, 12 * SEC, 10, None)
+            .is_err()
+    );
 }
 
 /// The same question of the sibling: an unknown **detector** name.

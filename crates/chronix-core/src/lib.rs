@@ -27,6 +27,7 @@
 pub mod config;
 pub mod decimal;
 pub mod error;
+pub mod histogram;
 pub mod schema;
 pub mod timebucket;
 pub mod types;
@@ -37,7 +38,7 @@ pub use config::{
     FieldEncryption, FloatEncoding, FsyncPolicy, WalConfig,
 };
 pub use decimal::{
-    pow10, Decimal, DecimalError, DECIMAL_PRECISION, MAX_DECIMAL_MANTISSA, MAX_DECIMAL_SCALE,
+    DECIMAL_PRECISION, Decimal, DecimalError, MAX_DECIMAL_MANTISSA, MAX_DECIMAL_SCALE, pow10,
 };
 pub use error::{ChronixError, ConfigError, SchemaError, WalError};
 pub use schema::{
@@ -45,12 +46,12 @@ pub use schema::{
 };
 pub use timebucket::{BucketParseError, BucketWidth, TimeBucket};
 pub use types::{
-    canonical_from_pairs, push_canonical, FieldValue, Fields, NamespaceId, NamespaceQuota,
-    NamespaceUsage, Point, SegmentFile, SegmentId, SegmentState, SeriesKey, ShardId, Tags,
-    Timestamp, Tombstone, TombstoneSet, WalEntry, KV_SEPARATOR, MAX_STRING_FIELD_LENGTH,
-    NAMESPACE_TAG, RESERVED_COLUMN_NAMES, TAG_SEPARATOR, TIME_COLUMN,
+    FieldValue, Fields, KV_SEPARATOR, MAX_STRING_FIELD_LENGTH, NAMESPACE_TAG, NamespaceId,
+    NamespaceQuota, NamespaceUsage, Point, RESERVED_COLUMN_NAMES, SegmentFile, SegmentId,
+    SegmentState, SeriesKey, ShardId, TAG_SEPARATOR, TIME_COLUMN, Tags, Timestamp, Tombstone,
+    TombstoneSet, WalEntry, canonical_from_pairs, push_canonical,
 };
 pub use wal_codec::{
-    decode as wal_decode, encode as wal_encode, encode_write_point as wal_encode_write_point,
-    CodecError as WalCodecError,
+    CodecError as WalCodecError, decode as wal_decode, encode as wal_encode,
+    encode_write_point as wal_encode_write_point,
 };

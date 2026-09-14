@@ -170,6 +170,15 @@ encoding_types! {
     /// nearly every real decimal column, delegates straight to the `i64`
     /// stack above and therefore inherits RLE, FOR, varint and pco.
     DecimalI128 = 24, "decimal-i128";
+    /// Opaque byte strings — a count, then a length and payload per value.
+    ///
+    /// For columns whose values are **composite objects** rather than
+    /// numbers: today, native histograms. There is deliberately no clever
+    /// codec here. A histogram's own encoding already packs it, and a
+    /// second-guessing layer over an opaque blob would compress nothing while
+    /// adding a decoder to audit — so this is a framing, and the general-purpose
+    /// block compression underneath the segment does the rest.
+    Bytes = 25, "bytes";
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +333,7 @@ impl ColumnEncoder {
                 return Ok(EncodedBlock {
                     encoding: EncodingType::PlainI64,
                     payload: PlainEncoder::encode_i64(values)?,
-                })
+                });
             }
             TimestampEncoding::DeltaOfDelta => (
                 EncodingType::DeltaOfDelta,
@@ -816,6 +825,8 @@ pub enum DecodedColumn {
     /// Exact decimal mantissas — `mantissa × 10⁻ˢᶜᵃˡᵉ`, with the scale held
     /// by the column rather than by each value.
     Decimal(Vec<i128>),
+    /// Opaque byte strings — a composite value's own encoding, carried whole.
+    Bytes(Vec<Vec<u8>>),
     /// Nullable signed 64-bit integers.
     NullableI64(Vec<Option<i64>>),
     /// Nullable unsigned 64-bit integers.
@@ -828,6 +839,8 @@ pub enum DecodedColumn {
     NullableString(Vec<Option<String>>),
     /// Nullable decimal mantissas.
     NullableDecimal(Vec<Option<i128>>),
+    /// Nullable byte strings.
+    NullableBytes(Vec<Option<Vec<u8>>>),
 }
 
 /// Bitwise f64 comparison helper (NaN-safe: NaN == NaN).
@@ -882,6 +895,8 @@ impl DecodedColumn {
             Self::NullableString(v) => v.len(),
             Self::Decimal(v) => v.len(),
             Self::NullableDecimal(v) => v.len(),
+            Self::Bytes(v) => v.len(),
+            Self::NullableBytes(v) => v.len(),
         }
     }
 
@@ -982,6 +997,10 @@ impl ColumnDecoder {
             EncodingType::PlainString => {
                 let values = PlainDecoder::decode_string(&block.payload)?;
                 Ok(DecodedColumn::String(values))
+            }
+            EncodingType::Bytes => {
+                let values = PlainDecoder::decode_bytes(&block.payload)?;
+                Ok(DecodedColumn::Bytes(values))
             }
             EncodingType::Nullable => Self::decode_nullable(&block.payload),
             EncodingType::Rle => Self::decode_rle(&block.payload),

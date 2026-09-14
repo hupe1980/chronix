@@ -96,6 +96,17 @@ pub enum ServerError {
     /// Access denied by row-level security policy.
     #[error("forbidden: {0}")]
     Forbidden(String),
+
+    /// The body is in a format this endpoint does not speak.
+    ///
+    /// Distinct from [`ServerError::BadRequest`] because the remedy is
+    /// different and a sender acts on it differently: 400 says "your data is
+    /// wrong, do not retry it", 415 says "I do not speak this dialect, send
+    /// another". Prometheus's remote-write specification requires 415 for an
+    /// unsupported `proto=`, and a sender uses it to fall back from 2.0 to
+    /// 1.0 without operator involvement.
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
 }
 
 /// Standard JSON error response body.
@@ -200,10 +211,10 @@ pub async fn error_envelope_layer(
 fn is_storage_full(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut cur = Some(err);
     while let Some(e) = cur {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            if io.kind() == std::io::ErrorKind::StorageFull {
-                return true;
-            }
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::StorageFull
+        {
+            return true;
         }
         cur = e.source();
     }
@@ -446,6 +457,11 @@ fn classify(err: &ServerError) -> Outcome {
             "FORBIDDEN",
             tonic::Code::PermissionDenied,
         ),
+        ServerError::UnsupportedMediaType(_) => Outcome::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "UNSUPPORTED_MEDIA_TYPE",
+            tonic::Code::InvalidArgument,
+        ),
         ServerError::Config(_) => Outcome::internal("CONFIG_ERROR"),
         ServerError::Tls(_) => Outcome::internal("TLS_ERROR"),
         ServerError::Io(_) => Outcome::internal("IO_ERROR"),
@@ -482,12 +498,12 @@ impl IntoResponse for ServerError {
         };
 
         let mut response = (outcome.status, axum::Json(body)).into_response();
-        if let Some(secs) = outcome.retry_after_secs {
-            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-                response
-                    .headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, value);
-            }
+        if let Some(secs) = outcome.retry_after_secs
+            && let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
         }
         response
     }

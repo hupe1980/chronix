@@ -213,23 +213,22 @@ pub fn apply_window(
                 | WindowFn::RangeCount { .. }
         )
     });
-    if needs_ts {
-        if let Some(ref ts) = ts_col {
-            if !ts.is_empty() {
-                // Find the maximum timestamp to judge the unit
-                let max_ts = (0..ts.len()).map(|i| ts.value(i)).max().unwrap_or(0);
-                // Seconds epoch for year ~2001 → ~978_307_200;
-                // Nanosecond epoch for same → ~978_307_200_000_000_000.
-                // If max is in [1_000_000_000, 100_000_000_000) it looks
-                // like seconds (1970-2001..~5138). Warn the caller.
-                if (1_000_000_000..100_000_000_000).contains(&max_ts) {
-                    tracing::warn!(
-                        max_ts,
-                        "timestamps may be in seconds instead of nanoseconds; \
+    if needs_ts
+        && let Some(ref ts) = ts_col
+        && !ts.is_empty()
+    {
+        // Find the maximum timestamp to judge the unit
+        let max_ts = (0..ts.len()).map(|i| ts.value(i)).max().unwrap_or(0);
+        // Seconds epoch for year ~2001 → ~978_307_200;
+        // Nanosecond epoch for same → ~978_307_200_000_000_000.
+        // If max is in [1_000_000_000, 100_000_000_000) it looks
+        // like seconds (1970-2001..~5138). Warn the caller.
+        if (1_000_000_000..100_000_000_000).contains(&max_ts) {
+            tracing::warn!(
+                max_ts,
+                "timestamps may be in seconds instead of nanoseconds; \
                          Rate/IRate assume nanosecond timestamps"
-                    );
-                }
-            }
+            );
         }
     }
 
@@ -530,11 +529,11 @@ fn compute_window_fn(
                     count += 1;
                 }
                 // Remove the leaving element (the one that slides out)
-                if i >= ws {
-                    if let Some(val) = values[i - ws] {
-                        sum -= val;
-                        count -= 1;
-                    }
+                if i >= ws
+                    && let Some(val) = values[i - ws]
+                {
+                    sum -= val;
+                    count -= 1;
                 }
                 if i + 1 < ws {
                     // Not enough data for a full window yet

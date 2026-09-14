@@ -216,11 +216,7 @@ impl StlConfig {
 /// The smallest odd integer that is at least `w` and at least `floor`.
 fn next_odd_at_least(w: usize, floor: usize) -> usize {
     let w = w.max(floor);
-    if w.is_multiple_of(2) {
-        w + 1
-    } else {
-        w
-    }
+    if w.is_multiple_of(2) { w + 1 } else { w }
 }
 
 /// Perform STL decomposition.

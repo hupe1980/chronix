@@ -58,5 +58,5 @@ pub mod tiering;
 pub use backend::{BackoffConfig, ObjectStoreBackend, ObjectStoreConfig};
 pub use cache::{CacheConfig, DiskCache};
 pub use error::{ObjStoreError, Result};
-pub use parquet_tier::{parquet_to_batches, ParquetArchiveWriter};
+pub use parquet_tier::{ParquetArchiveWriter, parquet_to_batches};
 pub use tiering::{ArchiveObject, TieringConfig, TieringEngine};

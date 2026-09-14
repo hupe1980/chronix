@@ -652,16 +652,13 @@ the `prev_hash` field, forming a tamper-evident chain:
   breaks the chain, making unauthorized changes immediately detectable
 
 **A broken chain means tampering, and nothing else.** That is the whole value
-of the mechanism, and it is why three benign ways of breaking it were
-removed rather than documented:
+of the mechanism, so it has no benign way to fail:
 
-- Sealing an event and writing it are **one step**. They were two, so two
-  concurrent requests could seal in one order and write in the other and
-  leave a file that failed its own verification — with no error anywhere.
-- An event that reaches **no durable sink** does not advance the chain. It
-  used to, so a full disk broke every later verification of that file,
-  permanently. The gap is counted by `chronix_audit_chain_gaps_total` and
-  logged at `error`, because a lost audit event is worth an alert of its own.
+- Sealing an event and writing it are **one step**, so concurrent requests
+  cannot seal in one order and write in the other.
+- An event that reaches **no durable sink** does not advance the chain. The
+  gap is counted by `chronix_audit_chain_gaps_total` and logged at `error`,
+  because a lost audit event is worth an alert of its own.
 - A line is written **whole or not at all**, so a failed write cannot swallow
   the event after it.
 

@@ -232,62 +232,58 @@ impl AuthMiddleware {
         // 1. Try mTLS — if a client certificate is presented and mTLS is
         //    enabled, it MUST succeed.  Falling through to weaker methods
         //    (JWT / API-key) would be a security downgrade.
-        if let Some(ref mtls) = self.mtls_validator {
-            if let Some(cn) = client_cert_cn {
-                if mtls.is_enabled() {
-                    let identity = mtls.extract_identity_from_cn(cn).map_err(|e| {
-                        AuthError::InvalidCertificate(format!(
-                            "mTLS certificate validation failed: {e}"
-                        ))
-                    })?;
-                    return Ok(AuthContext {
-                        principal: identity.principal().to_string(),
-                        method: AuthMethod::Mtls,
-                        claims: std::collections::HashMap::new(),
-                        admin: false,
-                        // A certificate carries no role list. An mTLS
-                        // deployment names the principal in the policy.
-                        roles: Vec::new(),
-                        namespaces: Vec::new(),
-                    });
-                }
-            }
+        if let Some(ref mtls) = self.mtls_validator
+            && let Some(cn) = client_cert_cn
+            && mtls.is_enabled()
+        {
+            let identity = mtls.extract_identity_from_cn(cn).map_err(|e| {
+                AuthError::InvalidCertificate(format!("mTLS certificate validation failed: {e}"))
+            })?;
+            return Ok(AuthContext {
+                principal: identity.principal().to_string(),
+                method: AuthMethod::Mtls,
+                claims: std::collections::HashMap::new(),
+                admin: false,
+                // A certificate carries no role list. An mTLS
+                // deployment names the principal in the policy.
+                roles: Vec::new(),
+                namespaces: Vec::new(),
+            });
         }
 
         // 2. Try JWT
-        if let Some(ref jwt) = self.jwt_validator {
-            if let Some(token) = bearer_token {
-                if let Some(outcome) = self.judge_jwt(token, jwt.validate(token)) {
-                    return outcome;
-                }
-            }
+        if let Some(ref jwt) = self.jwt_validator
+            && let Some(token) = bearer_token
+            && let Some(outcome) = self.judge_jwt(token, jwt.validate(token))
+        {
+            return outcome;
         }
 
         // 3. Try API key — skip if token looks like a JWT (has 2+ dot separators)
-        if let Some(ref store) = self.api_key_store {
-            if let Some(token) = bearer_token {
-                let looks_like_jwt = token.bytes().filter(|&b| b == b'.').count() >= 2;
-                if !looks_like_jwt {
-                    match store.validate(token) {
-                        Ok(name) => {
-                            let namespaces = store.namespaces_for(&name).to_vec();
-                            let admin = store.is_admin(&name);
-                            let roles = store.roles(&name);
-                            return Ok(AuthContext {
-                                principal: name,
-                                method: AuthMethod::ApiKey,
-                                claims: std::collections::HashMap::new(),
-                                admin,
-                                roles,
-                                namespaces,
-                            });
-                        }
-                        Err(AuthError::ExpiredApiKey(name)) => {
-                            return Err(AuthError::ExpiredApiKey(name));
-                        }
-                        Err(_) => {
-                            // API key validation failed
-                        }
+        if let Some(ref store) = self.api_key_store
+            && let Some(token) = bearer_token
+        {
+            let looks_like_jwt = token.bytes().filter(|&b| b == b'.').count() >= 2;
+            if !looks_like_jwt {
+                match store.validate(token) {
+                    Ok(name) => {
+                        let namespaces = store.namespaces_for(&name).to_vec();
+                        let admin = store.is_admin(&name);
+                        let roles = store.roles(&name);
+                        return Ok(AuthContext {
+                            principal: name,
+                            method: AuthMethod::ApiKey,
+                            claims: std::collections::HashMap::new(),
+                            admin,
+                            roles,
+                            namespaces,
+                        });
+                    }
+                    Err(AuthError::ExpiredApiKey(name)) => {
+                        return Err(AuthError::ExpiredApiKey(name));
+                    }
+                    Err(_) => {
+                        // API key validation failed
                     }
                 }
             }
@@ -324,10 +320,11 @@ impl AuthMiddleware {
 
         // A presented client certificate wins outright, exactly as in the
         // sync path, so delegate rather than restating the rule.
-        if let Some(ref mtls) = self.mtls_validator {
-            if client_cert_cn.is_some() && mtls.is_enabled() {
-                return self.authenticate(bearer_token, client_cert_cn);
-            }
+        if let Some(ref mtls) = self.mtls_validator
+            && client_cert_cn.is_some()
+            && mtls.is_enabled()
+        {
+            return self.authenticate(bearer_token, client_cert_cn);
         }
 
         if let (Some(jwt), Some(token)) = (self.jwt_validator.as_ref(), bearer_token) {
@@ -377,11 +374,7 @@ impl AuthMiddleware {
             Err(AuthError::ExpiredJwt) => Some(Err(AuthError::ExpiredJwt)),
             Err(e) => {
                 let looks_like_jwt = token.bytes().filter(|&b| b == b'.').count() >= 2;
-                if looks_like_jwt {
-                    Some(Err(e))
-                } else {
-                    None
-                }
+                if looks_like_jwt { Some(Err(e)) } else { None }
             }
         }
     }

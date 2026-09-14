@@ -480,6 +480,9 @@ Chronix exposes Prometheus metrics at `/metrics` (default port 8086).
 | Metric | Type | Description |
 |--------|------|-------------|
 | `chronix_wire_non_finite_samples_skipped_total` | Counter | NaN/Infinity values dropped from streaming aggregation |
+| `chronix_prom_remote_write_samples_total` | Counter | Float samples accepted over Prometheus remote write |
+| `chronix_prom_remote_write_histograms_total` | Counter | Native histograms accepted over Prometheus remote write |
+| `chronix_prom_remote_read_queries_total` | Counter | Prometheus remote read queries served |
 
 #### Self-maintenance
 

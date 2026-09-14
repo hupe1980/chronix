@@ -43,7 +43,7 @@ mod functions;
 mod provider;
 pub mod readonly;
 
-pub use asof_join::{execute_asof_join, AsofJoinExec};
+pub use asof_join::{AsofJoinExec, execute_asof_join};
 #[cfg(feature = "object-store")]
 pub(crate) use batch::to_archive_batch;
 pub use context::{create_namespaced_session_context, create_session_context};

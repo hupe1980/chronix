@@ -22,9 +22,9 @@
 //! of exactly that size: pco's own chunk headers are never trusted for an
 //! allocation, and a file that decodes to a different count is corrupt.
 
+use pco::ChunkConfig;
 use pco::data_types::Number;
 use pco::standalone::{simple_compress, simple_decompress_into};
-use pco::ChunkConfig;
 
 use crate::coding::MAX_BLOCK_VALUES;
 use crate::error::{EncodingError, Result};

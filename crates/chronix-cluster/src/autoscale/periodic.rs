@@ -369,13 +369,17 @@ mod tests {
         let snapshot = make_snapshot_stable();
 
         // First check should succeed (never checked before).
-        assert!(rebalancer
-            .check_and_rebalance(&snapshot, &mut make_id_alloc())
-            .is_some());
+        assert!(
+            rebalancer
+                .check_and_rebalance(&snapshot, &mut make_id_alloc())
+                .is_some()
+        );
         // Immediately after, should return None (not due yet).
-        assert!(rebalancer
-            .check_and_rebalance(&snapshot, &mut make_id_alloc())
-            .is_none());
+        assert!(
+            rebalancer
+                .check_and_rebalance(&snapshot, &mut make_id_alloc())
+                .is_none()
+        );
     }
 
     #[test]
@@ -389,9 +393,11 @@ mod tests {
         let snapshot = make_snapshot_unbalanced();
 
         // check_and_rebalance returns None when disabled.
-        assert!(rebalancer
-            .check_and_rebalance(&snapshot, &mut make_id_alloc())
-            .is_none());
+        assert!(
+            rebalancer
+                .check_and_rebalance(&snapshot, &mut make_id_alloc())
+                .is_none()
+        );
         // force always works.
         let result = rebalancer.force_rebalance(&snapshot, &mut make_id_alloc());
         assert!(result.triggered);
@@ -408,19 +414,25 @@ mod tests {
         let snapshot = make_snapshot_stable();
 
         // First check.
-        assert!(rebalancer
-            .check_and_rebalance(&snapshot, &mut make_id_alloc())
-            .is_some());
+        assert!(
+            rebalancer
+                .check_and_rebalance(&snapshot, &mut make_id_alloc())
+                .is_some()
+        );
         // Not due.
-        assert!(rebalancer
-            .check_and_rebalance(&snapshot, &mut make_id_alloc())
-            .is_none());
+        assert!(
+            rebalancer
+                .check_and_rebalance(&snapshot, &mut make_id_alloc())
+                .is_none()
+        );
         // Reset timer.
         rebalancer.reset_timer();
         // Now due again.
-        assert!(rebalancer
-            .check_and_rebalance(&snapshot, &mut make_id_alloc())
-            .is_some());
+        assert!(
+            rebalancer
+                .check_and_rebalance(&snapshot, &mut make_id_alloc())
+                .is_some()
+        );
     }
 
     #[test]

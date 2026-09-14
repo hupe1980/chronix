@@ -24,9 +24,9 @@
 //! - **JSON** (default): raw `AuditEvent` serialized as JSON
 //! - **CEF**: Common Event Format — widely supported by Splunk, ArcSight, QRadar
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -123,6 +123,22 @@ fn format_cef(event: &AuditEvent) -> String {
 ///
 /// Returns an error if a referenced variable is not set.
 fn expand_env_vars(s: &str) -> std::result::Result<String, String> {
+    expand_with(s, |name| std::env::var(name).ok())
+}
+
+/// `expand_env_vars` with the lookup supplied.
+///
+/// The split exists so the substitution can be tested without touching the
+/// process environment. `std::env::set_var` is `unsafe` in edition 2024
+/// because it mutates state shared by every thread, and `cargo test` runs
+/// tests in parallel — so the tests that used to set a variable, read it back
+/// and remove it were a data race against any concurrently running test that
+/// reads the environment. Passing the lookup in removes the hazard rather
+/// than annotating it.
+fn expand_with<F>(s: &str, lookup: F) -> std::result::Result<String, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -136,9 +152,9 @@ fn expand_env_vars(s: &str) -> std::result::Result<String, String> {
                     None => return Err("unclosed ${...} in env var reference".into()),
                 }
             }
-            match std::env::var(&var_name) {
-                Ok(val) => result.push_str(&val),
-                Err(_) => {
+            match lookup(&var_name) {
+                Some(val) => result.push_str(&val),
+                None => {
                     return Err(format!("environment variable '{var_name}' is not set"));
                 }
             }
@@ -392,7 +408,9 @@ impl WebhookSink {
                     // Reject control characters in expanded auth_header
                     // to prevent HTTP header injection attacks.
                     if expanded.chars().any(char::is_control) {
-                        tracing::error!("webhook auth_header contains control characters after expansion — rejecting");
+                        tracing::error!(
+                            "webhook auth_header contains control characters after expansion — rejecting"
+                        );
                         config.auth_header = None;
                     } else {
                         config.auth_header = Some(expanded);
@@ -479,15 +497,15 @@ impl super::AuditSink for WebhookSink {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(event)) => {
                 // AtLeastOnce mode — overflow to disk.
-                if self.delivery_guarantee == DeliveryGuarantee::AtLeastOnce {
-                    if let Some(ref overflow) = self.overflow {
-                        if let Err(e) = overflow.lock().append(&event) {
-                            tracing::error!(error = %e, "failed to write to overflow journal — event dropped");
-                            self.dropped.fetch_add(1, Ordering::Relaxed);
-                            metrics::counter!("chronix_audit_webhook_dropped_total").increment(1);
-                        }
-                        return Ok(());
+                if self.delivery_guarantee == DeliveryGuarantee::AtLeastOnce
+                    && let Some(ref overflow) = self.overflow
+                {
+                    if let Err(e) = overflow.lock().append(&event) {
+                        tracing::error!(error = %e, "failed to write to overflow journal — event dropped");
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        metrics::counter!("chronix_audit_webhook_dropped_total").increment(1);
                     }
+                    return Ok(());
                 }
                 // BestEffort or overflow unavailable — drop.
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -824,38 +842,46 @@ mod tests {
 
     #[test]
     fn expand_env_vars_replaces_variable() {
-        std::env::set_var("CHRONIX_TEST_TOKEN_9182", "secret-value");
-        let result = super::expand_env_vars("Bearer ${CHRONIX_TEST_TOKEN_9182}").unwrap();
+        let result = super::expand_with("Bearer ${TOKEN}", |n| {
+            (n == "TOKEN").then(|| "secret-value".to_string())
+        })
+        .unwrap();
         assert_eq!(result, "Bearer secret-value");
-        std::env::remove_var("CHRONIX_TEST_TOKEN_9182");
     }
 
     #[test]
     fn expand_env_vars_passthrough_literal() {
-        let result = super::expand_env_vars("Bearer my-literal-token").unwrap();
+        let result = super::expand_with("Bearer my-literal-token", |_| None).unwrap();
         assert_eq!(result, "Bearer my-literal-token");
     }
 
     #[test]
     fn expand_env_vars_missing_var_errors() {
-        let result = super::expand_env_vars("${CHRONIX_NONEXISTENT_VAR_XYZ}");
+        let result = super::expand_with("${NOPE}", |_| None);
         assert!(result.is_err());
     }
 
     #[test]
     fn expand_env_vars_unclosed_brace_errors() {
-        let result = super::expand_env_vars("${UNCLOSED");
+        let result = super::expand_with("${UNCLOSED", |_| None);
         assert!(result.is_err());
     }
 
     #[test]
     fn expand_env_vars_multiple_vars() {
-        std::env::set_var("CHRONIX_TEST_A_3847", "hello");
-        std::env::set_var("CHRONIX_TEST_B_3847", "world");
-        let result =
-            super::expand_env_vars("${CHRONIX_TEST_A_3847} ${CHRONIX_TEST_B_3847}").unwrap();
+        let result = super::expand_with("${A} ${B}", |n| match n {
+            "A" => Some("hello".to_string()),
+            "B" => Some("world".to_string()),
+            _ => None,
+        })
+        .unwrap();
         assert_eq!(result, "hello world");
-        std::env::remove_var("CHRONIX_TEST_A_3847");
-        std::env::remove_var("CHRONIX_TEST_B_3847");
+    }
+
+    #[test]
+    fn expand_env_vars_reads_the_real_environment() {
+        // The one test that must use the real lookup, so the delegation in
+        // `expand_env_vars` cannot rot: a variable that is never set.
+        assert!(super::expand_env_vars("${CHRONIX_NONEXISTENT_VAR_XYZ}").is_err());
     }
 }

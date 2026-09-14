@@ -60,9 +60,9 @@ pub async fn request_id_layer(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
-    use axum::Router;
     use tower::ServiceExt;
 
     async fn ok_handler() -> &'static str {

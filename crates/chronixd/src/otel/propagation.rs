@@ -127,10 +127,10 @@ pub fn inject_trace_context(
     if let Ok(val) = traceparent.parse() {
         metadata.insert(TRACEPARENT_KEY, val);
     }
-    if let Some(state) = tracestate {
-        if let Ok(val) = state.parse() {
-            metadata.insert(TRACESTATE_KEY, val);
-        }
+    if let Some(state) = tracestate
+        && let Ok(val) = state.parse()
+    {
+        metadata.insert(TRACESTATE_KEY, val);
     }
 }
 
@@ -151,8 +151,8 @@ pub fn inject_trace_context(
 /// ```
 #[must_use = "Assign this interceptor to a gRPC client channel"]
 #[allow(clippy::result_large_err)] // tonic::Status is large by design
-pub fn make_trace_interceptor(
-) -> impl Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+pub fn make_trace_interceptor()
+-> impl Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
     move |mut request: tonic::Request<()>| {
         // Only the `otlp` path can set this; without the feature the fallback
         // below always runs, so the binding is not mutated there.
@@ -192,11 +192,9 @@ pub fn make_trace_interceptor(
 
         // 2. Fallback: propagate the task-local trace context set by
         //    `with_trace_context`.  Works without any OTel backend.
-        if !injected {
-            if let Ok(tp) = TASK_TRACEPARENT.try_with(std::clone::Clone::clone) {
-                let ts = TASK_TRACESTATE.try_with(std::clone::Clone::clone).ok();
-                inject_trace_context(request.metadata_mut(), &tp, ts.as_deref());
-            }
+        if !injected && let Ok(tp) = TASK_TRACEPARENT.try_with(std::clone::Clone::clone) {
+            let ts = TASK_TRACESTATE.try_with(std::clone::Clone::clone).ok();
+            inject_trace_context(request.metadata_mut(), &tp, ts.as_deref());
         }
 
         Ok(request)

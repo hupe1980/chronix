@@ -33,11 +33,11 @@
 // authenticate anyone.
 const _: () = {
     #[allow(unused_imports)]
+    use chronix::Pipeline as _the_realtime_pipeline_is_compiled_in;
+    #[allow(unused_imports)]
     use chronix::chronix_security as _authn_authz_and_audit_are_compiled_in;
     #[allow(unused_imports)]
     use chronix::chronix_streaming as _cdc_and_signals_are_compiled_in;
-    #[allow(unused_imports)]
-    use chronix::Pipeline as _the_realtime_pipeline_is_compiled_in;
 };
 
 pub mod admin;
@@ -82,6 +82,16 @@ pub mod proto {
 #[allow(missing_docs)]
 pub mod prom_proto {
     include!(concat!(env!("OUT_DIR"), "/prometheus.rs"));
+}
+
+/// Prometheus Remote Write 2.0 protobuf types.
+///
+/// A separate message set from [`prom_proto`], not a superset: 2.0 interns
+/// every label into a per-request symbol table, so its `TimeSeries` has no
+/// labels of its own to share.
+#[allow(missing_docs)]
+pub mod prom_proto_v2 {
+    include!(concat!(env!("OUT_DIR"), "/io.prometheus.write.v2.rs"));
 }
 
 /// OpenTelemetry OTLP protobuf types.

@@ -31,8 +31,8 @@
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, SchemaRef};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 

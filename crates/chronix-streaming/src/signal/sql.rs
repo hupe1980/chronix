@@ -301,21 +301,20 @@ fn tokenize(sql: &str) -> Vec<String> {
                 )
             });
             chars.next();
-            if prev_is_operator {
-                if let Some(&next) = chars.peek() {
-                    if next.is_ascii_digit() || next == '.' {
-                        let mut word = String::from('-');
-                        while let Some(&c) = chars.peek() {
-                            if c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';' {
-                                break;
-                            }
-                            word.push(c);
-                            chars.next();
-                        }
-                        tokens.push(word);
-                        continue;
+            if prev_is_operator
+                && let Some(&next) = chars.peek()
+                && (next.is_ascii_digit() || next == '.')
+            {
+                let mut word = String::from('-');
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';' {
+                        break;
                     }
+                    word.push(c);
+                    chars.next();
                 }
+                tokens.push(word);
+                continue;
             }
             tokens.push("-".to_string());
             continue;
@@ -439,7 +438,7 @@ fn parse_create(tokens: &[String]) -> Result<TriggerStatement> {
                                      delivery was removed. Subscribe to the CDC event \
                                      bus and publish from there, or use \
                                      webhook('https://…')"
-                                )))
+                                )));
                             }
                             other => {
                                 return Err(SignalError::InvalidConfig(format!(
@@ -637,7 +636,7 @@ fn parse_primary_condition(tokens: &[String], pos: usize) -> Result<(ParsedCondi
                 return Err(SignalError::InvalidConfig(format!(
                     "operator {other} does not apply to the string '{value_str}'; \
                      a tag comparison is `=` or `<>`"
-                )))
+                )));
             }
         };
         return Ok((
@@ -984,7 +983,9 @@ mod tests {
         let tokens = tokenize("CREATE TRIGGER foo ON cpu WHEN value > 3.0");
         assert_eq!(
             tokens,
-            &["CREATE", "TRIGGER", "foo", "ON", "cpu", "WHEN", "value", ">", "3.0"]
+            &[
+                "CREATE", "TRIGGER", "foo", "ON", "cpu", "WHEN", "value", ">", "3.0"
+            ]
         );
     }
 

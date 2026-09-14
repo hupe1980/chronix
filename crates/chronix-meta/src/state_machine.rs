@@ -937,7 +937,7 @@ impl MetaStateMachine {
             None => {
                 return MetaResponse::Error {
                     message: format!("region {region_id} not found"),
-                }
+                };
             }
         };
 
@@ -1036,7 +1036,7 @@ impl MetaStateMachine {
             None => {
                 return MetaResponse::Error {
                     message: format!("region {region_id} not found"),
-                }
+                };
             }
         };
 
@@ -1124,7 +1124,7 @@ impl MetaStateMachine {
             None => {
                 return MetaResponse::Error {
                     message: format!("region {region_id} not found"),
-                }
+                };
             }
         };
 
@@ -1250,8 +1250,8 @@ mod tests {
         assert!(ok);
 
         let hb = sm.heartbeat_data();
-        let (gen, ts) = hb.get(&1).expect("heartbeat should be recorded");
-        assert_eq!(*gen, 10);
+        let (generation, ts) = hb.get(&1).expect("heartbeat should be recorded");
+        assert_eq!(*generation, 10);
         // Timestamp is receiver-side (SystemTime::now()), so just verify it's non-zero
         assert!(*ts > 0);
 
@@ -2105,8 +2105,8 @@ mod tests {
 
         let snap = sm.snapshot();
         assert!(!snap.heartbeat_store.is_empty());
-        let (gen, _ts) = snap.heartbeat_store[&1];
-        assert_eq!(gen, 42);
+        let (generation, _ts) = snap.heartbeat_store[&1];
+        assert_eq!(generation, 42);
     }
 
     #[test]

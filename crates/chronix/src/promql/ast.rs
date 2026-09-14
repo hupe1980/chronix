@@ -445,8 +445,64 @@ pub struct Sample {
 pub struct Series {
     /// Label key-value pairs identifying the series.
     pub labels: Vec<(String, String)>,
-    /// Data samples in the series.
+    /// Float samples in the series.
     pub samples: Vec<Sample>,
+    /// Native-histogram samples in the series.
+    ///
+    /// A **separate list**, not a sum type on [`Sample`], which is the shape
+    /// Prometheus itself uses (`Series.Floats` beside `Series.Histograms`).
+    /// The reason is not taste: nearly every operator in PromQL — `rate`,
+    /// the arithmetic, the comparison operators, the `*_over_time` family —
+    /// is defined on floats and has nothing to say about a distribution.
+    /// Making `Sample::value` a sum type would put a `match` in all of them
+    /// for a variant they must reject anyway, and would touch the code paths
+    /// where a wrong answer costs the most.
+    ///
+    /// Usually empty. A series carries floats or histograms, not both — a
+    /// metric that changed type mid-range is the one case where both are
+    /// populated, and the functions that meet it say so rather than mixing
+    /// them.
+    pub histograms: Vec<HistogramSample>,
+}
+
+/// One native-histogram observation in a series.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSample {
+    /// Timestamp in nanoseconds.
+    pub timestamp: i64,
+    /// The distribution observed at that instant.
+    ///
+    /// Boxed: a `Series` holds a vector of these, and a histogram carries
+    /// three `Vec`s of its own.
+    pub histogram: Box<chronix_core::histogram::Histogram>,
+}
+
+impl Series {
+    /// A series of float samples — the ordinary case.
+    #[must_use]
+    pub fn floats(labels: Vec<(String, String)>, samples: Vec<Sample>) -> Self {
+        Self {
+            labels,
+            samples,
+            histograms: Vec::new(),
+        }
+    }
+
+    /// A series of histogram samples.
+    #[must_use]
+    pub fn histograms(labels: Vec<(String, String)>, histograms: Vec<HistogramSample>) -> Self {
+        Self {
+            labels,
+            samples: Vec::new(),
+            histograms,
+        }
+    }
+
+    /// Whether this series carries histogram samples rather than floats.
+    #[must_use]
+    pub fn is_histogram(&self) -> bool {
+        !self.histograms.is_empty()
+    }
 }
 
 /// The result of a `PromQL` evaluation.

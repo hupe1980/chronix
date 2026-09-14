@@ -66,10 +66,11 @@ message Metric {
   string unit        = 3;
 
   oneof data {
-    Gauge     gauge      = 5;
-    Sum       sum        = 7;
-    Histogram histogram  = 9;
-    Summary   summary    = 11;
+    Gauge                gauge                 = 5;
+    Sum                  sum                   = 7;
+    Histogram            histogram             = 9;
+    ExponentialHistogram exponential_histogram = 10;
+    Summary              summary               = 11;
   }
 }
 
@@ -94,6 +95,15 @@ message Histogram {
   AggregationTemporality aggregation_temporality = 2;
 }
 
+// The base-2 exponential histogram: OTLP's native histogram.
+//
+// It is the same idea as Prometheus's, with one difference that matters and
+// is easy to get wrong — see `ExponentialHistogramDataPoint.Buckets`.
+message ExponentialHistogram {
+  repeated ExponentialHistogramDataPoint data_points = 1;
+  AggregationTemporality aggregation_temporality = 2;
+}
+
 message Summary {
   repeated SummaryDataPoint data_points = 1;
 }
@@ -114,9 +124,42 @@ message HistogramDataPoint {
   fixed64 start_time_unix_nano = 2;
   fixed64 time_unix_nano = 3;
   fixed64 count = 4;
-  double  sum   = 5;
+  optional double sum = 5;
   repeated fixed64 bucket_counts    = 6;
   repeated double  explicit_bounds  = 7;
+}
+
+message ExponentialHistogramDataPoint {
+  repeated KeyValue attributes = 1;
+  fixed64 start_time_unix_nano = 2;
+  fixed64 time_unix_nano = 3;
+  fixed64 count = 4;
+  // `optional` on purpose: OTLP says a histogram that recorded negative
+  // events should leave the sum unset, and without the presence bit an unset
+  // sum decodes as 0.0 — a number chronix would then store as if it had been
+  // measured.
+  optional double sum = 5;
+  // Same meaning as Prometheus's `schema`: base = 2^(2^-scale).
+  sint32 scale = 6;
+  fixed64 zero_count = 7;
+  Buckets positive = 8;
+  Buckets negative = 9;
+
+  // A contiguous run of bucket counts starting at `offset`.
+  //
+  // OTLP's bucket `i` covers `(base^i, base^(i+1)]` — one lower than
+  // Prometheus's. `wire::histogram` applies the shift.
+  message Buckets {
+    sint32 offset = 1;
+    repeated uint64 bucket_counts = 2;
+  }
+
+  uint32 flags = 10;
+  optional double min = 12;
+  optional double max = 13;
+  // Half-width of the zero region, which is the closed interval
+  // [-zero_threshold, +zero_threshold].
+  double zero_threshold = 14;
 }
 
 message SummaryDataPoint {
@@ -124,7 +167,7 @@ message SummaryDataPoint {
   fixed64 start_time_unix_nano = 2;
   fixed64 time_unix_nano = 3;
   fixed64 count = 4;
-  double  sum   = 5;
+  optional double sum = 5;
   repeated ValueAtQuantile quantile_values = 6;
 
   message ValueAtQuantile {

@@ -10,7 +10,7 @@
 use arrow::array::{Float64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use chronix_query::aggregate::AggFn;
 
 const SEC: i64 = 1_000_000_000;

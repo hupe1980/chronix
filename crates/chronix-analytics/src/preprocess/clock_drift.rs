@@ -28,7 +28,7 @@ pub enum ClockDriftStrategy {
 
 /// Report of clock drift detection and correction.
 #[derive(Debug, Clone)]
-pub struct DriftReport {
+pub struct ClockDriftReport {
     /// Maximum observed drift in nanoseconds.
     pub max_drift_ns: i64,
     /// Ranges of affected indices (start, end).
@@ -48,11 +48,11 @@ impl ClockDriftDetector {
         timestamps: &[i64],
         expected_interval_ns: i64,
         strategy: ClockDriftStrategy,
-    ) -> (Vec<i64>, DriftReport) {
+    ) -> (Vec<i64>, ClockDriftReport) {
         let result = match strategy {
             ClockDriftStrategy::None => (
                 timestamps.to_vec(),
-                DriftReport {
+                ClockDriftReport {
                     max_drift_ns: 0,
                     affected_ranges: Vec::new(),
                     corrections_applied: 0,
@@ -67,11 +67,11 @@ impl ClockDriftDetector {
     }
 
     /// Monotonic enforcement: snap backward/duplicate timestamps forward.
-    fn monotonic(timestamps: &[i64]) -> (Vec<i64>, DriftReport) {
+    fn monotonic(timestamps: &[i64]) -> (Vec<i64>, ClockDriftReport) {
         if timestamps.is_empty() {
             return (
                 Vec::new(),
-                DriftReport {
+                ClockDriftReport {
                     max_drift_ns: 0,
                     affected_ranges: Vec::new(),
                     corrections_applied: 0,
@@ -114,7 +114,7 @@ impl ClockDriftDetector {
 
         (
             corrected,
-            DriftReport {
+            ClockDriftReport {
                 max_drift_ns: max_drift,
                 affected_ranges: ranges,
                 corrections_applied: corrections,
@@ -124,11 +124,11 @@ impl ClockDriftDetector {
 
     /// Smooth correction: detect gradual drift via regression on deltas,
     /// apply linear correction.
-    fn smooth(timestamps: &[i64], expected_interval_ns: i64) -> (Vec<i64>, DriftReport) {
+    fn smooth(timestamps: &[i64], expected_interval_ns: i64) -> (Vec<i64>, ClockDriftReport) {
         if timestamps.len() < 3 {
             return (
                 timestamps.to_vec(),
-                DriftReport {
+                ClockDriftReport {
                     max_drift_ns: 0,
                     affected_ranges: Vec::new(),
                     corrections_applied: 0,
@@ -154,7 +154,7 @@ impl ClockDriftDetector {
         if denom.abs() < 1e-10 {
             return (
                 timestamps.to_vec(),
-                DriftReport {
+                ClockDriftReport {
                     max_drift_ns: 0,
                     affected_ranges: Vec::new(),
                     corrections_applied: 0,
@@ -169,7 +169,7 @@ impl ClockDriftDetector {
         if slope.abs() < expected * 0.001 {
             return (
                 timestamps.to_vec(),
-                DriftReport {
+                ClockDriftReport {
                     max_drift_ns: 0,
                     affected_ranges: Vec::new(),
                     corrections_applied: 0,
@@ -206,7 +206,7 @@ impl ClockDriftDetector {
 
         (
             corrected,
-            DriftReport {
+            ClockDriftReport {
                 max_drift_ns: max_drift,
                 affected_ranges: if max_drift > 0 {
                     vec![(0, n - 1)]

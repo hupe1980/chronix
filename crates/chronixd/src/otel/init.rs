@@ -5,8 +5,8 @@
 //! - Runtime-reloadable `EnvFilter` via `tracing_subscriber::reload`
 //! - OpenTelemetry trace export (when `otlp` feature is enabled)
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -16,9 +16,9 @@ use tracing_subscriber::layer::SubscriberExt;
 /// Queried by [`is_otel_active()`] so callers can distinguish "OTLP not
 /// configured" from "OTLP feature enabled but no provider set up".
 static OTEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use crate::otel::config::{LogFormat, TracingConfig};
 
@@ -162,11 +162,11 @@ fn init_with_otlp(
     otlp_config: &crate::otel::config::OtlpConfig,
     filter: EnvFilter,
 ) -> Result<TracingGuard, String> {
-    use opentelemetry::trace::TracerProvider as _;
     use opentelemetry::KeyValue;
+    use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use tracing_opentelemetry::OpenTelemetryLayer;
 
     // Validate TLS requirement.
@@ -304,8 +304,8 @@ pub fn replace_tracer_provider(
 ) -> Result<(), String> {
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 
     if !is_otel_active() {
         return Err("OTLP tracing was never initialized".into());

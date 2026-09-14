@@ -69,7 +69,23 @@ pub enum WalError {
         limit: usize,
     },
 
-    /// Invalid WAL file header (wrong magic bytes or unsupported version).
+    /// The log belongs to a different on-disk format generation.
+    ///
+    /// Distinct from [`Corruption`](Self::Corruption) and from
+    /// [`InvalidHeader`](Self::InvalidHeader): the header is well formed,
+    /// the bytes are intact, and the reader is from another generation — so
+    /// the remedy is to match the versions up rather than to restore. All
+    /// four durable formats classify this the same way; see
+    /// `chronix_engine::format`.
+    #[error("{detail}")]
+    UnsupportedVersion {
+        /// Path to the WAL file.
+        path: PathBuf,
+        /// What was read, what this build expects, and what to do.
+        detail: String,
+    },
+
+    /// Invalid WAL file header (wrong magic bytes).
     #[error("Invalid WAL header in {path}: {detail}")]
     InvalidHeader {
         /// Path to the WAL file with the invalid header.
@@ -179,7 +195,9 @@ pub enum SchemaError {
     },
 
     /// Type conflict: a field already exists with a different type.
-    #[error("Type conflict for field '{field}' in measurement '{measurement}': expected {expected}, got {got}")]
+    #[error(
+        "Type conflict for field '{field}' in measurement '{measurement}': expected {expected}, got {got}"
+    )]
     TypeConflict {
         /// Measurement name where the conflict occurred.
         measurement: String,

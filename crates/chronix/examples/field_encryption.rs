@@ -33,7 +33,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use chronix_core::FieldEncryption;
 
 const SECRET: &str = "PATIENT-4417-CONFIDENTIAL";

@@ -36,13 +36,12 @@ mod correlation;
 mod derived;
 mod error;
 /// Standalone Granger causality utilities.
-pub mod granger;
 mod mv_anomaly;
 mod mv_forecast;
 
 pub use composite::{
-    signal_channel, AnalyticsResults, CompositeSignal, CompositeSignalEngine, CompositeSignalRule,
-    SignalReceiver, SignalSender, DEFAULT_SIGNAL_CHANNEL_CAPACITY,
+    AnalyticsResults, CompositeSignal, CompositeSignalEngine, CompositeSignalRule,
+    DEFAULT_SIGNAL_CHANNEL_CAPACITY, SignalReceiver, SignalSender, signal_channel,
 };
 pub use context::{ColumnarMatrix, MultiSeriesContext};
 pub use correlation::{

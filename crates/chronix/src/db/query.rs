@@ -13,8 +13,8 @@ use chronix_engine::index::{
     SegmentCatalog, SegmentCatalogEntry, SeriesBloomFilter, TagInvertedIndex,
 };
 use chronix_engine::segment::reader::SegmentReader;
-use chronix_query::plan::{extract_scan, QueryPlan};
 use chronix_query::QueryBuilder;
+use chronix_query::plan::{QueryPlan, extract_scan};
 
 use crate::error::{DbError, Result};
 
@@ -349,12 +349,12 @@ impl super::Chronix {
             }
         };
         let mut scan = scan.clone();
-        if let QueryPlan::Scan { projection, .. } = &mut scan {
-            if !projection.is_empty() {
-                for col in needed {
-                    if !projection.contains(&col) {
-                        projection.push(col);
-                    }
+        if let QueryPlan::Scan { projection, .. } = &mut scan
+            && !projection.is_empty()
+        {
+            for col in needed {
+                if !projection.contains(&col) {
+                    projection.push(col);
                 }
             }
         }
@@ -631,14 +631,13 @@ impl super::Chronix {
         // cache for every series it tombstones, so a hit here is live — but a
         // ranged delete leaves neighbouring points cached, so the entry is
         // still checked against the tombstone rather than trusted.
-        if let Some(cached) = self.lvc.get_by_key(&key) {
-            if !self
+        if let Some(cached) = self.lvc.get_by_key(&key)
+            && !self
                 .tombstones
                 .read()
                 .covers(&canonical, cached.timestamp())
-            {
-                return Ok(Some(cached));
-            }
+        {
+            return Ok(Some(cached));
         }
 
         // 1. Take the memtable's newest point as a *candidate*.
@@ -707,10 +706,10 @@ impl super::Chronix {
         for entry in &entries {
             // If this segment's max_timestamp can't beat our global best,
             // all remaining segments are also older (sorted desc) — stop.
-            if let Some(best) = global_best_ts {
-                if entry.max_timestamp <= best {
-                    break;
-                }
+            if let Some(best) = global_best_ts
+                && entry.max_timestamp <= best
+            {
+                break;
             }
 
             // A segment that cannot be opened fails this lookup, as it fails
@@ -778,12 +777,12 @@ impl super::Chronix {
             }
 
             // Update global best if this segment has a newer point.
-            if let Some(seg_ts) = seg_best_ts {
-                if global_best_ts.is_none_or(|best| seg_ts > best) {
-                    global_best_ts = Some(seg_ts);
-                    global_best_batch = seg_best_batch;
-                    global_best_idx = seg_best_idx;
-                }
+            if let Some(seg_ts) = seg_best_ts
+                && global_best_ts.is_none_or(|best| seg_ts > best)
+            {
+                global_best_ts = Some(seg_ts);
+                global_best_batch = seg_best_batch;
+                global_best_idx = seg_best_idx;
             }
         }
 
@@ -1153,10 +1152,10 @@ impl super::Chronix {
         for row in 0..batch.num_rows() {
             let mut tags = StdBTreeMap::new();
             for &(col_idx, col_name) in &tag_cols {
-                if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>() {
-                    if !arr.is_null(row) {
-                        tags.insert(col_name.to_string(), arr.value(row).to_string());
-                    }
+                if let Some(arr) = batch.column(col_idx).as_any().downcast_ref::<StringArray>()
+                    && !arr.is_null(row)
+                {
+                    tags.insert(col_name.to_string(), arr.value(row).to_string());
                 }
             }
             if let Ok(sk) = SeriesKey::new(measurement.to_string(), tags) {

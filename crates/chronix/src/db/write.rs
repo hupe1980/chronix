@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 use metrics::{counter, gauge, histogram};
 use tracing::{debug, warn};
 
-use chronix_core::{wal_encode_write_point, Point, SeriesKey, Timestamp};
+use chronix_core::{Point, SeriesKey, Timestamp, wal_encode_write_point};
 #[cfg(feature = "streaming")]
 use chronix_streaming::cdc::CdcEvent;
 

@@ -12,8 +12,8 @@
 
 use std::collections::BTreeMap;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 const BASE: i64 = 1_700_000_000_000_000_000;
 const SEC: i64 = 1_000_000_000;

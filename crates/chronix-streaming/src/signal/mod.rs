@@ -56,8 +56,8 @@ pub use delivery::{
     LogChannel, MetricChannel, RetryPolicy, SignalStore, WebhookChannel, WebhookConfig,
 };
 pub use engine::{
-    anomaly_threshold_trigger, forecast_deviation_trigger, ma_crossover_trigger,
-    rate_of_change_trigger, TriggerEngine,
+    TriggerEngine, anomaly_threshold_trigger, forecast_deviation_trigger, ma_crossover_trigger,
+    rate_of_change_trigger,
 };
 pub use error::SignalError;
 pub use manager::TriggerManager;
@@ -65,6 +65,6 @@ pub use model::{
     CrossoverDirection, EventTrigger, Severity, SignalEvent, ThresholdOp, TriggerCondition,
 };
 pub use sql::{
-    execute_trigger_sql, parse_trigger_sql, AlterTrigger, CatalogEntry, CreateTrigger,
-    DeliveryTarget, ParsedCondition, SqlResult, TriggerCatalog, TriggerInfo, TriggerStatement,
+    AlterTrigger, CatalogEntry, CreateTrigger, DeliveryTarget, ParsedCondition, SqlResult,
+    TriggerCatalog, TriggerInfo, TriggerStatement, execute_trigger_sql, parse_trigger_sql,
 };

@@ -333,7 +333,7 @@ mod tests {
             .fill(&ts, &vals, 1_000_000_000)
             .unwrap();
         assert_eq!(filled, 2); // 2 points fill between index 2 and 3
-                               // Spline values should be between surrounding points
+        // Spline values should be between surrounding points
         assert!(out_vals[3] > 4.0 && out_vals[3] < 10.0);
         assert!(out_vals[4] > 4.0 && out_vals[4] < 10.0);
     }

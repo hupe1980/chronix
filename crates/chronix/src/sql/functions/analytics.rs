@@ -10,7 +10,7 @@ use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::DataType;
 use datafusion::common::{DataFusionError, Result as DFResult};
 
-use super::window::{column_f64, constant_f64, exec_err, f64_array, on_dense, PartitionKernel};
+use super::window::{PartitionKernel, column_f64, constant_f64, exec_err, f64_array, on_dense};
 
 /// Synthetic uniform timestamps for the routines that want one per sample.
 ///

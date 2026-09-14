@@ -11,10 +11,10 @@
 use chronix::chronix_core::FieldValue;
 use chronix::chronix_streaming::cdc::CdcEvent;
 use chronix::chronix_streaming::signal::{
-    anomaly_threshold_trigger, execute_trigger_sql, forecast_deviation_trigger,
-    ma_crossover_trigger, parse_trigger_sql, rate_of_change_trigger, DeadLetter, DeadLetterQueue,
-    DeliveryRouter, EventTrigger, LogChannel, MetricChannel, ThresholdOp, TriggerCatalog,
-    TriggerCondition, TriggerEngine,
+    DeadLetter, DeadLetterQueue, DeliveryRouter, EventTrigger, LogChannel, MetricChannel,
+    ThresholdOp, TriggerCatalog, TriggerCondition, TriggerEngine, anomaly_threshold_trigger,
+    execute_trigger_sql, forecast_deviation_trigger, ma_crossover_trigger, parse_trigger_sql,
+    rate_of_change_trigger,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -158,8 +158,7 @@ fn main() {
     let sql_engine = TriggerEngine::new();
 
     // CREATE TRIGGER via SQL
-    let create_sql =
-        "CREATE TRIGGER disk_alert ON disk_usage WHEN value > 90 DELIVER log COOLDOWN INTERVAL '120s'";
+    let create_sql = "CREATE TRIGGER disk_alert ON disk_usage WHEN value > 90 DELIVER log COOLDOWN INTERVAL '120s'";
     let stmt = parse_trigger_sql(create_sql).expect("Parse CREATE TRIGGER failed");
     let result = execute_trigger_sql(&sql_engine, &stmt).expect("Execute CREATE failed");
     println!("  SQL: {create_sql}");

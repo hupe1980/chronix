@@ -262,20 +262,19 @@ impl ObjectStoreBackend {
         match url.scheme() {
             "file" => {
                 let path = url.path();
-                Ok(Arc::new(
-                    LocalFileSystem::new_with_prefix(path)
-                        .map_err(|e| ObjStoreError::InvalidConfig {
-                            detail: format!("invalid local path: {e}"),
-                        })?,
-                ))
+                Ok(Arc::new(LocalFileSystem::new_with_prefix(path).map_err(
+                    |e| ObjStoreError::InvalidConfig {
+                        detail: format!("invalid local path: {e}"),
+                    },
+                )?))
             }
             "s3" | "gs" | "az" => {
                 // For real cloud stores, we build from the URL.
                 // The `object_store` crate reads credentials from
                 // environment variables (AWS_ACCESS_KEY_ID, etc.)
                 // or instance metadata automatically.
-                let (store, _) = object_store::parse_url(&url)
-                    .map_err(|e| ObjStoreError::InvalidConfig {
+                let (store, _) =
+                    object_store::parse_url(&url).map_err(|e| ObjStoreError::InvalidConfig {
                         detail: format!("failed to parse object store URL '{url_str}': {e}"),
                     })?;
                 Ok(Arc::new(store))

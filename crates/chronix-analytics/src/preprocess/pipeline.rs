@@ -1,6 +1,6 @@
 //! Preprocessing pipeline — composes preprocessing steps into configurable pipelines.
 
-use crate::preprocess::clock_drift::{ClockDriftDetector, ClockDriftStrategy, DriftReport};
+use crate::preprocess::clock_drift::{ClockDriftDetector, ClockDriftReport, ClockDriftStrategy};
 use crate::preprocess::interpolation::Interpolator;
 use crate::preprocess::resampling::{ResampleConfig, Resampler};
 use crate::preprocess::smoothing::Smoother;
@@ -15,7 +15,7 @@ pub struct PreprocessResult {
     /// Number of gaps filled during interpolation.
     pub gaps_filled: usize,
     /// Clock drift report (if drift correction was applied).
-    pub drift_report: Option<DriftReport>,
+    pub drift_report: Option<ClockDriftReport>,
 }
 
 /// Preprocessing errors.

@@ -32,11 +32,7 @@ impl WriteMode {
     /// The mode a request's `?backfill=` parameter asks for.
     #[must_use]
     pub fn from_flag(backfill: bool) -> Self {
-        if backfill {
-            Self::Backfill
-        } else {
-            Self::Live
-        }
+        if backfill { Self::Backfill } else { Self::Live }
     }
 }
 
@@ -302,6 +298,7 @@ pub fn column_type_to_str(ct: ColumnType) -> String {
         ColumnType::Bool => "bool".to_string(),
         ColumnType::String => "string".to_string(),
         ColumnType::Timestamp => "timestamp".to_string(),
+        ColumnType::Histogram => "histogram".to_string(),
         // The scale is part of the type, so it is part of the name: a
         // client that reads `decimal` alone cannot tell a schema endpoint
         // what the column actually stores.
@@ -378,7 +375,7 @@ pub fn parse_json_point(
         _ => {
             return Err(ServerError::BadRequest(
                 "'fields' must be a JSON object".into(),
-            ))
+            ));
         }
     };
 
@@ -456,7 +453,7 @@ pub fn json_value_to_field(key: &str, val: serde_json::Value) -> Result<FieldVal
                     return Err(ServerError::BadRequest(format!(
                         "decimal field '{key}' must be a string of digits, not {other} — \
                          a JSON number is parsed as a double and loses the value"
-                    )))
+                    )));
                 }
             };
             digits

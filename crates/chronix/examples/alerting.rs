@@ -65,13 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scored =
             anomaly_engine.process_write("cpu", &tags, &fields, base_ts + i * 1_000_000_000);
 
-        if let Some(anomaly) = scored {
-            if anomaly.score.is_anomaly {
-                println!(
-                    "     ⚠️  ts={} value={:.1} score={:.3}",
-                    anomaly.score.timestamp, anomaly.score.value, anomaly.score.score
-                );
-            }
+        if let Some(anomaly) = scored
+            && anomaly.score.is_anomaly
+        {
+            println!(
+                "     ⚠️  ts={} value={:.1} score={:.3}",
+                anomaly.score.timestamp, anomaly.score.value, anomaly.score.score
+            );
         }
     }
 

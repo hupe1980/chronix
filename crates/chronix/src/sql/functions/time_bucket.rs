@@ -103,7 +103,7 @@ impl ScalarUDFImpl for TimeBucketUdf {
             _ => {
                 return Err(datafusion::common::DataFusionError::Plan(
                     "time_bucket: first argument must be a string interval like '5m'".into(),
-                ))
+                ));
             }
         };
         // The zone is the optional third argument.
@@ -141,7 +141,7 @@ impl ScalarUDFImpl for TimeBucketUdf {
                         "time_bucket: the origin must be a constant timestamp or date string, \
                          e.g. TIMESTAMP '2024-01-15 00:00:00' or '2024-01-15'"
                             .into(),
-                    ))
+                    ));
                 }
             };
         }

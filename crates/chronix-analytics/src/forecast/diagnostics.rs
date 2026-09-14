@@ -439,7 +439,15 @@ fn gamma_cf(a: f64, z: f64) -> f64 {
 }
 
 /// Lanczos approximation for ln(Γ(x)).
-fn ln_gamma(x: f64) -> f64 {
+///
+/// `pub(crate)` because it is the crate's **only** implementation. There were
+/// two: this one, pinned by `ln_gamma_known_values`, and a copy in
+/// `multivariate::mv_forecast` carrying the g = 7 coefficients with `t = x +
+/// 6.5` — a g = 6 offset. Mismatched Lanczos parameters are not a precision
+/// problem: that copy returned 0.928 for `ln Γ(1)`, which is 0, and it sat
+/// under `ln_beta` → `regularized_incomplete_beta` → `f_distribution_sf`, so
+/// **every Granger causality p-value in the crate was wrong**.
+pub(crate) fn ln_gamma(x: f64) -> f64 {
     // Coefficients for g = 7, n = 9 (Lanczos).
     const COEFFS: [f64; 9] = [
         0.999_999_999_999_809_9,

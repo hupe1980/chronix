@@ -34,7 +34,7 @@ use std::sync::Arc;
 use arrow::array::Array;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use datafusion::prelude::SessionContext;
 
 /// 120 rows for one host, with `v` missing at rows 7, 8 and 60 and `w`

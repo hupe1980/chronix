@@ -31,7 +31,7 @@ use std::time::Duration;
 use arrow::array::Array as _;
 use base64::Engine as _;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use chronix_core::FieldEncryption;
 use tempfile::TempDir;
 

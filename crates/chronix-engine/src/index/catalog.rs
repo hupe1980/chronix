@@ -363,12 +363,16 @@ impl SegmentCatalog {
             let data = std::fs::read(&bin_snapshot_path)?;
             let snapshot: CatalogSnapshot = postcard::from_bytes(&data)
                 .map_err(|e| IndexError::BinarySerialization(e.to_string()))?;
-            // Reject snapshots from future versions we can't parse.
-            if snapshot.format_version > CATALOG_FORMAT_VERSION {
-                return Err(IndexError::BinarySerialization(format!(
-                    "catalog snapshot format version {} is newer than supported version {CATALOG_FORMAT_VERSION}",
-                    snapshot.format_version
-                )));
+            // Equality, both directions. This used to be `>`, so an *older*
+            // snapshot was accepted by a reader with no code to interpret
+            // one — an asymmetry against the three sibling formats that
+            // nobody had decided (see `crate::format`).
+            if let Some(detail) = crate::format::check(
+                "this catalog snapshot",
+                u64::from(snapshot.format_version),
+                u64::from(CATALOG_FORMAT_VERSION),
+            ) {
+                return Err(IndexError::UnsupportedVersion { detail });
             }
             debug!(
                 seq = snapshot.manifest_seq,
@@ -1485,7 +1489,7 @@ impl SegmentCatalog {
 ///
 /// Unlike the segment header this is compared with `>`: a snapshot from a
 /// *newer* Chronix is refused, an older one is read.
-const CATALOG_FORMAT_VERSION: u32 = 1;
+const CATALOG_FORMAT_VERSION: u32 = crate::format::CATALOG_FORMAT_VERSION;
 
 /// Serializable snapshot of the catalog state.
 #[derive(Debug, Serialize, Deserialize)]

@@ -24,6 +24,7 @@ doctest = false
 
 [dependencies]
 chronix-core.workspace = true
+postcard.workspace = true
 chronix-engine.workspace = true
 arrow.workspace = true
 fnv.workspace = true

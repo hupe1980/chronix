@@ -602,15 +602,15 @@ impl ChronixConfig {
                 message: "shard_duration must be > 0".into(),
             });
         }
-        if let Some(retention) = &self.retention {
-            if *retention < self.shard_duration {
-                return Err(ConfigError::Validation {
-                    message: format!(
-                        "retention ({retention:?}) must be >= shard_duration ({:?})",
-                        self.shard_duration
-                    ),
-                });
-            }
+        if let Some(retention) = &self.retention
+            && *retention < self.shard_duration
+        {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "retention ({retention:?}) must be >= shard_duration ({:?})",
+                    self.shard_duration
+                ),
+            });
         }
         if self.compaction_concurrency == 0 {
             return Err(ConfigError::Validation {

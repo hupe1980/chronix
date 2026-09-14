@@ -15,7 +15,7 @@
 //! request and a dead host process.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use tempfile::TempDir;
 
 /// A budget small enough that a few thousand groups cannot fit, but large

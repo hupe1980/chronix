@@ -9,8 +9,8 @@
 //! ```
 
 use chronix::chronix_analytics::compute::{
-    simd_dot_product, simd_mean, simd_min_max, simd_std_dev, simd_sum, simd_tier, simd_variance,
-    BufferPool, ComputeEngine, CpuEngine,
+    BufferPool, ComputeEngine, CpuEngine, simd_dot_product, simd_mean, simd_min_max, simd_std_dev,
+    simd_sum, simd_tier, simd_variance,
 };
 
 fn main() {

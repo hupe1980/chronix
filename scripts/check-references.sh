@@ -71,3 +71,46 @@ if [ -n "$missing" ]; then
 fi
 
 echo "all $(echo "$cited" | wc -l | tr -d ' ') cited D/R identifiers resolve"
+
+# ── Every claim in QUALITY.md §2 names a test, and that test must exist ──
+#
+# The table's whole premise is "a number without a test has already started
+# rotting", and nothing checked that the test it names is *there*. Two were
+# not: `header_older_version_rejected` had been renamed, and
+# `a_tiered_segment_is_readable_as_plain_parquet` has never existed — the
+# property it claims is real and is pinned by `cold_archive.rs`, but the
+# citation was fiction. A claim citing a test that does not exist is worse
+# than an uncited one, because it reads as evidence.
+#
+# Scope: the backticked identifiers in the table rows of §2, which is where
+# the citations live. An identifier resolves if it is a file stem or appears
+# in the source of any crate or SDK.
+echo "checking that every test QUALITY.md §2 names exists…"
+quality_missing=0
+section=$(awk '/^## 2\. Measured numbers/{f=1} /^### Throughput and latency/{f=0} f' concepts/QUALITY.md)
+ids=$(
+  printf '%s\n' "$section" \
+    | grep -E '^\|' \
+    | sed -E 's/^\|[^|]*\|[^|]*\|//' \
+    | grep -oE '`[^`]+`' | tr -d '`' \
+    | grep -oE '\b[a-z_][a-z_0-9]{8,}\b' \
+    | grep -vE '^(cargo|test|tests|nocapture|chronix|features|example|bench|lib|release|package)$' \
+    | sort -u
+)
+for id in $ids; do
+  if find crates sdks -name "$id.rs" -o -name "$id.py" 2>/dev/null | grep -q .; then
+    continue
+  fi
+  if grep -rq --include='*.rs' --include='*.py' "$id" crates sdks 2>/dev/null; then
+    continue
+  fi
+  echo "error: QUALITY.md §2 cites '$id' as pinning a claim, and it is nowhere in the tree" >&2
+  quality_missing=1
+done
+if [ "$quality_missing" -ne 0 ]; then
+  echo >&2
+  echo "A claim that names a test which does not exist reads as evidence and is" >&2
+  echo "not. Either point it at the test that really pins it, or write the test." >&2
+  exit 1
+fi
+echo "every test named in QUALITY.md §2 exists"

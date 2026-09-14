@@ -1636,11 +1636,11 @@ fn stepwise(
 
     for &(p, q) in &[(2, 2), (0, 0), (1, 0), (0, 1)] {
         let (p, q) = (p.min(max_p), q.min(max_q));
-        if let Some(s) = try_model(p, q, &mut candidates, &mut evals) {
-            if s < best_score {
-                best_score = s;
-                best = (p, q);
-            }
+        if let Some(s) = try_model(p, q, &mut candidates, &mut evals)
+            && s < best_score
+        {
+            best_score = s;
+            best = (p, q);
         }
     }
     if best_score.is_infinite() {
@@ -1669,12 +1669,12 @@ fn stepwise(
             ) else {
                 continue;
             };
-            if let Some(s) = try_model(np, nq, &mut candidates, &mut evals) {
-                if s < best_score {
-                    best_score = s;
-                    best = (np, nq);
-                    improved = true;
-                }
+            if let Some(s) = try_model(np, nq, &mut candidates, &mut evals)
+                && s < best_score
+            {
+                best_score = s;
+                best = (np, nq);
+                improved = true;
             }
         }
         if !improved || evals >= max_evals {
@@ -2374,11 +2374,11 @@ mod tests {
         let over: Vec<f64> = raw.windows(2).map(|w| w[1] - w[0]).collect();
         let ts: Vec<i64> = (0..over.len() as i64).collect();
         let mut model = ArimaModel::new(1, 0, 2);
-        if model.fit(&ts, &over).is_ok() {
-            if let ModelParams::Arima { ma_coeffs, .. } = model.params() {
-                let r = min_ma_root_modulus(ma_coeffs);
-                assert!(r > 1.0, "over-differenced fit is non-invertible: {r}");
-            }
+        if model.fit(&ts, &over).is_ok()
+            && let ModelParams::Arima { ma_coeffs, .. } = model.params()
+        {
+            let r = min_ma_root_modulus(ma_coeffs);
+            assert!(r > 1.0, "over-differenced fit is non-invertible: {r}");
         }
     }
 

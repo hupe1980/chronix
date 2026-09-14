@@ -9,7 +9,7 @@
 //! its matching bucket — making the detector seasonally aware.
 
 use crate::anomaly::error::AnomalyError;
-use crate::anomaly::traits::{validate_lengths, AnomalyDetector, AnomalyScore, DetectorType};
+use crate::anomaly::traits::{AnomalyDetector, AnomalyScore, DetectorType, validate_lengths};
 
 /// Anomaly detector with an adaptive rolling threshold.
 ///
@@ -264,10 +264,10 @@ impl AnomalyDetector for DynamicThresholdDetector {
         metrics::histogram!("chronix_anomaly_detect_duration_seconds", "method" => "dynamic_threshold").record(_start.elapsed().as_secs_f64());
 
         // Advance seasonal phase so consecutive detect() calls use the correct offset.
-        if let Some(period) = self.period {
-            if period > 0 {
-                self.seasonal_phase = (self.seasonal_phase + values.len()) % period;
-            }
+        if let Some(period) = self.period
+            && period > 0
+        {
+            self.seasonal_phase = (self.seasonal_phase + values.len()) % period;
         }
 
         Ok(scores)
@@ -320,10 +320,10 @@ impl AnomalyDetector for DynamicThresholdDetector {
         };
 
         // Advance seasonal phase for next streaming call.
-        if let Some(period) = self.period {
-            if period > 0 {
-                self.seasonal_phase = (self.seasonal_phase + 1) % period;
-            }
+        if let Some(period) = self.period
+            && period > 0
+        {
+            self.seasonal_phase = (self.seasonal_phase + 1) % period;
         }
 
         // Update ring buffer for non-seasonal rolling statistics.

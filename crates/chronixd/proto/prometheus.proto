@@ -36,10 +36,66 @@ message Exemplar {
   int64          timestamp = 3;
 }
 
+// A native histogram sample: one distribution, as one sample.
+//
+// Field numbers and semantics are Prometheus's `prompb.Histogram`. The two
+// `oneof`s exist because a histogram's counts are integers while a *float*
+// histogram — one that has been scaled, by `rate()` or by a downsample — has
+// fractional counts. Chronix stores both as `f64`, which is exact to 2^53.
+message Histogram {
+  enum ResetHint {
+    UNKNOWN = 0; // Test for a counter reset explicitly.
+    YES     = 1; // First histogram after a counter reset.
+    NO      = 2; // No reset between this sample and the previous one.
+    GAUGE   = 3; // A gauge histogram; counter resets do not apply.
+  }
+
+  oneof count {
+    uint64 count_int   = 1;
+    double count_float = 2;
+  }
+  double sum = 3;
+  // -4..=8 for exponential buckets, where each boundary is the previous one
+  // times 2^(2^-schema); -53 for custom (NHCB) boundaries in `custom_values`.
+  sint32 schema         = 4;
+  double zero_threshold = 5;
+  oneof zero_count {
+    uint64 zero_count_int   = 6;
+    double zero_count_float = 7;
+  }
+
+  repeated BucketSpan negative_spans  =  8;
+  repeated sint64     negative_deltas =  9; // integer histograms
+  repeated double     negative_counts = 10; // float histograms
+  repeated BucketSpan positive_spans  = 11;
+  repeated sint64     positive_deltas = 12;
+  repeated double     positive_counts = 13;
+
+  ResetHint reset_hint = 14;
+  // Milliseconds since epoch, as everywhere else on this wire.
+  int64 timestamp = 15;
+  // Upper-inclusive boundaries when schema == -53. Upstream marks this
+  // internal to its OTLP translation; chronix accepts it, because refusing a
+  // histogram whose boundaries are spelled out is refusing data it can store.
+  repeated double custom_values = 16;
+}
+
+// A run of consecutive populated buckets.
+//
+// `offset` is the gap from the end of the previous span, or the starting
+// index for the first span, and may be negative. The counts themselves live
+// in the flat `*_deltas` / `*_counts` arrays: the encoding is the reason a
+// sparse histogram costs a handful of bytes rather than one series per bucket.
+message BucketSpan {
+  sint32 offset = 1;
+  uint32 length = 2;
+}
+
 message TimeSeries {
-  repeated Label    labels   = 1;
-  repeated Sample   samples  = 2;
-  repeated Exemplar exemplars = 3;
+  repeated Label     labels     = 1;
+  repeated Sample    samples    = 2;
+  repeated Exemplar  exemplars  = 3;
+  repeated Histogram histograms = 4;
 }
 
 // ── Remote Write ───────────────────────────────────────────────────────

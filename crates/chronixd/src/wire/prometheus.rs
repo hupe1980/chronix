@@ -1,19 +1,36 @@
 //! Prometheus remote write and remote read handlers.
 //!
-//! - `POST /api/v1/prom/write` — accepts Snappy-compressed protobuf `WriteRequest`
+//! - `POST /api/v1/prom/write` — accepts Snappy-compressed protobuf, in either
+//!   remote-write version
 //! - `POST /api/v1/prom/read`  — accepts Snappy-compressed protobuf `ReadRequest`
 //!
-//! Wire format: content-type `application/x-protobuf`, body is Snappy-compressed.
+//! ## Two write versions, chosen by content type
+//!
+//! | `Content-Type` | version |
+//! |---|---|
+//! | `application/x-protobuf` | 1.0 |
+//! | `application/x-protobuf;proto=prometheus.WriteRequest` | 1.0 |
+//! | `application/x-protobuf;proto=io.prometheus.write.v2.Request` | 2.0 |
+//!
+//! Anything else is **415 Unsupported Media Type** naming both — which is what
+//! the specification asks for, and is how a sender discovers what a receiver
+//! speaks without a separate negotiation round trip.
+//!
+//! A 2.0 write answers with `X-Prometheus-Remote-Write-Samples-Written`,
+//! `-Histograms-Written` and `-Exemplars-Written`. They are not decoration: a
+//! receiver that quietly drops a sample and a receiver that stores it both
+//! return 204, and the counts are the only thing that tells them apart.
+//! Chronix stores no exemplars, so that header is honestly `0` rather than
+//! absent.
 //!
 //! ## Compatibility
-//!
-//! These endpoints implement the Prometheus Remote Write 1.0 and Remote Read
-//! protocols, enabling Chronix to act as a long-term storage backend for
-//! Prometheus. Configure Prometheus with:
 //!
 //! ```yaml
 //! remote_write:
 //!   - url: "http://<chronix-host>:8080/api/v1/prom/write"
+//!     # 2.0; omit for 1.0
+//!     protobuf_message: io.prometheus.write.v2.Request
+//!     send_native_histograms: true
 //!
 //! remote_read:
 //!   - url: "http://<chronix-host>:8080/api/v1/prom/read"
@@ -30,12 +47,13 @@ use axum::response::IntoResponse;
 use prost::Message;
 use tracing::debug;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
+use chronix::promql::metric::VALUE_FIELD;
 
 use crate::error::ServerError;
 use crate::http::AppState;
-use crate::prom_proto;
+use crate::{prom_proto, prom_proto_v2};
 
 /// `POST /api/v1/prom/write` — Prometheus remote write endpoint.
 ///
@@ -48,8 +66,10 @@ pub async fn remote_write_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
     axum::extract::Query(backfill): axum::extract::Query<crate::util::BackfillParam>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
+    let version = negotiate(&headers)?;
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     // Guard against decompression bombs: check the declared decompressed
     // size before allocating memory.  We cap at `max_body_size` (default
@@ -69,29 +89,124 @@ pub async fn remote_write_handler(
         .map_err(|e| ServerError::BadRequest(format!("snappy decompress error: {e}")))?;
 
     // Decode protobuf
-    let write_req = prom_proto::WriteRequest::decode(decompressed.as_slice())
-        .map_err(|e| ServerError::BadRequest(format!("protobuf decode error: {e}")))?;
-
-    let points = convert_write_request(&write_req)?;
-
-    if points.is_empty() {
-        return Ok(StatusCode::NO_CONTENT);
-    }
+    let (points, written) = match version {
+        WriteVersion::V1 => {
+            let req = prom_proto::WriteRequest::decode(decompressed.as_slice())
+                .map_err(|e| ServerError::BadRequest(format!("protobuf decode error: {e}")))?;
+            convert_write_request(&req)?
+        }
+        WriteVersion::V2 => {
+            let req = prom_proto_v2::Request::decode(decompressed.as_slice())
+                .map_err(|e| ServerError::BadRequest(format!("protobuf decode error: {e}")))?;
+            convert_write_request_v2(&req)?
+        }
+    };
 
     let count = points.len();
-
-    crate::util::insert_batch_with_mode(
-        &state.db,
-        scope.as_deref(),
-        points,
-        state.write_timeout,
-        backfill.mode(),
-    )
-    .await?;
+    if count > 0 {
+        crate::util::insert_batch_with_mode(
+            &state.db,
+            scope.as_deref(),
+            points,
+            state.write_timeout,
+            backfill.mode(),
+        )
+        .await?;
+    }
 
     debug!(count, "wrote points via Prometheus remote write");
-    metrics::counter!("chronix_prom_remote_write_samples_total").increment(count as u64);
-    Ok(StatusCode::NO_CONTENT)
+    metrics::counter!("chronix_prom_remote_write_samples_total").increment(written.samples);
+    metrics::counter!("chronix_prom_remote_write_histograms_total").increment(written.histograms);
+    Ok((StatusCode::NO_CONTENT, written.headers(version)))
+}
+
+/// Which remote-write version a request is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteVersion {
+    /// `prometheus.WriteRequest`.
+    V1,
+    /// `io.prometheus.write.v2.Request`.
+    V2,
+}
+
+/// The `proto=` parameter identifying a 2.0 body.
+const V2_PROTO: &str = "io.prometheus.write.v2.Request";
+/// The `proto=` parameter identifying a 1.0 body.
+const V1_PROTO: &str = "prometheus.WriteRequest";
+
+/// Decide which version a request carries, from its content type.
+///
+/// An absent content type is 1.0: that is what a 1.0 sender that predates the
+/// `proto=` parameter sends, and refusing it would break every existing
+/// Prometheus for the sake of strictness about a header the 1.0 specification
+/// never required.
+fn negotiate(headers: &axum::http::HeaderMap) -> Result<WriteVersion, ServerError> {
+    let Some(ct) = headers.get(axum::http::header::CONTENT_TYPE) else {
+        return Ok(WriteVersion::V1);
+    };
+    let ct = ct
+        .to_str()
+        .map_err(|_| ServerError::BadRequest("content-type is not text".into()))?;
+
+    let mut parts = ct.split(';').map(str::trim);
+    let base = parts.next().unwrap_or("").to_ascii_lowercase();
+    let proto = parts.find_map(|p| p.strip_prefix("proto=").map(str::trim));
+
+    // The media type itself is checked loosely: `application/x-protobuf` is
+    // what both versions use, and a sender that omits it while naming a
+    // `proto=` we understand has said enough.
+    match proto {
+        Some(V2_PROTO) => Ok(WriteVersion::V2),
+        Some(V1_PROTO) | None if base == "application/x-protobuf" || base.is_empty() => {
+            Ok(WriteVersion::V1)
+        }
+        Some(other) => Err(ServerError::UnsupportedMediaType(format!(
+            "remote write proto `{other}` is not supported; this receiver speaks              `{V1_PROTO}` and `{V2_PROTO}`"
+        ))),
+        None => Err(ServerError::UnsupportedMediaType(format!(
+            "content-type `{ct}` is not a remote write body; expected              `application/x-protobuf` with `proto={V1_PROTO}` or `proto={V2_PROTO}`"
+        ))),
+    }
+}
+
+/// What one request actually stored.
+///
+/// Reported back to a 2.0 sender, which is entitled to know that a 204 meant
+/// "written" rather than "discarded".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Written {
+    /// Float samples stored.
+    samples: u64,
+    /// Native histograms stored.
+    histograms: u64,
+}
+
+impl Written {
+    /// The accounting headers, which only 2.0 defines.
+    fn headers(self, version: WriteVersion) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        if version != WriteVersion::V2 {
+            return h;
+        }
+        for (name, value) in [
+            ("x-prometheus-remote-write-samples-written", self.samples),
+            (
+                "x-prometheus-remote-write-histograms-written",
+                self.histograms,
+            ),
+            // Chronix stores no exemplars. Zero is the truthful answer, and a
+            // sender reading it knows not to rely on them here.
+            ("x-prometheus-remote-write-exemplars-written", 0),
+        ] {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_str(&value.to_string()),
+            ) {
+                h.insert(name, value);
+            }
+        }
+        h
+    }
 }
 
 /// `POST /api/v1/prom/read` — Prometheus remote read endpoint.
@@ -144,9 +259,137 @@ pub async fn remote_read_handler(
     ))
 }
 
-/// Convert a Prometheus `WriteRequest` to Chronix points.
-fn convert_write_request(req: &prom_proto::WriteRequest) -> Result<Vec<Point>, ServerError> {
+/// Convert a Remote Write 2.0 `Request` to Chronix points.
+///
+/// Labels arrive as indices into a per-request symbol table, which is where
+/// 2.0's compactness comes from and also its one new failure mode: an index
+/// past the end of the table, or an odd number of them, describes a series
+/// that cannot be reconstructed. Both are refused rather than patched over,
+/// because a series assembled from the labels that *did* resolve is a
+/// different series wearing the right name.
+fn convert_write_request_v2(
+    req: &prom_proto_v2::Request,
+) -> Result<(Vec<Point>, Written), ServerError> {
+    let symbol = |i: u32| -> Result<&str, ServerError> {
+        req.symbols
+            .get(i as usize)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                ServerError::BadRequest(format!(
+                    "label reference {i} is past the end of a {}-entry symbol table",
+                    req.symbols.len()
+                ))
+            })
+    };
+
     let mut points = Vec::new();
+    let mut written = Written::default();
+
+    for ts in &req.timeseries {
+        if ts.label_refs.len() % 2 != 0 {
+            return Err(ServerError::BadRequest(format!(
+                "time series has {} label references, which is odd: they are                  name/value pairs, so an odd count leaves one name without a value",
+                ts.label_refs.len()
+            )));
+        }
+
+        let mut measurement = String::new();
+        let mut tags = BTreeMap::new();
+        for pair in ts.label_refs.as_chunks::<2>().0 {
+            let name = symbol(pair[0])?;
+            let value = symbol(pair[1])?;
+            if name == "__name__" {
+                measurement = value.to_string();
+            } else {
+                tags.insert(name.to_string(), value.to_string());
+            }
+        }
+
+        if measurement.is_empty() {
+            return Err(ServerError::BadRequest(
+                "time series missing __name__ label".into(),
+            ));
+        }
+
+        for sample in &ts.samples {
+            let Some(value) = crate::util::storable_sample(sample.value) else {
+                continue;
+            };
+            let key = SeriesKey::new(&measurement, tags.clone())
+                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+            let mut fields = BTreeMap::new();
+            fields.insert(VALUE_FIELD.to_string(), FieldValue::F64(value));
+            points.push(
+                Point::new(key, fields, sample.timestamp * 1_000_000)
+                    .map_err(|e| ServerError::BadRequest(e.to_string()))?,
+            );
+            written.samples += 1;
+        }
+
+        for h in &ts.histograms {
+            if let Some(p) = histogram_point(&measurement, &tags, &borrow_v2(h))? {
+                points.push(p);
+                written.histograms += 1;
+            }
+        }
+    }
+
+    Ok((points, written))
+}
+
+/// Borrow a 2.0 protobuf histogram into the version-neutral shape.
+///
+/// Identical to [`borrow_v1`] field for field, because the two protobuf
+/// messages are — they are two generated types for one definition, and this is
+/// the seam where that stops mattering.
+fn borrow_v2(h: &prom_proto_v2::Histogram) -> crate::wire::histogram::WireHistogram<'_> {
+    use prom_proto_v2::histogram::{Count, ZeroCount};
+    crate::wire::histogram::WireHistogram {
+        count_int: match h.count {
+            Some(Count::CountInt(v)) => Some(v),
+            _ => None,
+        },
+        count_float: match h.count {
+            Some(Count::CountFloat(v)) => Some(v),
+            _ => None,
+        },
+        sum: h.sum,
+        schema: h.schema,
+        zero_threshold: h.zero_threshold,
+        zero_count_int: match h.zero_count {
+            Some(ZeroCount::ZeroCountInt(v)) => Some(v),
+            _ => None,
+        },
+        zero_count_float: match h.zero_count {
+            Some(ZeroCount::ZeroCountFloat(v)) => Some(v),
+            _ => None,
+        },
+        negative_spans: h
+            .negative_spans
+            .iter()
+            .map(|s| (s.offset, s.length))
+            .collect(),
+        negative_deltas: &h.negative_deltas,
+        negative_counts: &h.negative_counts,
+        positive_spans: h
+            .positive_spans
+            .iter()
+            .map(|s| (s.offset, s.length))
+            .collect(),
+        positive_deltas: &h.positive_deltas,
+        positive_counts: &h.positive_counts,
+        reset_hint: h.reset_hint,
+        timestamp: h.timestamp,
+        custom_values: &h.custom_values,
+    }
+}
+
+/// Convert a Prometheus `WriteRequest` to Chronix points.
+fn convert_write_request(
+    req: &prom_proto::WriteRequest,
+) -> Result<(Vec<Point>, Written), ServerError> {
+    let mut points = Vec::new();
+    let mut written = Written::default();
 
     for ts in &req.timeseries {
         let mut measurement = String::new();
@@ -180,15 +423,128 @@ fn convert_write_request(req: &prom_proto::WriteRequest) -> Result<Vec<Point>, S
                 .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
             let mut fields = BTreeMap::new();
-            fields.insert("value".to_string(), FieldValue::F64(value));
+            fields.insert(VALUE_FIELD.to_string(), FieldValue::F64(value));
 
             let point = Point::new(key, fields, timestamp_ns)
                 .map_err(|e| ServerError::BadRequest(e.to_string()))?;
             points.push(point);
+            written.samples += 1;
+        }
+
+        for h in &ts.histograms {
+            if let Some(p) = histogram_point(&measurement, &tags, &borrow_v1(h))? {
+                points.push(p);
+                written.histograms += 1;
+            }
         }
     }
 
-    Ok(points)
+    Ok((points, written))
+}
+
+/// Borrow a v1 protobuf histogram into the version-neutral shape.
+fn borrow_v1(h: &prom_proto::Histogram) -> crate::wire::histogram::WireHistogram<'_> {
+    use prom_proto::histogram::{Count, ZeroCount};
+    crate::wire::histogram::WireHistogram {
+        count_int: match h.count {
+            Some(Count::CountInt(v)) => Some(v),
+            _ => None,
+        },
+        count_float: match h.count {
+            Some(Count::CountFloat(v)) => Some(v),
+            _ => None,
+        },
+        sum: h.sum,
+        schema: h.schema,
+        zero_threshold: h.zero_threshold,
+        zero_count_int: match h.zero_count {
+            Some(ZeroCount::ZeroCountInt(v)) => Some(v),
+            _ => None,
+        },
+        zero_count_float: match h.zero_count {
+            Some(ZeroCount::ZeroCountFloat(v)) => Some(v),
+            _ => None,
+        },
+        negative_spans: h
+            .negative_spans
+            .iter()
+            .map(|s| (s.offset, s.length))
+            .collect(),
+        negative_deltas: &h.negative_deltas,
+        negative_counts: &h.negative_counts,
+        positive_spans: h
+            .positive_spans
+            .iter()
+            .map(|s| (s.offset, s.length))
+            .collect(),
+        positive_deltas: &h.positive_deltas,
+        positive_counts: &h.positive_counts,
+        reset_hint: h.reset_hint,
+        timestamp: h.timestamp,
+        custom_values: &h.custom_values,
+    }
+}
+
+/// One wire histogram → zero or one point.
+///
+/// Zero when the sample is a staleness marker, which is a signal rather than a
+/// distribution. The field is [`VALUE_FIELD`] — the same column a float sample
+/// of the same metric would use — so the metric keeps its own name and
+/// `histogram_quantile(0.9, http_request_duration_seconds)` reads it under
+/// exactly the expression a Prometheus user already types.
+fn histogram_point(
+    measurement: &str,
+    tags: &BTreeMap<String, String>,
+    w: &crate::wire::histogram::WireHistogram<'_>,
+) -> Result<Option<Point>, ServerError> {
+    if w.is_stale_marker() {
+        return Ok(None);
+    }
+    let histogram = w.to_histogram().map_err(|e| {
+        ServerError::BadRequest(format!("metric {measurement}: native histogram: {e}"))
+    })?;
+    let key = SeriesKey::new(measurement, tags.clone())
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        VALUE_FIELD.to_string(),
+        FieldValue::Histogram(Box::new(histogram)),
+    );
+    Point::new(key, fields, w.timestamp * 1_000_000)
+        .map(Some)
+        .map_err(|e| ServerError::BadRequest(e.to_string()))
+}
+
+/// A chronix histogram → the v1 protobuf message.
+fn encode_v1(h: &chronix_core::histogram::Histogram, timestamp_ms: i64) -> prom_proto::Histogram {
+    let e = crate::wire::histogram::encode(h, timestamp_ms);
+    let spans = |v: Vec<(i32, u32)>| {
+        v.into_iter()
+            .map(|(offset, length)| prom_proto::BucketSpan { offset, length })
+            .collect()
+    };
+    prom_proto::Histogram {
+        // Always the float variant: chronix stores counts as `f64`, and a
+        // histogram a rollup has averaged genuinely has fractional counts.
+        // Claiming the integer form would round them where the reader cannot
+        // see it happen.
+        count: Some(prom_proto::histogram::Count::CountFloat(e.count)),
+        sum: e.sum,
+        schema: e.schema,
+        zero_threshold: e.zero_threshold,
+        zero_count: Some(prom_proto::histogram::ZeroCount::ZeroCountFloat(
+            e.zero_count,
+        )),
+        negative_spans: spans(e.negative_spans),
+        negative_deltas: Vec::new(),
+        negative_counts: e.negative_counts,
+        positive_spans: spans(e.positive_spans),
+        positive_deltas: Vec::new(),
+        positive_counts: e.positive_counts,
+        reset_hint: e.reset_hint,
+        timestamp: e.timestamp,
+        custom_values: e.custom_values,
+    }
 }
 
 /// Execute a Prometheus `ReadRequest` against the Chronix database.
@@ -205,6 +561,14 @@ fn execute_read_request(
     }
 
     Ok(prom_proto::ReadResponse { results })
+}
+
+/// One sample read back out of a column, before it is filed by kind.
+enum Value {
+    /// An ordinary float sample.
+    Float(f64),
+    /// A native histogram, already in wire form.
+    Histogram(Box<prom_proto::Histogram>),
 }
 
 /// One matcher that cannot be pushed into the scan, applied per series.
@@ -399,8 +763,16 @@ fn read_one_metric(
     // Group samples by tag combination → series. Streaming the scan keeps
     // peak memory to the series map plus one batch rather than the series map
     // plus every batch that fed it.
-    let mut series_map: BTreeMap<BTreeMap<String, String>, Vec<prom_proto::Sample>> =
-        BTreeMap::new();
+    // Floats and histograms are kept apart because they are different kinds of
+    // sample, not two encodings of one: a `TimeSeries` carries both lists, and
+    // squeezing a distribution through the float list is what a histogram
+    // column exists to stop.
+    #[derive(Default)]
+    struct Collected {
+        samples: Vec<prom_proto::Sample>,
+        histograms: Vec<prom_proto::Histogram>,
+    }
+    let mut series_map: BTreeMap<BTreeMap<String, String>, Collected> = BTreeMap::new();
 
     for batch in db.execute_iter(&plan).map_err(ServerError::Db)? {
         let batch = batch.map_err(ServerError::Db)?;
@@ -443,20 +815,29 @@ fn read_one_metric(
                 }
             };
 
-            let value = if let Some(vi) = val_idx {
-                let col = batch.column(vi);
-                // A row written before this field existed carries a null, and
-                // a null is not a sample of zero.
-                if arrow::array::Array::is_null(col.as_ref(), row) {
-                    continue;
+            let Some(vi) = val_idx else { continue };
+            let col = batch.column(vi);
+            // A row written before this field existed carries a null, and
+            // a null is not a sample of zero.
+            if arrow::array::Array::is_null(col.as_ref(), row) {
+                continue;
+            }
+            // A histogram column is `Binary`. Read it before the numeric
+            // cases: it has no float to fall back to, and skipping it here
+            // would make remote read silently answer nothing for a series
+            // remote write had just accepted.
+            let sample = if let Some(arr) = col.as_any().downcast_ref::<arrow::array::BinaryArray>()
+            {
+                match postcard::from_bytes::<chronix_core::histogram::Histogram>(arr.value(row)) {
+                    // One blob this build cannot decode is a gap, not a failed
+                    // query: a dashboard loses a point rather than a panel.
+                    Err(_) => continue,
+                    Ok(h) => Value::Histogram(Box::new(encode_v1(&h, timestamp_ms))),
                 }
-                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                    arr.value(row)
-                } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                    arr.value(row) as f64
-                } else {
-                    continue;
-                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                Value::Float(arr.value(row))
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                Value::Float(arr.value(row) as f64)
             } else {
                 continue;
             };
@@ -464,26 +845,27 @@ fn read_one_metric(
             let mut row_tags = BTreeMap::new();
             for (name, idx) in &tag_indices {
                 let col = batch.column(*idx);
-                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
-                    if !arr.is_null(row) {
-                        row_tags.insert(name.clone(), arr.value(row).to_string());
-                    }
+                if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>()
+                    && !arr.is_null(row)
+                {
+                    row_tags.insert(name.clone(), arr.value(row).to_string());
                 }
             }
 
-            series_map
-                .entry(row_tags)
-                .or_default()
-                .push(prom_proto::Sample {
+            let entry = series_map.entry(row_tags).or_default();
+            match sample {
+                Value::Float(value) => entry.samples.push(prom_proto::Sample {
                     value,
                     timestamp: timestamp_ms,
-                });
+                }),
+                Value::Histogram(h) => entry.histograms.push(*h),
+            }
         }
     }
 
     // Convert to TimeSeries, applying the matchers the scan could not.
     let mut result = Vec::with_capacity(series_map.len());
-    for (mut tags, samples) in series_map {
+    for (mut tags, collected) in series_map {
         // The namespace tag is the server's own bookkeeping. Returning it as
         // a label told each tenant its own scope name and, worse, made a
         // round trip through remote write and read change the series.
@@ -500,8 +882,9 @@ fn read_one_metric(
         }
         result.push(prom_proto::TimeSeries {
             labels,
-            samples,
+            samples: collected.samples,
             exemplars: Vec::new(),
+            histograms: collected.histograms,
         });
     }
 
@@ -537,10 +920,11 @@ mod tests {
                     },
                 ],
                 exemplars: vec![],
+                histograms: vec![],
             }],
         };
 
-        let points = convert_write_request(&req).unwrap();
+        let (points, _) = convert_write_request(&req).unwrap();
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].series_key().measurement(), "cpu_usage");
         assert_eq!(points[0].tag("host"), Some("srv1"));
@@ -565,6 +949,7 @@ mod tests {
                     timestamp: 1000,
                 }],
                 exemplars: vec![],
+                histograms: vec![],
             }],
         };
 
@@ -605,10 +990,11 @@ mod tests {
                     },
                 ],
                 exemplars: vec![],
+                histograms: vec![],
             }],
         };
 
-        let points = convert_write_request(&req).expect("a staleness marker must not 400");
+        let (points, _) = convert_write_request(&req).expect("a staleness marker must not 400");
         assert_eq!(
             points.len(),
             2,
@@ -637,16 +1023,17 @@ mod tests {
                     },
                 ],
                 exemplars: vec![],
+                histograms: vec![],
             }],
         };
-        let points = convert_write_request(&req).expect("must not 400");
+        let (points, _) = convert_write_request(&req).expect("must not 400");
         assert_eq!(points.len(), 1);
     }
 
     #[test]
     fn convert_write_request_empty() {
         let req = prom_proto::WriteRequest { timeseries: vec![] };
-        let points = convert_write_request(&req).unwrap();
+        let (points, _) = convert_write_request(&req).unwrap();
         assert!(points.is_empty());
     }
 
@@ -670,6 +1057,7 @@ mod tests {
                         timestamp: 100,
                     }],
                     exemplars: vec![],
+                    histograms: vec![],
                 },
                 prom_proto::TimeSeries {
                     labels: vec![
@@ -687,11 +1075,12 @@ mod tests {
                         timestamp: 200,
                     }],
                     exemplars: vec![],
+                    histograms: vec![],
                 },
             ],
         };
 
-        let points = convert_write_request(&req).unwrap();
+        let (points, _) = convert_write_request(&req).unwrap();
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].series_key().measurement(), "cpu");
         assert_eq!(points[1].series_key().measurement(), "mem");
@@ -710,6 +1099,7 @@ mod tests {
                     timestamp: 1000,
                 }],
                 exemplars: vec![],
+                histograms: vec![],
             }],
         };
 

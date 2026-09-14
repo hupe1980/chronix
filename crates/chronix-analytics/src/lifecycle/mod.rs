@@ -24,6 +24,6 @@ pub mod registry;
 pub use ab_test::{ABTestConfig, ABTestEvaluator, ABTestResult, PromotionCriteria};
 pub use accuracy::{AccuracyTracker, AccuracyTrackerConfig};
 pub use adwin::Adwin;
-pub use drift::{DriftAction, DriftCallback, DriftDetector, DriftMonitor, DriftReport};
+pub use drift::{DriftAction, DriftCallback, DriftDetector, DriftMonitor, ModelDriftReport};
 pub use error::{LifecycleError, Result};
-pub use registry::{AccuracyMetrics, ModelRegistry, ModelTag, ModelVersion};
+pub use registry::{ModelRegistry, ModelTag, ModelVersion, VersionAccuracy};

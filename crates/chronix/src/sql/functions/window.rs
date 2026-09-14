@@ -355,10 +355,10 @@ where
         .map(|series| {
             let mut out = vec![f64::NAN; n];
             for i in first..=last {
-                if values[i].is_finite() {
-                    if let Some(c) = series.get(i - first) {
-                        out[i] = *c;
-                    }
+                if values[i].is_finite()
+                    && let Some(c) = series.get(i - first)
+                {
+                    out[i] = *c;
                 }
             }
             out

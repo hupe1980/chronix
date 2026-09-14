@@ -40,6 +40,7 @@ mod prometheus_wire_tests {
                         },
                     ],
                     exemplars: vec![],
+                    histograms: vec![],
                 },
                 prom_proto::TimeSeries {
                     labels: vec![
@@ -61,6 +62,7 @@ mod prometheus_wire_tests {
                         timestamp: 1700000000000,
                     }],
                     exemplars: vec![],
+                    histograms: vec![],
                 },
             ],
         };

@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use chronix::prelude::*;
 use chronix::promql::{self, PromQLEvaluator, PromQLValue};
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const NOW: i64 = 1_700_000_000_000_000_000;
 
@@ -101,6 +101,30 @@ fn fixture(dir: &tempfile::TempDir) -> Arc<Chronix> {
             Point::new(
                 SeriesKey::new("chronix_points_written_total", tags! {}).unwrap(),
                 fields! { "value" => i as f64 },
+                ts,
+            )
+            .unwrap(),
+        );
+        // The data-model page's native-histogram examples. Stored as a
+        // histogram column under `value`, which is exactly what remote write
+        // and OTLP ingest produce, so `http_latency` is the metric name — and
+        // the `histogram_*` family has something to read. Without it those six
+        // examples were six empty graphs.
+        let mut h = chronix::chronix_core::histogram::Histogram::empty(3);
+        h.zero_threshold = 1e-6;
+        for k in 0..20 {
+            h.observe(0.005 + f64::from(k) * 0.05);
+        }
+        h.canonicalise();
+        let mut hfields = std::collections::BTreeMap::new();
+        hfields.insert(
+            "value".to_string(),
+            FieldValue::Histogram(Box::new(h.clone())),
+        );
+        points.push(
+            Point::new(
+                SeriesKey::new("http_latency", tags! { "job" => "api" }).unwrap(),
+                hfields,
                 ts,
             )
             .unwrap(),
@@ -203,8 +227,8 @@ fn curl_queries(text: &str) -> Vec<String> {
 /// documented alert condition, which tests the fixture rather than the docs.
 fn under_threshold(expr: &promql::Expr) -> &promql::Expr {
     use promql::{BinaryOp, Expr};
-    if let Expr::BinaryExpr { op, lhs, rhs, .. } = expr {
-        if matches!(
+    if let Expr::BinaryExpr { op, lhs, rhs, .. } = expr
+        && matches!(
             op,
             BinaryOp::Gtr
                 | BinaryOp::Lss
@@ -212,13 +236,13 @@ fn under_threshold(expr: &promql::Expr) -> &promql::Expr {
                 | BinaryOp::Lte
                 | BinaryOp::Eql
                 | BinaryOp::Neq
-        ) {
-            if matches!(**rhs, Expr::NumberLiteral(_)) {
-                return under_threshold(lhs);
-            }
-            if matches!(**lhs, Expr::NumberLiteral(_)) {
-                return under_threshold(rhs);
-            }
+        )
+    {
+        if matches!(**rhs, Expr::NumberLiteral(_)) {
+            return under_threshold(lhs);
+        }
+        if matches!(**lhs, Expr::NumberLiteral(_)) {
+            return under_threshold(rhs);
         }
     }
     expr

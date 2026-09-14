@@ -14,7 +14,7 @@
 //! would make every doc example a second copy of a semantics test.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::sync::Arc;
 
 /// Measurements and columns the documented examples use.

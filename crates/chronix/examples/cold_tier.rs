@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use chronix::cold_archive::ArchiveConfig;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

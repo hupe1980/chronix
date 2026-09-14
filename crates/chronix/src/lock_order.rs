@@ -59,14 +59,14 @@ fn push_level(level: usize) {
 fn pop_level(level: usize) {
     HELD_LEVELS.with(|h| {
         let mut stack = h.borrow_mut();
-        if let Some(&top) = stack.last() {
-            if top == level {
-                stack.pop();
-            }
-            // If top != level, the guard was moved across threads or
-            // dropped out of order — we silently skip rather than panic
-            // to avoid double-panic on unwind.
+        if let Some(&top) = stack.last()
+            && top == level
+        {
+            stack.pop();
         }
+        // If top != level, the guard was moved across threads or
+        // dropped out of order — we silently skip rather than panic
+        // to avoid double-panic on unwind.
     });
 }
 

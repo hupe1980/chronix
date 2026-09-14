@@ -33,7 +33,7 @@ mod reader;
 mod sink;
 mod writer;
 
-pub use reader::{replay_all, replay_range, WalReader, WalRecord};
+pub use reader::{WalReader, WalRecord, replay_all, replay_range};
 pub use sink::WalSink;
 pub use writer::WalWriter;
 
@@ -44,7 +44,7 @@ pub const WAL_MAGIC: &[u8; 4] = b"CXWL";
 ///
 /// Checked for equality by the reader. The number counts released formats,
 /// not the times the layout changed before anyone could see one.
-pub const WAL_VERSION: u16 = 1;
+pub const WAL_VERSION: u16 = crate::format::WAL_FORMAT_VERSION;
 
 /// WAL file header size: 4 (magic) + 2 (version) = 6 bytes.
 pub const WAL_HEADER_SIZE: usize = 6;

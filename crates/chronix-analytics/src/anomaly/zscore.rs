@@ -4,7 +4,7 @@ use crate::compute::{simd_mean, simd_variance};
 
 use crate::anomaly::error::AnomalyError;
 use crate::anomaly::traits::{
-    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+    AnomalyDetector, AnomalyScore, DetectorType, scale_floor, validate_lengths,
 };
 
 /// Flags points whose absolute Z-Score exceeds a configurable threshold.

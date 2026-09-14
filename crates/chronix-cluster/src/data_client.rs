@@ -14,8 +14,8 @@ use tracing::{debug, warn};
 use chronix_meta::NodeId;
 
 use crate::data_service::proto::{
-    data_service_client::DataServiceClient, DataPoint, QueryRegionRequest, QueryRegionResponse,
-    ReplicateRequest, ReplicateResponse, WriteRegionRequest, WriteRegionResponse,
+    DataPoint, QueryRegionRequest, QueryRegionResponse, ReplicateRequest, ReplicateResponse,
+    WriteRegionRequest, WriteRegionResponse, data_service_client::DataServiceClient,
 };
 use crate::error::{ClusterError, Result};
 

@@ -38,7 +38,7 @@ mod propagation;
 pub use config::{LogFormat, OtlpConfig, SamplingStrategy, TracingConfig};
 #[cfg(feature = "otlp")]
 pub use init::replace_tracer_provider;
-pub use init::{init_tracing, is_otel_active, update_log_filter, TracingGuard};
+pub use init::{TracingGuard, init_tracing, is_otel_active, update_log_filter};
 pub use propagation::{
     extract_trace_context, inject_trace_context, make_trace_interceptor, with_trace_context,
 };

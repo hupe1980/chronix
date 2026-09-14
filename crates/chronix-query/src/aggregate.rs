@@ -99,7 +99,10 @@ pub const AVG_EXTRA_SCALE: u8 = 6;
 /// array: `sum`, `min`, `max`, `first` and `last` over exact values are
 /// themselves exact, and turning them into a `double` on the way out would
 /// undo the whole point of the column.
-#[derive(Debug, Clone, Copy, PartialEq)]
+// No longer `Copy`: a merged histogram owns its buckets. Every call site
+// that relied on the implicit copy now clones explicitly, which is the
+// honest cost of a variant that carries a distribution.
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggResult {
     /// SQL `NULL` — an empty bucket, or a result that overflowed.
     Null,
@@ -112,6 +115,13 @@ pub enum AggResult {
         /// Digits after the decimal point.
         scale: u8,
     },
+    /// A merged native histogram.
+    ///
+    /// The aggregate of a distribution is a distribution, not a number —
+    /// which is why this is a variant rather than something `as_f64` can
+    /// answer. `sum` merges, `avg` merges and scales; `min` and `max` are
+    /// undefined over distributions and are refused rather than guessed.
+    Histogram(Box<chronix_core::histogram::Histogram>),
 }
 
 impl AggResult {
@@ -129,6 +139,10 @@ impl AggResult {
             Self::Decimal { mantissa, scale } => {
                 Some(mantissa as f64 / chronix_core::pow10(u32::from(scale)).unwrap_or(1) as f64)
             }
+            // A distribution has no `f64` it *is*. Collapsing it to its sum
+            // or its mean here would hand every caller that forgot to ask a
+            // number that looks like an answer.
+            Self::Histogram(_) => None,
         }
     }
 }
@@ -144,6 +158,23 @@ impl AggResult {
 /// is homogeneous by construction — they come from one accumulator over one
 /// input column — so the first non-null one decides.
 pub fn agg_result_column(name: &str, results: &[AggResult]) -> Result<(Field, ArrayRef)> {
+    // A histogram aggregate produces a histogram column, encoded the way the
+    // storage layer encodes one — so a rollup tier's target holds the same
+    // thing its source did, rather than a number derived from it.
+    if results.iter().any(|r| matches!(r, AggResult::Histogram(_))) {
+        let blobs: Vec<Option<Vec<u8>>> = results
+            .iter()
+            .map(|r| match r {
+                AggResult::Histogram(h) => postcard::to_allocvec(h.as_ref()).ok(),
+                _ => None,
+            })
+            .collect();
+        let refs: Vec<Option<&[u8]>> = blobs.iter().map(|b| b.as_deref()).collect();
+        return Ok((
+            Field::new(name, DataType::Binary, true),
+            Arc::new(arrow::array::BinaryArray::from(refs)),
+        ));
+    }
     let scale = results.iter().find_map(|r| match r {
         AggResult::Decimal { scale, .. } => Some(*scale),
         _ => None,
@@ -170,7 +201,7 @@ pub fn agg_result_column(name: &str, results: &[AggResult]) -> Result<(Field, Ar
             Ok((field, Arc::new(array)))
         }
         None => {
-            let values: Vec<Option<f64>> = results.iter().map(|r| r.as_f64()).collect();
+            let values: Vec<Option<f64>> = results.iter().map(|r| r.clone().as_f64()).collect();
             Ok((
                 Field::new(name, DataType::Float64, true),
                 Arc::new(Float64Array::from(values)),
@@ -637,10 +668,10 @@ pub fn aggregate_grouped(
 fn aggregate_column_ts(col: &dyn Array, func: AggFn, timestamps: Option<&Int64Array>) -> AggResult {
     // For First/Last with a timestamp column, find the index of the
     // min/max timestamp and return the value at that index.
-    if let Some(ts) = timestamps {
-        if matches!(func, AggFn::First | AggFn::Last) {
-            return first_last_by_ts(col, ts, func);
-        }
+    if let Some(ts) = timestamps
+        && matches!(func, AggFn::First | AggFn::Last)
+    {
+        return first_last_by_ts(col, ts, func);
     }
 
     // A decimal column is folded exactly, through the same accumulator the
@@ -929,14 +960,14 @@ impl IncrementalAccumulator {
                     }
                 }
                 Num::Dec(mantissa, scale) => {
-                    if let Some(track) = self.decimal.as_deref_mut() {
-                        if let Some(m) = track.align(mantissa, scale) {
-                            if first {
-                                track.first = m;
-                            }
-                            if last {
-                                track.last = m;
-                            }
+                    if let Some(track) = self.decimal.as_deref_mut()
+                        && let Some(m) = track.align(mantissa, scale)
+                    {
+                        if first {
+                            track.first = m;
+                        }
+                        if last {
+                            track.last = m;
                         }
                     }
                 }
@@ -1539,45 +1570,45 @@ impl UngroupedState {
                     if let Some(s) = arrow_agg::sum(a) {
                         self.sums[fi] += s;
                     }
-                    if let Some(m) = arrow_agg::min(a) {
-                        if m < self.mins[fi] {
-                            self.mins[fi] = m;
-                        }
+                    if let Some(m) = arrow_agg::min(a)
+                        && m < self.mins[fi]
+                    {
+                        self.mins[fi] = m;
                     }
-                    if let Some(m) = arrow_agg::max(a) {
-                        if m > self.maxs[fi] {
-                            self.maxs[fi] = m;
-                        }
+                    if let Some(m) = arrow_agg::max(a)
+                        && m > self.maxs[fi]
+                    {
+                        self.maxs[fi] = m;
                     }
                 }
                 TypedColumn::Int64(a) => {
                     if let Some(s) = arrow_agg::sum(a) {
                         self.sums[fi] += s as f64;
                     }
-                    if let Some(m) = arrow_agg::min(a) {
-                        if (m as f64) < self.mins[fi] {
-                            self.mins[fi] = m as f64;
-                        }
+                    if let Some(m) = arrow_agg::min(a)
+                        && (m as f64) < self.mins[fi]
+                    {
+                        self.mins[fi] = m as f64;
                     }
-                    if let Some(m) = arrow_agg::max(a) {
-                        if (m as f64) > self.maxs[fi] {
-                            self.maxs[fi] = m as f64;
-                        }
+                    if let Some(m) = arrow_agg::max(a)
+                        && (m as f64) > self.maxs[fi]
+                    {
+                        self.maxs[fi] = m as f64;
                     }
                 }
                 TypedColumn::UInt64(a) => {
                     if let Some(s) = arrow_agg::sum(a) {
                         self.sums[fi] += s as f64;
                     }
-                    if let Some(m) = arrow_agg::min(a) {
-                        if (m as f64) < self.mins[fi] {
-                            self.mins[fi] = m as f64;
-                        }
+                    if let Some(m) = arrow_agg::min(a)
+                        && (m as f64) < self.mins[fi]
+                    {
+                        self.mins[fi] = m as f64;
                     }
-                    if let Some(m) = arrow_agg::max(a) {
-                        if (m as f64) > self.maxs[fi] {
-                            self.maxs[fi] = m as f64;
-                        }
+                    if let Some(m) = arrow_agg::max(a)
+                        && (m as f64) > self.maxs[fi]
+                    {
+                        self.maxs[fi] = m as f64;
                     }
                 }
                 TypedColumn::Decimal(a, scale) => {
@@ -1613,45 +1644,45 @@ impl UngroupedState {
             // First/Last: find value at the row with min/max timestamp.
             // This is inherently a scatter operation (argmin/argmax + value
             // lookup), so a single linear scan per batch is optimal.
-            if self.needs_first_last {
-                if let Some(ts) = ts_col {
-                    let n = ts.len().min(col.len());
-                    for i in 0..n {
-                        if ts.is_null(i) || col.is_null(i) {
-                            continue;
+            if self.needs_first_last
+                && let Some(ts) = ts_col
+            {
+                let n = ts.len().min(col.len());
+                for i in 0..n {
+                    if ts.is_null(i) || col.is_null(i) {
+                        continue;
+                    }
+                    let t = ts.value(i);
+                    if let Some(v) = typed.value_num(i) {
+                        let first = t < self.first_ts[fi] || !self.first_set[fi];
+                        // `>=` so last-encountered wins on ties.
+                        let last = t >= self.last_ts[fi] || !self.last_set[fi];
+                        if first {
+                            self.first_ts[fi] = t;
+                            self.first_set[fi] = true;
                         }
-                        let t = ts.value(i);
-                        if let Some(v) = typed.value_num(i) {
-                            let first = t < self.first_ts[fi] || !self.first_set[fi];
-                            // `>=` so last-encountered wins on ties.
-                            let last = t >= self.last_ts[fi] || !self.last_set[fi];
-                            if first {
-                                self.first_ts[fi] = t;
-                                self.first_set[fi] = true;
+                        if last {
+                            self.last_ts[fi] = t;
+                            self.last_set[fi] = true;
+                        }
+                        match v {
+                            Num::F64(x) => {
+                                if first {
+                                    self.first_val[fi] = x;
+                                }
+                                if last {
+                                    self.last_val[fi] = x;
+                                }
                             }
-                            if last {
-                                self.last_ts[fi] = t;
-                                self.last_set[fi] = true;
-                            }
-                            match v {
-                                Num::F64(x) => {
+                            Num::Dec(mantissa, scale) => {
+                                let track = self.decimals[fi]
+                                    .get_or_insert_with(|| Box::new(DecimalTrack::new(scale)));
+                                if let Some(m) = track.align(mantissa, scale) {
                                     if first {
-                                        self.first_val[fi] = x;
+                                        track.first = m;
                                     }
                                     if last {
-                                        self.last_val[fi] = x;
-                                    }
-                                }
-                                Num::Dec(mantissa, scale) => {
-                                    let track = self.decimals[fi]
-                                        .get_or_insert_with(|| Box::new(DecimalTrack::new(scale)));
-                                    if let Some(m) = track.align(mantissa, scale) {
-                                        if first {
-                                            track.first = m;
-                                        }
-                                        if last {
-                                            track.last = m;
-                                        }
+                                        track.last = m;
                                     }
                                 }
                             }

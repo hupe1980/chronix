@@ -4,7 +4,7 @@ use crate::promql::ast::{
     AggregationModifier, AggregationOp, AtModifier, BinaryOp, Duration, Expr, LabelMatcher,
     MatchOp, UnaryOp, VectorMatching, VectorMatchingCardinality,
 };
-use crate::promql::lexer::{lex, Token};
+use crate::promql::lexer::{Token, lex};
 
 use std::fmt;
 

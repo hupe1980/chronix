@@ -15,8 +15,8 @@
 //! During migration, reads continue to be served from the source; writes are
 //! forwarded to the source leader until the routing table switches.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tracing::{debug, info, warn};
@@ -25,7 +25,7 @@ use chronix_meta::{MetaCommand, NodeId, RegionId, RegionState};
 
 use crate::client::MetaClient;
 use crate::data_client::DataGrpcClient;
-use crate::data_service::{core_to_proto_point, RegionQuery, RegionStorage};
+use crate::data_service::{RegionQuery, RegionStorage, core_to_proto_point};
 use crate::error::Result;
 use crate::region::RegionManager;
 

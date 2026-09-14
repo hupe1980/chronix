@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use arrow::array::Array;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 /// A counter incrementing by 1 every second, written in `flushes` segments so
 /// the scan produces at least that many batches.

@@ -40,7 +40,7 @@ pub const MAGIC: [u8; 4] = *b"CXSG";
 /// this reader did not write is refused rather than guessed at.
 ///
 /// [`ColumnBlockMeta::validity_length`]: crate::segment::metadata::ColumnBlockMeta::validity_length
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = crate::format::SEGMENT_FORMAT_VERSION;
 
 /// Size of the serialized header in bytes.
 pub const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 8 + 8 + 8 + 2 + 4 + 1 + 1;
@@ -121,7 +121,14 @@ impl SegmentHeader {
         // reading one would produce a batch whose time column has the name
         // this version stopped using.
         if version != VERSION {
-            return Err(SegmentError::UnsupportedVersion { version });
+            return Err(SegmentError::UnsupportedVersion {
+                version,
+                detail: crate::format::version_mismatch(
+                    "this `.csx` segment",
+                    u64::from(version),
+                    u64::from(VERSION),
+                ),
+            });
         }
 
         let flags = u16::from_le_bytes([data[6], data[7]]);

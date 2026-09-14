@@ -16,8 +16,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;

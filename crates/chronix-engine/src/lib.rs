@@ -24,6 +24,7 @@
 pub mod cache;
 pub mod compaction;
 pub mod durable;
+pub mod format;
 pub mod index;
 pub mod memtable;
 #[cfg(feature = "object-store")]

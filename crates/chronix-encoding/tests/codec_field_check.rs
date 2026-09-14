@@ -8,8 +8,8 @@
 //! a candidate in the adaptive selector.
 
 use chronix_encoding::{AlpDecoder, AlpEncoder, Chimp128Encoder};
-use pco::standalone::{simple_compress, simple_decompress};
 use pco::ChunkConfig;
+use pco::standalone::{simple_compress, simple_decompress};
 
 fn workloads() -> Vec<(&'static str, Vec<f64>)> {
     vec![

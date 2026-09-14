@@ -25,11 +25,18 @@ pub enum SegmentError {
         actual: u32,
     },
 
-    /// Unsupported segment version.
-    #[error("unsupported segment version: {version}")]
+    /// The segment belongs to a different format generation.
+    ///
+    /// The message is built by [`crate::format::version_mismatch`], so every
+    /// durable format says the same thing in the same words — and names the
+    /// remedy rather than printing a bare number, which is what this used to
+    /// do.
+    #[error("{detail}")]
     UnsupportedVersion {
         /// The version number found in the file.
         version: u16,
+        /// What was read, what this build expects, and what to do.
+        detail: String,
     },
 
     /// An I/O error occurred.

@@ -10,9 +10,9 @@
 
 use chronix::chronix_analytics::preprocess::auto_features::auto_features;
 use chronix::chronix_analytics::preprocess::{
-    detect_period, diff, ewm, lag, pct_change, rolling_std, stl_decompose, AutoFeatureConfig,
-    ExponentialSmoother, GapDetector, Interpolator, MovingAverageSmoother, PreprocessConfig,
-    PreprocessPipeline, ResampleConfig, Resampler, Smoother, StlConfig, WeightedMovingAverage,
+    AutoFeatureConfig, ExponentialSmoother, GapDetector, Interpolator, MovingAverageSmoother,
+    PreprocessConfig, PreprocessPipeline, ResampleConfig, Resampler, Smoother, StlConfig,
+    WeightedMovingAverage, detect_period, diff, ewm, lag, pct_change, rolling_std, stl_decompose,
 };
 
 fn main() {

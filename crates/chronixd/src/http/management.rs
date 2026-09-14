@@ -11,8 +11,8 @@ use tracing::debug;
 use crate::error::ServerError;
 
 use super::types::{
-    measurement_schema_to_info, AppState, MeasurementInfo, PaginatedResponse, PaginationParams,
-    TimeRangeRequest, DEFAULT_LIST_LIMIT,
+    AppState, DEFAULT_LIST_LIMIT, MeasurementInfo, PaginatedResponse, PaginationParams,
+    TimeRangeRequest, measurement_schema_to_info,
 };
 
 // ── Measurement handlers ───────────────────────────────────────────────
@@ -147,7 +147,7 @@ pub async fn declare_field_handler(
             other => {
                 return Err(ServerError::BadRequest(format!(
                     "'scale' applies only to a decimal column, not to {other}"
-                )))
+                )));
             }
         }
     }

@@ -77,6 +77,21 @@ pub enum ColumnType {
     U64,
     /// Boolean.
     Bool,
+    /// A Prometheus native histogram — a whole distribution per sample.
+    ///
+    /// Unlike every other column type this one is a **composite**: a value
+    /// carries its own count, sum, resolution and sparse buckets. It is
+    /// stored as an opaque encoded blob and read through the `histogram_*`
+    /// family rather than through arithmetic, which is also how Prometheus
+    /// models it.
+    ///
+    /// The *resolution* is deliberately **not** part of the column type, as
+    /// the decimal scale is. A scale must be fixed at the column because two
+    /// scales produce two incompatible Arrow types; two histogram schemas
+    /// produce the same Arrow type and are merged by re-bucketing to the
+    /// coarser, so a target that changes resolution stays readable.
+    Histogram,
+
     /// Exact fixed-point decimal with a fixed number of fractional digits.
     ///
     /// The scale is part of the column's type, not of each value, and it is
@@ -114,6 +129,7 @@ impl ColumnType {
             FieldValue::Bool(_) => Self::Bool,
             FieldValue::String(_) => Self::String,
             FieldValue::Decimal(d) => Self::Decimal { scale: d.scale() },
+            FieldValue::Histogram(_) => Self::Histogram,
         }
     }
 
@@ -152,6 +168,7 @@ impl fmt::Display for ColumnType {
             Self::I64 => write!(f, "i64"),
             Self::U64 => write!(f, "u64"),
             Self::Bool => write!(f, "bool"),
+            Self::Histogram => write!(f, "histogram"),
             // The precision is fixed at 38 for every decimal column, so the
             // scale is the only part worth printing — but printing it in
             // SQL's own `decimal(p,s)` shape keeps the error message and the
@@ -475,16 +492,16 @@ impl MeasurementSchema {
             return Ok(false);
         }
         SeriesKey::validate_name(name, "field name")?;
-        if let ColumnType::Decimal { scale } = column_type {
-            if scale > crate::decimal::MAX_DECIMAL_SCALE {
-                return Err(SchemaError::InvalidFieldValue {
-                    field: name.to_string(),
-                    reason: format!(
-                        "decimal scale {scale} exceeds the maximum of {}",
-                        crate::decimal::MAX_DECIMAL_SCALE
-                    ),
-                });
-            }
+        if let ColumnType::Decimal { scale } = column_type
+            && scale > crate::decimal::MAX_DECIMAL_SCALE
+        {
+            return Err(SchemaError::InvalidFieldValue {
+                field: name.to_string(),
+                reason: format!(
+                    "decimal scale {scale} exceeds the maximum of {}",
+                    crate::decimal::MAX_DECIMAL_SCALE
+                ),
+            });
         }
         let idx = self.columns.len();
         self.columns.push(ColumnDef {
@@ -1208,13 +1225,17 @@ mod tests {
             .declare_field("z1nb", ColumnType::Decimal { scale: 4 })
             .unwrap();
         // Fewer places: widened losslessly at write time, no schema change.
-        assert!(!schema
-            .add_field("z1nb", &FieldValue::Decimal("1.5".parse().unwrap()))
-            .unwrap());
+        assert!(
+            !schema
+                .add_field("z1nb", &FieldValue::Decimal("1.5".parse().unwrap()))
+                .unwrap()
+        );
         // Trailing zeros past the column's scale are still exact.
-        assert!(!schema
-            .add_field("z1nb", &FieldValue::Decimal("1.50000".parse().unwrap()))
-            .unwrap());
+        assert!(
+            !schema
+                .add_field("z1nb", &FieldValue::Decimal("1.50000".parse().unwrap()))
+                .unwrap()
+        );
         // A real fifth digit would have to be rounded.
         let err = schema
             .add_field("z1nb", &FieldValue::Decimal("1.00005".parse().unwrap()))

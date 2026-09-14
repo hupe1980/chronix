@@ -128,10 +128,10 @@ impl super::Chronix {
             .is_some_and(|id| *id == std::thread::current().id());
         if !on_maintenance_thread {
             let handle = self.maintenance_thread.lock().take();
-            if let Some(handle) = handle {
-                if handle.join().is_err() {
-                    warn!("maintenance thread panicked");
-                }
+            if let Some(handle) = handle
+                && handle.join().is_err()
+            {
+                warn!("maintenance thread panicked");
             }
         }
 
@@ -469,11 +469,11 @@ impl super::Chronix {
                 // A measurement with its own retention — a rollup tier kept
                 // for years beside raw data kept for days — is judged by
                 // that, not by the global cutoff that expired the shard.
-                if let Some(&own_cutoff) = per_measurement_cutoffs.get(&entry.measurement) {
-                    if entry.max_timestamp >= own_cutoff {
-                        protected.insert(entry.segment_id);
-                        continue;
-                    }
+                if let Some(&own_cutoff) = per_measurement_cutoffs.get(&entry.measurement)
+                    && entry.max_timestamp >= own_cutoff
+                {
+                    protected.insert(entry.segment_id);
+                    continue;
                 }
                 if !self.rollups_materialised_past(&entry.measurement, shard_end.saturating_add(1))
                 {
@@ -1112,10 +1112,10 @@ impl super::Chronix {
     /// Remove a segment's file and its series sidecar, tolerating a file that
     /// is already gone.
     fn unlink_segment_files(path: &std::path::Path) {
-        if let Err(e) = std::fs::remove_file(path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %path.display(), error = %e, "failed to remove segment file");
-            }
+        if let Err(e) = std::fs::remove_file(path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), error = %e, "failed to remove segment file");
         }
         if let Err(e) = chronix_engine::index::series_index::remove(path) {
             warn!(path = %path.display(), error = %e, "failed to remove series index");
@@ -1292,7 +1292,7 @@ impl super::Chronix {
             .read()
             .pending_measurement_drops()
             .iter()
-            .filter(|(_, &deadline)| reference_ms >= deadline)
+            .filter(|&(_, &deadline)| reference_ms >= deadline)
             .map(|(m, _)| m.clone())
             .collect();
 

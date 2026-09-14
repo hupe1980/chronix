@@ -6,8 +6,8 @@ use std::sync::{Arc, OnceLock};
 
 use crate::anomaly::AnomalyDetector;
 use crate::forecast::ForecastModel;
-use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use metrics::counter;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -121,12 +121,12 @@ fn validate_name(name: &str, reserved: &[&str]) -> Result<(), PluginError> {
         )));
     }
     let mut chars = name.chars();
-    if let Some(first) = chars.next() {
-        if !first.is_ascii_alphabetic() {
-            return Err(PluginError::InvalidName(format!(
-                "plugin name must start with an ASCII letter, got {first:?}"
-            )));
-        }
+    if let Some(first) = chars.next()
+        && !first.is_ascii_alphabetic()
+    {
+        return Err(PluginError::InvalidName(format!(
+            "plugin name must start with an ASCII letter, got {first:?}"
+        )));
     }
     for ch in chars {
         if !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' {

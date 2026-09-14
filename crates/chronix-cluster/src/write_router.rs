@@ -16,7 +16,7 @@ use chronix_meta::{NodeId, RegionId, RouteEntry};
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::data_client::DataGrpcClient;
-use crate::data_service::{core_to_proto_point, RegionStorage};
+use crate::data_service::{RegionStorage, core_to_proto_point};
 use crate::dedup::DeduplicationCache;
 use crate::error::{ClusterError, Result};
 use crate::metrics::{

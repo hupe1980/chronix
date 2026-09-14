@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use chronix_core::types::{FieldValue, Point, SeriesKey};

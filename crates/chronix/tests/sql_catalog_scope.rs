@@ -13,7 +13,7 @@
 //! first thing anyone types in a SQL shell.
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::sync::Arc;
 
 const NOW: i64 = 1_700_000_000_000_000_000;

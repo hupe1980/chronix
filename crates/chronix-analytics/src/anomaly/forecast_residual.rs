@@ -8,7 +8,7 @@ use crate::forecast::ModelParams;
 use crate::forecast::SesModel;
 
 use crate::anomaly::error::AnomalyError;
-use crate::anomaly::traits::{validate_lengths, AnomalyDetector, AnomalyScore, DetectorType};
+use crate::anomaly::traits::{AnomalyDetector, AnomalyScore, DetectorType, validate_lengths};
 
 /// Anomaly detector based on forecast residuals.
 ///
@@ -92,15 +92,16 @@ impl<'de> serde::Deserialize<'de> for ForecastResidualDetector {
         };
 
         // Automatically refit the model from stored training data.
-        if det.fitted && !det.train_ts.is_empty() {
-            if let Err(e) = det.refit() {
-                tracing::warn!(
-                    error = %e,
-                    "failed to refit forecast model during deserialization; \
-                     detector will need manual refit()"
-                );
-                det.fitted = false;
-            }
+        if det.fitted
+            && !det.train_ts.is_empty()
+            && let Err(e) = det.refit()
+        {
+            tracing::warn!(
+                error = %e,
+                "failed to refit forecast model during deserialization; \
+                 detector will need manual refit()"
+            );
+            det.fitted = false;
         }
 
         Ok(det)

@@ -115,8 +115,8 @@ async fn admin_heartbeat() {
     // Verify heartbeat updated in out-of-band store.
     let sm = store.state_machine();
     let hb_data = sm.heartbeat_data();
-    let (gen, _ts) = hb_data.get(&10).expect("heartbeat recorded");
-    assert_eq!(*gen, 1);
+    let (generation, _ts) = hb_data.get(&10).expect("heartbeat recorded");
+    assert_eq!(*generation, 1);
 }
 
 #[tokio::test]

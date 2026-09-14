@@ -68,7 +68,7 @@ impl Chronix {
                         "forecast: unknown model {name:?}; expected one of \"ses\", \"holt\", \
                          \"holt_winters\", \"arima\", \"sarima\", \"linear_regression\", \
                          or a name registered with the model registry"
-                    )))
+                    )));
                 }
             },
         };
@@ -193,7 +193,7 @@ impl Chronix {
                          \"zscore\", \"modified_zscore\", \"iqr\", \"dynamic_threshold\", \
                          \"forecast_residual\", \"moving_average\", or a name registered \
                          with the detector registry"
-                    )))
+                    )));
                 }
             },
         };

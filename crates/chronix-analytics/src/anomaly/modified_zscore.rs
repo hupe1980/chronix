@@ -2,7 +2,7 @@
 
 use crate::anomaly::error::AnomalyError;
 use crate::anomaly::traits::{
-    scale_floor, validate_lengths, AnomalyDetector, AnomalyScore, DetectorType,
+    AnomalyDetector, AnomalyScore, DetectorType, scale_floor, validate_lengths,
 };
 
 /// MAD-based detector robust to outliers in training data.

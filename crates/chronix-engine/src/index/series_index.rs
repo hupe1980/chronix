@@ -44,7 +44,7 @@ use crate::index::error::IndexError;
 pub const EXTENSION: &str = "series";
 const MAGIC: &[u8; 4] = b"CXSI";
 /// Sidecar format version — 1, the first that ships.
-const VERSION: u8 = 1;
+const VERSION: u8 = crate::format::SERIES_INDEX_FORMAT_VERSION;
 /// False-positive rate of the bloom filter rebuilt from the index.
 const BLOOM_FPR: f64 = 0.01;
 
@@ -167,10 +167,15 @@ pub fn read(segment_path: &Path, expected: SegmentStamp) -> Result<Vec<SeriesKey
             detail: "series index: bad magic".into(),
         });
     }
-    if data[4] != VERSION {
-        return Err(IndexError::Corrupt {
-            detail: format!("series index: unsupported version {}", data[4]),
-        });
+    if let Some(detail) = crate::format::check(
+        "this segment's `.series` sidecar",
+        u64::from(data[4]),
+        u64::from(VERSION),
+    ) {
+        // Deliberately not `Corrupt`: the bytes are intact and the reader is
+        // from another generation. Reporting it as corruption sends an
+        // operator to a restore when the fix is to match the versions up.
+        return Err(IndexError::UnsupportedVersion { detail });
     }
     let crc = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
     let body = &data[9..];

@@ -13,7 +13,7 @@
 use arrow::array::{Array, Float64Array};
 use arrow::record_batch::RecordBatch;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 fn open(dir: &tempfile::TempDir) -> Chronix {
     let config = ChronixConfig::builder()

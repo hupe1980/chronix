@@ -17,8 +17,8 @@
 //! which `AND`s the condition with the namespace tag and puts the trigger in
 //! the tenant's own key space.
 
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;

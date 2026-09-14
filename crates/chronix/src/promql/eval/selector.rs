@@ -47,13 +47,50 @@ use arrow::record_batch::RecordBatch;
 use crate::promql::ast::{
     AtModifier, Duration, Expr, LabelMatcher, MatchOp, PromQLValue, Sample, Series,
 };
-use crate::promql::metric::{self, MetricRef};
+use crate::promql::metric::{self, ClassicView, MetricRef};
 
-use super::{compile_post_filters, CompiledMatcher, EvalError, PromQLEvaluator, QueryParams};
-use super::{ScanKey, SCAN_CACHE_CAPACITY};
+use super::{CompiledMatcher, EvalError, PromQLEvaluator, QueryParams, compile_post_filters};
+use super::{SCAN_CACHE_CAPACITY, ScanKey};
 
 /// Samples grouped by label set, ascending by timestamp within each group.
-type SeriesMap = BTreeMap<Vec<(String, String)>, Vec<Sample>>;
+type SeriesMap = BTreeMap<Vec<(String, String)>, SeriesSamples>;
+
+/// What one series accumulated during a scan.
+///
+/// Two lists rather than one, matching [`Series`] — see its documentation for
+/// why floats and histograms are kept apart. In practice exactly one of these
+/// is non-empty for a given series: a column is `Binary` (a histogram) or it
+/// is numeric, and that is a property of the schema rather than of a row.
+#[derive(Default)]
+pub(crate) struct SeriesSamples {
+    floats: Vec<Sample>,
+    histograms: Vec<crate::promql::ast::HistogramSample>,
+}
+
+impl SeriesSamples {
+    /// The newest sample, as a one-sample series — what an instant vector is.
+    fn latest(&self, labels: Vec<(String, String)>) -> Option<Series> {
+        if let Some(h) = self.histograms.last() {
+            return Some(Series::histograms(labels, vec![h.clone()]));
+        }
+        let latest = *self.floats.last()?;
+        Some(Series::floats(labels, vec![latest]))
+    }
+
+    /// Everything, as a range-vector series.
+    fn all(self, labels: Vec<(String, String)>) -> Series {
+        if self.histograms.is_empty() {
+            Series::floats(labels, self.floats)
+        } else {
+            Series::histograms(labels, self.histograms)
+        }
+    }
+
+    fn sort(&mut self) {
+        self.floats.sort_by_key(|s| s.timestamp);
+        self.histograms.sort_by_key(|s| s.timestamp);
+    }
+}
 
 // ── PromQLEvaluator methods ────────────────────────────────────────────
 
@@ -185,6 +222,13 @@ impl PromQLEvaluator {
     }
 
     /// Read one metric's samples over `(window_start, window_end]`.
+    ///
+    /// The `le` matcher of a classic bucket selector is the one matcher that
+    /// cannot be pushed into the scan. `le` is not a stored tag — the bucket
+    /// view invents it from the histogram's boundaries — so a scan filtered on
+    /// `le="0.5"` matches no rows at all, and `foo_bucket{le="0.5"}` answered
+    /// nothing while bare `foo_bucket` answered every boundary. It is moved to
+    /// the post filters, where the label exists by the time it is tested.
     fn read_metric(
         &self,
         target: &MetricRef,
@@ -194,6 +238,30 @@ impl PromQLEvaluator {
         window: (i64, i64),
         deadline: Option<super::Deadline>,
     ) -> Result<SeriesMap, EvalError> {
+        if target.view == ClassicView::Bucket && matchers.iter().any(is_le_equality) {
+            let scan_matchers: Vec<LabelMatcher> = matchers
+                .iter()
+                .filter(|m| !is_le_equality(m))
+                .cloned()
+                .collect();
+            // Recompiled from the selector rather than cloned onto the end
+            // of `post_filters`: this is `compile_post_filters` plus the `le`
+            // equalities, and building it from one source keeps the two sets
+            // from drifting apart.
+            let filters: Vec<CompiledMatcher> = matchers
+                .iter()
+                .filter(|m| m.name != "__name__" && (m.op != MatchOp::Equal || is_le_equality(m)))
+                .map(CompiledMatcher::compile)
+                .collect::<Result<_, _>>()?;
+            let batches = self.fetch_scan(
+                &target.measurement,
+                &scan_matchers,
+                fetch.0,
+                fetch.1,
+                deadline,
+            )?;
+            return collect_series(&batches, target, &filters, window.0, window.1);
+        }
         let batches = self.fetch_scan(&target.measurement, matchers, fetch.0, fetch.1, deadline)?;
         collect_series(&batches, target, post_filters, window.0, window.1)
     }
@@ -232,13 +300,11 @@ impl PromQLEvaluator {
                 params.deadline,
             )?;
             // An instant vector is the newest sample in the lookback window.
-            result.extend(series_map.into_iter().filter_map(|(labels, samples)| {
-                let latest = samples.last().copied()?;
-                Some(Series {
-                    labels,
-                    samples: vec![latest],
-                })
-            }));
+            result.extend(
+                series_map
+                    .into_iter()
+                    .filter_map(|(labels, samples)| samples.latest(labels)),
+            );
         }
 
         Ok(PromQLValue::Vector(result))
@@ -289,7 +355,7 @@ impl PromQLEvaluator {
             result.extend(
                 series_map
                     .into_iter()
-                    .map(|(labels, samples)| Series { labels, samples }),
+                    .map(|(labels, samples)| samples.all(labels)),
             );
         }
 
@@ -436,30 +502,136 @@ fn collect_series(
                     .column(*idx)
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
+                    && !arrow::array::Array::is_null(arr, row)
                 {
-                    if !arrow::array::Array::is_null(arr, row) {
-                        labels.push((name.clone(), arr.value(row).to_string()));
-                    }
+                    labels.push((name.clone(), arr.value(row).to_string()));
                 }
             }
             labels.sort();
 
-            if !post_filters.iter().all(|f| f.matches(&labels)) {
-                continue;
+            // A histogram column is `Binary`: the sample *is* a distribution,
+            // so it goes in the other list rather than through `extract_f64`,
+            // which has no float to extract.
+            if let Some(bin) = value_col
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+            {
+                // A blob this build cannot decode is skipped rather than
+                // failing the whole query: one unreadable sample must not
+                // take a dashboard down, and the gap is visible as a
+                // missing point.
+                let Ok(h) =
+                    postcard::from_bytes::<chronix_core::histogram::Histogram>(bin.value(row))
+                else {
+                    continue;
+                };
+                match target.view {
+                    ClassicView::Native => {
+                        if !post_filters.iter().all(|f| f.matches(&labels)) {
+                            continue;
+                        }
+                        series_map.entry(labels).or_default().histograms.push(
+                            crate::promql::ast::HistogramSample {
+                                timestamp,
+                                histogram: Box::new(h),
+                            },
+                        );
+                    }
+                    ClassicView::Count => {
+                        push_float(&mut series_map, labels, post_filters, timestamp, h.count);
+                    }
+                    ClassicView::Sum => {
+                        push_float(&mut series_map, labels, post_filters, timestamp, h.sum);
+                    }
+                    ClassicView::Bucket => {
+                        // One series per boundary, carrying a **cumulative**
+                        // count — which is what `foo_bucket` has always meant
+                        // and what `histogram_quantile`'s classic path reads.
+                        for (le, cumulative) in h.classic_buckets() {
+                            let mut bucket_labels = labels.clone();
+                            // The view's `le` wins over a tag of the same
+                            // name: two labels called `le` is not a label set,
+                            // and the boundary is the one this series is
+                            // about.
+                            bucket_labels.retain(|(k, _)| k != LE_LABEL);
+                            bucket_labels.push((LE_LABEL.to_string(), format_le(le)));
+                            bucket_labels.sort();
+                            push_float(
+                                &mut series_map,
+                                bucket_labels,
+                                post_filters,
+                                timestamp,
+                                cumulative,
+                            );
+                        }
+                    }
+                }
+            } else {
+                // A classic view of a column that is not a histogram reads
+                // nothing. `metric::resolve` does not produce one, so this is
+                // a column whose type changed under a resolved selector.
+                if target.view != ClassicView::Native {
+                    continue;
+                }
+                if !post_filters.iter().all(|f| f.matches(&labels)) {
+                    continue;
+                }
+                series_map.entry(labels).or_default().floats.push(Sample {
+                    timestamp,
+                    value: extract_f64(value_col, row)?,
+                });
             }
-
-            let value = extract_f64(value_col, row)?;
-            series_map
-                .entry(labels)
-                .or_default()
-                .push(Sample { timestamp, value });
         }
     }
 
     for samples in series_map.values_mut() {
-        samples.sort_by_key(|s| s.timestamp);
+        samples.sort();
     }
     Ok(series_map)
+}
+
+/// The label a classic bucket series carries its upper bound in.
+const LE_LABEL: &str = "le";
+
+/// Is this an `le="…"` equality — the matcher the scan cannot push down?
+fn is_le_equality(m: &LabelMatcher) -> bool {
+    m.name == LE_LABEL && m.op == MatchOp::Equal
+}
+
+/// Record one float sample under `labels`, if the label set survives filtering.
+///
+/// The filters are applied **here** rather than before the histogram is
+/// decoded, because the bucket view adds `le` to the label set: a
+/// `foo_bucket{le="0.5"}` selector filtered before the label existed would see
+/// an absent `le`, which reads as the empty string, and match nothing.
+fn push_float(
+    series_map: &mut SeriesMap,
+    labels: Vec<(String, String)>,
+    post_filters: &[CompiledMatcher],
+    timestamp: i64,
+    value: f64,
+) {
+    if !post_filters.iter().all(|f| f.matches(&labels)) {
+        return;
+    }
+    series_map
+        .entry(labels)
+        .or_default()
+        .floats
+        .push(Sample { timestamp, value });
+}
+
+/// A bucket boundary as Prometheus writes it in an `le` label.
+///
+/// `+Inf` rather than Rust's `inf`, because that is the literal a dashboard
+/// written years ago has in its query and the one `histogram_quantile`'s
+/// classic path looks for.
+fn format_le(le: f64) -> String {
+    if le.is_infinite() {
+        if le > 0.0 { "+Inf" } else { "-Inf" }.to_string()
+    } else {
+        le.to_string()
+    }
 }
 
 /// One sample's value, as the `f64` PromQL is defined over.

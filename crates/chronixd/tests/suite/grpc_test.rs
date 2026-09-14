@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tonic::transport::Channel;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 use chronixd::grpc::ChronixGrpcService;
 use chronixd::proto;

@@ -167,8 +167,10 @@ mod align_tests {
     /// archived, and nothing said so louder than a warning.
     #[test]
     fn the_result_carries_the_target_schema_even_when_the_names_match() {
-        let src = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)
-            .with_metadata(crate::db::role_metadata(chronix_core::ColumnRole::Field))]));
+        let src = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, true)
+                .with_metadata(crate::db::role_metadata(chronix_core::ColumnRole::Field)),
+        ]));
         let batch =
             RecordBatch::try_new(src, vec![Arc::new(Int64Array::from(vec![1_i64, 2]))]).unwrap();
 

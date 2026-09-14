@@ -51,8 +51,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
@@ -509,7 +509,7 @@ impl AsofJoinStream {
             // Add right columns (excluding join keys)
             let mut out_col = num_left_cols;
             if let Some(right) = right {
-                let (_, _, _, _, ref right_output_cols) = right_ctx.as_ref().ok_or_else(|| {
+                let (_, _, _, _, right_output_cols) = right_ctx.as_ref().ok_or_else(|| {
                     datafusion::error::DataFusionError::Internal(
                         "right_ctx must be set when right batch exists".to_string(),
                     )
@@ -645,12 +645,10 @@ impl Stream for AsofJoinStream {
                                 if total_rows > MAX_RIGHT_BUFFER_ROWS {
                                     this.state = AsofJoinState::Done;
                                     return Poll::Ready(Some(Err(
-                                        DataFusionError::ResourcesExhausted(
-                                            format!(
-                                                "ASOF JOIN right side exceeds {} row limit ({} rows buffered)",
-                                                MAX_RIGHT_BUFFER_ROWS, total_rows,
-                                            )
-                                        )
+                                        DataFusionError::ResourcesExhausted(format!(
+                                            "ASOF JOIN right side exceeds {} row limit ({} rows buffered)",
+                                            MAX_RIGHT_BUFFER_ROWS, total_rows,
+                                        )),
                                     )));
                                 }
                                 this.right_buffer.push(batch);

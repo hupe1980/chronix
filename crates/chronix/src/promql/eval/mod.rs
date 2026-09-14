@@ -502,7 +502,7 @@ impl PromQLEvaluator {
 
         let matrix: Vec<Series> = series_map
             .into_iter()
-            .map(|(labels, samples)| Series { labels, samples })
+            .map(|(labels, samples)| Series::floats(labels, samples))
             .collect();
 
         Ok(PromQLValue::Matrix(matrix))
@@ -750,7 +750,7 @@ impl PromQLEvaluator {
 
         let matrix: Vec<Series> = series_map
             .into_iter()
-            .map(|(labels, samples)| Series { labels, samples })
+            .map(|(labels, samples)| Series::floats(labels, samples))
             .collect();
 
         Ok(PromQLValue::Matrix(matrix))

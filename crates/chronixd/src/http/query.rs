@@ -12,7 +12,7 @@ use chronix::prelude::*;
 use crate::error::ServerError;
 use crate::namespace::NamespaceContext;
 
-use super::types::{arrow_value_to_json, AppState, TimeRangeRequest, NAMESPACE_TAG};
+use super::types::{AppState, NAMESPACE_TAG, TimeRangeRequest, arrow_value_to_json};
 
 // ── Request / response types ───────────────────────────────────────────
 
@@ -400,14 +400,13 @@ pub async fn sql_handler(
         cache.retain(|_, (_, inserted_at, _)| inserted_at.elapsed() < SQL_PLAN_CACHE_TTL);
         // LRU eviction — remove least-recently-used entry instead of
         // clearing the entire cache.
-        if cache.len() >= SQL_PLAN_CACHE_MAX {
-            if let Some(lru_key) = cache
+        if cache.len() >= SQL_PLAN_CACHE_MAX
+            && let Some(lru_key) = cache
                 .iter()
                 .min_by_key(|(_, (_, _, la))| *la)
                 .map(|(k, _)| k.clone())
-            {
-                cache.remove(&lru_key);
-            }
+        {
+            cache.remove(&lru_key);
         }
         cache.insert(cache_key, (plan, now, now));
         df

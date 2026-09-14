@@ -3,8 +3,8 @@
 //! Manages registering the local node with the `MetaNode` cluster,
 //! periodic heartbeats, and graceful deregistration.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -158,12 +158,12 @@ impl DataNodeManager {
                         continue;
                     }
 
-                    let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Err(e) = meta_client.heartbeat(node_id, gen).await {
+                    let generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Err(e) = meta_client.heartbeat(node_id, generation).await {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         warn!(
                             node_id,
-                            generation = gen,
+                            generation = generation,
                             consecutive_failures,
                             backoff_ms = backoff.as_millis() as u64,
                             error = %e,

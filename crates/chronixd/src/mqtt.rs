@@ -35,8 +35,8 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use tracing::info;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 use crate::connector::{ConnectorMetrics, ConnectorStatus, IngestionConnector, MqttConfig};
 use crate::error::ServerError;

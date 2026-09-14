@@ -17,8 +17,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code may unwrap
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chronix::{Pipeline, PipelineConfig};
 use chronix_streaming::signal::error::Result as SignalResult;
@@ -153,9 +153,11 @@ fn a_webhook_trigger_registers_a_channel_named_by_its_url() {
              DELIVER webhook('https://alerts.example.com/a')",
         )
         .expect("a signable webhook trigger must be accepted");
-    assert!(pipeline
-        .delivery_router()
-        .has_channel("webhook:https://alerts.example.com/a"));
+    assert!(
+        pipeline
+            .delivery_router()
+            .has_channel("webhook:https://alerts.example.com/a")
+    );
 
     let before = pipeline.delivery_router().channel_count();
     pipeline
@@ -428,9 +430,11 @@ fn a_restored_trigger_keeps_its_delivery_channel() {
                  DELIVER webhook('https://alerts.example.com/hook')",
             )
             .unwrap();
-        assert!(pipeline
-            .delivery_router()
-            .has_channel("webhook:https://alerts.example.com/hook"));
+        assert!(
+            pipeline
+                .delivery_router()
+                .has_channel("webhook:https://alerts.example.com/hook")
+        );
     }
 
     // A fresh pipeline over the same catalog.

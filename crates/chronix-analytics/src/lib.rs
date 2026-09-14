@@ -65,7 +65,7 @@ mod streaming_anomaly;
 mod util;
 
 pub use accuracy::{
-    compute_accuracy, compute_accuracy_with_mase, mase, AccuracyMetrics, ForecastAccuracyTracker,
+    AccuracyMetrics, ForecastAccuracyTracker, compute_accuracy, compute_accuracy_with_mase, mase,
 };
 pub use alerting::{AlertAction, AlertConfig, AlertEngine, FiredAlert};
 pub use continuous_forecast::{ContinuousForecastConfig, ContinuousForecastEngine, ForecastUpdate};
@@ -73,6 +73,6 @@ pub use error::AnalyticsError;
 pub use feedback::{AnomalyFeedback, AnomalyPrecisionTracker, FeedbackLabel, PrecisionStats};
 pub use materialized::{ForecastCache, MaterializedForecast};
 pub use registry::{
-    global_registry, DetectorFactory, ModelFactory, PluginError, PluginInfo, PluginRegistry,
+    DetectorFactory, ModelFactory, PluginError, PluginInfo, PluginRegistry, global_registry,
 };
 pub use streaming_anomaly::{ScoredAnomaly, StreamingAnomalyConfig, StreamingAnomalyEngine};

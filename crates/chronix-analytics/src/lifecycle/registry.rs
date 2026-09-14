@@ -12,7 +12,7 @@ use tracing;
 
 /// Accuracy metrics for a model version.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AccuracyMetrics {
+pub struct VersionAccuracy {
     /// Mean Absolute Percentage Error.
     pub mape: f64,
     /// Root Mean Squared Error.
@@ -23,7 +23,7 @@ pub struct AccuracyMetrics {
     pub r_squared: f64,
 }
 
-impl AccuracyMetrics {
+impl VersionAccuracy {
     /// Create metrics from predictions vs actuals.
     pub fn compute(actuals: &[f64], predictions: &[f64]) -> Self {
         let n = actuals.len().min(predictions.len());
@@ -101,7 +101,7 @@ pub struct ModelVersion {
     /// Training data time range: `(start_ns, end_ns)`.
     pub training_range: (i64, i64),
     /// Accuracy metrics (if evaluated).
-    pub metrics: Option<AccuracyMetrics>,
+    pub metrics: Option<VersionAccuracy>,
     /// Lifecycle tag.
     pub tag: ModelTag,
     /// Serialized model bytes (postcard).
@@ -378,10 +378,10 @@ impl ModelRegistry {
         };
 
         // If setting champion, retire the current champion first
-        if tag == ModelTag::Champion {
-            if let Some(ci) = champion_idx {
-                versions[ci].tag = ModelTag::Retired;
-            }
+        if tag == ModelTag::Champion
+            && let Some(ci) = champion_idx
+        {
+            versions[ci].tag = ModelTag::Retired;
         }
 
         versions[target_idx].tag = tag;
@@ -394,7 +394,7 @@ impl ModelRegistry {
         measurement: &str,
         model_name: &str,
         version: u64,
-        metrics: AccuracyMetrics,
+        metrics: VersionAccuracy,
     ) -> bool {
         let mut map = self.versions.write();
         let versions = match Self::find_versions_mut(&mut map, measurement, model_name) {
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn test_update_metrics() {
         let reg = make_registry();
-        let metrics = AccuracyMetrics {
+        let metrics = VersionAccuracy {
             mape: 0.05,
             rmse: 1.2,
             mae: 0.8,
@@ -584,7 +584,7 @@ mod tests {
     fn test_accuracy_metrics_compute() {
         let actuals = vec![100.0, 200.0, 300.0];
         let preds = vec![110.0, 190.0, 310.0];
-        let m = AccuracyMetrics::compute(&actuals, &preds);
+        let m = VersionAccuracy::compute(&actuals, &preds);
 
         // MAE = (10+10+10)/3 = 10
         assert!((m.mae - 10.0).abs() < 1e-9);

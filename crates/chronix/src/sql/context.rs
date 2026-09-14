@@ -9,10 +9,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::common::DataFusionError;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use super::functions::register_udfs;
@@ -699,7 +699,7 @@ mod tests {
                         _ => {
                             return Err(datafusion::common::DataFusionError::Internal(
                                 "expected f64".into(),
-                            ))
+                            ));
                         }
                     };
                     Ok(ColumnarValue::Scalar(

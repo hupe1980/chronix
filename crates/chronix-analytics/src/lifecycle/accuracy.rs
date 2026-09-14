@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
-use crate::lifecycle::registry::AccuracyMetrics;
+use crate::lifecycle::registry::VersionAccuracy;
 
 /// Configuration for the accuracy tracker.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -74,7 +74,7 @@ impl ModelState {
         }
     }
 
-    fn current_metrics(&self) -> Option<AccuracyMetrics> {
+    fn current_metrics(&self) -> Option<VersionAccuracy> {
         if self.observations.len() < 2 {
             return None;
         }
@@ -94,7 +94,7 @@ impl ModelState {
             .skip(start)
             .map(|o| o.predicted)
             .collect();
-        Some(AccuracyMetrics::compute(&actuals, &preds))
+        Some(VersionAccuracy::compute(&actuals, &preds))
     }
 
     /// Check if the model needs refitting.
@@ -179,7 +179,7 @@ impl AccuracyTracker {
     }
 
     /// Get current accuracy metrics for a model.
-    pub fn metrics(&self, measurement: &str, model_name: &str) -> Option<AccuracyMetrics> {
+    pub fn metrics(&self, measurement: &str, model_name: &str) -> Option<VersionAccuracy> {
         let key = (measurement.to_string(), model_name.to_string());
         self.models.read().get(&key)?.current_metrics()
     }

@@ -45,10 +45,10 @@ fn walk(root: &Path, ext: &str, f: &mut impl FnMut(&Path, &str)) {
                     continue;
                 }
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == ext) {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    f(&path, &text);
-                }
+            } else if path.extension().is_some_and(|e| e == ext)
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                f(&path, &text);
             }
         }
     }

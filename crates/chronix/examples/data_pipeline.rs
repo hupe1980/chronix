@@ -12,10 +12,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronix::chronix_analytics::forecast::ModelType;
 use chronix::chronix_analytics::ContinuousForecastConfig;
+use chronix::chronix_analytics::forecast::ModelType;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, Pipeline, PipelineConfig};
+use chronix::{Chronix, Pipeline, PipelineConfig, fields, tags};
 use chronix_security::audit::{AuditAction, AuditDecision, AuditEvent};
 
 #[tokio::main]

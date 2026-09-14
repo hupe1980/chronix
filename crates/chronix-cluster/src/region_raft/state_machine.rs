@@ -2,12 +2,12 @@
 
 use std::collections::VecDeque;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use openraft::storage::{RaftStateMachine, Snapshot};
 use openraft::BasicNode;
+use openraft::storage::{RaftStateMachine, Snapshot};
 use openraft::{
     EntryPayload, LogId, RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership,

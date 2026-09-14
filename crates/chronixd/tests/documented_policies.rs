@@ -144,7 +144,9 @@ fn the_published_schema_is_the_one_the_engine_uses() {
     }
     // Every action the engine can be asked about is named in the schema; the
     // set equality itself is checked in `chronix-security`.
-    assert!(!chronix_security::authz::schema_action_names()
-        .expect("schema actions")
-        .is_empty());
+    assert!(
+        !chronix_security::authz::schema_action_names()
+            .expect("schema actions")
+            .is_empty()
+    );
 }

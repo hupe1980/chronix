@@ -24,7 +24,28 @@ rustdoc-args = ["--cfg", "docsrs"]
 doctest = false
 
 [features]
-default = ["sql", "field-encryption"]
+default = ["analytics", "sql", "field-encryption"]
+
+## Statistical analytics in-process: forecasting, anomaly detection,
+## preprocessing, the model registry, and the SQL kernels built on them.
+##
+## **On by default.** It is the wedge ([`OVERVIEW`]), so a consumer who does
+## not name a feature gets it. Turn it off for the smallest targets: it is the
+## largest crate in the workspace and it carries `rayon` — a work-stealing
+## thread pool — plus `sha2` and `rand`, which a gateway that never forecasts
+## has no use for.
+##
+## It was unconditional until somebody asked why. Every other engine crate is
+## either gated (`security`, `streaming`) or load-bearing for a write
+## (`core`, `encoding`, `engine`, `query`); this one is neither, and the
+## design partner — an aarch64 box building `default-features = false` —
+## carried all of it while using rollups and nothing else. The mirror of
+## D225's rule: a gateway should not carry a Cedar engine, and it should not
+## carry a thread pool it never schedules on.
+##
+## `sql` implies it, because the SQL window functions and forecast aggregates
+## are thin wrappers over these kernels.
+analytics = ["dep:chronix-analytics"]
 
 ## SQL through DataFusion: `db.sql()`, `session_context()`, the analytics
 ## functions, `EXPLAIN`, and the cold tier's read half.
@@ -46,7 +67,7 @@ default = ["sql", "field-encryption"]
 ## Without it, writes, the native query API, PromQL, rollups, retention,
 ## analytics, triggers and the cold *archive* all still work — the PromQL
 ## evaluator never touches DataFusion.
-sql = ["dep:datafusion"]
+sql = ["dep:datafusion", "analytics"]
 
 ## Per-column AES-256-GCM in the `.csx` segment format, declared by
 ## `ChronixConfig::field_encryption` — or `[database.field_encryption]` in
@@ -97,7 +118,7 @@ chronix-core.workspace = true
 chronix-encoding.workspace = true
 chronix-query.workspace = true
 chronix-engine.workspace = true
-chronix-analytics.workspace = true
+chronix-analytics = { workspace = true, optional = true }
 chronix-streaming = { workspace = true, optional = true }
 chronix-security = { workspace = true, optional = true }
 arrow.workspace = true
@@ -283,7 +304,7 @@ required-features = ["streaming"]
 
 [[example]]
 name = "data_pipeline"
-required-features = ["pipeline", "sql"]
+required-features = ["pipeline", "sql", "analytics"]
 
 [[test]]
 name = "decimal_lifecycle"
@@ -300,3 +321,46 @@ required-features = ["pipeline"]
 [[test]]
 name = "public_api"
 required-features = ["pipeline", "sql"]
+
+# Examples of the analytics surface, which is behind the `analytics`
+# feature (on by default). Declared so `--no-default-features` skips them
+# rather than failing to compile them.
+[[example]]
+name = "alerting"
+required-features = ["analytics"]
+
+[[example]]
+name = "anomaly_detection"
+required-features = ["analytics"]
+
+[[example]]
+name = "compute_engine"
+required-features = ["analytics"]
+
+[[example]]
+name = "continuous_forecast"
+required-features = ["analytics"]
+
+[[example]]
+name = "forecast"
+required-features = ["analytics"]
+
+[[example]]
+name = "model_lifecycle"
+required-features = ["analytics"]
+
+[[example]]
+name = "multivariate_analysis"
+required-features = ["analytics"]
+
+[[example]]
+name = "preprocessing"
+required-features = ["analytics"]
+
+[[example]]
+name = "quantile_forecast"
+required-features = ["analytics"]
+
+[[test]]
+name = "auto_forecast"
+required-features = ["analytics"]

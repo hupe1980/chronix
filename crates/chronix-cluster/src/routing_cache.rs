@@ -11,8 +11,8 @@
 //! `MetaNode` cluster during outages.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chronix_meta::{RegionId, RouteEntry, RoutingSnapshot};

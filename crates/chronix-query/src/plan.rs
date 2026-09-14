@@ -12,7 +12,7 @@ use crate::aggregate::AggFn;
 use crate::error::{QueryError, Result};
 use crate::window::WindowFn;
 
-pub use chronix_engine::segment::{FieldPredicate, ZoneMapOp};
+pub use chronix_engine::segment::{FieldPredicate, StatsOp};
 
 /// A time range for query filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -821,9 +821,11 @@ mod tests {
                 ..
             } => {
                 assert_eq!(namespace_id.as_deref(), Some("tenant-a"));
-                assert!(tag_filters
-                    .iter()
-                    .any(|f| f.key == "__namespace__" && f.value == "tenant-a"));
+                assert!(
+                    tag_filters
+                        .iter()
+                        .any(|f| f.key == "__namespace__" && f.value == "tenant-a")
+                );
             }
             _ => panic!("expected Scan"),
         }

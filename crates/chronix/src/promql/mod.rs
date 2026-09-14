@@ -23,6 +23,6 @@ pub use ast::{
     AggregationModifier, AggregationOp, AtModifier, BinaryOp, Duration, Expr, LabelMatcher,
     MatchOp, PromQLValue, Sample, Series, UnaryOp, VectorMatching, VectorMatchingCardinality,
 };
-pub use eval::{compile_label_matchers, label_set_matches, CompiledMatcher, PromQLEvaluator};
-pub use metric::{all_metrics, metric_name, metrics_of, MetricRef, VALUE_FIELD};
-pub use parser::{parse, ParseError};
+pub use eval::{CompiledMatcher, PromQLEvaluator, compile_label_matchers, label_set_matches};
+pub use metric::{ClassicView, MetricRef, VALUE_FIELD, all_metrics, metric_name, metrics_of};
+pub use parser::{ParseError, parse};

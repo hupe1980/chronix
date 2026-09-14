@@ -23,13 +23,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 use crate::error::ServerError;
 use crate::proto;
@@ -1033,87 +1033,79 @@ fn record_batch_to_proto_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<p
 
             match field.data_type() {
                 DataType::Utf8 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                        if !arr.is_null(row_idx) {
-                            let val = arr.value(row_idx).to_string();
-                            // The scan stamps the role: a tag and a string
-                            // field are the same Arrow type, so without it
-                            // every tag was reported as a field.
-                            if field
-                                .metadata()
-                                .get(chronix::db::ROLE_KEY)
-                                .map(std::string::String::as_str)
-                                == Some("tag")
-                            {
-                                tags.push(proto::Tag {
-                                    key: name,
-                                    value: val,
-                                });
-                            } else {
-                                fields.push(proto::Field {
-                                    key: name,
-                                    value: Some(proto::FieldValue {
-                                        value: Some(proto::field_value::Value::String(val)),
-                                    }),
-                                });
-                            }
+                    if let Some(arr) = col.as_any().downcast_ref::<StringArray>()
+                        && !arr.is_null(row_idx)
+                    {
+                        let val = arr.value(row_idx).to_string();
+                        // The scan stamps the role: a tag and a string
+                        // field are the same Arrow type, so without it
+                        // every tag was reported as a field.
+                        if field
+                            .metadata()
+                            .get(chronix::db::ROLE_KEY)
+                            .map(std::string::String::as_str)
+                            == Some("tag")
+                        {
+                            tags.push(proto::Tag {
+                                key: name,
+                                value: val,
+                            });
+                        } else {
+                            fields.push(proto::Field {
+                                key: name,
+                                value: Some(proto::FieldValue {
+                                    value: Some(proto::field_value::Value::String(val)),
+                                }),
+                            });
                         }
                     }
                 }
                 DataType::Float64 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-                        if !arr.is_null(row_idx) {
-                            fields.push(proto::Field {
-                                key: name,
-                                value: Some(proto::FieldValue {
-                                    value: Some(proto::field_value::Value::Float64(
-                                        arr.value(row_idx),
-                                    )),
-                                }),
-                            });
-                        }
+                    if let Some(arr) = col.as_any().downcast_ref::<Float64Array>()
+                        && !arr.is_null(row_idx)
+                    {
+                        fields.push(proto::Field {
+                            key: name,
+                            value: Some(proto::FieldValue {
+                                value: Some(proto::field_value::Value::Float64(arr.value(row_idx))),
+                            }),
+                        });
                     }
                 }
                 DataType::Int64 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                        if !arr.is_null(row_idx) {
-                            fields.push(proto::Field {
-                                key: name,
-                                value: Some(proto::FieldValue {
-                                    value: Some(proto::field_value::Value::Int64(
-                                        arr.value(row_idx),
-                                    )),
-                                }),
-                            });
-                        }
+                    if let Some(arr) = col.as_any().downcast_ref::<Int64Array>()
+                        && !arr.is_null(row_idx)
+                    {
+                        fields.push(proto::Field {
+                            key: name,
+                            value: Some(proto::FieldValue {
+                                value: Some(proto::field_value::Value::Int64(arr.value(row_idx))),
+                            }),
+                        });
                     }
                 }
                 DataType::UInt64 => {
-                    if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
-                        if !arr.is_null(row_idx) {
-                            fields.push(proto::Field {
-                                key: name,
-                                value: Some(proto::FieldValue {
-                                    value: Some(proto::field_value::Value::Uint64(
-                                        arr.value(row_idx),
-                                    )),
-                                }),
-                            });
-                        }
+                    if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>()
+                        && !arr.is_null(row_idx)
+                    {
+                        fields.push(proto::Field {
+                            key: name,
+                            value: Some(proto::FieldValue {
+                                value: Some(proto::field_value::Value::Uint64(arr.value(row_idx))),
+                            }),
+                        });
                     }
                 }
                 DataType::Boolean => {
-                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
-                        if !arr.is_null(row_idx) {
-                            fields.push(proto::Field {
-                                key: name,
-                                value: Some(proto::FieldValue {
-                                    value: Some(proto::field_value::Value::Boolean(
-                                        arr.value(row_idx),
-                                    )),
-                                }),
-                            });
-                        }
+                    if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>()
+                        && !arr.is_null(row_idx)
+                    {
+                        fields.push(proto::Field {
+                            key: name,
+                            value: Some(proto::FieldValue {
+                                value: Some(proto::field_value::Value::Boolean(arr.value(row_idx))),
+                            }),
+                        });
                     }
                 }
                 DataType::Decimal128(_, _) => {
@@ -1121,15 +1113,15 @@ fn record_batch_to_proto_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<p
                     // "unsupported" branch below and was dropped from the
                     // response entirely — a query that returned rows, with
                     // the one column the caller asked for missing.
-                    if let Some(arr) = col.as_any().downcast_ref::<Decimal128Array>() {
-                        if let Some(digits) = crate::util::decimal_cell_to_string(arr, row_idx) {
-                            fields.push(proto::Field {
-                                key: name,
-                                value: Some(proto::FieldValue {
-                                    value: Some(proto::field_value::Value::Decimal(digits)),
-                                }),
-                            });
-                        }
+                    if let Some(arr) = col.as_any().downcast_ref::<Decimal128Array>()
+                        && let Some(digits) = crate::util::decimal_cell_to_string(arr, row_idx)
+                    {
+                        fields.push(proto::Field {
+                            key: name,
+                            value: Some(proto::FieldValue {
+                                value: Some(proto::field_value::Value::Decimal(digits)),
+                            }),
+                        });
                     }
                 }
                 // Anything the storage layer does not produce today. It used

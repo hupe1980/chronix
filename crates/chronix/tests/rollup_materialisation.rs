@@ -5,7 +5,7 @@
 
 use chronix::prelude::*;
 use chronix::rollup::{RollupAggFn, RollupBuilder};
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::time::Duration;
 
 const HOUR: i64 = 3_600_000_000_000;

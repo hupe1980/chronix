@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use super::Chronix;
-use super::{catalog_dir_of, chrono_timestamp_ms, segments_dir_of, wal_dir_of, BackupManifest};
+use super::{BackupManifest, catalog_dir_of, chrono_timestamp_ms, segments_dir_of, wal_dir_of};
 use crate::error::{DbError, Result};
 
 /// Name of the marker written last, and the only proof a backup finished.

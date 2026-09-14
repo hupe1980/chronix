@@ -46,8 +46,8 @@ pub use admin::{GrpcMetaClient, MetaAdminServer};
 pub use durable_log_store::DurableLogStore;
 pub use error::{MetaError, Result};
 pub use grpc_transport::{
-    assemble_snapshot_chunks, chunk_snapshot, GrpcNetwork, GrpcNetworkFactory, NodeAddressMap,
-    RaftGrpcServer, SNAPSHOT_CHUNK_SIZE,
+    GrpcNetwork, GrpcNetworkFactory, NodeAddressMap, RaftGrpcServer, SNAPSHOT_CHUNK_SIZE,
+    assemble_snapshot_chunks, chunk_snapshot,
 };
 pub use network::{MetaNetwork, MetaNetworkFactory, MetaRouter};
 pub use routing::{RouteEntry, RoutingSnapshot, RoutingTable};

@@ -21,8 +21,8 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 use tracing::debug;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 use crate::util::WriteMode;
 
@@ -390,21 +390,21 @@ impl FlightSqlTrait for ChronixFlightSqlService {
                 }
 
                 // Server-authoritative: check existing schema first
-                if let Some(ref ms) = existing_schema {
-                    if let Some(col_def) = ms.column(field.name()) {
-                        match col_def.role {
-                            chronix_core::ColumnRole::Tag => {
-                                tag_indices.push((i, field.name().clone()));
-                            }
-                            chronix_core::ColumnRole::Field => {
-                                field_indices.push((i, field.name().clone()));
-                            }
-                            chronix_core::ColumnRole::Timestamp => {
-                                // Already handled above
-                            }
+                if let Some(ref ms) = existing_schema
+                    && let Some(col_def) = ms.column(field.name())
+                {
+                    match col_def.role {
+                        chronix_core::ColumnRole::Tag => {
+                            tag_indices.push((i, field.name().clone()));
                         }
-                        continue;
+                        chronix_core::ColumnRole::Field => {
+                            field_indices.push((i, field.name().clone()));
+                        }
+                        chronix_core::ColumnRole::Timestamp => {
+                            // Already handled above
+                        }
                     }
+                    continue;
                 }
 
                 // Fallback for new columns: string-like without role=field → tag

@@ -166,10 +166,10 @@ impl CompositeSignalEngine {
                 }
                 // Include per-contributing-series latest values
                 for sid in &rule.contributing_series {
-                    if let Some(idx) = ctx.matrix.series_ids.iter().position(|s| s == sid) {
-                        if let Some(&last_val) = ctx.matrix.data[idx].last() {
-                            metadata.insert(format!("latest_{sid}"), format!("{last_val:.6}"));
-                        }
+                    if let Some(idx) = ctx.matrix.series_ids.iter().position(|s| s == sid)
+                        && let Some(&last_val) = ctx.matrix.data[idx].last()
+                    {
+                        metadata.insert(format!("latest_{sid}"), format!("{last_val:.6}"));
                     }
                 }
 

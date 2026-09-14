@@ -158,12 +158,12 @@ impl QuantileConfig {
                 "step must be at least 1".into(),
             ));
         }
-        if let (Some(lo), Some(hi)) = (self.lower_bound, self.upper_bound) {
-            if lo > hi {
-                return Err(ForecastError::InvalidInput(format!(
-                    "lower_bound {lo} exceeds upper_bound {hi}"
-                )));
-            }
+        if let (Some(lo), Some(hi)) = (self.lower_bound, self.upper_bound)
+            && lo > hi
+        {
+            return Err(ForecastError::InvalidInput(format!(
+                "lower_bound {lo} exceeds upper_bound {hi}"
+            )));
         }
         Ok(())
     }

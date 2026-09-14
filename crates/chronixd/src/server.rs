@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use axum::http::{header, Method};
-use axum::routing::{delete, get, post, put};
 use axum::Router;
+use axum::http::{Method, header};
+use axum::routing::{delete, get, post, put};
 use tokio::signal;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
@@ -145,12 +145,11 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     // ── Authentication (optional) ──────────────────────────────────────
     // When metrics_require_auth is false, add the metrics endpoint
     // to the auth exempt list so Prometheus can scrape without auth.
-    if !config.server.metrics_require_auth {
-        if let Some(ref mut auth) = config.auth {
-            if !auth.exempt_paths.contains(&config.server.metrics_path) {
-                auth.exempt_paths.push(config.server.metrics_path.clone());
-            }
-        }
+    if !config.server.metrics_require_auth
+        && let Some(ref mut auth) = config.auth
+        && !auth.exempt_paths.contains(&config.server.metrics_path)
+    {
+        auth.exempt_paths.push(config.server.metrics_path.clone());
     }
 
     // Beside the namespace registry, in the data directory: the durable
@@ -436,15 +435,15 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_cfg);
 
             // Spawn TLS hot-reload watcher if configured
-            if tls_reload_interval > 0 {
-                if let Some(tls_cfg) = tls_config_for_watcher {
-                    crate::tls_watcher::spawn_tls_watcher(
-                        tls_cfg,
-                        rustls_config.clone(),
-                        tls_reload_interval,
-                        grpc_cert_resolver,
-                    );
-                }
+            if tls_reload_interval > 0
+                && let Some(tls_cfg) = tls_config_for_watcher
+            {
+                crate::tls_watcher::spawn_tls_watcher(
+                    tls_cfg,
+                    rustls_config.clone(),
+                    tls_reload_interval,
+                    grpc_cert_resolver,
+                );
             }
 
             let handle = axum_server::Handle::new();
@@ -535,10 +534,10 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         // When using manual TLS (hot-reloadable), do NOT set
         // tonic's built-in TLS — we handle it at the connection level.
         let mut builder = tonic::transport::Server::builder();
-        if grpc_tls_acceptor_grpc.is_none() {
-            if let Some(tls) = tonic_tls_grpc {
-                builder = builder.tls_config(tls).map_err(std::io::Error::other)?;
-            }
+        if grpc_tls_acceptor_grpc.is_none()
+            && let Some(tls) = tonic_tls_grpc
+        {
+            builder = builder.tls_config(tls).map_err(std::io::Error::other)?;
         }
 
         // Keepalive configuration
@@ -674,10 +673,10 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         // When using manual TLS (hot-reloadable), do NOT set
         // tonic's built-in TLS — we handle it at the connection level.
         let mut builder = tonic::transport::Server::builder();
-        if grpc_tls_acceptor.is_none() {
-            if let Some(tls) = tonic_tls {
-                builder = builder.tls_config(tls).map_err(std::io::Error::other)?;
-            }
+        if grpc_tls_acceptor.is_none()
+            && let Some(tls) = tonic_tls
+        {
+            builder = builder.tls_config(tls).map_err(std::io::Error::other)?;
         }
 
         info!(%flight_addr, "Flight SQL server listening");

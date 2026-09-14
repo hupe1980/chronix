@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 fn db_with_int_column(dir: &tempfile::TempDir) -> Arc<Chronix> {
     let db = Arc::new(

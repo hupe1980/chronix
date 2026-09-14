@@ -21,12 +21,12 @@
 //!    tag-filtered query returned no rows at all — and on a tenanted server
 //!    every query carries a `__namespace__` filter.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const SEC: i64 = 1_000_000_000;
 const HOUR: i64 = 3_600 * SEC;
@@ -98,10 +98,11 @@ fn a_scan_in_flight_outlives_a_retention_pass() {
     // `min(now, newest held)`, and without this every row would be equally
     // old and nothing would expire.
     let fresh = SeriesKey::new("cpu", tags! { "host" => "h2" }).unwrap();
-    assert!(db
-        .insert_batch(&[Point::new(fresh, fields! { "v" => 1.0 }, now).unwrap()])
-        .unwrap()
-        .is_complete());
+    assert!(
+        db.insert_batch(&[Point::new(fresh, fields! { "v" => 1.0 }, now).unwrap()])
+            .unwrap()
+            .is_complete()
+    );
     db.flush().unwrap();
 
     let plan = db

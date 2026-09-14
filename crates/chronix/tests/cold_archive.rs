@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use chronix::cold_archive::ArchiveConfig;
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 /// Seed `n` one-second-spaced points starting `age` before now, then flush.
 ///

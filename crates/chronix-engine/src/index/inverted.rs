@@ -528,25 +528,29 @@ mod tests {
         );
 
         // Old segments should be gone
-        assert!(idx
-            .segments_for_tag("host", "srv1")
-            .contains(&SegmentId(10)));
+        assert!(
+            idx.segments_for_tag("host", "srv1")
+                .contains(&SegmentId(10))
+        );
         assert!(!idx.segments_for_tag("host", "srv1").contains(&SegmentId(1)));
-        assert!(idx
-            .segments_for_tag("host", "srv2")
-            .contains(&SegmentId(10)));
+        assert!(
+            idx.segments_for_tag("host", "srv2")
+                .contains(&SegmentId(10))
+        );
         assert!(!idx.segments_for_tag("host", "srv2").contains(&SegmentId(2)));
 
         // Segment 3 should be unaffected
         assert_eq!(idx.segments_for_tag("host", "srv3"), vec![SegmentId(3)]);
-        assert!(idx
-            .segments_for_tag("region", "eu-west")
-            .contains(&SegmentId(3)));
+        assert!(
+            idx.segments_for_tag("region", "eu-west")
+                .contains(&SegmentId(3))
+        );
 
         // New segment should appear in us-east
-        assert!(idx
-            .segments_for_tag("region", "us-east")
-            .contains(&SegmentId(10)));
+        assert!(
+            idx.segments_for_tag("region", "us-east")
+                .contains(&SegmentId(10))
+        );
 
         // key_values should be consistent
         let mut hosts = idx.values_for_key("host");

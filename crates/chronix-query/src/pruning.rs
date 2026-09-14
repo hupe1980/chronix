@@ -1,10 +1,18 @@
 //! Multi-level segment pruning pipeline.
 //!
-//! Eliminates segments from query processing before any data is decoded:
-//! 1. **Bloom pruning** — Exclude segments that cannot contain the series key
-//! 2. **Stats pruning** — Exclude segments where column statistics exclude the predicate
+//! Eliminates segments from query processing before any data is decoded.
+//! This module is **levels 3 and 4** of the six the read path applies:
 //!
-//! Time and tag-index pruning happen one level up, in `Chronix::prune_segments`,
+//! 3. **Bloom pruning** — exclude segments that cannot contain the series key
+//! 4. **Stats pruning** — exclude segments where column statistics exclude the
+//!    predicate
+//!
+//! The numbers are the read path's, counted from the catalog, and they are
+//! spelled out because this header used to number these two steps 1 and 2
+//! while the code below called them 2 and 3.
+//!
+//! Levels 1 (catalog time range) and 2 (inverted tag index) happen one level
+//! up, in `Chronix::prune_segments`,
 //! where the candidate set is already scoped to one measurement: the catalog
 //! entry carries `min_timestamp`/`max_timestamp`, so a separate time index
 //! answered nothing the catalog could not.
@@ -88,13 +96,12 @@ where
     let mut surviving: Vec<PrunedSegment> = Vec::with_capacity(input_count);
 
     for entry in entries {
-        if let Some(series_key) = series_key {
-            if let Some(bloom) = bloom_lookup(entry.segment_id.0) {
-                if !bloom.may_contain(series_key) {
-                    stats.pruned_by_bloom += 1;
-                    continue;
-                }
-            }
+        if let Some(series_key) = series_key
+            && let Some(bloom) = bloom_lookup(entry.segment_id.0)
+            && !bloom.may_contain(series_key)
+        {
+            stats.pruned_by_bloom += 1;
+            continue;
         }
 
         surviving.push(PrunedSegment {
@@ -108,11 +115,12 @@ where
     if !tag_filter_keys.is_empty() {
         surviving.retain(|ps| {
             for tag_key in tag_filter_keys {
-                if let Some(cs) = ps.entry.column_stats.iter().find(|c| c.name == *tag_key) {
-                    if cs.stats.distinct_count == 0 && cs.stats.value_count == 0 {
-                        stats.pruned_by_stats += 1;
-                        return false;
-                    }
+                if let Some(cs) = ps.entry.column_stats.iter().find(|c| c.name == *tag_key)
+                    && cs.stats.distinct_count == 0
+                    && cs.stats.value_count == 0
+                {
+                    stats.pruned_by_stats += 1;
+                    return false;
                 }
             }
             true

@@ -8,8 +8,23 @@
 //! - Resource attributes + data-point attributes → tags
 //! - Gauge data points → field `gauge` (float64)
 //! - Sum data points → field `value` (float64)
-//! - Histogram → fields: `count`, `sum`, `bucket_<bound>`
+//! - Histogram → field `value` (a native histogram with custom buckets)
+//! - Exponential histogram → field `value` (a native histogram)
 //! - Summary → fields: `count`, `sum`, `quantile_<q>`
+//!
+//! ## Both histogram shapes become one histogram
+//!
+//! An OTLP explicit-bucket histogram used to be spread across one `bucket_<b>`
+//! field per boundary, plus `count` and `sum`. That stores the data and
+//! answers nothing: `histogram_quantile` has no bucketed series to work on,
+//! and a Grafana histogram panel over it renders as a summary. It is also the
+//! per-bucket cardinality that native histograms exist to remove.
+//!
+//! Both shapes now land in a single `value` column of type histogram:
+//! explicit bounds as schema −53 (custom buckets), exponential as the
+//! matching base-2 schema. `histogram_quantile`, `histogram_count`,
+//! `histogram_sum` and the rest read them, a rollup merges rather than drops
+//! them, and the metric keeps its own name because the field is `value`.
 
 use std::collections::BTreeMap;
 
@@ -189,23 +204,63 @@ fn convert_metric_data(
                 let key = SeriesKey::new(measurement, tags)
                     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
                 let mut fields = BTreeMap::new();
-                fields.insert("count".to_string(), FieldValue::U64(dp.count));
-                // An empty histogram reports a NaN sum; the bucket counts are
-                // still real, so drop the field rather than the point.
-                if let Some(sum) = crate::util::storable_sample(dp.sum) {
-                    fields.insert("sum".to_string(), FieldValue::F64(sum));
-                }
+                let histogram = crate::wire::histogram::from_otlp_explicit(
+                    &dp.explicit_bounds,
+                    &dp.bucket_counts,
+                    dp.count,
+                    dp.sum,
+                )
+                .map_err(|e| {
+                    ServerError::BadRequest(format!(
+                        "metric {measurement}: explicit-bucket histogram: {e}"
+                    ))
+                })?;
+                fields.insert(
+                    chronix::promql::metric::VALUE_FIELD.to_string(),
+                    FieldValue::Histogram(Box::new(histogram)),
+                );
 
-                // Bucket counts with explicit bounds
-                for (i, &count) in dp.bucket_counts.iter().enumerate() {
-                    let bound = dp.explicit_bounds.get(i).copied().unwrap_or(f64::INFINITY);
-                    let key_name = if bound.is_infinite() {
-                        "bucket_inf".to_string()
-                    } else {
-                        format!("bucket_{bound}")
-                    };
-                    fields.insert(key_name, FieldValue::U64(count));
+                let point = Point::new(key, fields, timestamp_ns)
+                    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+                points.push(point);
+            }
+        }
+        Data::ExponentialHistogram(histogram) => {
+            for dp in &histogram.data_points {
+                let tags = merge_tags(resource_tags, scope_tags, &dp.attributes);
+                let timestamp_ns = saturating_u64_to_i64(dp.time_unix_nano);
+
+                let key = SeriesKey::new(measurement, tags)
+                    .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+                fn buckets(
+                    b: &Option<otlp::exponential_histogram_data_point::Buckets>,
+                ) -> Option<crate::wire::histogram::OtlpBuckets<'_>> {
+                    b.as_ref().map(|b| crate::wire::histogram::OtlpBuckets {
+                        offset: b.offset,
+                        counts: &b.bucket_counts,
+                    })
                 }
+                let histogram = crate::wire::histogram::from_otlp_exponential(
+                    dp.scale,
+                    dp.zero_threshold,
+                    dp.zero_count,
+                    dp.count,
+                    dp.sum,
+                    buckets(&dp.positive),
+                    buckets(&dp.negative),
+                )
+                .map_err(|e| {
+                    ServerError::BadRequest(format!(
+                        "metric {measurement}: exponential histogram: {e}"
+                    ))
+                })?;
+
+                let mut fields = BTreeMap::new();
+                fields.insert(
+                    chronix::promql::metric::VALUE_FIELD.to_string(),
+                    FieldValue::Histogram(Box::new(histogram)),
+                );
 
                 let point = Point::new(key, fields, timestamp_ns)
                     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
@@ -221,7 +276,10 @@ fn convert_metric_data(
                     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
                 let mut fields = BTreeMap::new();
                 fields.insert("count".to_string(), FieldValue::U64(dp.count));
-                if let Some(sum) = crate::util::storable_sample(dp.sum) {
+                // OTLP leaves `sum` unset for a summary that recorded negative
+                // events; an unset sum is not a sum of zero, so the field is
+                // simply absent rather than fabricated.
+                if let Some(sum) = dp.sum.and_then(crate::util::storable_sample) {
                     fields.insert("sum".to_string(), FieldValue::F64(sum));
                 }
 
@@ -449,6 +507,8 @@ struct OtlpJsonMetric {
     #[serde(default)]
     histogram: Option<OtlpJsonHistogram>,
     #[serde(default)]
+    exponential_histogram: Option<OtlpJsonExponentialHistogram>,
+    #[serde(default)]
     summary: Option<OtlpJsonSummary>,
 }
 
@@ -501,6 +561,45 @@ struct OtlpJsonHistogramDataPoint {
     bucket_counts: Vec<u64>,
     #[serde(default)]
     explicit_bounds: Vec<f64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtlpJsonExponentialHistogram {
+    #[serde(default)]
+    data_points: Vec<OtlpJsonExponentialHistogramDataPoint>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtlpJsonExponentialHistogramDataPoint {
+    #[serde(default)]
+    attributes: Vec<OtlpJsonKeyValue>,
+    #[serde(default, deserialize_with = "json_int::u64")]
+    time_unix_nano: u64,
+    #[serde(default, deserialize_with = "json_int::u64")]
+    count: u64,
+    #[serde(default)]
+    sum: Option<f64>,
+    #[serde(default)]
+    scale: i32,
+    #[serde(default, deserialize_with = "json_int::u64")]
+    zero_count: u64,
+    #[serde(default)]
+    zero_threshold: f64,
+    #[serde(default)]
+    positive: Option<OtlpJsonBuckets>,
+    #[serde(default)]
+    negative: Option<OtlpJsonBuckets>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OtlpJsonBuckets {
+    #[serde(default)]
+    offset: i32,
+    #[serde(default, deserialize_with = "json_int::vec_u64")]
+    bucket_counts: Vec<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -587,6 +686,17 @@ impl OtlpJsonRequest {
                                             .collect(),
                                         aggregation_temporality: 0,
                                     }))
+                                } else if let Some(exp) = m.exponential_histogram {
+                                    Some(otlp::metric::Data::ExponentialHistogram(
+                                        otlp::ExponentialHistogram {
+                                            data_points: exp
+                                                .data_points
+                                                .into_iter()
+                                                .map(json_exponential_histogram_dp_to_proto)
+                                                .collect(),
+                                            aggregation_temporality: 0,
+                                        },
+                                    ))
                                 } else if let Some(summary) = m.summary {
                                     Some(otlp::metric::Data::Summary(otlp::Summary {
                                         data_points: summary
@@ -646,9 +756,35 @@ fn json_histogram_dp_to_proto(dp: OtlpJsonHistogramDataPoint) -> otlp::Histogram
         start_time_unix_nano: 0,
         time_unix_nano: dp.time_unix_nano,
         count: dp.count,
-        sum: dp.sum.unwrap_or(0.0),
+        sum: dp.sum,
         bucket_counts: dp.bucket_counts,
         explicit_bounds: dp.explicit_bounds,
+    }
+}
+
+fn json_exponential_histogram_dp_to_proto(
+    dp: OtlpJsonExponentialHistogramDataPoint,
+) -> otlp::ExponentialHistogramDataPoint {
+    let buckets = |b: Option<OtlpJsonBuckets>| {
+        b.map(|b| otlp::exponential_histogram_data_point::Buckets {
+            offset: b.offset,
+            bucket_counts: b.bucket_counts,
+        })
+    };
+    otlp::ExponentialHistogramDataPoint {
+        attributes: dp.attributes.into_iter().map(json_kv_to_proto).collect(),
+        start_time_unix_nano: 0,
+        time_unix_nano: dp.time_unix_nano,
+        count: dp.count,
+        sum: dp.sum,
+        scale: dp.scale,
+        zero_count: dp.zero_count,
+        positive: buckets(dp.positive),
+        negative: buckets(dp.negative),
+        flags: 0,
+        min: None,
+        max: None,
+        zero_threshold: dp.zero_threshold,
     }
 }
 
@@ -658,7 +794,7 @@ fn json_summary_dp_to_proto(dp: OtlpJsonSummaryDataPoint) -> otlp::SummaryDataPo
         start_time_unix_nano: 0,
         time_unix_nano: dp.time_unix_nano,
         count: dp.count,
-        sum: dp.sum.unwrap_or(0.0),
+        sum: dp.sum,
         quantile_values: dp
             .quantile_values
             .into_iter()
@@ -808,7 +944,7 @@ mod tests {
                                 start_time_unix_nano: 0,
                                 time_unix_nano: 3_000_000_000,
                                 count: 100,
-                                sum: 50.5,
+                                sum: Some(50.5),
                                 bucket_counts: vec![10, 40, 30, 20],
                                 explicit_bounds: vec![0.01, 0.1, 1.0],
                             }],
@@ -822,16 +958,84 @@ mod tests {
         let points = convert_otlp_request(&req).unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].series_key().measurement(), "http_duration");
-        assert!(matches!(
-            points[0].field("count"),
-            Some(FieldValue::U64(100))
-        ));
-        assert!(matches!(
-            points[0].field("sum"),
-            Some(FieldValue::F64(v)) if (*v - 50.5).abs() < f64::EPSILON
-        ));
-        assert!(points[0].field("bucket_0.01").is_some());
-        assert!(points[0].field("bucket_inf").is_some());
+
+        // One histogram column under `value`, not one field per boundary.
+        // The metric therefore keeps its own name — `http_duration`, not
+        // `http_duration_bucket_0.01` and six siblings — and answers
+        // `histogram_quantile` the way a Prometheus user expects.
+        let Some(FieldValue::Histogram(h)) = points[0].field("value") else {
+            panic!("expected a histogram column, got {:?}", points[0].fields());
+        };
+        assert_eq!(h.schema, chronix_core::histogram::CUSTOM_BUCKETS_SCHEMA);
+        assert_eq!(h.custom_values, vec![0.01, 0.1, 1.0]);
+        assert_eq!(h.count, 100.0);
+        assert!((h.sum - 50.5).abs() < f64::EPSILON);
+        // 10 + 40 + 30 + 20, the last being the +Inf overflow.
+        assert_eq!(h.positive.len(), 4);
+        assert!((h.fraction(f64::NEG_INFINITY, f64::INFINITY) - 1.0).abs() < 1e-12);
+    }
+
+    /// An OTLP exponential histogram is stored, not dropped.
+    ///
+    /// Before the `ExponentialHistogram` arm existed the message decoded to a
+    /// `data` of `None` and the whole data point vanished without a word — an
+    /// OTel SDK configured for base-2 histograms wrote nothing and got 200 OK.
+    #[test]
+    fn convert_exponential_histogram() {
+        let req = otlp::ExportMetricsServiceRequest {
+            resource_metrics: vec![otlp::ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![otlp::ScopeMetrics {
+                    scope: None,
+                    metrics: vec![otlp::Metric {
+                        name: "rpc_latency".into(),
+                        description: String::new(),
+                        unit: String::new(),
+                        data: Some(otlp::metric::Data::ExponentialHistogram(
+                            otlp::ExponentialHistogram {
+                                data_points: vec![otlp::ExponentialHistogramDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: 5_000_000_000,
+                                    count: 4,
+                                    sum: Some(12.0),
+                                    scale: 0,
+                                    zero_count: 1,
+                                    // OTLP index 1 covers (2, 4]; index 2 covers (4, 8].
+                                    positive: Some(
+                                        otlp::exponential_histogram_data_point::Buckets {
+                                            offset: 1,
+                                            bucket_counts: vec![2, 1],
+                                        },
+                                    ),
+                                    negative: None,
+                                    flags: 0,
+                                    min: None,
+                                    max: None,
+                                    zero_threshold: 0.5,
+                                }],
+                                aggregation_temporality: 2,
+                            },
+                        )),
+                    }],
+                }],
+            }],
+        };
+
+        let points = convert_otlp_request(&req).unwrap();
+        assert_eq!(points.len(), 1);
+        let Some(FieldValue::Histogram(h)) = points[0].field("value") else {
+            panic!("expected a histogram column");
+        };
+        assert_eq!(h.schema, 0);
+        assert_eq!(h.zero_count, 1.0);
+        assert_eq!(h.zero_threshold, 0.5);
+        assert_eq!(h.count, 4.0);
+        // OTLP index 1 is Prometheus index 2, whose bounds are (2, 4].
+        assert_eq!(h.positive[0].index, 2);
+        assert_eq!(h.bucket_bounds(2, false), (2.0, 4.0));
+        assert_eq!(h.positive[1].index, 3);
+        assert_eq!(h.bucket_bounds(3, false), (4.0, 8.0));
     }
 
     #[test]
@@ -851,7 +1055,7 @@ mod tests {
                                 start_time_unix_nano: 0,
                                 time_unix_nano: 4_000_000_000,
                                 count: 200,
-                                sum: 100.0,
+                                sum: Some(100.0),
                                 quantile_values: vec![
                                     otlp::summary_data_point::ValueAtQuantile {
                                         quantile: 0.5,

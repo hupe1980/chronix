@@ -360,11 +360,7 @@ impl RateAccumulator {
             .windows(2)
             .map(|w| {
                 let delta = w[1] - w[0];
-                if delta >= 0.0 {
-                    delta
-                } else {
-                    w[1]
-                }
+                if delta >= 0.0 { delta } else { w[1] }
             })
             .sum()
     }
@@ -1162,7 +1158,7 @@ impl SeriesAccumulator {
                     .values)
             }
             ForecastKind::Auto => {
-                use chronix_analytics::forecast::{auto_forecast, AutoForecastOptions};
+                use chronix_analytics::forecast::{AutoForecastOptions, auto_forecast};
                 if values.len() < 8 {
                     return Err(datafusion::common::DataFusionError::Plan(
                         "auto_forecast: need at least 8 non-null rows".into(),

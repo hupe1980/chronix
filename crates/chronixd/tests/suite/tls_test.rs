@@ -13,8 +13,8 @@ use reqwest::{Certificate, StatusCode};
 use tempfile::TempDir;
 use tokio::time::Duration;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 use chronixd::http::{AppState, SharedState};
 use chronixd::server::build_router;
 

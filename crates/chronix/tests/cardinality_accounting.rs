@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use tempfile::TempDir;
 
 fn db_with_limit(dir: &TempDir, max_series: usize) -> Chronix {

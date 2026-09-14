@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, ForecastConfig};
+use chronix::{Chronix, ForecastConfig, fields, tags};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;

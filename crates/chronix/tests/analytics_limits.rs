@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 
 const SEC: i64 = 1_000_000_000;
 const T: i64 = 1_700_000_000 * SEC;

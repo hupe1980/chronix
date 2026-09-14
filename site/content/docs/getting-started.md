@@ -34,6 +34,8 @@ cargo add chronix --features streaming
 
 | Feature | What it adds | Cost |
 |---|---|---|
+| `analytics` (**on**) | Forecasting, anomaly detection, preprocessing, the model registry, and the SQL kernels built on them | The largest sub-crate, plus `sha2`. Turn it off with `default-features = false` for a storage-only build |
+| `sql` (**on**) | `db.sql()`, the DataFusion session, `EXPLAIN`, the cold tier's read half. Implies `analytics` | DataFusion — about 96 s of build time, and ~0.3 MiB of binary when unused |
 | `streaming` | The CDC bus and `db.subscribe()`, triggers and delivery | An HTTP client and a TLS stack, for webhook delivery |
 | `security` | API keys, JWT/OIDC, mTLS, Cedar authorization, the audit chain, namespaces | A JWT library, Cedar, Argon2 and `aes-gcm` |
 | `pipeline` | The real-time pipeline — CDC → triggers → delivery, streaming anomaly detection, continuous forecasting. Implies both | — |
@@ -249,8 +251,41 @@ FROM cpu;
 
 ## A note on maturity
 
-Chronix is pre-1.0 and has no production deployments yet. The on-disk format
-and the public API are **not stable**, and the distributed tier is deliberately
-frozen — see [Cluster](@/docs/cluster.md). What *is* solid is the single-node
-engine: every performance and compression number in this documentation names
-the test that pins it, and the gaps are written down rather than implied away.
+Chronix is pre-1.0. The on-disk format and the public API are **not stable**,
+and the distributed tier is deliberately frozen — see
+[Cluster](@/docs/cluster.md). What *is* solid is the single-node engine: every
+performance and compression number in this documentation names the test that
+pins it, and the gaps are written down rather than implied away.
+
+### Upgrading, before 1.0
+
+**A data directory belongs to one format generation, and there is no
+migration.** Chronix reads exactly the generation it writes: `.csx` segments,
+the write-ahead log, the catalog snapshot and the `.series` sidecar all carry
+the same version, and a directory from another generation is refused at
+`Chronix::open()` with a message naming both versions and what to do.
+
+That is a deliberate choice. Before 1.0 the format is still changing, and
+carrying a reader for every superseded layout is a permanent cost paid for data
+that so far exists only on developers' machines. The alternative would be to
+freeze the format now, around gaps everyone can see.
+
+**The remaining format changes are batched into one break**, so this happens
+once rather than at every release. Until that break lands, the generation is
+unchanged and every existing data directory opens normally.
+
+So, when a release changes the generation:
+
+1. The changelog says so at the top, in bold. There is one changelog, at the
+   repository root, and since this release it also ships **inside** the
+   published crate.
+2. Re-create the data directory and re-ingest. Time-series data usually has an
+   upstream that can replay — a scrape, a broker, a collector — and
+   [`backfill`](@/docs/api-reference.md) is the door for history.
+3. If a rollup tier is the only copy of something, materialise or export it
+   **before** upgrading: `export_parquet` writes a time window that any
+   Parquet reader can load.
+
+**From 1.0 this stops.** The contract published with 1.0 will say what a minor
+version may do to a data directory, and the answer will be "nothing". Until
+then, pin your version and read the changelog before `cargo update`.

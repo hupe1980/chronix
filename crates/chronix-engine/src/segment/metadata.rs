@@ -8,7 +8,7 @@ use chronix_encoding::EncodingType;
 use serde::{Deserialize, Serialize};
 
 use crate::segment::error::{Result, SegmentError};
-use crate::segment::stats::{ColumnStats, COLUMN_STATS_SIZE};
+use crate::segment::stats::{COLUMN_STATS_SIZE, ColumnStats};
 use crate::segment::to_array;
 
 /// Metadata for a single column within a segment.
@@ -110,6 +110,17 @@ impl ColumnMeta {
                 // power of ten but not a panic.
                 self.decimal_scale.unwrap_or(0) as i8,
             ),
+            // A composite value, carried as its own encoding. Added here and
+            // not only in the reader because this comment's own warning came
+            // true a second time: the fallback below is what silently turned a
+            // decimal column into `Utf8`, and it would have done the same to a
+            // histogram. `every_data_type_has_an_arrow_type` now refuses to let
+            // a new code reach the fallback at all.
+            data_types::HISTOGRAM => DataType::Binary,
+            data_types::STRING => DataType::Utf8,
+            // Unknown code from a segment this build does not understand.
+            // Reading it as text is the least-wrong guess and the reason the
+            // test above exists.
             _ => DataType::Utf8,
         }
     }
@@ -140,6 +151,9 @@ impl ColumnMeta {
                     Err(_) => std::sync::Arc::new(Decimal128Array::from(Vec::<i128>::new())),
                 }
             }
+            data_types::HISTOGRAM => {
+                std::sync::Arc::new(arrow::array::BinaryArray::from(Vec::<&[u8]>::new()))
+            }
             _ => std::sync::Arc::new(StringArray::from(Vec::<&str>::new())),
         }
     }
@@ -169,6 +183,14 @@ pub mod data_types {
     /// Exact decimal column: an `i128` mantissa with the scale held in
     /// [`ColumnMeta::decimal_scale`](super::ColumnMeta::decimal_scale).
     pub const DECIMAL: u8 = 6;
+    /// Native histogram column: each value is a whole distribution, stored
+    /// as an opaque encoded blob and read through the `histogram_*` family.
+    ///
+    /// It is the only **composite** column type — a value carries its own
+    /// count, sum, resolution and sparse buckets — which is why it is a blob
+    /// rather than a numeric column: there is no single number to zone-map,
+    /// and a predicate on it is not a comparison.
+    pub const HISTOGRAM: u8 = 7;
 }
 
 /// Column role tags.
@@ -577,5 +599,86 @@ mod tests {
     #[test]
     fn corrupt_metadata_detected() {
         assert!(SegmentMetadata::from_bytes(&[0; 2]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod data_type_coverage {
+    use super::*;
+
+    /// Every declared column type maps to an Arrow type deliberately.
+    ///
+    /// `arrow_data_type` ends in `_ => DataType::Utf8`, and its own doc
+    /// comment records what that cost: it "silently turned a decimal column
+    /// into `Utf8` the moment one existed". Adding the histogram type was
+    /// about to do it a second time — the column wrote as `Binary` and read
+    /// back as `Utf8`, and the only reason it surfaced was a `RecordBatch`
+    /// refusing the mismatch.
+    ///
+    /// So the fallback stays — an unknown code from a future segment has to
+    /// become *something* — and this refuses to let a code we declare reach
+    /// it. The list is the `data_types` module itself; a constant added
+    /// without an arm fails here rather than in a user's query.
+    #[test]
+    fn every_declared_data_type_has_its_own_arrow_type() {
+        use arrow::datatypes::DataType;
+        let declared: &[(&str, u8)] = &[
+            ("TIMESTAMP", data_types::TIMESTAMP),
+            ("STRING", data_types::STRING),
+            ("F64", data_types::F64),
+            ("I64", data_types::I64),
+            ("U64", data_types::U64),
+            ("BOOL", data_types::BOOL),
+            ("DECIMAL", data_types::DECIMAL),
+            ("HISTOGRAM", data_types::HISTOGRAM),
+        ];
+
+        // The source is the authority on how many there are: a constant added
+        // to `data_types` without an entry above is caught here too, so this
+        // test cannot go stale by omission.
+        let source = include_str!("metadata.rs");
+        let marker = "pub mod data_types {";
+        let body = &source[source.find(marker).expect("the module") + marker.len()..];
+        let body = &body[..body.find("\n}").expect("its end")];
+        let declared_in_source = body.matches("pub const ").count();
+        assert_eq!(
+            declared_in_source,
+            declared.len(),
+            "`data_types` declares {declared_in_source} codes and this test lists \
+             {}. A column type with no arm in `arrow_data_type` reads back as \
+             text, which is how a decimal column became `Utf8` once already.",
+            declared.len()
+        );
+
+        for &(name, code) in declared {
+            let meta = ColumnMeta {
+                name: name.to_string(),
+                data_type: code,
+                role: roles::FIELD,
+                default_encoding: 0,
+                stats: ColumnStats::empty(),
+                bloom_filter: None,
+                encrypted: false,
+                key_id: None,
+                decimal_scale: Some(2),
+                row_group_blooms: None,
+            };
+            let arrow = meta.arrow_data_type();
+            if code != data_types::STRING {
+                assert_ne!(
+                    arrow,
+                    DataType::Utf8,
+                    "{name} falls through to the `Utf8` fallback"
+                );
+            }
+            // And the empty array must agree with the declared type, or a
+            // pruned row group produces a batch the schema refuses.
+            assert_eq!(
+                meta.empty_array().data_type(),
+                &arrow,
+                "{name}: empty_array and arrow_data_type disagree, so a pruned \
+                 row group would not fit the schema it is being put into"
+            );
+        }
     }
 }

@@ -5,7 +5,7 @@ use chronix_analytics::anomaly::{
     AnomalyDetector, DynamicThresholdDetector, IqrDetector, ModifiedZScoreDetector,
     MovingAverageResidualDetector, ZScoreDetector,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 fn gen_data(n: usize) -> (Vec<i64>, Vec<f64>) {

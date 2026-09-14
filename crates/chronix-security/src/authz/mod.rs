@@ -69,6 +69,6 @@ mod model;
 #[cfg(test)]
 mod perf;
 
-pub use engine::{schema_action_names, AuthzEngine, SCHEMA_SRC};
+pub use engine::{AuthzEngine, SCHEMA_SRC, schema_action_names};
 pub use error::AuthzError;
 pub use model::{ChronixAction, ChronixNamespace, ChronixPrincipal, ChronixSystem, Decision};

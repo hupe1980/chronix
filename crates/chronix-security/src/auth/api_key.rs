@@ -14,8 +14,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};

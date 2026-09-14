@@ -6,11 +6,11 @@
 
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
-use tokio_stream::{wrappers::BroadcastStream, Stream};
+use tokio_stream::{Stream, wrappers::BroadcastStream};
 
 use crate::cdc::bus::{BusStats, EventBus, Subscription};
 use crate::cdc::event::CdcEvent;
@@ -85,17 +85,17 @@ impl SubscriptionFilter {
     /// Returns `true` if the event matches this filter.
     pub fn matches(&self, event: &CdcEvent) -> bool {
         // Check measurement filter
-        if let Some(measurements) = &self.measurements {
-            if !measurements.contains(event.measurement()) {
-                return false;
-            }
+        if let Some(measurements) = &self.measurements
+            && !measurements.contains(event.measurement())
+        {
+            return false;
         }
 
         // Check event type filter
-        if let Some(event_types) = &self.event_types {
-            if !event_types.contains(event.event_type()) {
-                return false;
-            }
+        if let Some(event_types) = &self.event_types
+            && !event_types.contains(event.event_type())
+        {
+            return false;
         }
 
         // Check tag predicates (only for events that have tags)

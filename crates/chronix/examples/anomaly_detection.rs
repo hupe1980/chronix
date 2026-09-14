@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, AnomalyConfig, Chronix};
+use chronix::{AnomalyConfig, Chronix, fields, tags};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;

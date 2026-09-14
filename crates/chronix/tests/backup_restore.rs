@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use tempfile::TempDir;
 
 fn open(dir: &Path) -> Chronix {
@@ -120,9 +120,8 @@ fn a_restored_database_does_not_share_files_with_the_original() {
     // is never rewritten, only unlinked, and an unlink drops one name.
     // Sharing a *path* is what is not safe.
     {
-        let cat = copy.catalog().read();
-        for entry in cat.all_segments() {
-            let path = entry.file.resolve(&restored.join("segments"));
+        for entry in copy.segments() {
+            let path = entry.path;
             assert!(
                 path.starts_with(&restored),
                 "the copy's catalog names {}, which is outside {}",
@@ -414,7 +413,7 @@ fn the_manifest_counts_the_segments_it_captured() {
 
     let db = open(&data);
     seed(&db, 200);
-    let expected = db.catalog().read().segment_count();
+    let expected = db.segment_count();
     let manifest = db.backup(&backup).unwrap();
     db.close().unwrap();
 

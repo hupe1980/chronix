@@ -11,7 +11,7 @@ mod split;
 
 pub use config::{AutoScaleConfig, RegionMetrics};
 pub use periodic::{ClusterSnapshot, PeriodicRebalancer, RebalanceResult};
-pub use rebalance::{build_leader_map, estimate_disk_usage, NodeDiskUsage, ScaleAssessment};
+pub use rebalance::{NodeDiskUsage, ScaleAssessment, build_leader_map, estimate_disk_usage};
 pub use split::{SplitPhase, SplitPlan, SplitReason, SplitResult};
 
 /// Automatic region scaling engine.

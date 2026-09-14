@@ -26,8 +26,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 use chronixd::http::{AppState, SharedState};
 use chronixd::server::build_router;
 

@@ -41,13 +41,13 @@ pub mod decomposition;
 pub mod features;
 
 pub use arrow_adapters::{
-    arrow_interpolate, arrow_preprocess, arrow_smooth, ArrowPreprocessResult,
+    ArrowPreprocessResult, arrow_interpolate, arrow_preprocess, arrow_smooth,
 };
 pub use auto_features::{AutoFeatureConfig, FeatureMatrix};
-pub use clock_drift::{ClockDriftDetector, ClockDriftStrategy, DriftReport};
+pub use clock_drift::{ClockDriftDetector, ClockDriftReport, ClockDriftStrategy};
 pub use decomposition::{
-    detect_period, detect_period_with_threshold, stl_decompose, Decomposition, DecompositionError,
-    SeasonalDecomposer, StlConfig, StlDecomposer,
+    Decomposition, DecompositionError, SeasonalDecomposer, StlConfig, StlDecomposer, detect_period,
+    detect_period_with_threshold, stl_decompose,
 };
 pub use features::{diff, ewm, lag, pct_change, rolling_corr, rolling_mean, rolling_std, zscore};
 pub use gap::GapDetector;

@@ -6,6 +6,309 @@ per [CONTRIBUTING.md](CONTRIBUTING.md), a breaking change bumps the minor
 version and a fix bumps the patch — there is no stability promise before 1.0,
 and no migration tooling for the on-disk format.
 
+## [0.7.0] - 2026-09-14
+
+**The on-disk format is unchanged — existing data directories open normally.**
+This release is breaking for the *API*, not for the bytes. The format-changing
+work is deliberately batched into one later break, so that it happens once and
+the format then freezes at 1.0.
+
+### Changed
+
+- **One policy for the four on-disk format versions**, in
+  `chronix_engine::format`: `.csx` segments, the write-ahead log, the catalog
+  snapshot and the `.series` sidecar. All four stay at version **1** — nothing
+  here changes the bytes — but they are now checked the same way and reported
+  the same way.
+
+  The refusal itself was the reason to do this now. The four formats had four
+  version constants, three different comparisons and four different error
+  texts. The catalog compared with `>`, so an **older** snapshot was silently
+  accepted by a reader with no code to interpret one. The `.series` sidecar
+  reported a version mismatch as `IndexError::Corrupt`, which sends an
+  operator who has just upgraded chronix looking for a failing disk — the
+  bytes are intact and the remedy is to match the versions up. And three of
+  the four printed a bare number, which is the first error somebody meets
+  before they have any other information.
+
+  There is now one policy in `chronix_engine::format`: equality in both
+  directions, a dedicated `UnsupportedVersion` on each error enum — never a
+  corruption variant — and one message naming both versions and what to do.
+  Guarded by `no_durable_reader_reports_a_version_mismatch_as_corruption`,
+  which reads the code rather than the comments, after its first version
+  tripped over its own justification for the rule.
+
+  **The versions move when the bytes move, and not before.** A bump with no
+  layout change invalidates every directory in exchange for nothing; a layout
+  change with no bump is worse, because an old directory then has matching
+  magic and a matching version, so the reader walks into a layout it does not
+  understand and the failure arrives as a CRC error or a decode error — the
+  very confusion this policy removes.
+
+- **BREAKING — `chronix-analytics` is behind the facade's `analytics`
+  feature**, on by default. `default-features = false` now drops the largest
+  crate in the workspace — forecasting, anomaly detection, preprocessing, the
+  model registry — along with `sha2`, for a consumer that only stores and
+  queries. `sql` implies it, because the SQL window functions and forecast
+  aggregates are wrappers over those kernels.
+
+  It was unconditional while `chronix-security` and `chronix-streaming` were
+  both optional, and the design partner asked the question nobody had: why is
+  the biggest sub-crate the only engine crate I cannot turn off? `rayon` is
+  **not** removed by this — the scan path uses it to read segments in parallel
+  above a threshold — which is worth knowing before anyone expects otherwise.
+
+- **BREAKING — the six accessors that handed out the engine's internal locks
+  are gone:** `Chronix::catalog`, `bloom_filters`, `rollup_registry`, `wal`,
+  `shards` and `tag_index`. Five had no caller anywhere in this repository.
+
+  They were not merely untidy. `CatalogLock` lives in a `pub(crate)` module,
+  so a caller could invoke the method and could **not name what came back** —
+  no struct field, no signature, no annotated `let`. The lock hierarchy is
+  documented as an invariant of this crate's implementation rather than a
+  contract with callers, and was then enforced on callers by a debug-build
+  panic naming levels they had no way to read: an external program doing two
+  ordinary reads in the wrong order panicked on the second. In release the
+  assertion compiles away and the same two reads deadlock against the
+  maintenance thread.
+
+  **Replacement:** `Chronix::segment_count()`, `segments()` and
+  `segments_of(measurement)`, returning owned `SegmentInfo` values taken under
+  the lock and handed back after it is released. Every call site in this
+  repository got shorter.
+
+- **BREAKING — `MultivariateForecastResult` names its rows.** New fields
+  `series` (one name per row of `predictions`) and `target` (the series
+  `fit` was asked for), and new methods `for_series()` and
+  `target_forecast()`.
+
+  `MultivariateForecastModel::fit(ctx, target_idx)` documents `target_idx` as
+  the series to forecast. `MultiLinearRegression` honoured it and returned one
+  row; `VarModel` bound it `_target_idx`, discarded it, and returned one row
+  per series — so generic code reading `predictions[0]` got the requested
+  series from one implementor and series index 0 from the other. Asking for a
+  series whose values sit around 50 000 returned **12.00**, which is a
+  plausible number belonging to a different series. `VarModel` now also
+  validates the index it used to ignore.
+
+- **BREAKING — duplicate public type names disambiguated.**
+  `preprocess::DriftReport` → `ClockDriftReport` (a sensor's clock drifting),
+  `lifecycle::DriftReport` → `ModelDriftReport` (a model's accuracy drifting),
+  and `lifecycle::registry::AccuracyMetrics` → `VersionAccuracy` (distinct
+  from the crate-root `AccuracyMetrics`, which is a forecast scorecard).
+
+- **BREAKING — `chronix_analytics::multivariate::granger` is deleted.** It was
+  a second implementation of Granger causality in the same crate, with a
+  second result type, and **no consumer** — nothing in the facade, the server,
+  the examples or the tests referenced it. Run against
+  `VarModel::granger_causality` on the same data at three lag orders the two
+  agreed to 5×10⁻⁴, so this was a duplicate rather than a divergence. Use
+  `VarModel::granger_causality` / `granger_causality_robust`.
+
+- **The workspace is on Rust edition 2024.** MSRV is unchanged at 1.94. The
+  migration paid for itself immediately: `std::env::set_var` is `unsafe` in
+  2024 because it mutates state every thread shares, and six calls sat in
+  `cargo test`'s parallel harness, racing any concurrently running test that
+  reads the environment. They are gone rather than annotated — the variable
+  substitution takes its lookup as an argument, so the tests touch no global
+  state.
+
+### Added
+
+- **Native histograms.** A whole distribution as one sample, end to end:
+  `FieldValue::Histogram`, `ColumnType::Histogram` and
+  `chronix_core::histogram::Histogram` with the Prometheus model — schemas −4
+  to 8 plus −53 for custom boundaries, exponentially-interpolated quantiles,
+  fractions, moments and merge.
+
+  - **Storage.** Survives the memtable, a flush and a restart; keeps custom
+    boundaries; coexists with scalar columns. A histogram with unsorted
+    buckets is refused at `Point::new` rather than interpolating to a
+    plausible wrong quantile later.
+  - **Rollups.** A tier over a histogram column **merges** it: `sum` is the
+    merge, `avg` scales by 1/n, `min`/`max` are NULL, and two schemas in one
+    bucket are refused rather than silently re-bucketed.
+  - **PromQL.** `histogram_count`, `histogram_sum`, `histogram_avg`,
+    `histogram_stddev`, `histogram_stdvar` and `histogram_fraction`;
+    `histogram_quantile` dispatches between native and classic `le` input.
+    The rest refuse a float series **by name** — `histogram_count` of a gauge
+    is not the gauge.
+  - **Ingest.** Remote write **1.0 and 2.0**, selected by the `Content-Type`
+    `proto=` parameter (`prometheus.WriteRequest` or
+    `io.prometheus.write.v2.Request`); anything else is `415` naming both. A
+    2.0 write answers `X-Prometheus-Remote-Write-Samples-Written`,
+    `-Histograms-Written` and `-Exemplars-Written` — the last always `0`,
+    since Chronix stores no exemplars. OTLP **exponential** and
+    **explicit-bucket** histograms both land as histogram columns.
+  - **Remote read** returns histograms, so a federating Prometheus reading
+    Chronix as long-term storage gets the distribution back.
+  - **The classic names.** `foo_bucket`, `foo_count` and `foo_sum` read a
+    stored histogram as a read-time view — nothing stored twice — so an
+    existing panel needs no change. They are resolvable but not *listed*, so
+    `{__name__=~".+"}` cannot return the same observations three times. A
+    measurement with a real float field called `count` keeps it.
+
+    The `le` values are the boundaries the histogram **has**. Custom-bucket
+    data (OTLP explicit-bucket, or a classic histogram) carries the
+    instrumentation's own boundaries, so an existing `le="0.5"` matches; an
+    exponential schema carries powers of `2^(2^-n)`, so it does not, and the
+    query returns empty rather than the nearest bucket.
+
+- **`EncodingType::Bytes`** — a length-prefixed framing for columns whose
+  values are composite objects with their own encoding. Deliberately not a
+  clever codec: a histogram is already packed, and a second-guessing layer
+  over an opaque blob would compress nothing while adding a decoder to audit.
+  It joins the fuzz corpus and the adversarial proptests by construction,
+  because both are generated from the encoding enum.
+
+- **`Chronix::segments()`, `segments_of()` and `segment_count()`**, returning
+  `SegmentInfo` — measurement, absolute path, rows, series, time bounds and
+  size on disk. Sorted, so two calls on an unchanged database compare equal.
+- **`chronix_engine::format`** — the four format versions and the single rule
+  for checking them, with the policy written down where the next person
+  changing a format will read it.
+- **The changelog travels with the published crate.** `cargo package` includes
+  nothing from outside a package directory, so a root-level `CHANGELOG.md` is
+  invisible on crates.io and docs.rs — and the reader who most needs it is the
+  one whose `cargo update` just moved them a minor version. The design partner
+  proposed `include = ["../../CHANGELOG.md"]`; that does **not** work, and the
+  way it fails is the problem — cargo drops a path outside the package root
+  with no error and no warning. `scripts/publish-crate.sh` now copies the root
+  changelog into the crate directory for the duration of the publish and
+  removes it after, so the tarball carries it and the repository still has
+  exactly one.
+- **`scripts/check-references.sh` resolves the evidence citations too.** The
+  architecture notes carry a table whose premise is that every measured claim
+  names the test pinning it — and nothing checked that the named test exists.
+  Two did not: one had been renamed, and one had never existed while the
+  property it claimed was real and pinned elsewhere. A dangling citation is
+  worse than an absent one, because an absent one reads as a gap and a
+  dangling one reads as evidence.
+
+- **`scripts/check-docs.sh` gained two checks.** §13 refuses two public types
+  with the same name inside one crate — three pairs existed, each locally
+  sensible and each invisible until a caller holds both. And the
+  internal-reference check now covers `CHANGELOG.md`, because the changelog
+  ships inside the crate as of this release and a reader with the tarball
+  cannot open a gitignored note.
+
+  The changelog joins *that* check and not the others, which is the
+  interesting half: most checks in that script ask "is this still true?", and
+  a changelog exists to record states that are deliberately no longer true.
+  Adding it to the general list immediately flagged an entry describing the
+  release that **fixed** a wrong port, for naming the wrong port.
+
+- **`crates/chronix/tests/public_api.rs` pins the handle's surface.** It
+  pinned the crate root's re-exports and public modules and never the methods
+  on `Chronix`, which is what a caller touches — and which had reached eighty.
+  Two new tests: a list every addition must join deliberately, and a
+  structural check that no public method returns one of the engine's ordered
+  locks.
+- **`crates/chronix/tests/promql_surface.rs`** states the PromQL surface
+  against a **named** Prometheus version — 3.14 — and asserts it in both
+  directions: every function listed as implemented is accepted by the
+  evaluator, and every function listed as absent is refused **by name** rather
+  than answering something plausible. A third test refuses to let a name
+  appear in both lists.
+
+  The documentation used to say "what remains of the 3.x surface is native
+  histograms and the experimental `limitk` / `limit_ratio`" — an
+  exhaustive-sounding list that stopped being exhaustive three Prometheus
+  releases later, when 3.5 through 3.14 added nine functions. "3.x" is not a
+  version, and a claim about somebody else's project kept in prose decays
+  silently. Each absent entry now carries its reason, because an unimplemented
+  list without one is a to-do list rather than a set of decisions.
+
+- **`crates/chronix-analytics/tests/multivariate_contract.rs`** — what one
+  call to `MultivariateForecastModel` promises, asked of every implementor:
+  that `target_forecast()` answers for the series the caller named, that every
+  row says which series it is, and that an out-of-range target index is
+  refused.
+
+### Changed — BREAKING
+
+- **An OTLP explicit-bucket histogram is now one histogram column**, not
+  `count`, `sum` and a `bucket_<bound>` field per boundary. It lands as schema
+  −53 in the metric's own `value` column and answers the whole `histogram_*`
+  family — the field expansion stored the data and answered nothing, because
+  `histogram_quantile` had no bucketed series to read.
+
+  **Migration:** `bucket_<bound>` fields are gone. Use
+  `histogram_quantile(0.99, your_metric)`, or the classic names —
+  `your_metric_bucket{le="0.5"}`, `your_metric_count`, `your_metric_sum`. Note
+  the spelling: the old expansion produced `your_metric_bucket_0.5` as a
+  *metric name*; the exposition produces `your_metric_bucket` with an `le`
+  label, which is what Prometheus has always meant by a bucket series.
+
+- **An unset OTLP `sum` is now absent rather than zero.** `HistogramDataPoint`,
+  `SummaryDataPoint` and `ExponentialHistogramDataPoint` declare `sum` as
+  `optional`, as upstream does. Without the presence bit an unset sum decoded
+  as `0.0` — and OTLP leaves it unset precisely when the instrument recorded
+  negative events, so `histogram_avg` reported a number that was wrong and
+  indistinguishable from a real one.
+
+### Added — server
+
+- **`ServerError::UnsupportedMediaType`**, answering `415`. Distinct from
+  `BadRequest` because a sender acts on them differently: `400` says "your data
+  is wrong, do not retry", `415` says "I do not speak this dialect, send
+  another".
+
+### Fixed — testing
+
+- **Two test helpers leaked a temporary directory on every run.**
+  `promql_surface.rs` and `chronixd`'s `auth.rs` both ended in
+  `std::mem::forget(dir)` so a database could outlive the helper — which works,
+  and leaves a directory of database files behind on every run, on every
+  machine. Between them they filled a disk during this pass. Both now return
+  the directory beside the handle, and `scripts/check-docs.sh` §14 refuses the
+  shortcut — `into_path()` and `keep()` included, since they disarm the same
+  cleanup by another name.
+
+### Fixed
+
+- **Every Granger causality p-value was wrong.** `chronix-analytics` carried
+  two `ln_gamma` implementations, and the one in `multivariate::mv_forecast`
+  had the g = 7 Lanczos coefficients with a `t = x + 6.5` offset — g = 6.
+  Mismatched parameters are not a precision problem: that copy returned
+  **0.928** for `ln Γ(1)`, which is 0. It sits under `ln_beta` →
+  `regularized_incomplete_beta` → `f_distribution_sf`, so
+  `VarModel::granger_causality` and its HC3-robust sibling reported
+  significance from a broken survival function — `F(2,1)` at 0.01 answered
+  0.9966 where the truth is 0.9901.
+
+  The correct `ln_gamma`, with a passing known-values test, was one module
+  away in `forecast::diagnostics`. There is now one, `pub(crate)`, and
+  `chronix-analytics --test one_definition` counts the definitions of every
+  special function in the crate so a second copy cannot reappear.
+
+  `f_distribution_sf` is pinned two ways: five **closed forms** — `F(2,d₂)`,
+  `F(d₁,2)`, `F(1,1)`, the reciprocal identity `sf_{F(d₁,d₂)}(x) = 1 −
+  sf_{F(d₂,d₁)}(1/x)`, and survival-function bounds — and a **392-point**
+  generated `scipy.stats.f.sf` table for the parameter pairs with no
+  elementary form. A closed form is ground truth rather than a second opinion,
+  and reproduces with nothing installed.
+
+- **`HoltWintersModel::fit` panicked on an empty series.** It indexed
+  `values[0]` on a method that returns `Result`, so an empty measurement took
+  down the host process — which, in an embedded database, is the caller's
+  daemon. The check went into `validate_input`, the one function every
+  forecasting model calls, because the other five survived the same input only
+  by luck: their fitting loops are no-ops over an empty slice, and they then
+  answered `predict()` from an uninitialised level. Fitting an empty series is
+  now an error for all of them, with a message naming the problem.
+
+  Found by pushing eight degenerate series — empty, one point, all-NaN,
+  constant, infinite, extreme, subnormal, and a seasonal period longer than the
+  data — through the public surface. `chronix-analytics --test
+  degenerate_input` keeps the question asked, of every model *and* every
+  anomaly detector; the detectors were clean.
+
+- **`WalError::UnsupportedVersion` and `IndexError::UnsupportedVersion`** are
+  new variants, distinct from `InvalidHeader` and `Corrupt`. A log or sidecar
+  from another format generation is well-formed data the reader cannot
+  interpret, not damage.
+
 ## [0.6.0] - 2026-09-13
 
 ### Added

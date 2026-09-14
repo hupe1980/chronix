@@ -4,7 +4,7 @@
 
 use chronix::prelude::*;
 use chronix::rollup::{RollupAggFn, RollupBuilder};
-use chronix::{fields, tags, Chronix};
+use chronix::{Chronix, fields, tags};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,13 +89,7 @@ fn unreadable_segment_is_not_dropped_by_rollup_aware_retention() {
     db.flush().unwrap();
     advance_clock(&db, 10 * HOUR);
 
-    let segs: Vec<_> = {
-        let cat = db.catalog().read();
-        cat.active_segments_for_measurement("raw")
-            .iter()
-            .map(|e| e.file.resolve(&db.data_dir().join("segments")))
-            .collect()
-    };
+    let segs: Vec<_> = { db.segments_of("raw").into_iter().map(|s| s.path).collect() };
     assert_eq!(segs.len(), 1, "expected exactly one segment");
     std::fs::write(&segs[0], b"NOT A SEGMENT").unwrap();
 
@@ -109,13 +103,7 @@ fn unreadable_segment_is_not_dropped_by_rollup_aware_retention() {
         segs[0].exists(),
         "the unreadable segment must be preserved, not dropped"
     );
-    assert_eq!(
-        db.catalog()
-            .read()
-            .active_segments_for_measurement("raw")
-            .len(),
-        1
-    );
+    assert_eq!(db.segments_of("raw").len(), 1);
     db.close().unwrap();
 }
 
@@ -144,11 +132,7 @@ fn readable_segment_is_dropped_after_rollup() {
         result.segments_deleted, 1,
         "the raw segment; the clock anchors the reference"
     );
-    assert!(db
-        .catalog()
-        .read()
-        .active_segments_for_measurement("raw")
-        .is_empty());
+    assert!(db.segments_of("raw").is_empty());
 
     let batch = scan(&db, "raw_1m");
     assert_eq!(batch.num_rows(), 1);
@@ -232,10 +216,7 @@ fn retention_rolls_a_bucket_up_over_every_segment_that_feeds_it() {
         db.flush().unwrap();
     }
     assert_eq!(
-        db.catalog()
-            .read()
-            .active_segments_for_measurement("raw")
-            .len(),
+        db.segments_of("raw").len(),
         3,
         "the shard must hold three uncompacted segments"
     );

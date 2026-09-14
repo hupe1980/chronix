@@ -331,32 +331,32 @@ impl ConnectorManager {
         *connectors = to_keep;
 
         // Register and start newly-configured connectors (with retry)
-        if desired.contains("kafka-default") {
-            if let Some(ref kafka_cfg) = config.kafka {
-                let consumer = crate::kafka::KafkaConsumer::new_arc(
-                    "kafka-default",
-                    kafka_cfg.clone(),
-                    self.db.clone(),
-                    config.server.multi_tenancy,
-                );
-                info!(name = "kafka-default", "registering new Kafka connector");
-                connectors.push(consumer.clone());
-                self.start_with_retry(consumer.as_ref()).await?;
-            }
+        if desired.contains("kafka-default")
+            && let Some(ref kafka_cfg) = config.kafka
+        {
+            let consumer = crate::kafka::KafkaConsumer::new_arc(
+                "kafka-default",
+                kafka_cfg.clone(),
+                self.db.clone(),
+                config.server.multi_tenancy,
+            );
+            info!(name = "kafka-default", "registering new Kafka connector");
+            connectors.push(consumer.clone());
+            self.start_with_retry(consumer.as_ref()).await?;
         }
 
-        if desired.contains("mqtt-default") {
-            if let Some(ref mqtt_cfg) = config.mqtt {
-                let subscriber = crate::mqtt::MqttSubscriber::new_arc(
-                    "mqtt-default",
-                    mqtt_cfg.clone(),
-                    self.db.clone(),
-                    config.server.multi_tenancy,
-                );
-                info!(name = "mqtt-default", "registering new MQTT connector");
-                connectors.push(subscriber.clone());
-                self.start_with_retry(subscriber.as_ref()).await?;
-            }
+        if desired.contains("mqtt-default")
+            && let Some(ref mqtt_cfg) = config.mqtt
+        {
+            let subscriber = crate::mqtt::MqttSubscriber::new_arc(
+                "mqtt-default",
+                mqtt_cfg.clone(),
+                self.db.clone(),
+                config.server.multi_tenancy,
+            );
+            info!(name = "mqtt-default", "registering new MQTT connector");
+            connectors.push(subscriber.clone());
+            self.start_with_retry(subscriber.as_ref()).await?;
         }
 
         info!(count = connectors.len(), "connector reload complete");

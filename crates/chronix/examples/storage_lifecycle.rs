@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronix::prelude::*;
-use chronix::{fields, tags, Chronix, ParquetExportConfig, RollupAggFn, RollupBuilder};
+use chronix::{Chronix, ParquetExportConfig, RollupAggFn, RollupBuilder, fields, tags};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;

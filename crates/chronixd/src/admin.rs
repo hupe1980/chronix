@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 #[cfg(feature = "cluster")]
-use crate::http::{PaginatedResponse, PaginationParams, DEFAULT_LIST_LIMIT};
+use crate::http::{DEFAULT_LIST_LIMIT, PaginatedResponse, PaginationParams};
 
 #[cfg(feature = "cluster")]
 use chronix_cluster::MetaClient;
@@ -941,7 +941,7 @@ fn confine_to_root(
                 None => {
                     return Err(ServerError::BadRequest(
                         "path does not resolve inside the backup root".into(),
-                    ))
+                    ));
                 }
             },
         }

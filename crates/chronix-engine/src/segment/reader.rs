@@ -60,15 +60,15 @@ use chronix_encoding::{ColumnDecoder, DecodedColumn, EncodedBlock};
 
 use crate::segment::compression::decompress_block_with_optional_dict;
 use crate::segment::error::{Result, SegmentError};
-use crate::segment::header::{SegmentFooter, SegmentHeader, FOOTER_SIZE, HEADER_SIZE};
-use crate::segment::metadata::{data_types, ColumnBlockMeta, ColumnMeta, SegmentMetadata};
+use crate::segment::header::{FOOTER_SIZE, HEADER_SIZE, SegmentFooter, SegmentHeader};
+use crate::segment::metadata::{ColumnBlockMeta, ColumnMeta, SegmentMetadata, data_types};
 use crate::segment::stats::ordered_i64_to_f64;
 
 // ── Zone-map field predicates for late-materialisation ─────────────────
 
 /// A numeric comparison operator for zone-map row-group pruning.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ZoneMapOp {
+pub enum StatsOp {
     /// Equals.
     Eq,
     /// Greater than.
@@ -89,7 +89,7 @@ pub struct FieldPredicate {
     /// Column name.
     pub column: String,
     /// Comparison operator.
-    pub op: ZoneMapOp,
+    pub op: StatsOp,
     /// Predicate value as `f64`.  Integer predicates are cast to `f64`.
     pub value: f64,
 }
@@ -107,11 +107,11 @@ impl FieldPredicate {
             return true;
         }
         match self.op {
-            ZoneMapOp::Eq => self.value >= rg_min && self.value <= rg_max,
-            ZoneMapOp::Gt => rg_max > self.value,
-            ZoneMapOp::GtEq => rg_max >= self.value,
-            ZoneMapOp::Lt => rg_min < self.value,
-            ZoneMapOp::LtEq => rg_min <= self.value,
+            StatsOp::Eq => self.value >= rg_min && self.value <= rg_max,
+            StatsOp::Gt => rg_max > self.value,
+            StatsOp::GtEq => rg_max >= self.value,
+            StatsOp::Lt => rg_min < self.value,
+            StatsOp::LtEq => rg_min <= self.value,
         }
     }
 
@@ -136,12 +136,12 @@ impl FieldPredicate {
         match self.op {
             // The column is integral, so an equality against a fractional
             // value cannot match any row in it, whatever the range says.
-            ZoneMapOp::Eq if self.value.fract() != 0.0 => false,
-            ZoneMapOp::Eq => self.value >= lo && self.value <= hi,
-            ZoneMapOp::Gt => hi > self.value,
-            ZoneMapOp::GtEq => hi >= self.value,
-            ZoneMapOp::Lt => lo < self.value,
-            ZoneMapOp::LtEq => lo <= self.value,
+            StatsOp::Eq if self.value.fract() != 0.0 => false,
+            StatsOp::Eq => self.value >= lo && self.value <= hi,
+            StatsOp::Gt => hi > self.value,
+            StatsOp::GtEq => hi >= self.value,
+            StatsOp::Lt => lo < self.value,
+            StatsOp::LtEq => lo <= self.value,
         }
     }
 
@@ -662,45 +662,43 @@ impl SegmentReader {
         // return an empty RecordBatch immediately.
         if !tag_predicates.is_empty() {
             for &(col_name, value) in tag_predicates {
-                if let Some(col_meta) = self.metadata.columns.iter().find(|c| c.name == col_name) {
-                    if let Some(ref bf) = col_meta.bloom_filter {
-                        if !crate::segment::bloom::bloom_filter_contains(bf, value) {
-                            metrics::counter!("chronix_segment_pruned_by_bloom_filter_total")
-                                .increment(1);
-                            // Build empty RecordBatch with correct schema
-                            let mut empty_arrays: Vec<ArrayRef> = Vec::with_capacity(names.len());
-                            for &name in &names {
-                                let cm = self
-                                    .metadata
-                                    .columns
-                                    .iter()
-                                    .find(|c| c.name == name)
-                                    .ok_or_else(|| SegmentError::CorruptFile {
-                                        detail: format!("column '{name}' not in metadata"),
-                                    })?;
-                                empty_arrays.push(cm.empty_array());
-                            }
-                            let fields: Vec<Field> = names
-                                .iter()
-                                .map(|&n| {
-                                    let cm2 = self
-                                        .metadata
-                                        .columns
-                                        .iter()
-                                        .find(|c| c.name == n)
-                                        .ok_or_else(|| SegmentError::CorruptFile {
-                                            detail: format!("column '{n}' not in metadata"),
-                                        })?;
-                                    Ok(cm2.arrow_field())
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                            let schema = Schema::new(fields);
-                            return RecordBatch::try_new(std::sync::Arc::new(schema), empty_arrays)
-                                .map_err(|e| SegmentError::CorruptFile {
-                                    detail: format!("failed to create empty RecordBatch: {e}"),
-                                });
-                        }
+                if let Some(col_meta) = self.metadata.columns.iter().find(|c| c.name == col_name)
+                    && let Some(ref bf) = col_meta.bloom_filter
+                    && !crate::segment::bloom::bloom_filter_contains(bf, value)
+                {
+                    metrics::counter!("chronix_segment_pruned_by_bloom_filter_total").increment(1);
+                    // Build empty RecordBatch with correct schema
+                    let mut empty_arrays: Vec<ArrayRef> = Vec::with_capacity(names.len());
+                    for &name in &names {
+                        let cm = self
+                            .metadata
+                            .columns
+                            .iter()
+                            .find(|c| c.name == name)
+                            .ok_or_else(|| SegmentError::CorruptFile {
+                                detail: format!("column '{name}' not in metadata"),
+                            })?;
+                        empty_arrays.push(cm.empty_array());
                     }
+                    let fields: Vec<Field> = names
+                        .iter()
+                        .map(|&n| {
+                            let cm2 = self
+                                .metadata
+                                .columns
+                                .iter()
+                                .find(|c| c.name == n)
+                                .ok_or_else(|| SegmentError::CorruptFile {
+                                    detail: format!("column '{n}' not in metadata"),
+                                })?;
+                            Ok(cm2.arrow_field())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let schema = Schema::new(fields);
+                    return RecordBatch::try_new(std::sync::Arc::new(schema), empty_arrays)
+                        .map_err(|e| SegmentError::CorruptFile {
+                            detail: format!("failed to create empty RecordBatch: {e}"),
+                        });
                 }
             }
         }
@@ -714,17 +712,16 @@ impl SegmentReader {
             // intervals don't overlap, no rows in this row group can match
             // so we skip it entirely — no I/O, no decompression, no
             // decoding.
-            if let (Some((start_ns, end_ns)), Some(ts_idx)) = (time_range, ts_col_idx) {
-                if let Some(ts_block) = rg_blocks.iter().find(|b| b.column_index == ts_idx as u16) {
-                    let rg_min = ts_block.stats.min_value;
-                    let rg_max = ts_block.stats.max_value;
-                    // Skip if row group is entirely before or after query range.
-                    // Both boundaries are inclusive: [start_ns, end_ns]
-                    if rg_max < start_ns || rg_min > end_ns {
-                        metrics::counter!("chronix_segment_rg_pruned_by_time_range_total")
-                            .increment(1);
-                        continue;
-                    }
+            if let (Some((start_ns, end_ns)), Some(ts_idx)) = (time_range, ts_col_idx)
+                && let Some(ts_block) = rg_blocks.iter().find(|b| b.column_index == ts_idx as u16)
+            {
+                let rg_min = ts_block.stats.min_value;
+                let rg_max = ts_block.stats.max_value;
+                // Skip if row group is entirely before or after query range.
+                // Both boundaries are inclusive: [start_ns, end_ns]
+                if rg_max < start_ns || rg_min > end_ns {
+                    metrics::counter!("chronix_segment_rg_pruned_by_time_range_total").increment(1);
+                    continue;
                 }
             }
 
@@ -750,11 +747,11 @@ impl SegmentReader {
                 for &tag_idx in &tag_col_indices {
                     if let Some(tag_block) =
                         rg_blocks.iter().find(|b| b.column_index == tag_idx as u16)
+                        && tag_block.stats.value_count == 0
+                        && !tag_block.stats.says_nothing()
                     {
-                        if tag_block.stats.value_count == 0 && !tag_block.stats.says_nothing() {
-                            skip = true;
-                            break;
-                        }
+                        skip = true;
+                        break;
                     }
                 }
                 if skip {
@@ -772,20 +769,13 @@ impl SegmentReader {
                 for &(col_name, value) in tag_predicates {
                     if let Some(col_meta) =
                         self.metadata.columns.iter().find(|c| c.name == col_name)
+                        && let Some(ref rg_blooms) = col_meta.row_group_blooms
+                        && let Some(bloom_bytes) = rg_blooms.get(rg_idx)
+                        && !bloom_bytes.is_empty()
+                        && !crate::segment::bloom::bloom_filter_contains(bloom_bytes, value)
                     {
-                        if let Some(ref rg_blooms) = col_meta.row_group_blooms {
-                            if let Some(bloom_bytes) = rg_blooms.get(rg_idx) {
-                                if !bloom_bytes.is_empty()
-                                    && !crate::segment::bloom::bloom_filter_contains(
-                                        bloom_bytes,
-                                        value,
-                                    )
-                                {
-                                    skip = true;
-                                    break;
-                                }
-                            }
-                        }
+                        skip = true;
+                        break;
                     }
                 }
                 if skip {
@@ -809,38 +799,35 @@ impl SegmentReader {
                         .iter()
                         .enumerate()
                         .find(|(_, c)| c.name == pred.column)
-                    {
-                        if let Some(block) =
+                        && let Some(block) =
                             rg_blocks.iter().find(|b| b.column_index == col_idx as u16)
-                        {
-                            // Statistics that say nothing — an encrypted
-                            // block, whose stats are suppressed so the zone
-                            // map cannot leak its values — must not prune.
-                            let matches = if block.stats.says_nothing() {
-                                true
-                            } else {
-                                match col_meta.data_type {
-                                    data_types::F64 => {
-                                        let rg_min = ordered_i64_to_f64(block.stats.min_value);
-                                        let rg_max = ordered_i64_to_f64(block.stats.max_value);
-                                        pred.may_match_f64(rg_min, rg_max)
-                                    }
-                                    data_types::TIMESTAMP | data_types::I64 => pred.may_match_i64(
-                                        block.stats.min_value,
-                                        block.stats.max_value,
-                                    ),
-                                    data_types::DECIMAL => pred.may_match_decimal(
-                                        block.stats.min_value,
-                                        block.stats.max_value,
-                                        col_meta.decimal_scale.unwrap_or(0),
-                                    ),
-                                    _ => true, // non-numeric → can't prune
+                    {
+                        // Statistics that say nothing — an encrypted
+                        // block, whose stats are suppressed so the zone
+                        // map cannot leak its values — must not prune.
+                        let matches = if block.stats.says_nothing() {
+                            true
+                        } else {
+                            match col_meta.data_type {
+                                data_types::F64 => {
+                                    let rg_min = ordered_i64_to_f64(block.stats.min_value);
+                                    let rg_max = ordered_i64_to_f64(block.stats.max_value);
+                                    pred.may_match_f64(rg_min, rg_max)
                                 }
-                            };
-                            if !matches {
-                                skip = true;
-                                break;
+                                data_types::TIMESTAMP | data_types::I64 => {
+                                    pred.may_match_i64(block.stats.min_value, block.stats.max_value)
+                                }
+                                data_types::DECIMAL => pred.may_match_decimal(
+                                    block.stats.min_value,
+                                    block.stats.max_value,
+                                    col_meta.decimal_scale.unwrap_or(0),
+                                ),
+                                _ => true, // non-numeric → can't prune
                             }
+                        };
+                        if !matches {
+                            skip = true;
+                            break;
                         }
                     }
                 }
@@ -1180,6 +1167,16 @@ fn decoded_to_arrow(
                 })?;
             Ok(std::sync::Arc::new(apply_nulls(array, nulls)?))
         }
+        (DecodedColumn::Bytes(values), data_types::HISTOGRAM) => {
+            // Straight back out as `Binary`: the bytes are the histogram's own
+            // encoding, and decoding them here would mean every scan paid for
+            // parsing a distribution that most queries only count.
+            let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+            Ok(std::sync::Arc::new(apply_nulls(
+                arrow::array::BinaryArray::from(refs),
+                nulls,
+            )?))
+        }
         (decoded, _) => Err(SegmentError::CorruptFile {
             detail: format!(
                 "type mismatch: decoded variant {:?} does not match expected data_type {data_type}",
@@ -1193,7 +1190,7 @@ fn decoded_to_arrow(
 mod zone_map_tests {
     use super::*;
 
-    fn pred(op: ZoneMapOp, value: f64) -> FieldPredicate {
+    fn pred(op: StatsOp, value: f64) -> FieldPredicate {
         FieldPredicate {
             column: "n".into(),
             op,
@@ -1206,16 +1203,16 @@ mod zone_map_tests {
     /// even though 1 matches — a pruning step that loses rows.
     #[test]
     fn a_fractional_bound_does_not_prune_an_integer_block() {
-        assert!(pred(ZoneMapOp::Lt, 1.5).may_match_i64(1, 3));
-        assert!(pred(ZoneMapOp::LtEq, 1.5).may_match_i64(1, 3));
-        assert!(pred(ZoneMapOp::Gt, 2.5).may_match_i64(1, 3));
-        assert!(pred(ZoneMapOp::GtEq, 2.5).may_match_i64(1, 3));
-        assert!(pred(ZoneMapOp::Eq, 2.0).may_match_i64(1, 3));
+        assert!(pred(StatsOp::Lt, 1.5).may_match_i64(1, 3));
+        assert!(pred(StatsOp::LtEq, 1.5).may_match_i64(1, 3));
+        assert!(pred(StatsOp::Gt, 2.5).may_match_i64(1, 3));
+        assert!(pred(StatsOp::GtEq, 2.5).may_match_i64(1, 3));
+        assert!(pred(StatsOp::Eq, 2.0).may_match_i64(1, 3));
         // And it still prunes what it should.
-        assert!(!pred(ZoneMapOp::Lt, 1.0).may_match_i64(1, 3));
-        assert!(!pred(ZoneMapOp::Gt, 3.0).may_match_i64(1, 3));
+        assert!(!pred(StatsOp::Lt, 1.0).may_match_i64(1, 3));
+        assert!(!pred(StatsOp::Gt, 3.0).may_match_i64(1, 3));
         // An integer column cannot hold 2.5 at all.
-        assert!(!pred(ZoneMapOp::Eq, 2.5).may_match_i64(1, 3));
+        assert!(!pred(StatsOp::Eq, 2.5).may_match_i64(1, 3));
     }
 
     /// Beyond 2^53 an `i64` bound cannot be compared as an `f64`, so the
@@ -1223,8 +1220,8 @@ mod zone_map_tests {
     #[test]
     fn a_bound_beyond_exact_float_range_never_prunes() {
         let big = (1_i64 << 53) + 1;
-        assert!(pred(ZoneMapOp::Eq, big as f64).may_match_i64(big, big));
-        assert!(pred(ZoneMapOp::Lt, 0.0).may_match_i64(big, big + 10));
+        assert!(pred(StatsOp::Eq, big as f64).may_match_i64(big, big));
+        assert!(pred(StatsOp::Lt, 0.0).may_match_i64(big, big + 10));
     }
 
     /// Statistics that say nothing — the sentinel range an encrypted block
@@ -1236,10 +1233,10 @@ mod zone_map_tests {
         let empty = crate::segment::stats::ColumnStats::empty();
         assert!(empty.says_nothing());
         assert!(
-            pred(ZoneMapOp::Gt, 0.0).may_match_i64(empty.min_value, empty.max_value),
+            pred(StatsOp::Gt, 0.0).may_match_i64(empty.min_value, empty.max_value),
             "an inverted sentinel range must not prune"
         );
-        assert!(pred(ZoneMapOp::Eq, 42.0).may_match_f64(f64::NAN, f64::NAN));
+        assert!(pred(StatsOp::Eq, 42.0).may_match_f64(f64::NAN, f64::NAN));
 
         // A genuinely all-null block *is* impossible to match, and pruning
         // it stays correct.
@@ -1402,9 +1399,11 @@ mod tests {
         writer.finalize().unwrap();
 
         let reader = SegmentReader::open(&path).unwrap();
-        assert!(reader
-            .read_columns(&[chronix_core::TIME_COLUMN], 999)
-            .is_err());
+        assert!(
+            reader
+                .read_columns(&[chronix_core::TIME_COLUMN], 999)
+                .is_err()
+        );
     }
 
     #[test]

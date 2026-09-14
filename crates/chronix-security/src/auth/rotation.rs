@@ -354,19 +354,18 @@ impl RotatingKeyProvider {
     /// Check if rotation is needed based on the policy.
     fn check_rotation_needed(&self, state: &RotatingState, usage: u64) -> Option<RotationReason> {
         // Check usage-based rotation first (more urgent)
-        if let Some(max) = self.policy.max_encryptions {
-            if usage >= max {
-                return Some(RotationReason::MaxEncryptions);
-            }
+        if let Some(max) = self.policy.max_encryptions
+            && usage >= max
+        {
+            return Some(RotationReason::MaxEncryptions);
         }
 
         // Check time-based rotation
-        if let Some(max_age) = self.policy.max_age {
-            if let Some(created) = state.created_at.get(&state.current_key_id) {
-                if created.elapsed() >= max_age {
-                    return Some(RotationReason::MaxAge);
-                }
-            }
+        if let Some(max_age) = self.policy.max_age
+            && let Some(created) = state.created_at.get(&state.current_key_id)
+            && created.elapsed() >= max_age
+        {
+            return Some(RotationReason::MaxAge);
         }
 
         None

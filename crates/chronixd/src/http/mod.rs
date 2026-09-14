@@ -25,7 +25,7 @@ mod write;
 
 // Re-export shared types used by other modules in the crate.
 pub use types::{
-    AppState, PaginatedResponse, PaginationParams, SharedState, WriteDedupCache, DEFAULT_LIST_LIMIT,
+    AppState, DEFAULT_LIST_LIMIT, PaginatedResponse, PaginationParams, SharedState, WriteDedupCache,
 };
 
 // Re-export all handler functions so server.rs can reference them as `http::handler_name`.
@@ -41,11 +41,11 @@ pub use prom::{
     prom_empty_rules_handler, prom_instant_query_handler, prom_label_values_handler,
     prom_labels_handler, prom_metadata_handler, prom_range_query_handler, prom_series_handler,
 };
-pub use prom_params::{parse_duration_ns, parse_time_ns, PromParams};
+pub use prom_params::{PromParams, parse_duration_ns, parse_time_ns};
 pub use query::{query_explain_handler, query_handler, sql_handler};
 pub use streaming::{annotations_handler, annotations_stream_handler, cdc_stream_handler};
 pub use triggers::{
-    drop_trigger_handler, get_trigger_handler, list_signals_handler, list_triggers_handler,
-    trigger_sql_handler, SignalView, TriggerResponse, TriggerSqlRequest, TriggerView,
+    SignalView, TriggerResponse, TriggerSqlRequest, TriggerView, drop_trigger_handler,
+    get_trigger_handler, list_signals_handler, list_triggers_handler, trigger_sql_handler,
 };
 pub use write::{write_handler, write_influx_handler};

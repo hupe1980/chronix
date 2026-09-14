@@ -347,10 +347,7 @@ mod tests {
         }
         assert!(
             wait_until(Duration::from_secs(10), || {
-                !db.catalog()
-                    .read()
-                    .active_segments_for_measurement("cpu")
-                    .is_empty()
+                !db.segments_of("cpu").is_empty()
             }),
             "the maintenance thread should have flushed"
         );
@@ -401,11 +398,7 @@ mod tests {
 
         assert!(
             wait_until(Duration::from_secs(10), || {
-                db.catalog()
-                    .read()
-                    .active_segments_for_measurement("cpu")
-                    .len()
-                    == 1
+                db.segments_of("cpu").len() == 1
             }),
             "the expired shard must have been dropped by the maintenance thread"
         );
@@ -456,11 +449,7 @@ mod tests {
         let before = 10;
         assert!(
             wait_until(Duration::from_secs(10), || {
-                db.catalog()
-                    .read()
-                    .active_segments_for_measurement("cpu")
-                    .len()
-                    < before
+                db.segments_of("cpu").len() < before
             }),
             "compaction should have reduced the segment count"
         );

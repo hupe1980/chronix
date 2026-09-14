@@ -63,8 +63,8 @@ use crate::forecast::error::ForecastError;
 use crate::forecast::result::{ForecastResult, ModelType};
 use crate::forecast::traits::ForecastModel;
 use crate::forecast::{
-    auto_arima, select_differencing_order, ArimaModel, AutoArimaOptions, HoltLinearModel,
-    HoltWintersModel, LinearRegressionModel, SarimaModel, SearchStrategy, SesModel,
+    ArimaModel, AutoArimaOptions, HoltLinearModel, HoltWintersModel, LinearRegressionModel,
+    SarimaModel, SearchStrategy, SesModel, auto_arima, select_differencing_order,
 };
 
 /// Which accuracy metric decides the winner.

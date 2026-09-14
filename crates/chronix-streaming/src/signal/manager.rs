@@ -100,14 +100,14 @@ impl TriggerManager {
                     match crate::signal::sql::execute_trigger_sql(&self.engine, &stmt) {
                         Ok(_) => {
                             // Sync enabled state from catalog
-                            if !entry.enabled {
-                                if let Err(e) = self.engine.set_enabled(&entry.name, false) {
-                                    tracing::warn!(
-                                        trigger = %entry.name,
-                                        error = %e,
-                                        "failed to sync trigger enabled state"
-                                    );
-                                }
+                            if !entry.enabled
+                                && let Err(e) = self.engine.set_enabled(&entry.name, false)
+                            {
+                                tracing::warn!(
+                                    trigger = %entry.name,
+                                    error = %e,
+                                    "failed to sync trigger enabled state"
+                                );
                             }
                             restored += 1;
                         }

@@ -6,7 +6,7 @@
 //! set cannot express.
 //!
 //! Run with `cargo run -p chronix-analytics --example seasonal_pq_search`.
-use chronix_analytics::forecast::{auto_forecast, AutoForecastOptions, ForecastModel, SarimaModel};
+use chronix_analytics::forecast::{AutoForecastOptions, ForecastModel, SarimaModel, auto_forecast};
 
 /// Simulate `x_t = Φ·x_{t−m} + e_t + Θ·e_{t−m}` — seasonal ARMA(1,1).
 fn seasonal_arma11(n: usize, m: usize, phi: f64, theta: f64, seed: u64) -> Vec<f64> {
@@ -59,19 +59,19 @@ fn main() {
         let mut fixed = [f64::NAN; 2];
         for (i, (sp, sq)) in [(1usize, 0usize), (0, 1)].into_iter().enumerate() {
             let mut mdl = SarimaModel::new(0, 0, 0, sp, 0, sq, m);
-            if mdl.fit(&ts, train).is_ok() {
-                if let Ok(f) = mdl.predict(horizon) {
-                    fixed[i] = mase(test, &f.values, train, m);
-                }
+            if mdl.fit(&ts, train).is_ok()
+                && let Ok(f) = mdl.predict(horizon)
+            {
+                fixed[i] = mase(test, &f.values, train, m);
             }
         }
         // The shape it cannot: the true (1,0,1).
         let mut truth = f64::NAN;
         let mut mdl = SarimaModel::new(0, 0, 0, 1, 0, 1, m);
-        if mdl.fit(&ts, train).is_ok() {
-            if let Ok(f) = mdl.predict(horizon) {
-                truth = mase(test, &f.values, train, m);
-            }
+        if mdl.fit(&ts, train).is_ok()
+            && let Ok(f) = mdl.predict(horizon)
+        {
+            truth = mase(test, &f.values, train, m);
         }
 
         for (fi, folds) in FOLDS.iter().enumerate() {

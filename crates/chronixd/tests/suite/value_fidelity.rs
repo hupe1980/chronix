@@ -14,7 +14,7 @@
 //! are the behavioural half — they pin the *encoding* each type gets, which a
 //! compile-time check cannot.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::integration::{client, start_test_server};
 

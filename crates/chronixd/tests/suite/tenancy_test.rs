@@ -16,12 +16,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use reqwest::StatusCode;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 use chronixd::http::{AppState, SharedState};
 use chronixd::server::build_router;
 

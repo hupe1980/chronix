@@ -765,9 +765,30 @@ a Unix timestamp in seconds and answer in **UTC**, so `hour() < 9` means the
 same thing wherever the server runs. Called with no argument they use
 `vector(time())`, and all of them drop `__name__`.
 
-Not implemented: native histograms (`histogram_quantile` handles classic
-`le`-bucketed histograms only) and the experimental `limitk` / `limit_ratio`.
-A query using one of these returns an error rather than a wrong answer.
+The native-histogram family — `histogram_count`, `histogram_sum`,
+`histogram_avg`, `histogram_stddev`, `histogram_stdvar` and
+`histogram_fraction` — reads a stored distribution, and `histogram_quantile`
+dispatches: a series carrying native histograms answers from its own buckets,
+a classic `le`-bucketed one takes the original path. The rest refuse a float
+series **by name** — `histogram_count` of a gauge is not the gauge.
+
+A stored native histogram also answers the **classic** names — `foo_bucket`
+with cumulative counts ending at `le="+Inf"`, `foo_count` and `foo_sum` — so a
+dashboard written before native histograms existed needs no change. Those names
+are resolvable but not listed by `/api/v1/label/__name__/values`: listing them
+would make `{__name__=~".+"}` return the same observations four times.
+
+The `le` values are the boundaries the histogram **has**. A custom-bucket
+histogram — what an OTLP explicit-bucket or classic histogram becomes — carries
+the boundaries the instrumentation chose, so an existing `le="0.5"` matches. An
+exponential one carries powers of `2^(2^-schema)`, so `le="0.5"` matches
+nothing: `histogram_quantile(0.99, foo_bucket)` and a heatmap over the whole
+series both work, but a hand-pinned boundary returns an empty result rather
+than the nearest bucket.
+
+Not implemented: the variadic `histogram_quantiles`, `limitk`, `limit_ratio`,
+and everything else still behind an upstream feature flag. A query using one of
+these returns an error rather than a wrong answer.
 
 ### Instant Query
 
@@ -811,13 +832,42 @@ All PromQL endpoints return the standard Prometheus response envelope:
 
 ### `POST /api/v1/prom/write`
 
-Prometheus Remote Write endpoint. Accepts snappy-compressed protobuf.
+Prometheus Remote Write endpoint. Accepts snappy-compressed protobuf, in
+**either** remote-write version.
 
 ```bash
 # Used automatically by Prometheus with remote_write config:
 # remote_write:
 #   - url: http://chronix:8086/api/v1/prom/write
+#     send_native_histograms: true
+#     # Optional; omit for 1.0.
+#     protobuf_message: io.prometheus.write.v2.Request
 ```
+
+| `Content-Type` | Version |
+|---|---|
+| absent, or `application/x-protobuf` | 1.0 |
+| `application/x-protobuf;proto=prometheus.WriteRequest` | 1.0 |
+| `application/x-protobuf;proto=io.prometheus.write.v2.Request` | 2.0 |
+
+Anything else is **415 Unsupported Media Type**, with both supported message
+sets named in the body so a sender can fall back on its own.
+
+A 2.0 write answers with what it actually stored:
+
+| Header | Meaning |
+|---|---|
+| `X-Prometheus-Remote-Write-Samples-Written` | float samples stored |
+| `X-Prometheus-Remote-Write-Histograms-Written` | native histograms stored |
+| `X-Prometheus-Remote-Write-Exemplars-Written` | always `0` — Chronix stores no exemplars |
+
+A 1.0 write answers none of them, because 1.0 does not define them.
+
+**Native histograms** are carried by both versions and stored in the metric's
+own column, so the name you query is the name you exported. A float sample and
+a histogram under one metric name is a type conflict and is refused by name: a
+metric that is a gauge on Monday and a distribution on Tuesday is two metrics.
+A histogram staleness marker is dropped like a float one.
 
 **Non-finite samples are skipped, not rejected.** Chronix refuses to store
 `NaN` and `±Inf` — a `NaN` in storage poisons every aggregate that reads it —
@@ -840,14 +890,31 @@ data points carrying a non-finite value are skipped; a histogram or summary
 keeps the fields that *are* finite rather than losing the whole point.
 
 
-OpenTelemetry OTLP metrics ingestion. Accepts OTLP JSON format with
-gauges, sums, histograms, and summaries.
+OpenTelemetry OTLP metrics ingestion, in protobuf
+(`application/x-protobuf`) or JSON. Accepts gauges, sums, summaries, and
+**both** histogram shapes.
 
 ```bash
 curl -X POST http://localhost:8086/api/v1/otlp/metrics \
   -H 'Content-Type: application/json' \
   -d '{"resourceMetrics": [...]}'
 ```
+
+| Instrument | Stored as |
+|---|---|
+| Gauge | field `gauge` |
+| Sum | field `value` |
+| Exponential histogram | field `value`, a native histogram at the matching schema |
+| Explicit-bucket histogram | field `value`, a native histogram with custom boundaries (schema −53) |
+| Summary | fields `count`, `sum`, `quantile_<q>` |
+
+Both histogram shapes answer `histogram_quantile` and the rest of the
+`histogram_*` family, and both answer the classic `foo_bucket` / `foo_count` /
+`foo_sum` names.
+
+An OTLP `sum` the exporter left unset stays **absent** rather than being stored
+as zero — an unset sum means the instrument recorded negative events, not that
+the observations summed to nothing.
 
 ---
 
@@ -1016,10 +1083,17 @@ The exporter appends `/v1/metrics` and gzips by default; both are served.
 ```yaml
 remote_write:
   - url: http://chronixd:8086/api/v1/prom/write
+    send_native_histograms: true
+    # Optional; omit for remote write 1.0, which also carries histograms.
+    protobuf_message: io.prometheus.write.v2.Request
 
 remote_read:
   - url: http://chronixd:8086/api/v1/prom/read
 ```
+
+Remote read returns native histograms as well as float samples, so a
+federating Prometheus reading Chronix as long-term storage gets the
+distribution back rather than an empty series.
 
 Remote read applies all four matcher types — `=`, `!=`, `=~` and `!~` — with
 regexes anchored the way Prometheus anchors its own, and a `__name__` regex

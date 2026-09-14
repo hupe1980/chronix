@@ -70,6 +70,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 /// Analytics configuration types for the Rust API.
+#[cfg(feature = "analytics")]
 pub mod analytics;
 #[cfg(feature = "object-store")]
 pub mod cold_archive;
@@ -97,6 +98,7 @@ pub mod sql;
 // The engine crates, for advanced use. No aliases: a module alias is a
 // second name for the same thing, and every one of them was a name the
 // docs could not resolve.
+#[cfg(feature = "analytics")]
 pub use chronix_analytics;
 pub use chronix_core;
 pub use chronix_encoding;
@@ -108,10 +110,12 @@ pub use chronix_security;
 pub use chronix_streaming;
 
 // Primary export
+#[cfg(feature = "analytics")]
 pub use analytics::{AnomalyConfig, ForecastConfig};
 pub use db::BackupManifest;
 pub use db::Chronix;
 pub use db::DatabaseStatistics;
+pub use db::SegmentInfo;
 pub use delete::{DeleteBuilder, DeleteOutcome, DeleteRequest};
 pub use error::DbError;
 pub use error::InsertResult;

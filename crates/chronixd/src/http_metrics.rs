@@ -51,7 +51,7 @@ pub async fn request_duration_layer(request: Request, next: Next) -> Response {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::{routing::get, Router};
+    use axum::{Router, routing::get};
     use tower::ServiceExt as _;
 
     #[tokio::test]

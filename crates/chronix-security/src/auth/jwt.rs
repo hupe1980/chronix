@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -319,7 +319,7 @@ impl JwtValidator {
             (other, _, _) => {
                 return Err(AuthError::Config(format!(
                     "JWT algorithm {other:?} is not supported"
-                )))
+                )));
             }
         };
 
@@ -552,7 +552,7 @@ fn parse_algorithm(s: &str) -> Result<Algorithm, AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
 
     fn make_token(claims: &JwtClaims, secret: &str) -> String {
         let header = Header::new(Algorithm::HS256);
@@ -960,7 +960,7 @@ mod tests {
 #[cfg(test)]
 mod algorithm_family_tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use std::collections::HashMap;
     use zeroize::Zeroizing;
 

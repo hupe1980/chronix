@@ -18,7 +18,6 @@
 /// that provides them.
 const SURFACE: &[&str] = &[
     // ── Modules ────────────────────────────────────────────────────
-    "mod analytics",
     "mod db",
     "mod delete",
     "mod error",
@@ -29,13 +28,11 @@ const SURFACE: &[&str] = &[
     "mod retention",
     "mod rollup",
     // ── Re-exported engine crates (tier 3) ─────────────────────────
-    "mod chronix_analytics",
     "mod chronix_core",
     "mod chronix_encoding",
     "mod chronix_engine",
     "mod chronix_query",
     // ── Types and macros at the crate root (tier 1) ────────────────
-    "AnomalyConfig",
     "BackupManifest",
     "Chronix",
     "DatabaseStatistics",
@@ -43,10 +40,10 @@ const SURFACE: &[&str] = &[
     "DeleteBuilder",
     "DeleteOutcome",
     "DeleteRequest",
-    "ForecastConfig",
     "InsertResult",
     "ParquetCompression",
     "ParquetExportConfig",
+    "SegmentInfo",
     "RollupAggFn",
     "RollupBuilder",
     "RollupConfig",
@@ -58,6 +55,21 @@ const SURFACE: &[&str] = &[
 
 /// Feature-gated additions, keyed by the feature that provides them.
 const FEATURE_SURFACE: &[(&str, &[&str])] = &[
+    // On by default. `default-features = false` drops the largest sub-crate
+    // in the workspace — forecasting, anomaly detection, preprocessing and
+    // the model registry — for a consumer that only stores and queries. The
+    // design partner is exactly that consumer and carried all of it until
+    // somebody asked why the largest sub-crate was the only engine crate a
+    // consumer could not opt out of.
+    (
+        "analytics",
+        &[
+            "mod analytics",
+            "mod chronix_analytics",
+            "AnomalyConfig",
+            "ForecastConfig",
+        ],
+    ),
     ("object-store", &["mod cold_archive"]),
     // On by default; `default-features = false` drops DataFusion and with it
     // `db.sql()`, `session_context()` and the analytics SQL functions. The
@@ -291,4 +303,246 @@ fn the_prelude_is_the_one_that_was_reviewed() {
         actual, expected,
         "the prelude changed; update PRELUDE in this file in the same commit"
     );
+}
+
+// ── The handle's own surface ────────────────────────────────────────
+//
+// `SURFACE` above pins the crate root: which modules and which names
+// `use chronix::*` brings in. It never pinned the methods on `Chronix`,
+// which is the surface almost every caller actually touches — and that is
+// how the handle reached **eighty** methods, six of which returned the
+// engine's internal `RwLock`s.
+//
+// Those six were not a documentation problem. `CatalogLock` lives in a
+// `pub(crate)` module, so a caller could call `db.catalog()` and could not
+// name what came back; the lock hierarchy is documented as "an invariant of
+// this crate's own implementation, not a contract with callers" and was then
+// enforced on callers by a debug-build panic naming levels they had no way
+// to read; and in release the assertion compiles away, so the same two reads
+// deadlock against the maintenance thread instead. An external probe doing
+// two ordinary reads in the wrong order panicked on the second one.
+//
+// This test is the guard that would have caught it. It is deliberately a
+// *list*, not a rule: a new method is a deliberate edit here, in the same
+// commit, which is the only mechanism that has ever worked for a surface
+// that grows one convenience at a time.
+
+/// Every inherent method on `Chronix`, sorted.
+const HANDLE_SURFACE: &[&str] = &[
+    // lifecycle
+    "close",
+    "open",
+    "open_small",
+    // write
+    "backfill",
+    "declare_field",
+    "insert",
+    "insert_batch",
+    // read
+    "execute",
+    "execute_iter",
+    "execute_stream",
+    "execute_with_stats",
+    "last_value",
+    "promql",
+    "promql_range",
+    "query",
+    "sql",
+    "sql_async",
+    // schema and catalog inspection
+    "config",
+    "data_dir",
+    "has_measurement_in",
+    "measurement_names_in",
+    "schema",
+    "schema_registry",
+    "segment_count",
+    "segments",
+    "segments_of",
+    "statistics",
+    "disk_usage_bytes",
+    "tag_keys",
+    "tag_values",
+    // delete
+    "delete_builder",
+    "delete_series",
+    "drop_measurement",
+    "execute_delete",
+    "is_measurement_pending_drop",
+    "restore_measurement",
+    // maintenance
+    "check_writable",
+    "compact",
+    "enforce_configured_retention",
+    "enforce_retention",
+    "flush",
+    "flush_shard",
+    "gc",
+    "gc_pending_measurement_drops",
+    "gc_tombstones",
+    // rollups
+    "create_rollup",
+    "delete_rollup",
+    "list_rollups",
+    "materialise_rollups",
+    "refresh_rollup",
+    "rollup",
+    "rollup_state",
+    "rollup_where",
+    // analytics
+    "auto_forecast",
+    "detect_anomalies",
+    "fetch_series_data",
+    "forecast",
+    "preprocess",
+    // backup
+    "backup",
+    "restore",
+    "verify_backup",
+    // interop and extension points
+    "custom_udafs",
+    "custom_udfs",
+    "event_bus",
+    "export_parquet",
+    "register_udaf",
+    "register_udf",
+    "session_context",
+    "subscribe",
+    // WAL and memtable observability. `scan_memtable` answers "is this
+    // point still unflushed?", which is what a durability test asks; it
+    // returns owned points and holds no lock.
+    "scan_memtable",
+    "wal_replayed_records",
+    "wal_sequence",
+];
+
+/// Read every `pub fn` / `pub async fn` declared in an `impl Chronix` block.
+///
+/// Scoped to those blocks on purpose: `db/stream.rs` also defines
+/// `impl BatchStream`, whose methods are that type's surface rather than the
+/// handle's, and the first draft of this scanner conflated the two.
+fn handle_methods() -> Vec<String> {
+    let mut out = Vec::new();
+    for src in [
+        include_str!("../src/db/accessors.rs"),
+        include_str!("../src/db/analytics_api.rs"),
+        include_str!("../src/db/backup.rs"),
+        include_str!("../src/db/delete.rs"),
+        include_str!("../src/db/lifecycle.rs"),
+        include_str!("../src/db/mod.rs"),
+        include_str!("../src/db/query.rs"),
+        include_str!("../src/db/rollup.rs"),
+        include_str!("../src/db/stream.rs"),
+        include_str!("../src/db/write.rs"),
+    ] {
+        let mut in_chronix_impl = false;
+        for line in src.lines() {
+            // Blocks start at column 0, so a line with no indentation that
+            // opens an `impl` ends the previous block and may open ours.
+            if !line.starts_with(char::is_whitespace) && line.contains("impl ") {
+                let head = line.split_once("impl").map_or("", |(_, t)| t);
+                // `impl Chronix {` and `impl super::Chronix {` — half the
+                // blocks spell it the second way — but not `impl BatchStream`,
+                // `impl SegmentInfo`, or a trait impl like `impl Clone for
+                // Chronix`, whose methods are the trait's surface.
+                let head = head.trim_start().trim_start_matches("super::");
+                in_chronix_impl = head.starts_with("Chronix") && !head.contains(" for ");
+                continue;
+            }
+            if !in_chronix_impl {
+                continue;
+            }
+            let t = line.trim();
+            let Some(rest) = t
+                .strip_prefix("pub async fn ")
+                .or_else(|| t.strip_prefix("pub fn "))
+            else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    assert!(
+        out.len() > 40,
+        "the scanner found only {} methods, which means it stopped matching \
+         the source layout rather than that the surface shrank",
+        out.len()
+    );
+    out
+}
+
+#[test]
+fn the_handle_surface_is_the_one_that_was_reviewed() {
+    let actual = handle_methods();
+    let mut expected: Vec<String> = HANDLE_SURFACE.iter().map(|s| (*s).to_string()).collect();
+    expected.sort();
+    expected.dedup();
+
+    let added: Vec<_> = actual.iter().filter(|m| !expected.contains(m)).collect();
+    let removed: Vec<_> = expected.iter().filter(|m| !actual.contains(m)).collect();
+
+    assert!(
+        added.is_empty() && removed.is_empty(),
+        "the `Chronix` handle's surface changed.\n\
+         \n  added (new public methods, not in HANDLE_SURFACE): {added:?}\
+         \n  removed (in HANDLE_SURFACE, no longer public):     {removed:?}\n\
+         \nIf the change is deliberate, edit `HANDLE_SURFACE` in this file in\n\
+         the same commit. Before adding one, ask the question this guard exists\n\
+         for: can a caller outside this crate *name* every type in the\n\
+         signature, and can they hold the result across another call without\n\
+         deadlocking the maintenance thread? Six methods that failed both were\n\
+         deleted rather than documented."
+    );
+}
+
+#[test]
+fn the_handle_hands_out_no_internal_locks() {
+    // The narrower question, asked structurally so it survives a rename:
+    // no public method on `Chronix` may return one of the engine's ordered
+    // locks. They are the crate's own hierarchy (`lock_order`), a
+    // `pub(crate)` module — so such a return type is unnameable from
+    // outside *and* lets a caller violate an ordering the compiler cannot
+    // check for them.
+    for (file, src) in [
+        ("accessors.rs", include_str!("../src/db/accessors.rs")),
+        ("lifecycle.rs", include_str!("../src/db/lifecycle.rs")),
+        ("mod.rs", include_str!("../src/db/mod.rs")),
+        ("query.rs", include_str!("../src/db/query.rs")),
+        ("rollup.rs", include_str!("../src/db/rollup.rs")),
+        ("stream.rs", include_str!("../src/db/stream.rs")),
+        ("write.rs", include_str!("../src/db/write.rs")),
+    ] {
+        for (i, line) in src.lines().enumerate() {
+            let t = line.trim();
+            if !t.starts_with("pub fn ") && !t.starts_with("pub async fn ") {
+                continue;
+            }
+            let Some((_, ret)) = t.split_once("->") else {
+                continue;
+            };
+            for lock in [
+                "CatalogLock",
+                "BloomsLock",
+                "TombstonesLock",
+                "RollupRegistryLock",
+            ] {
+                assert!(
+                    !ret.contains(lock),
+                    "{file}:{} returns `{lock}`, one of this crate's ordered locks.\n\
+                     A caller outside the crate cannot name it (the module is\n\
+                     `pub(crate)`) and can deadlock the maintenance thread with it.\n\
+                     Return an owned snapshot instead — see `Chronix::segments`.",
+                    i + 1
+                );
+            }
+        }
+    }
 }

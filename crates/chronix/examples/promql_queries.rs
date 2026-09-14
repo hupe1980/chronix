@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use chronix::prelude::*;
 use chronix::promql::eval::QueryParams;
-use chronix::promql::{parse, PromQLEvaluator, PromQLValue};
-use chronix::{fields, tags, Chronix};
+use chronix::promql::{PromQLEvaluator, PromQLValue, parse};
+use chronix::{Chronix, fields, tags};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;

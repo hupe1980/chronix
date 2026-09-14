@@ -43,8 +43,8 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use tracing::info;
 
-use chronix::prelude::*;
 use chronix::Chronix;
+use chronix::prelude::*;
 
 use crate::connector::{ConnectorMetrics, ConnectorStatus, IngestionConnector, KafkaConfig};
 use crate::error::ServerError;
@@ -288,7 +288,7 @@ mod consumer_impl {
                     return Err(ServerError::BadRequest(format!(
                         "kafka security_protocol must be PLAINTEXT, SSL, SASL_PLAINTEXT or \
                          SASL_SSL, got {other:?}"
-                    )))
+                    )));
                 }
             }
 
@@ -321,7 +321,7 @@ mod consumer_impl {
                     return Err(ServerError::BadRequest(format!(
                         "kafka sasl_mechanism must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512, \
                          got {other:?}"
-                    )))
+                    )));
                 }
             };
 

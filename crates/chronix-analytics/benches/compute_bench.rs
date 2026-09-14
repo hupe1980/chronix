@@ -2,9 +2,9 @@
 //! Benchmarks for chronix-compute SIMD, CPU, and GPU engine operations.
 
 use chronix_analytics::compute::{
-    simd_mean, simd_min_max, simd_sum, simd_variance, ComputeEngine, CpuEngine,
+    ComputeEngine, CpuEngine, simd_mean, simd_min_max, simd_sum, simd_variance,
 };
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 fn bench_simd_sum(c: &mut Criterion) {

@@ -157,6 +157,7 @@ impl PromQLEvaluator {
                             timestamp: params.time,
                             value: count as f64,
                         }],
+                        histograms: Vec::new(),
                     });
                 }
                 continue;
@@ -168,6 +169,7 @@ impl PromQLEvaluator {
                     timestamp: params.time,
                     value: agg_value,
                 }],
+                histograms: Vec::new(),
             });
         }
 
@@ -276,6 +278,7 @@ mod tests {
                 timestamp: 100,
                 value: 1.0,
             }],
+            histograms: Vec::new(),
         }];
         let series2 = [Series {
             labels: vec![("__name__".into(), "m".into())],
@@ -283,6 +286,7 @@ mod tests {
                 timestamp: 100,
                 value: 2.0,
             }],
+            histograms: Vec::new(),
         }];
         let series3 = [Series {
             labels: vec![("__name__".into(), "m".into())],
@@ -290,6 +294,7 @@ mod tests {
                 timestamp: 100,
                 value: 1.0,
             }],
+            histograms: Vec::new(),
         }];
         // Build a combined vector with duplicate value 1.0
         let all: Vec<f64> = [&series[..], &series2[..], &series3[..]]
