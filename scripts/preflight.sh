@@ -40,6 +40,9 @@ step "D/R references"              ./scripts/check-references.sh
 # A release-day check that only runs on release day finds its problem on
 # release day. This one costs a `cargo metadata`.
 step "publish order"               ./scripts/publish-order.sh --check
+# And that they package. A release once stopped on its first crate; this makes
+# the same checks a publish does, without compiling or uploading.
+step "crates package"              ./scripts/check-package.sh
 step "unused dependencies"         cargo machete
 
 step "formatting"                  cargo fmt --all --check

@@ -155,7 +155,8 @@ Each is exercised by a CI job, and the `verify` job fails the release if that
 stops being true. Adding a target means adding it to CI in the same commit.
 
 Crates go up in dependency order, which `scripts/publish-order.sh` derives
-from the manifests. The workflow needs a crates.io API token with publish
+from the manifests, and `scripts/check-package.sh` proves each one still
+packages, with its readme, on every commit rather than on release day. The workflow needs a crates.io API token with publish
 rights in the `crates-io` environment as `CARGO_REGISTRY_TOKEN`; run the
 workflow manually with `dry_run` to exercise the path without uploading.
 

@@ -50,6 +50,14 @@ jobs:
       - name: Publish steps can actually publish
         run: ./scripts/publish-order.sh --check
 
+      # The other half of the same argument: that the crates *package*. A real
+      # release stopped on its first crate, and `cargo package --list` makes
+      # the same checks — including the working-directory cleanliness check —
+      # without compiling or uploading, so it costs seconds on every commit
+      # instead of one failed release.
+      - name: Crates package
+        run: ./scripts/check-package.sh
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}

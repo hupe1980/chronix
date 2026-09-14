@@ -167,16 +167,6 @@ the format then freezes at 1.0.
 - **`chronix_engine::format`** — the four format versions and the single rule
   for checking them, with the policy written down where the next person
   changing a format will read it.
-- **The changelog travels with the published crate.** `cargo package` includes
-  nothing from outside a package directory, so a root-level `CHANGELOG.md` is
-  invisible on crates.io and docs.rs — and the reader who most needs it is the
-  one whose `cargo update` just moved them a minor version. The design partner
-  proposed `include = ["../../CHANGELOG.md"]`; that does **not** work, and the
-  way it fails is the problem — cargo drops a path outside the package root
-  with no error and no warning. `scripts/publish-crate.sh` now copies the root
-  changelog into the crate directory for the duration of the publish and
-  removes it after, so the tarball carries it and the repository still has
-  exactly one.
 - **`scripts/check-references.sh` resolves the evidence citations too.** The
   architecture notes carry a table whose premise is that every measured claim
   names the test pinning it — and nothing checked that the named test exists.
@@ -266,6 +256,17 @@ the format then freezes at 1.0.
   cleanup by another name.
 
 ### Fixed
+
+- **A release stopped on its first crate.** `publish-crate.sh` wrote the root
+  changelog into each crate directory before publishing, and `cargo publish`
+  refuses a dirty package directory. That copying is gone: there is one
+  changelog, at the repository root, read in git, and the README links to it
+  by absolute URL so a crates.io reader can follow it.
+
+  `scripts/check-package.sh` now runs `cargo package --list` for every
+  publishable crate on each commit — the same checks a real publish makes,
+  without compiling or uploading — because a step exercised only on release
+  day fails only on release day. It is in CI and in `preflight.sh`.
 
 - **A histogram's bucket boundaries were not the same number on every
   machine.** They were computed as `base(schema).powi(index)`, and neither
