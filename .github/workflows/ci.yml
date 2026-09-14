@@ -108,7 +108,13 @@ jobs:
       - name: Install musl toolchain
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update -qq && sudo apt-get install -y musl-tools
-      - run: cargo clippy -p chronix -p chronixd --target ${{ matrix.target }} -- -D warnings
+      # `-p chronix-analytics` explicitly: it holds the NEON tier of
+      # `compute/simd.rs`, and a dependency compiled on the way to another
+      # package is built with rustc rather than linted, so an aarch64-only
+      # defect in it would reach neither this job nor the x86_64 one. The
+      # mirror of that hole let 103 `unsafe_op_in_unsafe_fn` errors sit in
+      # the AVX2 tier until an x86_64 runner rejected the push.
+      - run: cargo clippy -p chronix -p chronixd -p chronix-analytics --target ${{ matrix.target }} -- -D warnings
       # The connectors are the features most likely to reintroduce a C
       # dependency, so they are cross-checked rather than assumed.
       - run: cargo clippy -p chronixd --features all-connectors --target ${{ matrix.target }} -- -D warnings

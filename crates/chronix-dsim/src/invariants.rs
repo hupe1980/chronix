@@ -111,17 +111,17 @@ impl InvariantChecker {
                     if let Some(writes) = self.acked_writes.get(key) {
                         let prev_idx = writes.iter().position(|w| w == prev);
                         let curr_idx = writes.iter().position(|w| w == val);
-                        if let (Some(pi), Some(ci)) = (prev_idx, curr_idx) {
-                            if ci < pi {
-                                self.violations.push(InvariantError::Violation {
-                                    name: "MonotonicReads".into(),
-                                    detail: format!(
-                                        "client {client_id} read '{val}' (write #{ci}) \
-                                         after previously reading '{prev}' (write #{pi}) \
-                                         on key '{key}'"
-                                    ),
-                                });
-                            }
+                        if let (Some(pi), Some(ci)) = (prev_idx, curr_idx)
+                            && ci < pi
+                        {
+                            self.violations.push(InvariantError::Violation {
+                                name: "MonotonicReads".into(),
+                                detail: format!(
+                                    "client {client_id} read '{val}' (write #{ci}) \
+                                     after previously reading '{prev}' (write #{pi}) \
+                                     on key '{key}'"
+                                ),
+                            });
                         }
                     }
                 }

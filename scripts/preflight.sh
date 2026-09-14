@@ -45,6 +45,27 @@ step "unused dependencies"         cargo machete
 step "formatting"                  cargo fmt --all --check
 step "clippy"                      cargo clippy --all-targets -- -D warnings
 
+# The *other* architecture. `compute/simd.rs` has an AVX2/AVX-512 tier behind
+# `#[cfg(target_arch = "x86_64")]` and a NEON tier behind `aarch64`, so a
+# developer only ever compiles one of them — and 103 edition-2024
+# `unsafe_op_in_unsafe_fn` errors sat in the x86_64 tier, invisible on an
+# aarch64 machine, until CI rejected the push. `clippy` needs no linker for a
+# cross target, so this costs a compile and nothing else.
+step "clippy (other architecture)" bash -c '
+    host=$(rustc -vV | sed -n "s/^host: //p")
+    case "$host" in
+        aarch64-*) other=x86_64-apple-darwin ;;
+        x86_64-*)  other=aarch64-apple-darwin ;;
+        *)         echo "   skipped: unknown host $host"; exit 0 ;;
+    esac
+    case "$host" in *-apple-darwin) ;; *)
+        other=$(echo "$other" | sed s/apple-darwin/unknown-linux-gnu/) ;;
+    esac
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$other"; then
+        echo "   skipped: rustup target add $other"; exit 0
+    fi
+    cargo clippy --all-targets --target "$other" -- -D warnings'
+
 # The embedded build, without DataFusion. `sql` is on by default everywhere
 # else, so a `#[cfg(feature = "sql")]` that stops compiling — or a test that
 # reaches `chronix::sql` without declaring `required-features` — is invisible

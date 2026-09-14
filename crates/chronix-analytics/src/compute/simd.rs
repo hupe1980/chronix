@@ -53,12 +53,16 @@
 #[inline(always)]
 unsafe fn hsum_256(v: std::arch::x86_64::__m256d) -> f64 {
     use std::arch::x86_64::*;
-    // hi = [v2, v3], lo = [v0, v1]
-    let hi = _mm256_extractf128_pd(v, 1);
-    let lo = _mm256_castpd256_pd128(v);
-    let sum128 = _mm_add_pd(lo, hi); // [v0+v2, v1+v3]
-    let hi64 = _mm_unpackhi_pd(sum128, sum128);
-    _mm_cvtsd_f64(_mm_add_sd(sum128, hi64))
+    // SAFETY: register-to-register intrinsics only — no loads, no stores.
+    // The caller guarantees the CPU feature, per this function's `# Safety`.
+    unsafe {
+        // hi = [v2, v3], lo = [v0, v1]
+        let hi = _mm256_extractf128_pd(v, 1);
+        let lo = _mm256_castpd256_pd128(v);
+        let sum128 = _mm_add_pd(lo, hi); // [v0+v2, v1+v3]
+        let hi64 = _mm_unpackhi_pd(sum128, sum128);
+        _mm_cvtsd_f64(_mm_add_sd(sum128, hi64))
+    }
 }
 
 /// Horizontal sum of a 512-bit register (8×f64 → scalar) via manual lane
@@ -72,10 +76,14 @@ unsafe fn hsum_256(v: std::arch::x86_64::__m256d) -> f64 {
 #[inline]
 unsafe fn hsum_512(v: std::arch::x86_64::__m512d) -> f64 {
     use std::arch::x86_64::*;
-    let lo = _mm512_castpd512_pd256(v);
-    let hi = _mm512_extractf64x4_pd(v, 1);
-    let sum256 = _mm256_add_pd(lo, hi);
-    hsum_256(sum256)
+    // SAFETY: register-to-register intrinsics only — no loads, no stores.
+    // The caller guarantees the CPU feature, per this function's `# Safety`.
+    unsafe {
+        let lo = _mm512_castpd512_pd256(v);
+        let hi = _mm512_extractf64x4_pd(v, 1);
+        let sum256 = _mm256_add_pd(lo, hi);
+        hsum_256(sum256)
+    }
 }
 
 /// Horizontal min of a 256-bit register (4×f64 → scalar).
@@ -87,11 +95,15 @@ unsafe fn hsum_512(v: std::arch::x86_64::__m512d) -> f64 {
 #[inline(always)]
 unsafe fn hmin_256(v: std::arch::x86_64::__m256d) -> f64 {
     use std::arch::x86_64::*;
-    let hi = _mm256_extractf128_pd(v, 1);
-    let lo = _mm256_castpd256_pd128(v);
-    let m = _mm_min_pd(lo, hi);
-    let hi64 = _mm_unpackhi_pd(m, m);
-    _mm_cvtsd_f64(_mm_min_sd(m, hi64))
+    // SAFETY: register-to-register intrinsics only — no loads, no stores.
+    // The caller guarantees the CPU feature, per this function's `# Safety`.
+    unsafe {
+        let hi = _mm256_extractf128_pd(v, 1);
+        let lo = _mm256_castpd256_pd128(v);
+        let m = _mm_min_pd(lo, hi);
+        let hi64 = _mm_unpackhi_pd(m, m);
+        _mm_cvtsd_f64(_mm_min_sd(m, hi64))
+    }
 }
 
 /// Horizontal max of a 256-bit register (4×f64 → scalar).
@@ -103,11 +115,15 @@ unsafe fn hmin_256(v: std::arch::x86_64::__m256d) -> f64 {
 #[inline(always)]
 unsafe fn hmax_256(v: std::arch::x86_64::__m256d) -> f64 {
     use std::arch::x86_64::*;
-    let hi = _mm256_extractf128_pd(v, 1);
-    let lo = _mm256_castpd256_pd128(v);
-    let m = _mm_max_pd(lo, hi);
-    let hi64 = _mm_unpackhi_pd(m, m);
-    _mm_cvtsd_f64(_mm_max_sd(m, hi64))
+    // SAFETY: register-to-register intrinsics only — no loads, no stores.
+    // The caller guarantees the CPU feature, per this function's `# Safety`.
+    unsafe {
+        let hi = _mm256_extractf128_pd(v, 1);
+        let lo = _mm256_castpd256_pd128(v);
+        let m = _mm_max_pd(lo, hi);
+        let hi64 = _mm_unpackhi_pd(m, m);
+        _mm_cvtsd_f64(_mm_max_sd(m, hi64))
+    }
 }
 
 /// Horizontal min of a 512-bit register (8×f64 → scalar).
@@ -120,10 +136,14 @@ unsafe fn hmax_256(v: std::arch::x86_64::__m256d) -> f64 {
 #[inline]
 unsafe fn hmin_512(v: std::arch::x86_64::__m512d) -> f64 {
     use std::arch::x86_64::*;
-    let lo = _mm512_castpd512_pd256(v);
-    let hi = _mm512_extractf64x4_pd(v, 1);
-    let m = _mm256_min_pd(lo, hi);
-    hmin_256(m)
+    // SAFETY: register-to-register intrinsics only — no loads, no stores.
+    // The caller guarantees the CPU feature, per this function's `# Safety`.
+    unsafe {
+        let lo = _mm512_castpd512_pd256(v);
+        let hi = _mm512_extractf64x4_pd(v, 1);
+        let m = _mm256_min_pd(lo, hi);
+        hmin_256(m)
+    }
 }
 
 /// Horizontal max of a 512-bit register (8×f64 → scalar).
@@ -136,10 +156,14 @@ unsafe fn hmin_512(v: std::arch::x86_64::__m512d) -> f64 {
 #[inline]
 unsafe fn hmax_512(v: std::arch::x86_64::__m512d) -> f64 {
     use std::arch::x86_64::*;
-    let lo = _mm512_castpd512_pd256(v);
-    let hi = _mm512_extractf64x4_pd(v, 1);
-    let m = _mm256_max_pd(lo, hi);
-    hmax_256(m)
+    // SAFETY: register-to-register intrinsics only — no loads, no stores.
+    // The caller guarantees the CPU feature, per this function's `# Safety`.
+    unsafe {
+        let lo = _mm512_castpd512_pd256(v);
+        let hi = _mm512_extractf64x4_pd(v, 1);
+        let m = _mm256_max_pd(lo, hi);
+        hmax_256(m)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -288,161 +312,181 @@ fn scalar_dot_product(a: &[f64], b: &[f64]) -> f64 {
 #[target_feature(enable = "avx512f")]
 unsafe fn avx512_sum(data: &[f64]) -> f64 {
     use std::arch::x86_64::*;
-    let mut acc0 = _mm512_setzero_pd();
-    let mut acc1 = _mm512_setzero_pd();
-    let mut acc2 = _mm512_setzero_pd();
-    let mut acc3 = _mm512_setzero_pd();
-    // Kahan compensation vectors.
-    let mut comp0 = _mm512_setzero_pd();
-    let mut comp1 = _mm512_setzero_pd();
-    let mut comp2 = _mm512_setzero_pd();
-    let mut comp3 = _mm512_setzero_pd();
-    let chunks = data.len() / 32;
-    let ptr = data.as_ptr();
-    for i in 0..chunks {
-        let b = i * 32;
-        let v0 = _mm512_loadu_pd(ptr.add(b));
-        let y0 = _mm512_sub_pd(v0, comp0);
-        let t0 = _mm512_add_pd(acc0, y0);
-        comp0 = _mm512_sub_pd(_mm512_sub_pd(t0, acc0), y0);
-        acc0 = t0;
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let mut acc0 = _mm512_setzero_pd();
+        let mut acc1 = _mm512_setzero_pd();
+        let mut acc2 = _mm512_setzero_pd();
+        let mut acc3 = _mm512_setzero_pd();
+        // Kahan compensation vectors.
+        let mut comp0 = _mm512_setzero_pd();
+        let mut comp1 = _mm512_setzero_pd();
+        let mut comp2 = _mm512_setzero_pd();
+        let mut comp3 = _mm512_setzero_pd();
+        let chunks = data.len() / 32;
+        let ptr = data.as_ptr();
+        for i in 0..chunks {
+            let b = i * 32;
+            let v0 = _mm512_loadu_pd(ptr.add(b));
+            let y0 = _mm512_sub_pd(v0, comp0);
+            let t0 = _mm512_add_pd(acc0, y0);
+            comp0 = _mm512_sub_pd(_mm512_sub_pd(t0, acc0), y0);
+            acc0 = t0;
 
-        let v1 = _mm512_loadu_pd(ptr.add(b + 8));
-        let y1 = _mm512_sub_pd(v1, comp1);
-        let t1 = _mm512_add_pd(acc1, y1);
-        comp1 = _mm512_sub_pd(_mm512_sub_pd(t1, acc1), y1);
-        acc1 = t1;
+            let v1 = _mm512_loadu_pd(ptr.add(b + 8));
+            let y1 = _mm512_sub_pd(v1, comp1);
+            let t1 = _mm512_add_pd(acc1, y1);
+            comp1 = _mm512_sub_pd(_mm512_sub_pd(t1, acc1), y1);
+            acc1 = t1;
 
-        let v2 = _mm512_loadu_pd(ptr.add(b + 16));
-        let y2 = _mm512_sub_pd(v2, comp2);
-        let t2 = _mm512_add_pd(acc2, y2);
-        comp2 = _mm512_sub_pd(_mm512_sub_pd(t2, acc2), y2);
-        acc2 = t2;
+            let v2 = _mm512_loadu_pd(ptr.add(b + 16));
+            let y2 = _mm512_sub_pd(v2, comp2);
+            let t2 = _mm512_add_pd(acc2, y2);
+            comp2 = _mm512_sub_pd(_mm512_sub_pd(t2, acc2), y2);
+            acc2 = t2;
 
-        let v3 = _mm512_loadu_pd(ptr.add(b + 24));
-        let y3 = _mm512_sub_pd(v3, comp3);
-        let t3 = _mm512_add_pd(acc3, y3);
-        comp3 = _mm512_sub_pd(_mm512_sub_pd(t3, acc3), y3);
-        acc3 = t3;
+            let v3 = _mm512_loadu_pd(ptr.add(b + 24));
+            let y3 = _mm512_sub_pd(v3, comp3);
+            let t3 = _mm512_add_pd(acc3, y3);
+            comp3 = _mm512_sub_pd(_mm512_sub_pd(t3, acc3), y3);
+            acc3 = t3;
+        }
+        let sum = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
+        let mut total = hsum_512(sum);
+        // Kahan tail for remainder elements.
+        let mut c = 0.0_f64;
+        for &v in &data[chunks * 32..] {
+            let y = v - c;
+            let t = total + y;
+            c = (t - total) - y;
+            total = t;
+        }
+        total
     }
-    let sum = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
-    let mut total = hsum_512(sum);
-    // Kahan tail for remainder elements.
-    let mut c = 0.0_f64;
-    for &v in &data[chunks * 32..] {
-        let y = v - c;
-        let t = total + y;
-        c = (t - total) - y;
-        total = t;
-    }
-    total
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn avx512_variance(data: &[f64], mean: f64) -> f64 {
     use std::arch::x86_64::*;
-    let vmean = _mm512_set1_pd(mean);
-    let mut acc0 = _mm512_setzero_pd();
-    let mut acc1 = _mm512_setzero_pd();
-    let mut acc2 = _mm512_setzero_pd();
-    let mut acc3 = _mm512_setzero_pd();
-    let chunks = data.len() / 32;
-    let ptr = data.as_ptr();
-    for i in 0..chunks {
-        let b = i * 32;
-        let d0 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b)), vmean);
-        let d1 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b + 8)), vmean);
-        let d2 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b + 16)), vmean);
-        let d3 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b + 24)), vmean);
-        acc0 = _mm512_fmadd_pd(d0, d0, acc0);
-        acc1 = _mm512_fmadd_pd(d1, d1, acc1);
-        acc2 = _mm512_fmadd_pd(d2, d2, acc2);
-        acc3 = _mm512_fmadd_pd(d3, d3, acc3);
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let vmean = _mm512_set1_pd(mean);
+        let mut acc0 = _mm512_setzero_pd();
+        let mut acc1 = _mm512_setzero_pd();
+        let mut acc2 = _mm512_setzero_pd();
+        let mut acc3 = _mm512_setzero_pd();
+        let chunks = data.len() / 32;
+        let ptr = data.as_ptr();
+        for i in 0..chunks {
+            let b = i * 32;
+            let d0 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b)), vmean);
+            let d1 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b + 8)), vmean);
+            let d2 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b + 16)), vmean);
+            let d3 = _mm512_sub_pd(_mm512_loadu_pd(ptr.add(b + 24)), vmean);
+            acc0 = _mm512_fmadd_pd(d0, d0, acc0);
+            acc1 = _mm512_fmadd_pd(d1, d1, acc1);
+            acc2 = _mm512_fmadd_pd(d2, d2, acc2);
+            acc3 = _mm512_fmadd_pd(d3, d3, acc3);
+        }
+        let sum = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
+        let mut total = hsum_512(sum);
+        for &v in &data[chunks * 32..] {
+            let d = v - mean;
+            total += d * d;
+        }
+        total / data.len() as f64
     }
-    let sum = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
-    let mut total = hsum_512(sum);
-    for &v in &data[chunks * 32..] {
-        let d = v - mean;
-        total += d * d;
-    }
-    total / data.len() as f64
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn avx512_min_max(data: &[f64]) -> (f64, f64) {
     use std::arch::x86_64::*;
-    let mut vmin0 = _mm512_set1_pd(f64::INFINITY);
-    let mut vmax0 = _mm512_set1_pd(f64::NEG_INFINITY);
-    let mut vmin1 = vmin0;
-    let mut vmax1 = vmax0;
-    let chunks = data.len() / 16;
-    let ptr = data.as_ptr();
-    for i in 0..chunks {
-        let b = i * 16;
-        let a = _mm512_loadu_pd(ptr.add(b));
-        let c = _mm512_loadu_pd(ptr.add(b + 8));
-        vmin0 = _mm512_min_pd(a, vmin0);
-        vmax0 = _mm512_max_pd(a, vmax0);
-        vmin1 = _mm512_min_pd(c, vmin1);
-        vmax1 = _mm512_max_pd(c, vmax1);
-    }
-    let vmin = _mm512_min_pd(vmin0, vmin1);
-    let vmax = _mm512_max_pd(vmax0, vmax1);
-    let mut min_val = hmin_512(vmin);
-    let mut max_val = hmax_512(vmax);
-    for &v in &data[chunks * 16..] {
-        if v < min_val {
-            min_val = v;
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let mut vmin0 = _mm512_set1_pd(f64::INFINITY);
+        let mut vmax0 = _mm512_set1_pd(f64::NEG_INFINITY);
+        let mut vmin1 = vmin0;
+        let mut vmax1 = vmax0;
+        let chunks = data.len() / 16;
+        let ptr = data.as_ptr();
+        for i in 0..chunks {
+            let b = i * 16;
+            let a = _mm512_loadu_pd(ptr.add(b));
+            let c = _mm512_loadu_pd(ptr.add(b + 8));
+            vmin0 = _mm512_min_pd(a, vmin0);
+            vmax0 = _mm512_max_pd(a, vmax0);
+            vmin1 = _mm512_min_pd(c, vmin1);
+            vmax1 = _mm512_max_pd(c, vmax1);
         }
-        if v > max_val {
-            max_val = v;
+        let vmin = _mm512_min_pd(vmin0, vmin1);
+        let vmax = _mm512_max_pd(vmax0, vmax1);
+        let mut min_val = hmin_512(vmin);
+        let mut max_val = hmax_512(vmax);
+        for &v in &data[chunks * 16..] {
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
         }
+        (min_val, max_val)
     }
-    (min_val, max_val)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn avx512_dot_product(a: &[f64], b: &[f64]) -> f64 {
     use std::arch::x86_64::*;
-    let mut acc0 = _mm512_setzero_pd();
-    let mut acc1 = _mm512_setzero_pd();
-    let mut acc2 = _mm512_setzero_pd();
-    let mut acc3 = _mm512_setzero_pd();
-    let chunks = a.len() / 32;
-    let pa = a.as_ptr();
-    let pb = b.as_ptr();
-    for i in 0..chunks {
-        let base = i * 32;
-        acc0 = _mm512_fmadd_pd(
-            _mm512_loadu_pd(pa.add(base)),
-            _mm512_loadu_pd(pb.add(base)),
-            acc0,
-        );
-        acc1 = _mm512_fmadd_pd(
-            _mm512_loadu_pd(pa.add(base + 8)),
-            _mm512_loadu_pd(pb.add(base + 8)),
-            acc1,
-        );
-        acc2 = _mm512_fmadd_pd(
-            _mm512_loadu_pd(pa.add(base + 16)),
-            _mm512_loadu_pd(pb.add(base + 16)),
-            acc2,
-        );
-        acc3 = _mm512_fmadd_pd(
-            _mm512_loadu_pd(pa.add(base + 24)),
-            _mm512_loadu_pd(pb.add(base + 24)),
-            acc3,
-        );
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let mut acc0 = _mm512_setzero_pd();
+        let mut acc1 = _mm512_setzero_pd();
+        let mut acc2 = _mm512_setzero_pd();
+        let mut acc3 = _mm512_setzero_pd();
+        let chunks = a.len() / 32;
+        let pa = a.as_ptr();
+        let pb = b.as_ptr();
+        for i in 0..chunks {
+            let base = i * 32;
+            acc0 = _mm512_fmadd_pd(
+                _mm512_loadu_pd(pa.add(base)),
+                _mm512_loadu_pd(pb.add(base)),
+                acc0,
+            );
+            acc1 = _mm512_fmadd_pd(
+                _mm512_loadu_pd(pa.add(base + 8)),
+                _mm512_loadu_pd(pb.add(base + 8)),
+                acc1,
+            );
+            acc2 = _mm512_fmadd_pd(
+                _mm512_loadu_pd(pa.add(base + 16)),
+                _mm512_loadu_pd(pb.add(base + 16)),
+                acc2,
+            );
+            acc3 = _mm512_fmadd_pd(
+                _mm512_loadu_pd(pa.add(base + 24)),
+                _mm512_loadu_pd(pb.add(base + 24)),
+                acc3,
+            );
+        }
+        let sum = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
+        let mut total = hsum_512(sum);
+        for i in (chunks * 32)..a.len() {
+            total += a[i] * b[i];
+        }
+        total
     }
-    let sum = _mm512_add_pd(_mm512_add_pd(acc0, acc1), _mm512_add_pd(acc2, acc3));
-    let mut total = hsum_512(sum);
-    for i in (chunks * 32)..a.len() {
-        total += a[i] * b[i];
-    }
-    total
 }
 
 // ── AVX2+FMA (4×f64, 16 elements/iteration) ─────────────────────────
@@ -460,161 +504,181 @@ unsafe fn avx512_dot_product(a: &[f64], b: &[f64]) -> f64 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn avx2_sum(data: &[f64]) -> f64 {
     use std::arch::x86_64::*;
-    let mut acc0 = _mm256_setzero_pd();
-    let mut acc1 = _mm256_setzero_pd();
-    let mut acc2 = _mm256_setzero_pd();
-    let mut acc3 = _mm256_setzero_pd();
-    // Kahan compensation vectors.
-    let mut comp0 = _mm256_setzero_pd();
-    let mut comp1 = _mm256_setzero_pd();
-    let mut comp2 = _mm256_setzero_pd();
-    let mut comp3 = _mm256_setzero_pd();
-    let chunks = data.len() / 16;
-    let ptr = data.as_ptr();
-    for i in 0..chunks {
-        let b = i * 16;
-        let v0 = _mm256_loadu_pd(ptr.add(b));
-        let y0 = _mm256_sub_pd(v0, comp0);
-        let t0 = _mm256_add_pd(acc0, y0);
-        comp0 = _mm256_sub_pd(_mm256_sub_pd(t0, acc0), y0);
-        acc0 = t0;
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let mut acc0 = _mm256_setzero_pd();
+        let mut acc1 = _mm256_setzero_pd();
+        let mut acc2 = _mm256_setzero_pd();
+        let mut acc3 = _mm256_setzero_pd();
+        // Kahan compensation vectors.
+        let mut comp0 = _mm256_setzero_pd();
+        let mut comp1 = _mm256_setzero_pd();
+        let mut comp2 = _mm256_setzero_pd();
+        let mut comp3 = _mm256_setzero_pd();
+        let chunks = data.len() / 16;
+        let ptr = data.as_ptr();
+        for i in 0..chunks {
+            let b = i * 16;
+            let v0 = _mm256_loadu_pd(ptr.add(b));
+            let y0 = _mm256_sub_pd(v0, comp0);
+            let t0 = _mm256_add_pd(acc0, y0);
+            comp0 = _mm256_sub_pd(_mm256_sub_pd(t0, acc0), y0);
+            acc0 = t0;
 
-        let v1 = _mm256_loadu_pd(ptr.add(b + 4));
-        let y1 = _mm256_sub_pd(v1, comp1);
-        let t1 = _mm256_add_pd(acc1, y1);
-        comp1 = _mm256_sub_pd(_mm256_sub_pd(t1, acc1), y1);
-        acc1 = t1;
+            let v1 = _mm256_loadu_pd(ptr.add(b + 4));
+            let y1 = _mm256_sub_pd(v1, comp1);
+            let t1 = _mm256_add_pd(acc1, y1);
+            comp1 = _mm256_sub_pd(_mm256_sub_pd(t1, acc1), y1);
+            acc1 = t1;
 
-        let v2 = _mm256_loadu_pd(ptr.add(b + 8));
-        let y2 = _mm256_sub_pd(v2, comp2);
-        let t2 = _mm256_add_pd(acc2, y2);
-        comp2 = _mm256_sub_pd(_mm256_sub_pd(t2, acc2), y2);
-        acc2 = t2;
+            let v2 = _mm256_loadu_pd(ptr.add(b + 8));
+            let y2 = _mm256_sub_pd(v2, comp2);
+            let t2 = _mm256_add_pd(acc2, y2);
+            comp2 = _mm256_sub_pd(_mm256_sub_pd(t2, acc2), y2);
+            acc2 = t2;
 
-        let v3 = _mm256_loadu_pd(ptr.add(b + 12));
-        let y3 = _mm256_sub_pd(v3, comp3);
-        let t3 = _mm256_add_pd(acc3, y3);
-        comp3 = _mm256_sub_pd(_mm256_sub_pd(t3, acc3), y3);
-        acc3 = t3;
+            let v3 = _mm256_loadu_pd(ptr.add(b + 12));
+            let y3 = _mm256_sub_pd(v3, comp3);
+            let t3 = _mm256_add_pd(acc3, y3);
+            comp3 = _mm256_sub_pd(_mm256_sub_pd(t3, acc3), y3);
+            acc3 = t3;
+        }
+        let sum = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
+        let mut total = hsum_256(sum);
+        // Kahan tail for remainder elements.
+        let mut c = 0.0_f64;
+        for &v in &data[chunks * 16..] {
+            let y = v - c;
+            let t = total + y;
+            c = (t - total) - y;
+            total = t;
+        }
+        total
     }
-    let sum = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
-    let mut total = hsum_256(sum);
-    // Kahan tail for remainder elements.
-    let mut c = 0.0_f64;
-    for &v in &data[chunks * 16..] {
-        let y = v - c;
-        let t = total + y;
-        c = (t - total) - y;
-        total = t;
-    }
-    total
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn avx2_variance(data: &[f64], mean: f64) -> f64 {
     use std::arch::x86_64::*;
-    let vmean = _mm256_set1_pd(mean);
-    let mut acc0 = _mm256_setzero_pd();
-    let mut acc1 = _mm256_setzero_pd();
-    let mut acc2 = _mm256_setzero_pd();
-    let mut acc3 = _mm256_setzero_pd();
-    let chunks = data.len() / 16;
-    let ptr = data.as_ptr();
-    for i in 0..chunks {
-        let b = i * 16;
-        let d0 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b)), vmean);
-        let d1 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b + 4)), vmean);
-        let d2 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b + 8)), vmean);
-        let d3 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b + 12)), vmean);
-        acc0 = _mm256_fmadd_pd(d0, d0, acc0);
-        acc1 = _mm256_fmadd_pd(d1, d1, acc1);
-        acc2 = _mm256_fmadd_pd(d2, d2, acc2);
-        acc3 = _mm256_fmadd_pd(d3, d3, acc3);
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let vmean = _mm256_set1_pd(mean);
+        let mut acc0 = _mm256_setzero_pd();
+        let mut acc1 = _mm256_setzero_pd();
+        let mut acc2 = _mm256_setzero_pd();
+        let mut acc3 = _mm256_setzero_pd();
+        let chunks = data.len() / 16;
+        let ptr = data.as_ptr();
+        for i in 0..chunks {
+            let b = i * 16;
+            let d0 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b)), vmean);
+            let d1 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b + 4)), vmean);
+            let d2 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b + 8)), vmean);
+            let d3 = _mm256_sub_pd(_mm256_loadu_pd(ptr.add(b + 12)), vmean);
+            acc0 = _mm256_fmadd_pd(d0, d0, acc0);
+            acc1 = _mm256_fmadd_pd(d1, d1, acc1);
+            acc2 = _mm256_fmadd_pd(d2, d2, acc2);
+            acc3 = _mm256_fmadd_pd(d3, d3, acc3);
+        }
+        let sum = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
+        let mut total = hsum_256(sum);
+        for &v in &data[chunks * 16..] {
+            let d = v - mean;
+            total += d * d;
+        }
+        total / data.len() as f64
     }
-    let sum = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
-    let mut total = hsum_256(sum);
-    for &v in &data[chunks * 16..] {
-        let d = v - mean;
-        total += d * d;
-    }
-    total / data.len() as f64
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2_min_max(data: &[f64]) -> (f64, f64) {
     use std::arch::x86_64::*;
-    let mut vmin0 = _mm256_set1_pd(f64::INFINITY);
-    let mut vmax0 = _mm256_set1_pd(f64::NEG_INFINITY);
-    let mut vmin1 = vmin0;
-    let mut vmax1 = vmax0;
-    let chunks = data.len() / 8;
-    let ptr = data.as_ptr();
-    for i in 0..chunks {
-        let b = i * 8;
-        let a = _mm256_loadu_pd(ptr.add(b));
-        let c = _mm256_loadu_pd(ptr.add(b + 4));
-        vmin0 = _mm256_min_pd(a, vmin0);
-        vmax0 = _mm256_max_pd(a, vmax0);
-        vmin1 = _mm256_min_pd(c, vmin1);
-        vmax1 = _mm256_max_pd(c, vmax1);
-    }
-    let vmin = _mm256_min_pd(vmin0, vmin1);
-    let vmax = _mm256_max_pd(vmax0, vmax1);
-    let mut min_val = hmin_256(vmin);
-    let mut max_val = hmax_256(vmax);
-    for &v in &data[chunks * 8..] {
-        if v < min_val {
-            min_val = v;
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let mut vmin0 = _mm256_set1_pd(f64::INFINITY);
+        let mut vmax0 = _mm256_set1_pd(f64::NEG_INFINITY);
+        let mut vmin1 = vmin0;
+        let mut vmax1 = vmax0;
+        let chunks = data.len() / 8;
+        let ptr = data.as_ptr();
+        for i in 0..chunks {
+            let b = i * 8;
+            let a = _mm256_loadu_pd(ptr.add(b));
+            let c = _mm256_loadu_pd(ptr.add(b + 4));
+            vmin0 = _mm256_min_pd(a, vmin0);
+            vmax0 = _mm256_max_pd(a, vmax0);
+            vmin1 = _mm256_min_pd(c, vmin1);
+            vmax1 = _mm256_max_pd(c, vmax1);
         }
-        if v > max_val {
-            max_val = v;
+        let vmin = _mm256_min_pd(vmin0, vmin1);
+        let vmax = _mm256_max_pd(vmax0, vmax1);
+        let mut min_val = hmin_256(vmin);
+        let mut max_val = hmax_256(vmax);
+        for &v in &data[chunks * 8..] {
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
         }
+        (min_val, max_val)
     }
-    (min_val, max_val)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn avx2_dot_product(a: &[f64], b: &[f64]) -> f64 {
     use std::arch::x86_64::*;
-    let mut acc0 = _mm256_setzero_pd();
-    let mut acc1 = _mm256_setzero_pd();
-    let mut acc2 = _mm256_setzero_pd();
-    let mut acc3 = _mm256_setzero_pd();
-    let chunks = a.len() / 16;
-    let pa = a.as_ptr();
-    let pb = b.as_ptr();
-    for i in 0..chunks {
-        let base = i * 16;
-        acc0 = _mm256_fmadd_pd(
-            _mm256_loadu_pd(pa.add(base)),
-            _mm256_loadu_pd(pb.add(base)),
-            acc0,
-        );
-        acc1 = _mm256_fmadd_pd(
-            _mm256_loadu_pd(pa.add(base + 4)),
-            _mm256_loadu_pd(pb.add(base + 4)),
-            acc1,
-        );
-        acc2 = _mm256_fmadd_pd(
-            _mm256_loadu_pd(pa.add(base + 8)),
-            _mm256_loadu_pd(pb.add(base + 8)),
-            acc2,
-        );
-        acc3 = _mm256_fmadd_pd(
-            _mm256_loadu_pd(pa.add(base + 12)),
-            _mm256_loadu_pd(pb.add(base + 12)),
-            acc3,
-        );
+    // SAFETY: the tier contract above — `#[target_feature]` guarantees the
+    // intrinsics, and every load offset is inside a chunk derived from the
+    // slice length, with the remainder handled by safe scalar code.
+    unsafe {
+        let mut acc0 = _mm256_setzero_pd();
+        let mut acc1 = _mm256_setzero_pd();
+        let mut acc2 = _mm256_setzero_pd();
+        let mut acc3 = _mm256_setzero_pd();
+        let chunks = a.len() / 16;
+        let pa = a.as_ptr();
+        let pb = b.as_ptr();
+        for i in 0..chunks {
+            let base = i * 16;
+            acc0 = _mm256_fmadd_pd(
+                _mm256_loadu_pd(pa.add(base)),
+                _mm256_loadu_pd(pb.add(base)),
+                acc0,
+            );
+            acc1 = _mm256_fmadd_pd(
+                _mm256_loadu_pd(pa.add(base + 4)),
+                _mm256_loadu_pd(pb.add(base + 4)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_pd(
+                _mm256_loadu_pd(pa.add(base + 8)),
+                _mm256_loadu_pd(pb.add(base + 8)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_pd(
+                _mm256_loadu_pd(pa.add(base + 12)),
+                _mm256_loadu_pd(pb.add(base + 12)),
+                acc3,
+            );
+        }
+        let sum = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
+        let mut total = hsum_256(sum);
+        for i in (chunks * 16)..a.len() {
+            total += a[i] * b[i];
+        }
+        total
     }
-    let sum = _mm256_add_pd(_mm256_add_pd(acc0, acc1), _mm256_add_pd(acc2, acc3));
-    let mut total = hsum_256(sum);
-    for i in (chunks * 16)..a.len() {
-        total += a[i] * b[i];
-    }
-    total
 }
 
 // ── SSE2 (2×f64, 8 elements/iteration — x86_64 baseline) ────────────

@@ -15,7 +15,7 @@
 //! Prometheus bucket *i* covers `(base^(i-1), base^i]`; OTLP bucket *i* covers
 //! `(base^i, base^(i+1)]`. They are off by one, both call the field an index,
 //! and a copied index produces a histogram that validates, stores cleanly, and
-//! answers every quantile a factor of `base` wrong. [`from_otlp_exponential`]
+//! answers every quantile a factor of `base` wrong. `from_otlp_exponential`
 //! adds the one; nothing else may.
 
 use chronix_core::histogram::{Bucket, CUSTOM_BUCKETS_SCHEMA, Histogram, ResetHint};

@@ -152,13 +152,13 @@ impl SimCluster {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             for (id, node) in &self.nodes {
-                if let Some(leader_id) = node.raft.current_leader().await {
-                    if leader_id == *id {
-                        // Record leader observation for invariant checking.
-                        let term: u64 = node.raft.metrics().borrow().current_term;
-                        self.checker.observe_leader(term, *id);
-                        return *id;
-                    }
+                if let Some(leader_id) = node.raft.current_leader().await
+                    && leader_id == *id
+                {
+                    // Record leader observation for invariant checking.
+                    let term: u64 = node.raft.metrics().borrow().current_term;
+                    self.checker.observe_leader(term, *id);
+                    return *id;
                 }
             }
             if tokio::time::Instant::now() > deadline {
@@ -171,10 +171,10 @@ impl SimCluster {
     /// Find the current leader (non-blocking, returns None if no leader).
     pub async fn find_leader(&self) -> Option<u64> {
         for (id, node) in &self.nodes {
-            if let Some(leader_id) = node.raft.current_leader().await {
-                if leader_id == *id {
-                    return Some(*id);
-                }
+            if let Some(leader_id) = node.raft.current_leader().await
+                && leader_id == *id
+            {
+                return Some(*id);
             }
         }
         None
