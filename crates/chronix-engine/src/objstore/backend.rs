@@ -609,10 +609,10 @@ impl StorageBackend for ObjectStoreBackend {
         metrics::counter!("chronix_objstore_get_bytes_total").increment(data.len() as u64);
 
         // Populate cache
-        if let Some(ref cache) = self.cache {
-            if let Err(e) = cache.put(&key, &data).await {
-                warn!(%key, error = %e, "failed to cache segment after fetch");
-            }
+        if let Some(ref cache) = self.cache
+            && let Err(e) = cache.put(&key, &data).await
+        {
+            warn!(%key, error = %e, "failed to cache segment after fetch");
         }
 
         Ok(data.to_vec())
@@ -627,20 +627,20 @@ impl StorageBackend for ObjectStoreBackend {
         // For range reads, try to serve from cache if the full object is cached
         let key = Self::cache_key(path);
 
-        if let Some(ref cache) = self.cache {
-            if let Some(data) = cache.get(&key).await {
-                #[allow(clippy::cast_possible_truncation)]
-                let start = offset as usize;
-                let end = start.checked_add(length).ok_or_else(|| {
-                    crate::storage::StorageError::InvalidPath {
-                        detail: "offset + length overflow".to_string(),
-                    }
-                })?;
-                if end <= data.len() {
-                    return Ok(data[start..end].to_vec());
+        if let Some(ref cache) = self.cache
+            && let Some(data) = cache.get(&key).await
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            let start = offset as usize;
+            let end = start.checked_add(length).ok_or_else(|| {
+                crate::storage::StorageError::InvalidPath {
+                    detail: "offset + length overflow".to_string(),
                 }
-                // Cache entry is too small (corrupt?) — fall through to remote
+            })?;
+            if end <= data.len() {
+                return Ok(data[start..end].to_vec());
             }
+            // Cache entry is too small (corrupt?) — fall through to remote
         }
 
         // Fetch the range directly from remote with retry for transient errors.
@@ -730,10 +730,10 @@ impl StorageBackend for ObjectStoreBackend {
 
     async fn exists(&self, path: &SegmentPath) -> crate::storage::error::Result<bool> {
         // Check cache first
-        if let Some(ref cache) = self.cache {
-            if cache.contains(&Self::cache_key(path)) {
-                return Ok(true);
-            }
+        if let Some(ref cache) = self.cache
+            && cache.contains(&Self::cache_key(path))
+        {
+            return Ok(true);
         }
 
         let obj_path = Self::to_obj_path(path);

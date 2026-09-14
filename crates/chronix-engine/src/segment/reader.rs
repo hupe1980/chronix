@@ -1000,8 +1000,14 @@ impl SegmentReader {
             std::borrow::Cow::Borrowed(raw_data)
         };
 
+        // Both `cfg` arms end at the same type on purpose. When they differed —
+        // `Cow<[u8]>` with the feature, `&[u8]` without — no single spelling of
+        // the argument below was clean in both: `&raw_data` is a needless
+        // borrow of a reference, and `&*raw_data` is a needless deref of one.
+        // Unifying the type is what makes the code after this point
+        // feature-independent.
         #[cfg(not(feature = "field-encryption"))]
-        let raw_data: &[u8] = raw_data;
+        let raw_data: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(raw_data);
 
         // Decompress if needed — the dictionary is passed for ZSTD_DICT blocks.
         let decompressed = if block_meta.compressed {

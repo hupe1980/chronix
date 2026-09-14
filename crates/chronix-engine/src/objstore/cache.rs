@@ -309,22 +309,22 @@ impl DiskCache {
         let mut evicted = 0u64;
         for (key, path, size) in &to_evict {
             debug!(key, "evicting cached object");
-            if let Err(e) = fs::remove_file(path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!(key, error = %e, "failed to evict cached file, re-adding to state");
-                    // Rollback: re-insert the entry so state stays in sync with disk.
-                    // Use generation 0 so it stays at front of LRU (oldest) and
-                    // gets retried on next eviction pass.
-                    let mut state = self.state.lock();
-                    state.upsert(
-                        key.clone(),
-                        CacheEntry {
-                            size: *size,
-                            generation: 0,
-                        },
-                    );
-                    continue;
-                }
+            if let Err(e) = fs::remove_file(path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(key, error = %e, "failed to evict cached file, re-adding to state");
+                // Rollback: re-insert the entry so state stays in sync with disk.
+                // Use generation 0 so it stays at front of LRU (oldest) and
+                // gets retried on next eviction pass.
+                let mut state = self.state.lock();
+                state.upsert(
+                    key.clone(),
+                    CacheEntry {
+                        size: *size,
+                        generation: 0,
+                    },
+                );
+                continue;
             }
             evicted += 1;
         }

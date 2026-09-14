@@ -267,6 +267,28 @@ the format then freezes at 1.0.
 
 ### Fixed
 
+- **A histogram's bucket boundaries were not the same number on every
+  machine.** They were computed as `base(schema).powi(index)`, and neither
+  `powf` nor `powi` is correctly rounded — their last bit is specified by
+  neither IEEE 754 nor Rust. So `bucket_bounds(0)` at schema 0 returned
+  `0.4999999999999999` instead of `0.5`, and a quantile could come back one
+  ULP *outside* the bucket it was located in.
+
+  A bucket boundary decides which bucket an observation belongs to, which
+  makes it a storage-format semantic rather than a display detail. Bounds are
+  now computed as `2^q · 2^(r / 2^schema)` — the first factor read straight
+  out of the IEEE exponent field, the second from repeated `sqrt`, the one
+  root operation IEEE 754 requires to be correctly rounded. Every step is
+  exact or correctly rounded, so the result is identical everywhere. Quantile
+  interpolation returns its endpoints exactly and clamps into its own bucket.
+
+  Found by Miri, which perturbs `powf` and `log2` by a ULP deliberately — it
+  failed two *different* tests on two consecutive runs, which is what
+  depending on an unspecified bit looks like.
+
+- **`Histogram::bound(schema, index)`** is public, so the geometry can be
+  asked for without constructing a histogram.
+
 - **Every Granger causality p-value was wrong.** `chronix-analytics` carried
   two `ln_gamma` implementations, and the one in `multivariate::mv_forecast`
   had the g = 7 Lanczos coefficients with a `t = x + 6.5` offset — g = 6.

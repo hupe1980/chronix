@@ -40,10 +40,10 @@ impl Drop for TracingGuard {
         // runs during stack unwinding.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(feature = "otlp")]
-            if let Some(ref provider) = self.provider {
-                if let Err(e) = provider.shutdown() {
-                    eprintln!("tracing provider shutdown error: {e}");
-                }
+            if let Some(ref provider) = self.provider
+                && let Err(e) = provider.shutdown()
+            {
+                eprintln!("tracing provider shutdown error: {e}");
             }
         }));
         if result.is_err() {

@@ -788,3 +788,163 @@ fn the_sum_is_the_sum_regardless_of_resolution() {
         }
     }
 }
+
+// ── Bucket bounds are exact, not merely close ────────────────────────
+
+/// Every bound that *is* a power of two is that power of two exactly.
+///
+/// `2^(index / 2^schema)` is an exact power of two whenever `index` is a
+/// multiple of `2^schema`, at every schema. Computed with `powf` it was not:
+/// schema 0 index 0 came back as `0.4999999999999999`, and under Miri — which
+/// perturbs `powf` by a ULP on purpose, because its last bit is unspecified —
+/// it moved from run to run. A bucket boundary decides which bucket an
+/// observation belongs to, so it cannot be allowed to depend on the machine.
+#[test]
+fn bounds_that_are_powers_of_two_are_exact_at_every_schema() {
+    /// `2^k`, by exact doubling — a reference that owes nothing to the code
+    /// under test and nothing to `powi`, whose last bit is unspecified.
+    fn reference(k: i32) -> f64 {
+        let mut v = 1.0_f64;
+        for _ in 0..k.abs() {
+            if k > 0 {
+                v *= 2.0;
+            } else {
+                v /= 2.0;
+            }
+        }
+        v
+    }
+
+    for schema in MIN_SCHEMA..=MAX_SCHEMA {
+        // bound(schema, index) = 2^(index / 2^schema). It is an exact power of
+        // two whenever that exponent is an integer: for schema <= 0 that is
+        // every index, and for schema > 0 the multiples of 2^schema.
+        for power in -6..=6i32 {
+            let (index, exponent) = if schema <= 0 {
+                (power, power * (1 << -i32::from(schema)))
+            } else {
+                (power * (1 << schema), power)
+            };
+            assert_eq!(
+                Histogram::bound(schema, index),
+                reference(exponent),
+                "schema {schema}, index {index}: 2^{exponent} must be exact"
+            );
+        }
+    }
+}
+
+/// Bounds ascend strictly, so no observation can fall in two buckets.
+#[test]
+fn bounds_are_strictly_increasing_in_the_index() {
+    for schema in MIN_SCHEMA..=MAX_SCHEMA {
+        let mut previous = f64::NEG_INFINITY;
+        for index in -40..=40 {
+            let b = Histogram::bound(schema, index);
+            assert!(
+                b > previous,
+                "schema {schema}: bound({index}) = {b} did not exceed {previous}"
+            );
+            previous = b;
+        }
+    }
+}
+
+/// `base()` is the ratio between consecutive bounds, at every schema.
+#[test]
+fn base_is_the_ratio_between_consecutive_bounds() {
+    for schema in MIN_SCHEMA..=MAX_SCHEMA {
+        let base = Histogram::base(schema);
+        let ratio = Histogram::bound(schema, 1) / Histogram::bound(schema, 0);
+        assert!(
+            (ratio - base).abs() <= 4.0 * f64::EPSILON * base,
+            "schema {schema}: base is {base} but consecutive bounds differ by {ratio}"
+        );
+    }
+}
+
+/// A quantile never leaves the bucket it was located in.
+///
+/// The interpolation runs through `log2` and `powf`, neither of which is
+/// correctly rounded, so `2^log2(x)` need not be `x`: `q = 1` over the bucket
+/// `(1, 2]` returned `2.000000000000003`. A quantile outside its own bucket
+/// is wrong by definition, however small the excess.
+#[test]
+fn a_quantile_never_leaves_its_bucket_at_any_schema() {
+    for schema in MIN_SCHEMA..=MAX_SCHEMA {
+        for index in [-3i32, 0, 1, 5] {
+            let mut h = Histogram::empty(schema);
+            h.positive = vec![Bucket { index, count: 10.0 }];
+            h.count = 10.0;
+            h.sum = 10.0;
+            h.validate().expect("fixture is valid");
+
+            let (lo, hi) = h.bucket_bounds(index, false);
+            for step in 0..=20 {
+                let q = f64::from(step) / 20.0;
+                let v = h.quantile(q);
+                assert!(
+                    v >= lo && v <= hi,
+                    "schema {schema}, index {index}, q={q}: {v} is outside ({lo}, {hi}]"
+                );
+            }
+        }
+    }
+}
+
+/// The same holds on the negative side, where the mirror is easy to get wrong.
+#[test]
+fn a_negative_quantile_never_leaves_its_bucket() {
+    for schema in MIN_SCHEMA..=MAX_SCHEMA {
+        let mut h = Histogram::empty(schema);
+        h.negative = vec![Bucket {
+            index: 2,
+            count: 8.0,
+        }];
+        h.count = 8.0;
+        h.sum = -8.0;
+        h.validate().expect("fixture is valid");
+
+        let (lo, hi) = h.bucket_bounds(2, true);
+        for step in 0..=20 {
+            let q = f64::from(step) / 20.0;
+            let v = h.quantile(q);
+            assert!(
+                v >= lo && v <= hi,
+                "schema {schema}, q={q}: {v} is outside [{lo}, {hi})"
+            );
+        }
+    }
+}
+
+/// `exp2i` is the exponent field, so it agrees with the literal powers.
+#[test]
+fn exp2i_matches_the_literal_powers_of_two() {
+    assert_eq!(exp2i(0), 1.0);
+    assert_eq!(exp2i(1), 2.0);
+    assert_eq!(exp2i(-1), 0.5);
+    assert_eq!(exp2i(-2), 0.25);
+    assert_eq!(exp2i(10), 1024.0);
+    assert_eq!(exp2i(-1022), f64::MIN_POSITIVE);
+    // The smallest subnormal, and one step past it.
+    assert_eq!(exp2i(-1074), 5e-324);
+    assert_eq!(exp2i(-1075), 0.0);
+    // The largest power of two, and one step past it.
+    assert_eq!(exp2i(1023), 8.988_465_674_311_58e307);
+    assert_eq!(exp2i(1024), f64::INFINITY);
+}
+
+/// `root_of_two(n)` squared `n` times returns to 2.
+#[test]
+fn repeated_square_roots_of_two_invert_by_squaring() {
+    for n in 0..=8u32 {
+        let mut v = root_of_two(n);
+        for _ in 0..n {
+            v *= v;
+        }
+        assert!(
+            (v - 2.0).abs() < 1e-12,
+            "{n} roots of two squared back gave {v}"
+        );
+    }
+}

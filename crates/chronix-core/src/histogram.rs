@@ -172,6 +172,63 @@ pub enum HistogramError {
     },
 }
 
+/// `2^k`, built from the IEEE-754 exponent field rather than computed.
+///
+/// Exact for every `k` a power of two can represent, and — unlike `exp2`,
+/// `powi` or `powf` — specified to the last bit, so two machines agree.
+/// Saturates to `0.0` and `f64::INFINITY` outside the representable range.
+fn exp2i(k: i32) -> f64 {
+    const MAX_NORMAL_EXP: i32 = 1023;
+    const MIN_NORMAL_EXP: i32 = -1022;
+    /// Below this, `2^k` is not representable even as a subnormal.
+    const MIN_SUBNORMAL_EXP: i32 = -1074;
+
+    if k > MAX_NORMAL_EXP {
+        return f64::INFINITY;
+    }
+    if k < MIN_SUBNORMAL_EXP {
+        return 0.0;
+    }
+    if k >= MIN_NORMAL_EXP {
+        // Biased exponent, zero mantissa.
+        #[allow(clippy::cast_sign_loss)] // k + 1023 is in 1..=2046 here
+        return f64::from_bits(((k + 1023) as u64) << 52);
+    }
+    // Subnormal: the single set mantissa bit carries the exponent.
+    #[allow(clippy::cast_sign_loss)] // k - MIN_SUBNORMAL_EXP is in 0..=51 here
+    f64::from_bits(1u64 << ((k - MIN_SUBNORMAL_EXP) as u32))
+}
+
+/// `2^(1/2^n)` — `n` successive square roots of two.
+///
+/// `sqrt` is the one root operation IEEE 754 requires to be correctly
+/// rounded, so this is reproducible everywhere. `powf` is not, which is the
+/// whole reason this function exists.
+fn root_of_two(n: u32) -> f64 {
+    let mut v = 2.0_f64;
+    for _ in 0..n {
+        v = v.sqrt();
+    }
+    v
+}
+
+/// `2^(r / 2^s)` for `0 <= r < 2^s`, without a transcendental.
+///
+/// `r / 2^s` is a sum of distinct negative powers of two — one per set bit of
+/// `r` — so the result is the product of the corresponding roots of two.
+/// Multiplied low bit first, so the order (and therefore the rounding) is
+/// fixed rather than incidental.
+fn frac_power_of_two(r: u32, s: u32) -> f64 {
+    let mut acc = 1.0_f64;
+    for bit in 0..s {
+        if r & (1 << bit) != 0 {
+            // Bit `bit` of `r` contributes 2^bit / 2^s = 1 / 2^(s - bit).
+            acc *= root_of_two(s - bit);
+        }
+    }
+    acc
+}
+
 /// A distribution captured as one sample.
 ///
 /// See the [module documentation](self) for the model and the two
@@ -240,7 +297,13 @@ impl Histogram {
     /// `2^(2^-schema)`. Meaningless for [`CUSTOM_BUCKETS_SCHEMA`].
     #[must_use]
     pub fn base(schema: i8) -> f64 {
-        (2.0_f64).powf((2.0_f64).powi(-i32::from(schema)))
+        if schema <= 0 {
+            // 2^(2^|schema|) — an exact power of two.
+            exp2i(1i32 << (-i32::from(schema)).min(30))
+        } else {
+            // 2^(1/2^schema) — `schema` correctly-rounded square roots of 2.
+            root_of_two(u32::from(schema.unsigned_abs()))
+        }
     }
 
     /// The index of the bucket an observation falls in.
@@ -298,14 +361,54 @@ impl Histogram {
             };
             return (lower, upper);
         }
-        let base = Self::base(self.schema);
-        let upper = base.powi(index);
-        let lower = base.powi(index - 1);
+        let upper = Self::bound(self.schema, index);
+        let lower = Self::bound(self.schema, index - 1);
         if negative {
             (-upper, -lower)
         } else {
             (lower, upper)
         }
+    }
+
+    /// The upper bound of bucket `index`: `2^(index / 2^schema)`.
+    ///
+    /// Computed **without a transcendental**, which is the point. `powf` and
+    /// `powi` are not correctly rounded and their last bit is not specified by
+    /// IEEE 754 or by Rust, so the same stored histogram could report
+    /// different boundaries on two machines — and a bucket boundary is a
+    /// storage-format semantic, not a display detail. It showed up as
+    /// `bucket_bounds(0)` returning `0.4999999999999999` instead of `0.5` at
+    /// schema 0, where the answer is an exact power of two.
+    ///
+    /// Instead, `index` is split as `index = q · 2^schema + r`, giving
+    /// `2^q · 2^(r / 2^schema)`. The first factor is built straight from the
+    /// IEEE exponent field, and the second from repeated `sqrt` — the one
+    /// root operation IEEE 754 *does* require to be correctly rounded. Every
+    /// step is exact or correctly rounded, so the result is identical on
+    /// every platform.
+    #[must_use]
+    pub fn bound(schema: i8, index: i32) -> f64 {
+        let s = i32::from(schema);
+        if s <= 0 {
+            // The bound is 2^(index · 2^|s|) — an exact power of two, and the
+            // shift cannot overflow for the defined schema range.
+            let shift = (-s).min(30);
+            return match index.checked_shl(shift as u32) {
+                Some(k) => exp2i(k),
+                None if index > 0 => f64::INFINITY,
+                None => 0.0,
+            };
+        }
+        // Euclidean division, so a negative index still yields 0 <= r < 2^s.
+        let m = 1i32 << s;
+        let q = index.div_euclid(m);
+        let r = index.rem_euclid(m);
+        let frac = frac_power_of_two(r as u32, s as u32);
+        let scale = exp2i(q);
+        if scale == 0.0 || !scale.is_finite() {
+            return scale * frac.signum().abs();
+        }
+        scale * frac
     }
 
     /// Record one observation.
@@ -553,6 +656,18 @@ impl Histogram {
     /// straddling zero interpolate linearly, because neither has that
     /// geometry.
     fn interpolate(&self, lower: f64, upper: f64, fraction: f64) -> f64 {
+        // The endpoints are returned as themselves rather than computed. A
+        // log₂ round trip does not land back on its own input — `2^log2(2)`
+        // came back as `2.000000000000003`, one ULP *outside* the bucket that
+        // produced it — and a quantile outside the bucket it was located in is
+        // wrong by definition, not merely imprecise.
+        if !(fraction > 0.0) {
+            return lower;
+        }
+        if fraction >= 1.0 {
+            return upper;
+        }
+
         let linear = lower + (upper - lower) * fraction;
         if self.has_custom_buckets() || (lower <= 0.0 && upper >= 0.0) {
             return linear;
@@ -560,16 +675,20 @@ impl Histogram {
         if !lower.is_finite() || !upper.is_finite() || lower == 0.0 || upper == 0.0 {
             return linear;
         }
-        if lower < 0.0 {
+        let interpolated = if lower < 0.0 {
             // Mirror: interpolate over the magnitudes, from the larger
             // magnitude (the lower, more negative bound) downwards.
             let log_hi = (-lower).log2();
             let log_lo = (-upper).log2();
-            return -(2.0_f64).powf(log_hi + (log_lo - log_hi) * fraction);
-        }
-        let log_lo = lower.log2();
-        let log_hi = upper.log2();
-        (2.0_f64).powf(log_lo + (log_hi - log_lo) * fraction)
+            -(2.0_f64).powf(log_hi + (log_lo - log_hi) * fraction)
+        } else {
+            let log_lo = lower.log2();
+            let log_hi = upper.log2();
+            (2.0_f64).powf(log_lo + (log_hi - log_lo) * fraction)
+        };
+        // `powf` is not correctly rounded, so the strictly-inside case can
+        // still land a ULP outside. The bucket is the authority.
+        interpolated.clamp(lower, upper)
     }
 
     /// The φ-quantile of the observations.

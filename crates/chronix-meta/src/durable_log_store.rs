@@ -48,20 +48,14 @@ const LAST_PURGED_KEY: &str = "last_purged";
 /// Helper to convert any Display error into a `StorageError` for writes.
 fn write_err(e: impl std::fmt::Display) -> StorageError<u64> {
     StorageError::IO {
-        source: StorageIOError::write_logs(&std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        )),
+        source: StorageIOError::write_logs(&std::io::Error::other(e.to_string())),
     }
 }
 
 /// Helper to convert any Display error into a `StorageError` for reads.
 fn read_err(e: impl std::fmt::Display) -> StorageError<u64> {
     StorageError::IO {
-        source: StorageIOError::read_logs(&std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        )),
+        source: StorageIOError::read_logs(&std::io::Error::other(e.to_string())),
     }
 }
 

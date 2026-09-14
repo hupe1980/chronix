@@ -75,6 +75,42 @@ step "clippy (other architecture)" bash -c '
 step "embedded build (no sql)"     cargo clippy -p chronix --no-default-features \
                                        --all-targets -- -D warnings
 
+# The feature matrix. A `#[cfg(feature = …)]` block is compiled by exactly the
+# configurations that turn it on, so a lint inside one is invisible to every
+# other step here — which is how four `collapsible_if` errors sat in
+# `objstore` and one `needless_borrow` in a `field-encryption` `cfg` arm until
+# CI rejected the push. The list mirrors CI's "Optional features" job, plus
+# the two specs that job runs under `check`/`test` rather than `clippy` and so
+# never lints at all.
+step "feature matrix" bash -c '
+    set -uo pipefail
+    rc=0
+    while IFS= read -r spec; do
+        [ -z "$spec" ] && continue
+        if ! eval "cargo clippy $spec --all-targets -- -D warnings" >/tmp/chronix-fm.log 2>&1; then
+            printf "   %s\n" "$spec"
+            grep -E "^error" /tmp/chronix-fm.log | head -3
+            rc=1
+        fi
+    done <<SPECS
+-p chronix --no-default-features
+-p chronix --features streaming
+-p chronix --features security
+-p chronix --features pipeline
+-p chronix --features object-store
+-p chronix --features rust_decimal
+-p chronix-core --features rust_decimal
+-p chronix-engine --no-default-features
+-p chronix-engine --features field-encryption
+-p chronix-engine --features object-store
+-p chronix-security --no-default-features
+-p chronix-streaming --features arrow
+-p chronixd --features all-connectors
+-p chronixd --features otlp
+-p chronixd --features object-store
+SPECS
+    exit $rc'
+
 # `cargo doc` is its own gate: an intra-doc link resolves against the item
 # tree, which neither `check` nor `clippy` walks.
 step "rustdoc links"               env RUSTDOCFLAGS="-D warnings" \
@@ -108,6 +144,19 @@ if [ "$QUICK" -eq 0 ]; then
     # declared no `[workspace]` and was in neither `members` nor `exclude`,
     # which cargo refuses outright. Building is enough to catch that class;
     # actually fuzzing stays on the schedule where it belongs.
+    # Miri is the only step that questions floating point: it perturbs
+    # `powf`/`log2` by a ULP on purpose, because their last bit is
+    # unspecified, and that is how the histogram's bucket bounds were found to
+    # depend on the machine. It is also the only UB check in this script.
+    step "miri (chronix-core)" bash -c '
+        if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
+            echo "   skipped: no nightly toolchain"; exit 0
+        fi
+        if ! cargo +nightly miri --version >/dev/null 2>&1; then
+            echo "   skipped: rustup +nightly component add miri"; exit 0
+        fi
+        cargo +nightly miri test -p chronix-core >/dev/null'
+
     step "fuzz targets build" bash -c '
         if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
             echo "   skipped: no nightly toolchain"; exit 0
