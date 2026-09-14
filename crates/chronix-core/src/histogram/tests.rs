@@ -948,3 +948,24 @@ fn repeated_square_roots_of_two_invert_by_squaring() {
         );
     }
 }
+
+/// The endpoint guards must not swallow a `NaN` φ.
+///
+/// `quantile` screens `NaN` before it reaches `interpolate`, so this asserts
+/// the interpolation's *own* behaviour rather than relying on that screen —
+/// the two guards that return `lower` at φ ≤ 0 and `upper` at φ ≥ 1 are one
+/// spelling away from turning a `NaN` into a plausible number. Written
+/// `!(fraction > 0.0)`, the first of them did exactly that.
+#[test]
+fn interpolation_propagates_a_nan_fraction_rather_than_returning_a_bound() {
+    let h = Histogram::empty(0);
+    assert!(
+        h.interpolate(1.0, 2.0, f64::NAN).is_nan(),
+        "a NaN fraction must stay NaN, not become the bucket's lower bound"
+    );
+    // And the guards themselves still do their job.
+    assert_eq!(h.interpolate(1.0, 2.0, 0.0), 1.0);
+    assert_eq!(h.interpolate(1.0, 2.0, 1.0), 2.0);
+    assert_eq!(h.interpolate(1.0, 2.0, -0.5), 1.0);
+    assert_eq!(h.interpolate(1.0, 2.0, 1.5), 2.0);
+}

@@ -661,7 +661,12 @@ impl Histogram {
         // came back as `2.000000000000003`, one ULP *outside* the bucket that
         // produced it — and a quantile outside the bucket it was located in is
         // wrong by definition, not merely imprecise.
-        if !(fraction > 0.0) {
+        //
+        // A `NaN` fraction satisfies neither test and falls through to the
+        // arithmetic below, which propagates it — as it did before these two
+        // guards existed. Writing the first as `!(fraction > 0.0)` would have
+        // swallowed it and returned `lower`.
+        if fraction <= 0.0 {
             return lower;
         }
         if fraction >= 1.0 {
