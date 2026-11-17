@@ -35,7 +35,7 @@ _REPO = _SDK.parent.parent
 _DOCS = [
     _SDK / "README.md",
     _SDK / "examples" / "basic_usage.py",
-    _REPO / "site" / "content" / "docs" / "client-sdks.md",
+    _REPO / "site" / "content" / "guides" / "python.md",
 ]
 
 
