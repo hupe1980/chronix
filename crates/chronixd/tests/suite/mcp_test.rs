@@ -78,13 +78,20 @@ fn demo_db(dir: &Path) -> Arc<Chronix> {
 }
 
 /// The demo week, served once for the whole binary.
+///
+/// Every test in this binary shares it, in parallel, so it gets more query
+/// slots than the tests can hold at once: the default (cores − 1) is 2 on a
+/// 3-core CI runner, where a queue of debug-build forecasts outlasts the 30 s
+/// slot wait. The cap itself is tested by `one_query_slot_serves_concurrent_tools`.
 fn demo_server() -> SocketAddr {
     static SERVER: OnceLock<(tempfile::TempDir, SocketAddr)> = OnceLock::new();
     SERVER
         .get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
             let db = demo_db(&dir.path().join("data"));
-            let addr = spawn(SharedState::standalone(db, ServerConfig::default()));
+            let mut config = ServerConfig::default();
+            config.server.max_concurrent_queries = 64;
+            let addr = spawn(SharedState::standalone(db, config));
             (dir, addr)
         })
         .1
@@ -707,4 +714,34 @@ async fn stdio_refuses_a_live_directory() {
     assert!(stderr.contains("in use by process"), "{stderr}");
     assert!(out.stdout.is_empty(), "nothing on the protocol channel");
     drop(live);
+}
+
+/// With a single query slot, a tool takes exactly one slot per query — never
+/// one for the tool and another for a handler it calls — so concurrent tool
+/// calls queue behind each other and all complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_query_slot_serves_concurrent_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = demo_db(&dir.path().join("data"));
+    let mut config = ServerConfig::default();
+    config.server.max_concurrent_queries = 1;
+    let addr = spawn(SharedState::standalone(db, config));
+
+    let (a, b, c) = tokio::join!(
+        connect(addr, ProtocolVersion::LATEST, &[]),
+        connect(addr, ProtocolVersion::LATEST, &[]),
+        connect(addr, ProtocolVersion::LATEST, &[]),
+    );
+    let forecast = json!({ "metric": "pv_power_w", "labels": { "device": "pv" },
+                           "start": "now-1d", "step": "15m", "horizon": 8 });
+    let detect = json!({ "metric": "heat_pump_power_w", "start": "now-1d" });
+    let query = json!({ "query": "pv_power_w", "start": "now-1h", "end": "now", "step": "1m" });
+    let (f, d, q) = tokio::join!(
+        call(&a, "forecast", forecast),
+        call(&b, "detect_anomalies", detect),
+        call(&c, "query_promql", query),
+    );
+    ok(&f, "forecast");
+    ok(&d, "detect_anomalies");
+    ok(&q, "query_promql");
 }
