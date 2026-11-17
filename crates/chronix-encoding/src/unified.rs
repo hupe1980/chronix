@@ -99,8 +99,8 @@ macro_rules! encoding_types {
 encoding_types! {
     /// Delta-of-delta for timestamps.
     ///
-    /// Kept as a selectable codec — it still wins on a perfect metronome —
-    /// but no longer the default: see [`ColumnEncoder::encode_timestamps`].
+    /// Selectable, and trial-encoded by `Auto`, which keeps it when it is
+    /// smaller; not the default: see [`ColumnEncoder::encode_timestamps`].
     DeltaOfDelta = 0, "delta-of-delta";
     /// Chimp XOR for floats.
     Chimp = 1, "chimp";
@@ -1324,13 +1324,23 @@ mod tests {
 
     // -- Timestamp encoding -----------------------------------------------
 
+    /// `Auto` keeps the smaller of pco and delta-of-delta. Which one that is on
+    /// a short perfect metronome depends on pco's fixed overhead; the field
+    /// shapes are pinned in `tests/timestamp_codec_check.rs`.
     #[test]
     fn encode_timestamps_monotonic() {
         let ts: Vec<i64> = (0..1000).map(|i| 1_000_000 + i * 10_000).collect();
         let block = ColumnEncoder::encode_timestamps(&ts).unwrap();
-        // pco wins even on a perfect metronome (see
-        // `tests/timestamp_codec_check.rs`).
-        assert_eq!(block.encoding, EncodingType::PcoI64);
+        let pco = ColumnEncoder::encode_timestamps_with(&ts, TimestampEncoding::Pco).unwrap();
+        let dod =
+            ColumnEncoder::encode_timestamps_with(&ts, TimestampEncoding::DeltaOfDelta).unwrap();
+        let smaller = if pco.payload.len() <= dod.payload.len() {
+            &pco
+        } else {
+            &dod
+        };
+        assert_eq!(block.encoding, smaller.encoding);
+        assert_eq!(block.payload.len(), smaller.payload.len());
         let decoded = ColumnDecoder::decode(&block).unwrap();
         assert_eq!(decoded, DecodedColumn::I64(ts));
     }
@@ -1342,7 +1352,6 @@ mod tests {
             (TimestampEncoding::Pco, EncodingType::PcoI64),
             (TimestampEncoding::DeltaOfDelta, EncodingType::DeltaOfDelta),
             (TimestampEncoding::Plain, EncodingType::PlainI64),
-            (TimestampEncoding::Auto, EncodingType::PcoI64),
         ] {
             let block = ColumnEncoder::encode_timestamps_with(&ts, strategy).unwrap();
             assert_eq!(block.encoding, expected, "{strategy:?}");
