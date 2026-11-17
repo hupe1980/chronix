@@ -367,10 +367,10 @@ jobs:
           done
           bound=$(date +%s.%N)
           promql=$(curl -sf 'http://127.0.0.1:8086/api/v1/query?query=pv_power_w')
-          echo "$promql" | grep -q '"pv_power_w"'
+          grep -q '"pv_power_w"' <<<"$promql"
           sql=$(curl -sf http://127.0.0.1:8086/api/v1/chronix/sql -H 'content-type: application/json' \
             -d '{"query":"SELECT device, avg(power_w) FROM pv GROUP BY device"}')
-          echo "$sql" | grep -q '"row_count":1'
+          grep -q '"row_count":1' <<<"$sql"
           done_at=$(date +%s.%N)
           to_bind=$(echo "$bound - $start" | bc)
           to_answer=$(echo "$done_at - $start" | bc)
@@ -382,10 +382,10 @@ jobs:
           chrome="google-chrome --headless=new --no-sandbox --disable-gpu --virtual-time-budget=8000 --dump-dom"
           base='http://127.0.0.1:8086/console'
           table=$($chrome "$base#q=pv_power_w&r=7d&t=table")
-          echo "$table" | grep -q '<td class="num">'
+          grep -q '<td class="num">' <<<"$table"
           chart=$($chrome "$base#q=pv_power_w&r=7d")
-          echo "$chart" | grep -q '<canvas'
-          ms=$(echo "$chart" | grep -oE 'data-first-chart-ms="[0-9]+"' | grep -oE '[0-9]+')
+          grep -q '<canvas' <<<"$chart"
+          ms=$(grep -oE 'data-first-chart-ms="[0-9]+"' <<<"$chart" | grep -oE '[0-9]+')
           echo "first chart: ${ms} ms"
           [ "$ms" -lt 2000 ]
 
@@ -393,8 +393,8 @@ jobs:
           curl -sf http://127.0.0.1:8086/write --data-binary \
             'xss,name=\"><img\ src\=x\ onerror\=alert(1)> v=1'
           hostile=$($chrome "$base#q=xss_v&r=1h&t=table")
-          echo "$hostile" | grep -q '&lt;img'
-          ! echo "$hostile" | grep -q '<img'
+          grep -q '&lt;img' <<<"$hostile"
+          ! grep -q '<img' <<<"$hostile"
 
   deny:
     # The single advisory gate. `cargo audit` used to run beside this and was
