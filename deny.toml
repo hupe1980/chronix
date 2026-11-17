@@ -13,6 +13,19 @@ ignore = [
   # re-check on every object_store bump.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
+  # chrono and chrono-tz — unmaintained, not vulnerable. Arrow and DataFusion
+  # expose them in their public timestamp and time-zone API, and chronix-core's
+  # calendar buckets use them; replacing our own use would leave Arrow's in
+  # place. Clears when arrow-rs moves off chrono; re-check on every Arrow bump.
+  "RUSTSEC-2026-0543",
+  "RUSTSEC-2026-0555",
+  # humantime — unmaintained, not vulnerable; object_store parses durations in
+  # its own configuration with it. Re-check on every object_store bump.
+  "RUSTSEC-2026-0542",
+  # astral-tokio-tar — unmaintained; a dev-dependency only, through
+  # testcontainers in the Kafka and MQTT integration tests. Never in a
+  # published build.
+  "RUSTSEC-2026-0440",
 ]
 
 [licenses]
