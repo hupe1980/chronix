@@ -110,7 +110,7 @@ impl KafkaConsumer {
         self
     }
 
-    #[cfg_attr(not(any(feature = "kafka", feature = "mqtt")), allow(dead_code))]
+    #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     fn ingest_limiter(&self) -> &crate::rate_limit::NamespaceIngestLimiter {
         self.ingest
             .get_or_init(crate::rate_limit::NamespaceIngestLimiter::new)
