@@ -9,7 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["timeseries", "cdc", "streaming", "triggers", "database"]
 categories = ["database-implementations"]
-homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
@@ -25,11 +24,8 @@ doctest = false
 
 [features]
 default = []
-## Encode CDC events as Arrow `RecordBatch`es, for a consumer that speaks
-## Arrow — a Flight service, an IPC stream, a Parquet writer.
-##
-## An encoding, not a transport: nothing here serves the batches over a
-## network. Adds the `arrow` crate.
+## Encode change events as Arrow `RecordBatch`es for an Arrow consumer (Flight,
+## IPC, Parquet). An encoding only; adds the `arrow` crate.
 arrow = ["dep:arrow"]
 
 [dependencies]

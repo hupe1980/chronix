@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "chronix"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "async-stream",
@@ -1115,6 +1115,7 @@ dependencies = [
  "proptest",
  "rayon",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1127,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-analytics"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1150,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-cluster"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chronix-analytics",
@@ -1181,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -1200,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-dsim"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chronix-meta",
  "openraft",
@@ -1213,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-encoding"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chronix-core",
  "criterion",
@@ -1225,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-engine"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -1259,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-meta"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "futures",
  "metrics",
@@ -1283,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-query"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1297,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-security"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1328,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-streaming"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -1356,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "chronixd"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1367,9 +1368,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chronix",
- "chronix-cluster",
  "chronix-core",
- "chronix-meta",
  "chronix-query",
  "chronix-security",
  "chrono",
@@ -1385,7 +1384,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "object_store",
- "openraft",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1399,6 +1397,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.13.5",
+ "rmcp",
  "rumqttc",
  "rustls",
  "serde",
@@ -1410,7 +1409,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
- "tokio-util",
  "toml",
  "tonic",
  "tonic-build",
@@ -1426,6 +1424,33 @@ dependencies = [
  "utoipa",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "chronixd-cluster"
+version = "0.8.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "axum",
+ "chronix",
+ "chronix-cluster",
+ "chronix-core",
+ "chronix-meta",
+ "chronix-query",
+ "chronix-security",
+ "chronixd",
+ "clap",
+ "openraft",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -4166,6 +4191,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nix"
+version = "0.31.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4580,6 +4617,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4858,6 +4901,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "process-wrap"
+version = "10.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
+dependencies = [
+ "futures",
+ "indexmap 2.14.2",
+ "nix",
+ "tokio",
+ "tracing",
+ "windows",
 ]
 
 [[package]]
@@ -5359,7 +5416,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
 ]
 
@@ -5393,12 +5450,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -5414,6 +5473,41 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rmcp"
+version = "3.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5949e504d5ab9944a168259afc0c39ac0230627b6ec5367ace194c59bcbe163"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "indexmap 2.14.2",
+ "libc",
+ "pastey",
+ "pin-project-lite",
+ "process-wrap",
+ "rand 0.10.2",
+ "reqwest 0.13.5",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sse-stream",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-service",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5630,10 +5724,24 @@ version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "ref-cast",
+ "schemars_derive",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -5707,6 +5815,17 @@ name = "serde_derive"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5992,6 +6111,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25ac7aff0abd1dbc474536e40416e1102c7dd9bfba0b9861c6d357f835dcfb4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -7021,6 +7153,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7090,6 +7235,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7100,6 +7266,17 @@ dependencies = [
  "windows-link",
  "windows-result",
  "windows-strings",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core",
+ "windows-link",
+ "windows-threading",
 ]
 
 [[package]]
@@ -7129,6 +7306,16 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core",
+ "windows-link",
+]
 
 [[package]]
 name = "windows-result"
@@ -7180,6 +7367,15 @@ dependencies = [
  "windows_x86_64_gnu",
  "windows_x86_64_gnullvm",
  "windows_x86_64_msvc",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

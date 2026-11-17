@@ -1,42 +1,24 @@
 //! Bounded-memory streaming scan execution.
 //!
-//! # Why this exists
+//! [`Chronix::execute_stream`](super::Chronix::execute_stream) reads every
+//! surviving segment before merging, so its peak memory is the whole result.
+//! [`BatchStream`] bounds it.
 //!
-//! [`Chronix::execute_stream`](super::Chronix::execute_stream) returns a
-//! `Vec<RecordBatch>`: every surviving segment is read, then merged. Peak
-//! memory is therefore `O(total surviving rows)` even though the *output* is
-//! chunked. Exporting a 7-day window of 50 series at 1 Hz — ~30M points —
-//! needs gigabytes before the first byte is written, which a 512 MB gateway
-//! does not have.
-//!
-//! # The bound
-//!
-//! Segments are written **series-major** (tags in cardinality order, then
-//! timestamp) because that is what makes the columnar encodings compress. A
-//! segment's row groups are therefore *not* time-ordered, so a lazy
-//! row-group-level time merge is not possible without re-sorting.
-//!
-//! What *is* available is that a time-partitioned LSM produces segments whose
-//! `[min_timestamp, max_timestamp]` ranges rarely overlap: writes are routed
-//! to 1-hour shards, and TWCS compacts within a shard. So instead of merging
-//! every surviving segment at once, [`BatchStream`] sweeps the catalog entries
-//! into **time-disjoint buckets** and merges one bucket at a time. Because the
-//! buckets are disjoint and processed in ascending time order, concatenating
-//! their output yields exactly the same globally sorted, deduplicated sequence
-//! as a single k-way merge would.
-//!
-//! Peak memory becomes `O(rows in the largest bucket)` — one shard's worth,
-//! ~180K points for the gateway workload above — instead of `O(total rows)`.
-//! The bucketing is derived from the catalog rather than assumed from shard
-//! semantics, so a pathologically overlapping set of segments degrades to a
-//! single bucket (today's behaviour) rather than to a wrong answer.
+//! Segments are written series-major, because that is what compresses, so a
+//! segment's row groups are not time-ordered. Segments of a time-partitioned
+//! LSM, however, rarely overlap: writes go to 1-hour shards and compaction
+//! stays within a shard. [`BatchStream`] sweeps the catalog into
+//! **time-disjoint buckets** and merges one bucket at a time; concatenating the
+//! buckets in time order gives exactly what one global k-way merge would.
+//! Peak memory is the largest bucket — about one shard — and a pathologically
+//! overlapping set of segments degrades to a single bucket, never to a wrong
+//! answer.
 //!
 //! # Ordering
 //!
 //! Deduplication is last-write-wins by input position, so within a bucket the
-//! sources are ordered oldest-first: catalog order for segments, then the
-//! memtable slice last. The memtable holds the newest writes — a point that
-//! was flushed and then overwritten must read back as the overwrite.
+//! sources are oldest first: catalog order for segments, then the memtable,
+//! which holds the newest writes.
 
 use std::collections::VecDeque;
 
@@ -55,7 +37,8 @@ use super::query::SegmentFilterCtx;
 /// Rows per emitted `RecordBatch`.
 pub(super) const CHUNK_ROWS: usize = 65_536;
 
-/// Read segments in parallel once a bucket holds at least this many.
+/// Read segments in parallel once a bucket holds at least this many — and
+/// only when the database's parallelism budget is above one.
 const PARALLEL_THRESHOLD: usize = 4;
 
 /// One time-disjoint unit of work: the segments and memtable rows whose
@@ -84,6 +67,8 @@ pub struct BatchStream<'a> {
     tag_filters: Vec<TagFilter>,
     time_range: TimeRange,
     field_predicates: Vec<FieldPredicate>,
+    /// See [`chronix_query::QueryBuilder::present`].
+    presence: Vec<String>,
     scan_columns: Option<Vec<String>>,
     tag_col_names: Option<Vec<String>>,
     buckets: VecDeque<Bucket>,
@@ -106,15 +91,17 @@ pub struct BatchStream<'a> {
     to_skip: usize,
     /// Set after an error so the iterator stops rather than retrying.
     done: bool,
+    /// Emit newest first: buckets from the back, each one reversed.
+    ///
+    /// Deduplication still runs on the ascending merge of a bucket, so
+    /// last-write-wins is the same either way; only the order the merged rows
+    /// leave in changes. Memory stays bounded by one bucket.
+    descending: bool,
     /// When this scan must stop, and the budget it was given.
     ///
-    /// **The deadline belongs to the iterator, not to the fold above it.**
-    /// `query_timeout` used to be checked only by `execute_stream_inner`,
-    /// once the whole scan had already been collected — so the work was done
-    /// and *then* the caller was told it had run out of time — and the
-    /// streaming handlers, `/api/v1/chronix/query` among them, did not check
-    /// it at all. Checking here, before each bucket's segment I/O, is what
-    /// makes a deadline stop the reading rather than describe it.
+    /// The deadline belongs to the iterator, not to the fold above it: it is
+    /// checked before each bucket's segment I/O, so it stops the reading
+    /// rather than reporting afterwards that the reading took too long.
     deadline: Option<(std::time::Instant, std::time::Duration)>,
     /// What segment pruning did for this scan.
     pruning_stats: chronix_query::pruning::PruningStats,
@@ -155,6 +142,18 @@ impl BatchStream<'_> {
     #[must_use]
     pub fn without_deadline(mut self) -> Self {
         self.deadline = None;
+        self
+    }
+
+    /// Emit rows in descending `_time` order.
+    ///
+    /// Buckets are time-disjoint, so taking them newest-first and reversing
+    /// each merged bucket yields a globally non-increasing sequence — which
+    /// is what lets `ORDER BY _time DESC LIMIT n` stop after the newest
+    /// bucket instead of reading every one.
+    #[must_use]
+    pub fn descending(mut self) -> Self {
+        self.descending = true;
         self
     }
 
@@ -228,6 +227,7 @@ impl BatchStream<'_> {
             time_range: &self.time_range,
             tag_filter_refs: &tag_filter_refs,
             field_predicates: &self.field_predicates,
+            presence: &self.presence,
             measurement: &self.measurement,
             projection: &self.projection,
             plan: &self.plan,
@@ -244,13 +244,19 @@ impl BatchStream<'_> {
 
         // Segments first (oldest → newest), so the memtable can overwrite them.
         let mut sources: Vec<RecordBatch> = Vec::with_capacity(bucket.segments.len() + 1);
-        if bucket.segments.len() >= PARALLEL_THRESHOLD {
+        let executor = &self.db.executor;
+        if executor.budget() > 1 && bucket.segments.len() >= PARALLEL_THRESHOLD {
             use rayon::prelude::*;
-            let read: Vec<Result<Option<RecordBatch>>> = bucket
-                .segments
-                .par_iter()
-                .map(|entry| Chronix::read_segment_filtered(entry, &ctx))
-                .collect();
+            let read: Vec<Result<Option<RecordBatch>>> = executor.run(|| {
+                bucket
+                    .segments
+                    .par_iter()
+                    .map(|entry| {
+                        super::exec::probe();
+                        Chronix::read_segment_filtered(entry, &ctx)
+                    })
+                    .collect()
+            });
             for r in read {
                 if let Some(batch) = r? {
                     sources.push(batch);
@@ -258,6 +264,7 @@ impl BatchStream<'_> {
             }
         } else {
             for entry in &bucket.segments {
+                super::exec::probe();
                 if let Some(batch) = Chronix::read_segment_filtered(entry, &ctx)? {
                     sources.push(batch);
                 }
@@ -283,6 +290,9 @@ impl BatchStream<'_> {
                 tag_refs.as_deref(),
                 None,
             )?;
+            // The memtable holds values, not bitmaps; presence is the same
+            // question asked of them.
+            let filtered = keep_present_rows(filtered, &self.presence)?;
             if filtered.num_rows() > 0 {
                 sources.push(filtered);
             }
@@ -339,7 +349,11 @@ impl Iterator for BatchStream<'_> {
                 self.done = true;
                 return None;
             }
-            let bucket = self.buckets.pop_front()?;
+            let bucket = if self.descending {
+                self.buckets.pop_back()?
+            } else {
+                self.buckets.pop_front()?
+            };
             // Before the I/O, not after it: a bucket read is the unit of work
             // this deadline exists to stop.
             if let Some((expiry, budget)) = self.deadline
@@ -349,6 +363,17 @@ impl Iterator for BatchStream<'_> {
                 return Some(Err(DbError::QueryTimeout(budget)));
             }
             match self.materialise(bucket) {
+                Ok(chunks) if self.descending => {
+                    for chunk in chunks.into_iter().rev() {
+                        match reverse_rows(&chunk) {
+                            Ok(r) => self.pending.push_back(r),
+                            Err(e) => {
+                                self.done = true;
+                                return Some(Err(e));
+                            }
+                        }
+                    }
+                }
                 Ok(chunks) => self.pending.extend(chunks),
                 Err(e) => {
                     self.done = true;
@@ -440,10 +465,6 @@ impl Chronix {
         // No tombstone filter here, and that is a property rather than an
         // omission: every delete flushes the memtables before it scans, so a
         // tombstone can only ever refer to data that is already in a segment.
-        // What used to stand here asked "does this series have any tombstone",
-        // ignoring the tombstone's time range, so deleting one hour of one
-        // series hid that series entirely from this path while the segment
-        // scan beside it — which does check the range — kept showing it.
         let memtable_points: Vec<chronix_core::Point> =
             self.shards
                 .scan_measurement(measurement, time_range.start, time_range.end);
@@ -475,6 +496,7 @@ impl Chronix {
             tag_filters: tag_filters.to_vec(),
             time_range: *time_range,
             field_predicates: extract_field_predicates(plan).to_vec(),
+            presence: chronix_query::plan::extract_presence(plan).to_vec(),
             tag_col_names,
             plan: plan.clone(),
             buckets: buckets.into(),
@@ -484,6 +506,7 @@ impl Chronix {
             remaining: None,
             to_skip: 0,
             done: false,
+            descending: false,
             deadline: {
                 let budget = self.config.query_timeout;
                 (!budget.is_zero()).then(|| (std::time::Instant::now() + budget, budget))
@@ -492,6 +515,22 @@ impl Chronix {
             _segment_lease: segment_lease,
         })
     }
+}
+
+/// The same rows, last first.
+fn reverse_rows(batch: &RecordBatch) -> Result<RecordBatch> {
+    // A chunk holds at most `CHUNK_ROWS` rows, so the count fits a `u32`.
+    let n = u32::try_from(batch.num_rows())
+        .map_err(|_| DbError::Internal("a bucket chunk exceeds u32 rows".into()))?;
+    let indices = arrow::array::UInt32Array::from_iter_values((0..n).rev());
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| DbError::Internal(format!("reversing a bucket: {e}")))?;
+    RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|e| DbError::Internal(format!("reversing a bucket: {e}")))
 }
 
 /// Ensure a batch is ascending by timestamp, sorting only if it is not.
@@ -619,4 +658,33 @@ fn build_buckets(entries: Vec<SegmentCatalogEntry>, memtable: RecordBatch) -> Re
     }
 
     Ok(buckets)
+}
+
+/// Drop the rows where any `presence` column is null (or absent).
+fn keep_present_rows(batch: RecordBatch, presence: &[String]) -> Result<RecordBatch> {
+    if presence.is_empty() || batch.num_rows() == 0 {
+        return Ok(batch);
+    }
+    let mut mask: Option<arrow::array::BooleanArray> = None;
+    for name in presence {
+        let Some(col) = batch.column_by_name(name) else {
+            // No column, no value of it on any row.
+            return Ok(batch.slice(0, 0));
+        };
+        if col.null_count() == 0 {
+            continue;
+        }
+        let present = arrow::compute::is_not_null(col.as_ref())
+            .map_err(|e| DbError::Internal(format!("presence of '{name}': {e}")))?;
+        mask = Some(match mask {
+            None => present,
+            Some(m) => arrow::compute::and(&m, &present)
+                .map_err(|e| DbError::Internal(format!("presence of '{name}': {e}")))?,
+        });
+    }
+    match mask {
+        None => Ok(batch),
+        Some(m) => arrow::compute::filter_record_batch(&batch, &m)
+            .map_err(|e| DbError::Internal(format!("filtering by presence: {e}"))),
+    }
 }

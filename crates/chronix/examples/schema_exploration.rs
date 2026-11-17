@@ -129,6 +129,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   cpu series across all hosts: {} rows", batch.num_rows());
     arrow::util::pretty::print_batches(&[batch])?;
 
+    // ── Where the series budget goes ───────────────────────────
+    println!("\n─── Cardinality ───");
+    let stats = db.cardinality(5, None)?;
+    println!(
+        "   {} series of {} allowed ({} left)",
+        stats.used,
+        stats
+            .budget
+            .map_or("unlimited".to_string(), |b| b.to_string()),
+        stats
+            .headroom
+            .map_or("unlimited".to_string(), |h| h.to_string()),
+    );
+    for m in &stats.series_by_measurement {
+        println!("   {:>6}  {}", m.value, m.name);
+    }
+
     db.close()?;
     println!("\n✅ Done");
     Ok(())

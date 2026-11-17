@@ -366,7 +366,7 @@ impl MetaStateMachine {
         let mut restored_hb = snapshot.heartbeat_store;
         if snapshot.snapshot_timestamp_secs > 0 && now_secs > snapshot.snapshot_timestamp_secs {
             let elapsed = now_secs - snapshot.snapshot_timestamp_secs;
-            for (_node, (last_seen_secs, _gen)) in restored_hb.iter_mut() {
+            for (last_seen_secs, _gen) in restored_hb.values_mut() {
                 // Age the heartbeat by the time elapsed since snapshot.
                 *last_seen_secs = last_seen_secs.saturating_sub(elapsed);
             }
@@ -765,10 +765,10 @@ impl MetaStateMachine {
         state.regions.insert(info.region_id, info.clone());
 
         // Track on leader node
-        if let Some(node) = state.nodes.get_mut(&info.leader_node_id) {
-            if !node.region_ids.contains(&info.region_id) {
-                node.region_ids.push(info.region_id);
-            }
+        if let Some(node) = state.nodes.get_mut(&info.leader_node_id)
+            && !node.region_ids.contains(&info.region_id)
+        {
+            node.region_ids.push(info.region_id);
         }
 
         debug!(region_id = info.region_id, measurement = %info.measurement, "Region created");
@@ -859,17 +859,17 @@ impl MetaStateMachine {
         }
 
         // Add node to replica set
-        if let Some(region) = state.regions.get_mut(&region_id) {
-            if !region.replica_node_ids.contains(&node_id) {
-                region.replica_node_ids.push(node_id);
-            }
+        if let Some(region) = state.regions.get_mut(&region_id)
+            && !region.replica_node_ids.contains(&node_id)
+        {
+            region.replica_node_ids.push(node_id);
         }
 
         // Cross-update: track region on the node
-        if let Some(node) = state.nodes.get_mut(&node_id) {
-            if !node.region_ids.contains(&region_id) {
-                node.region_ids.push(region_id);
-            }
+        if let Some(node) = state.nodes.get_mut(&node_id)
+            && !node.region_ids.contains(&region_id)
+        {
+            node.region_ids.push(region_id);
         }
 
         MetaResponse::Ok
@@ -1098,10 +1098,10 @@ impl MetaStateMachine {
         region.state = RegionState::Migrating;
 
         // Cross-update: track region on the destination node.
-        if let Some(dest) = state.nodes.get_mut(&dest_node_id) {
-            if !dest.region_ids.contains(&region_id) {
-                dest.region_ids.push(region_id);
-            }
+        if let Some(dest) = state.nodes.get_mut(&dest_node_id)
+            && !dest.region_ids.contains(&region_id)
+        {
+            dest.region_ids.push(region_id);
         }
 
         debug!(

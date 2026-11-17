@@ -12,15 +12,10 @@ pub struct MultivariateForecastResult {
     pub timestamps: Vec<i64>,
     /// The series each row of `predictions` belongs to, in the same order.
     ///
-    /// This exists because the two implementors of
-    /// [`MultivariateForecastModel`] return **different numbers of rows** for
-    /// the same call, and nothing used to say so.
-    /// [`MultiLinearRegression`] is many-predictors-to-one-target and returns
-    /// one row; [`VarModel`] fits every equation of the system and returns one
-    /// row per series. A caller reaching for `predictions[0]` therefore got
-    /// the requested series from one and series index 0 from the other — a
-    /// plausible number belonging to a different series, with nothing in the
-    /// type to catch it.
+    /// The implementors return different numbers of rows:
+    /// [`MultiLinearRegression`] is many-predictors-to-one-target and returns one
+    /// row; [`VarModel`] fits every equation and returns one row per series. Look
+    /// a series up here rather than assuming `predictions[0]`.
     pub series: Vec<String>,
     /// Predicted values, one row per entry of [`series`](Self::series).
     pub predictions: Vec<Vec<f64>>,
@@ -1571,19 +1566,11 @@ mod tests {
 
     // ── The F-distribution survival function, against ground truth ──
     //
-    // `f_distribution_sf` decides every Granger p-value, and the copy in this
-    // module was **wrong**: `F(2,1)` at 0.01 returned 0.996593 where the truth
-    // is 0.990148. It went unnoticed because the only comparison ever made
-    // between this module and its now-deleted sibling compared *F-statistics*,
-    // which agreed — and both p-values were ~0 in the deep tail, so the
-    // comparison was blind to the defect it was meant to find.
-    //
-    // These assert against **closed forms**, not against another
-    // implementation. That is stronger than a table copied from scipy: for
-    // these parameter pairs the survival function is an elementary
-    // expression, so the assertion is ground truth and reproduces with no
-    // third-party install. Comparing against the regularized incomplete beta
-    // would be circular — that is what the code computes.
+    // `f_distribution_sf` decides every Granger p-value. These assert against
+    // closed forms rather than another implementation: for these parameter pairs
+    // the survival function is an elementary expression, so the assertion is
+    // ground truth with no third-party install. Comparing against the regularised
+    // incomplete beta would be circular — that is what the code computes.
 
     /// `F(2, d₂)`: `sf(x) = (1 + 2x/d₂)^(−d₂/2)`, from `I_z(a,1) = z^a`.
     #[test]
@@ -1630,11 +1617,9 @@ mod tests {
 
     /// `sf_{F(d₁,d₂)}(x) = 1 − sf_{F(d₂,d₁)}(1/x)`.
     ///
-    /// The reciprocal of an `F(d₁,d₂)` variate is `F(d₂,d₁)`. This holds for
-    /// every parameter pair, including those with no elementary form, so it
-    /// covers the region the closed forms cannot reach — and it exercises the
-    /// argument-swapping branch of the continued fraction, which is where the
-    /// sibling `gamma_cf` defect lived.
+    /// The reciprocal of an `F(d₁,d₂)` variate is `F(d₂,d₁)`. This holds for every
+    /// parameter pair, so it covers the region the closed forms cannot reach and
+    /// exercises the argument-swapping branch of the continued fraction.
     #[test]
     fn f_distribution_sf_is_consistent_under_reciprocal() {
         for d1 in [1.0_f64, 3.0, 7.0, 12.0, 40.0] {

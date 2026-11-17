@@ -65,6 +65,14 @@ pub struct ServerConfig {
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
 
+    /// The MCP server at `/mcp`.
+    #[serde(default)]
+    pub mcp: McpConfig,
+
+    /// The console page at `/console`.
+    #[serde(default)]
+    pub console: ConsoleConfig,
+
     /// Embedded database configuration.
     #[serde(default)]
     pub database: DatabaseConfig,
@@ -81,14 +89,10 @@ pub struct ServerSettings {
 
     /// gRPC bind address, or `None` to take the host from `http_addr`.
     ///
-    /// **Unset is not the same as the default**, which is why this is an
-    /// `Option`. `chronixd --bind 127.0.0.1:8086` is the line in every
-    /// quickstart, and it used to bind HTTP to loopback and leave gRPC and
-    /// Flight SQL listening on `0.0.0.0` — two unauthenticated listeners on
-    /// every interface, from a command whose whole point was not to do that.
-    /// Unset, the host follows `http_addr` and only the port is this
-    /// endpoint's own; set, it is used exactly as written, so a deployment
-    /// that really does want HTTP local and gRPC public can still say so.
+    /// Unset is not the same as the default: unset, the host follows `http_addr`
+    /// and only the port is this endpoint's own, so `chronixd --bind
+    /// 127.0.0.1:8086` keeps every listener on loopback. Set, it is used exactly
+    /// as written.
     #[serde(default)]
     pub grpc_addr: Option<SocketAddr>,
 
@@ -242,6 +246,13 @@ pub struct ServerSettings {
     #[serde(default = "default_prom_query_timeout_secs")]
     pub prom_query_timeout_secs: u64,
 
+    /// How many SQL, PromQL and Flight SQL queries may execute at once
+    /// (default `0`: one less than the database's parallelism budget, at
+    /// least one). A query waits for a slot within its own timeout, then is
+    /// answered `503`. Writes and health checks never wait.
+    #[serde(default)]
+    pub max_concurrent_queries: usize,
+
     /// Maximum number of rows returned by a single SQL query (default: 100 000).
     #[serde(default = "default_sql_max_rows")]
     pub sql_max_rows: usize,
@@ -257,15 +268,9 @@ pub struct ServerSettings {
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
 
-    /// Maximum evaluation points for a PromQL range query (default: 11 000).
-    ///
-    /// Set in the config file; the default (11 000) matches the Prometheus
-    /// server default. Set a lower value for memory-constrained deployments.
-    ///
-    /// There is no environment-variable override. This comment used to claim
-    /// `CHRONIXD_MAX_RANGE_QUERY_POINTS`, which nothing has ever read: the
-    /// only environment resolution in the config layer is the `${VAR}` form
-    /// on individual secret-bearing fields.
+    /// Maximum evaluation points for a PromQL range query (default: 11 000, the
+    /// Prometheus server default). Set a lower value for memory-constrained
+    /// deployments.
     #[serde(default = "default_max_range_query_points")]
     pub max_range_query_points: u64,
 
@@ -476,6 +481,11 @@ pub struct DatabaseConfig {
     #[serde(default = "default_compaction_concurrency")]
     pub compaction_concurrency: usize,
 
+    /// Threads one query or forecast may use: `"serial"`, `"auto"` (one per
+    /// core, the default) or a count.
+    #[serde(default)]
+    pub parallelism: chronix_core::Parallelism,
+
     /// Max series cardinality.
     #[serde(default = "default_max_cardinality")]
     pub max_series_cardinality: usize,
@@ -523,18 +533,12 @@ pub struct TlsConfig {
     /// Seconds between checks for a changed certificate or key. `0` disables
     /// it; the default is 60.
     ///
-    /// **On by default, because every certificate expires.** Let's Encrypt is
-    /// 90 days and `cert-manager` rotates on its own schedule; a server that
-    /// configures TLS and does not reload serves the old certificate until
-    /// somebody restarts it, which is an outage with no warning beforehand.
-    /// Defaulting this off made a rotation mechanism that is implemented,
-    /// tested and reached by no deployment.
-    ///
-    /// It cannot cause the outage it prevents: a certificate that fails to
-    /// parse — a file caught half-written — leaves the running configuration
-    /// in place, counts `chronix_tls_reloads_total{status="error"}` and
-    /// retries on the next tick. The cost when nothing changes is two
-    /// `stat` calls a minute.
+    /// On by default because every certificate expires: a server that does not
+    /// reload serves the old certificate until somebody restarts it. A
+    /// certificate that fails to parse — a file caught half-written — leaves the
+    /// running configuration in place, counts
+    /// `chronix_tls_reloads_total{status="error"}` and retries on the next tick.
+    /// The cost when nothing changes is two `stat` calls a minute.
     #[serde(default = "default_tls_reload_interval_secs")]
     pub reload_interval_secs: u64,
 }
@@ -686,6 +690,90 @@ pub fn resolve_env_reference(value: &str) -> std::result::Result<String, String>
 /// Serde default for boolean fields that default to `true`.
 const fn default_true() -> bool {
     true
+}
+
+/// Every tool the MCP server has, in the order `tools/list` returns them.
+pub const MCP_TOOLS: [&str; 8] = [
+    "list_metrics",
+    "label_values",
+    "query_promql",
+    "query_sql",
+    "explain",
+    "cardinality",
+    "forecast",
+    "detect_anomalies",
+];
+
+/// The `[console]` section: the page at `/console`.
+///
+/// The page holds no data and every request it makes is authenticated and
+/// authorised like any other client's, so turning it off removes a page, not
+/// an access path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsoleConfig {
+    /// Serve `/console` (default: `true`; needs the `console` feature, which
+    /// is on in a default build).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// The `[mcp]` section: the MCP server at `/mcp`.
+///
+/// Every tool reads; none writes. They go through the same authentication,
+/// namespace and Cedar checks as `/api/v1/query` (`Read`), so a key that may
+/// read a namespace may ask an agent's questions of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Serve `/mcp` (default: `true`; needs the `mcp` feature, which is on
+    /// in a default build).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// The tools offered, by name (default: all of them). A tool left out is
+    /// neither listed nor callable. Names are checked at startup.
+    #[serde(default = "default_mcp_tools")]
+    pub tools: Vec<String>,
+
+    /// The largest result a tool returns, in bytes of JSON (default: 256 KiB).
+    /// A larger one is cut, and says so.
+    #[serde(default = "default_mcp_max_result_bytes")]
+    pub max_result_bytes: usize,
+
+    /// The `Host` headers `/mcp` accepts.
+    ///
+    /// Unset: loopback names only when the server has no authentication — a
+    /// page in a browser cannot rebind a public name onto a local server
+    /// that answers without a key — and any host when it has. Set it to the
+    /// names a proxy serves the server under.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tools: default_mcp_tools(),
+            max_result_bytes: default_mcp_max_result_bytes(),
+            allowed_hosts: None,
+        }
+    }
+}
+
+fn default_mcp_tools() -> Vec<String> {
+    MCP_TOOLS.iter().map(|t| (*t).to_owned()).collect()
+}
+
+fn default_mcp_max_result_bytes() -> usize {
+    256 * 1024
 }
 
 /// Audit log configuration.
@@ -958,6 +1046,7 @@ impl Default for ServerSettings {
             allow_unsafe_cors: false,
             sql_query_timeout_secs: default_sql_query_timeout_secs(),
             prom_query_timeout_secs: default_prom_query_timeout_secs(),
+            max_concurrent_queries: 0,
             sql_max_rows: default_sql_max_rows(),
             max_write_batch_size: default_max_write_batch_size(),
             max_range_query_points: default_max_range_query_points(),
@@ -1002,6 +1091,7 @@ impl Default for DatabaseConfig {
             segment_cache_size: default_segment_cache_size(),
             enable_last_value_cache: false,
             compaction_concurrency: default_compaction_concurrency(),
+            parallelism: chronix_core::Parallelism::Auto,
             max_series_cardinality: default_max_cardinality(),
             query_timeout_secs: default_query_timeout_secs(),
             per_query_memory_limit: default_per_query_memory_limit(),
@@ -1165,6 +1255,30 @@ impl ServerConfig {
         }
     }
 
+    /// `[mcp] tools` names only tools that exist, and the result bound is
+    /// usable.
+    ///
+    /// # Errors
+    ///
+    /// An unknown tool name, or a `max_result_bytes` under 1 KiB.
+    pub fn validate_mcp(&self) -> Result<(), ServerConfigError> {
+        for tool in &self.mcp.tools {
+            if !MCP_TOOLS.contains(&tool.as_str()) {
+                return Err(ServerConfigError::Invalid(format!(
+                    "[mcp] tools names \"{tool}\", which is not a tool; the tools are {}",
+                    MCP_TOOLS.join(", ")
+                )));
+            }
+        }
+        if self.mcp.max_result_bytes < 1024 {
+            return Err(ServerConfigError::Invalid(format!(
+                "[mcp] max_result_bytes is {}; it must be at least 1024",
+                self.mcp.max_result_bytes
+            )));
+        }
+        Ok(())
+    }
+
     /// Refuse a `[tracing]` section this build cannot honour.
     ///
     /// Without the `otlp` feature the exporter is not compiled in and
@@ -1213,27 +1327,16 @@ impl ServerConfig {
 
     /// Apply `CHRONIX_*` environment overrides in place.
     ///
-    /// # Precedence
-    ///
-    /// File, then environment, then CLI flags — so a container image can carry
-    /// a config file and a deployment can override the handful of settings
-    /// that differ per environment without templating the file, while an
-    /// operator debugging by hand still wins with a flag.
-    ///
-    /// # Why this exists
-    ///
-    /// It was documented and not implemented. The deployment guide listed
-    /// `CHRONIX_DATA_DIR`, `CHRONIX_LOG_LEVEL`, `CHRONIX_HTTP_ADDR` and
-    /// `CHRONIX_JWT_SECRET` in a table of overrides, and nothing in the tree
-    /// read any of them — so a container setting `CHRONIX_DATA_DIR` wrote to
-    /// `./chronix-data` instead, silently, which is the worst possible way to
-    /// find out. `documented_env_vars` now checks the table against the code.
+    /// Precedence is file, then environment, then CLI flags: a container image
+    /// carries a config file, a deployment overrides the settings that differ
+    /// per environment, and a flag still wins when debugging by hand.
+    /// `documented_env_vars` checks the documented variables against this code.
     ///
     /// # Errors
     ///
-    /// Returns [`ServerConfigError::Invalid`] if a variable is set to
-    /// something that cannot be parsed. Failing to start is right: the
-    /// alternative is running with a value the operator did not ask for.
+    /// Returns [`ServerConfigError::Invalid`] if a variable cannot be parsed:
+    /// failing to start is better than running with a value the operator did not
+    /// ask for.
     pub fn apply_env_overrides(&mut self) -> Result<(), ServerConfigError> {
         self.apply_overrides_from(|name| std::env::var(name).ok())
     }
@@ -1374,6 +1477,7 @@ impl ServerConfig {
             .segment_cache_size(self.database.segment_cache_size)
             .enable_last_value_cache(self.database.enable_last_value_cache)
             .compaction_concurrency(self.database.compaction_concurrency)
+            .parallelism(self.database.parallelism)
             .max_series_cardinality(self.database.max_series_cardinality)
             .query_timeout(Duration::from_secs(self.database.query_timeout_secs))
             .per_query_memory_limit(self.database.per_query_memory_limit)
@@ -1475,7 +1579,7 @@ fn default_sql_max_rows() -> usize {
 ///
 /// Short enough that a rotation is picked up before a monitoring system
 /// would notice, long enough to be two `stat` calls a minute.
-fn default_tls_reload_interval_secs() -> u64 {
+pub(crate) fn default_tls_reload_interval_secs() -> u64 {
     60
 }
 
@@ -1623,12 +1727,7 @@ fn default_max_query_result_bytes() -> usize {
 mod tests {
     use super::*;
 
-    /// `chronixd --bind 127.0.0.1:8086` binds *all three* listeners to
-    /// loopback.
-    ///
-    /// It used to bind HTTP there and leave gRPC and Flight SQL on
-    /// `0.0.0.0` — two unauthenticated listeners on every interface, from the
-    /// command every quickstart shows for keeping the server off the network.
+    /// `chronixd --bind 127.0.0.1:8086` binds all three listeners to loopback.
     #[test]
     fn an_unset_grpc_address_follows_the_http_host() {
         let mut config = ServerConfig::default();

@@ -25,11 +25,40 @@ use crate::grpc::ChronixGrpcService;
 use crate::http::{self, AppState, SharedState};
 use crate::proto;
 
-/// Active cluster state — either meta or data node.
-#[cfg(feature = "cluster")]
-enum ClusterState {
-    Meta(crate::cluster::MetaNodeState),
-    Data(crate::cluster::DataNodeState),
+/// A component that runs inside the server: started after the database
+/// opens, given its own routes, stopped on shutdown.
+///
+/// Routes an extension returns are merged **inside** the authentication,
+/// authorization and namespace layers, so they are guarded exactly like the
+/// built-in ones; wrap a group with [`admin_group`] to require a capability.
+/// The cluster binary (`chronixd-cluster`) is the one implementor.
+#[async_trait::async_trait]
+pub trait Extension: Send + Sync + 'static {
+    /// Short name, used in logs and to claim a configuration section
+    /// (`"cluster"` claims `[cluster]`).
+    fn name(&self) -> &'static str;
+
+    /// Start the extension and return the routes it serves.
+    ///
+    /// # Errors
+    ///
+    /// A failure aborts startup; extensions already started are stopped in
+    /// reverse order.
+    async fn start(&self, ctx: ExtensionContext) -> Result<Router<AppState>, ServerError>;
+
+    /// Stop the extension. Called once, in reverse start order.
+    async fn stop(&self);
+}
+
+/// What an [`Extension`] is given at start: owned handles, no engine locks.
+#[derive(Clone)]
+pub struct ExtensionContext {
+    /// The open database.
+    pub db: Arc<Chronix>,
+    /// The resolved server configuration.
+    pub config: Arc<ServerConfig>,
+    /// The application state the extension's routes run against.
+    pub state: AppState,
 }
 
 /// Run the chronixd server with the given configuration.
@@ -40,56 +69,51 @@ enum ClusterState {
 /// # Errors
 ///
 /// Returns an error if the database fails to open or any server fails to bind.
-pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
+pub async fn run(config: ServerConfig) -> Result<(), ServerError> {
+    run_with(config, Vec::new()).await
+}
+
+/// [`run`], with [`Extension`]s started after the database opens and stopped
+/// before it closes.
+///
+/// A `[cluster]` section is refused unless an extension named `"cluster"`
+/// is present: a section nothing reads is a setting that silently does
+/// nothing.
+///
+/// # Errors
+///
+/// As [`run`], plus any extension's start failure.
+pub async fn run_with(
+    mut config: ServerConfig,
+    extensions: Vec<Box<dyn Extension>>,
+) -> Result<(), ServerError> {
     // Before anything builds a TLS client or server: `reqwest` and
     // `axum-server` both resolve the *process-level* rustls provider and
     // panic when none is installed.
     crate::tls::ensure_crypto_provider();
     let start_time = std::time::Instant::now();
 
+    // Refused before the database opens, so a rejected configuration never
+    // touches the data directory. `Config`: the section is the operator's input.
+    if config.cluster.is_some() && !extensions.iter().any(|e| e.name() == "cluster") {
+        return Err(ServerError::Config(
+            crate::config::ServerConfigError::Invalid(
+                "[cluster] is not supported by chronixd; cluster mode is the frozen \
+                 chronixd-cluster binary (build it from the repository: \
+                 cargo build -p chronixd-cluster)"
+                    .into(),
+            ),
+        ));
+    }
+
     // ── Open database ──────────────────────────────────────────────────
-    // Database must be opened before DataNode startup (which needs it for
-    // region-local storage), while MetaNode doesn't require the DB.
+    // Before the extensions start: a cluster DataNode serves regions from it.
     let chronix_config = config.to_chronix_config()?;
     let db = Arc::new(Chronix::open(chronix_config).map_err(ServerError::Db)?);
     info!(
         data_dir = %config.database.data_dir.display(),
         "database opened"
     );
-
-    // ── Cluster mode (optional) ────────────────────────────────────
-    // `Config`, not `Internal`: a section this build cannot honour is the
-    // operator's input, and every sibling refusal classifies it that way.
-    #[cfg(not(feature = "cluster"))]
-    if config.cluster.is_some() {
-        return Err(ServerError::Config(
-            crate::config::ServerConfigError::Invalid(
-                "[cluster] is configured but this binary was built without the \
-                 `cluster` feature: rebuild with `--features cluster`, or \
-                 remove the section"
-                    .into(),
-            ),
-        ));
-    }
-    #[cfg(feature = "cluster")]
-    let cluster_state = if let Some(ref cluster_cfg) = config.cluster {
-        use crate::config::ClusterMode;
-        match cluster_cfg.mode {
-            ClusterMode::Meta => {
-                let state =
-                    crate::cluster::start_meta_node(cluster_cfg, &config.database.data_dir).await?;
-                Some(ClusterState::Meta(state))
-            }
-            ClusterMode::Data => {
-                let grpc_addr = config.server.grpc_addr().to_string();
-                let state =
-                    crate::cluster::start_data_node(cluster_cfg, &grpc_addr, db.clone()).await?;
-                Some(ClusterState::Data(state))
-            }
-        }
-    } else {
-        None
-    };
 
     // ── Prometheus metrics ─────────────────────────────────────────────
     let metrics_handle = setup_prometheus()?;
@@ -106,9 +130,37 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     metrics::counter!("chronix_namespace_denied_total").absolute(0);
     metrics::counter!("chronix_authz_denied_total").absolute(0);
 
+    // ── Tenants, and their quotas ──────────────────────────────────────
+    // The registry lives beside the data it scopes, so a restart keeps the
+    // tenants. A failure to open it is fatal rather than a silent fall back
+    // to an empty in-memory one, which would answer 400 for every tenant.
+    let namespace_registry = {
+        let dir = db.data_dir().join("namespaces");
+        chronix_security::tenant::NamespaceRegistry::open(&dir).map_err(|e| {
+            ServerError::Internal(format!(
+                "cannot open the namespace registry at {}: {e}",
+                dir.display()
+            ))
+        })?
+    };
+    // Every persisted quota is in force before a listener binds or a
+    // connector starts.
+    let namespace_rate_limiter = crate::rate_limit::NamespaceRateLimiter::new();
+    let namespace_ingest_limiter = crate::rate_limit::NamespaceIngestLimiter::new();
+    for ns in namespace_registry.list_all() {
+        crate::namespace::apply_quota(
+            &db,
+            &namespace_rate_limiter,
+            &namespace_ingest_limiter,
+            ns.info.id.as_str(),
+            &ns.info.quota,
+        );
+    }
+
     // ── Connector manager ───────────────────────────────────────────────
     let connector_manager = Arc::new(
         crate::connector::ConnectorManager::new(db.clone())
+            .with_ingest_limiter(namespace_ingest_limiter.clone())
             .with_max_start_retries(config.server.connector_start_retries)
             .with_start_retry_backoff_ms(config.server.connector_start_retry_backoff_ms),
     );
@@ -122,7 +174,8 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             kafka_cfg.clone(),
             db.clone(),
             config.server.multi_tenancy,
-        );
+        )
+        .with_ingest_limiter(namespace_ingest_limiter.clone());
         connector_manager.register(consumer).await;
     }
 
@@ -132,7 +185,8 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             mqtt_cfg.clone(),
             db.clone(),
             config.server.multi_tenancy,
-        );
+        )
+        .with_ingest_limiter(namespace_ingest_limiter.clone());
         connector_manager.register(subscriber).await;
     }
 
@@ -296,28 +350,16 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     }
 
     // ── Shared state ───────────────────────────────────────────────────
-    // The registry lives beside the data it scopes, so a restart keeps the
-    // tenants. A failure to open it is fatal rather than a silent fall back
-    // to an empty in-memory one, which would answer 400 for every tenant.
-    let namespace_registry = {
-        let dir = db.data_dir().join("namespaces");
-        chronix_security::tenant::NamespaceRegistry::open(&dir).map_err(|e| {
-            ServerError::Internal(format!(
-                "cannot open the namespace registry at {}: {e}",
-                dir.display()
-            ))
-        })?
-    };
 
     let sql_contexts = crate::namespace::SqlContexts::new(db.clone());
-    #[cfg(feature = "cluster")]
-    let meta_client = cluster_state.as_ref().map(|cs| match cs {
-        ClusterState::Meta(s) => Arc::clone(&s.meta_client),
-        ClusterState::Data(s) => Arc::clone(s.manager.meta_client()),
-    });
     // ── Signal triggers (optional) ─────────────────────────────────────
     let pipeline = build_trigger_pipeline(&config, &db)?;
 
+    // One set of query slots for SQL, PromQL and Flight SQL.
+    let query_slots = crate::query_slots::QuerySlots::for_server(
+        config.server.max_concurrent_queries,
+        db.config().parallelism.budget(),
+    );
     let state: AppState = Arc::new(SharedState {
         db: db.clone(),
         pipeline: pipeline.clone(),
@@ -326,8 +368,6 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         connector_manager: Some(connector_manager.clone()),
         sql_contexts,
         auth_state: auth_state.clone(),
-        #[cfg(feature = "cluster")]
-        meta_client,
         // **Durable**, not in memory. A namespace that vanished at restart
         // made every non-default tenant's data unreachable — the middleware
         // answers `400 namespace not found` for a namespace the registry
@@ -340,7 +380,8 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         authz_engine: authz_engine.clone(),
         audit_logger: audit_logger.clone(),
-        namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+        namespace_rate_limiter: namespace_rate_limiter.clone(),
+        namespace_ingest_limiter: namespace_ingest_limiter.clone(),
         // Write dedup cache for idempotency keys.
         write_dedup_cache: crate::http::WriteDedupCache::new(
             config.server.dedup_window_secs,
@@ -348,6 +389,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         ),
         write_timeout: std::time::Duration::from_secs(config.server.write_timeout_secs),
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: query_slots.clone(),
     });
 
     // The pipeline is fed by the database's CDC bus, which is what makes a
@@ -404,13 +446,40 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         }
     });
 
+    // ── Extensions ─────────────────────────────────────────────────────
+    // Started in order; a failure stops the ones already running, in reverse.
+    let ext_ctx = ExtensionContext {
+        db: Arc::clone(&db),
+        config: Arc::new(config.clone()),
+        state: state.clone(),
+    };
+    let mut started: Vec<Box<dyn Extension>> = Vec::with_capacity(extensions.len());
+    let mut extension_routes = Vec::with_capacity(extensions.len());
+    for ext in extensions {
+        match ext.start(ext_ctx.clone()).await {
+            Ok(routes) => {
+                info!(extension = ext.name(), "extension started");
+                extension_routes.push(routes);
+                started.push(ext);
+            }
+            Err(e) => {
+                error!(extension = ext.name(), %e, "extension failed to start");
+                for s in started.iter().rev() {
+                    s.stop().await;
+                }
+                return Err(e);
+            }
+        }
+    }
+
     let metrics_path = config.server.metrics_path.clone();
-    let app = build_router(
+    let app = build_router_with(
         state,
         &metrics_path,
         metrics_handle,
         config.server.max_body_size,
         auth_state,
+        extension_routes,
     );
 
     let http_addr = config.server.http_addr;
@@ -467,16 +536,11 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
             let _shutdown_guard = shutdown_guard;
             let listener = tokio::net::TcpListener::bind(http_addr).await?;
             info!(%http_addr, "HTTP server listening");
-            // `axum::serve`'s graceful shutdown waits for every open
-            // connection **without a deadline**, and `/api/v1/cdc/stream` and
-            // the annotations SSE stream do not end on their own — so one
-            // subscriber would hold the process open for ever. The TLS,
-            // gRPC and Flight SQL paths each carry `shutdown_timeout`; this
-            // one did not, and only got away with it because the old outer
-            // `select!` returned as soon as *another* server drained and let
-            // the process exit out from under it. Waiting for all three, as
-            // the database's lifetime requires, makes the missing deadline a
-            // hang.
+            // `axum::serve`'s graceful shutdown waits for every open connection
+            // without a deadline, and `/api/v1/cdc/stream` and the annotations SSE
+            // stream do not end on their own, so one subscriber would hold the process
+            // open for ever. This path carries `shutdown_timeout` like TLS, gRPC and
+            // Flight SQL do.
             tokio::select! {
                 res = axum::serve(listener, app).with_graceful_shutdown(drain_signal) => res,
                 () = async {
@@ -505,6 +569,10 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     .with_multi_tenancy(config.server.multi_tenancy)
     .with_authz(authz_engine.clone())
     .with_audit(audit_logger.clone())
+    .with_limiters(
+        namespace_rate_limiter.clone(),
+        namespace_ingest_limiter.clone(),
+    )
     .with_max_dedup_entries(config.server.max_dedup_entries)
     .with_sql_limits(
         config.server.sql_query_timeout_secs,
@@ -656,11 +724,15 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
         .with_multi_tenancy(config.server.multi_tenancy)
         .with_authz(authz_engine.clone())
         .with_audit(audit_logger.clone())
-        .with_audit(audit_logger.clone())
+        .with_limiters(
+            namespace_rate_limiter.clone(),
+            namespace_ingest_limiter.clone(),
+        )
         .with_limits(
             std::time::Duration::from_secs(config.server.sql_query_timeout_secs),
             config.server.sql_max_rows,
         )
+        .with_query_slots(query_slots.clone())
         .with_write_timeout(std::time::Duration::from_secs(
             config.server.write_timeout_secs,
         ));
@@ -782,18 +854,11 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
 
     // ── Wait for every server to finish ────────────────────────────────
     //
-    // All three drain on the same `SIGTERM`, but they do not finish together:
-    // one with no open connections returns at once while another is still
-    // streaming a Flight SQL result. This used to be a `tokio::select!` over
-    // the three handles, which returns on the **first** and drops the other
-    // two — and dropping a `JoinHandle` does not stop its task. So the
-    // database was flushed, closed and its directory lock released while gRPC
-    // and Flight SQL were still serving requests against it, and a write in
-    // flight at that moment met a closed database.
-    //
-    // `join!` waits for all three. Each already carries its own drain
-    // deadline (`shutdown_timeout`), so this cannot wait for ever; what it
-    // adds is that the database outlives every surface that reads it.
+    // All three drain on the same `SIGTERM` but finish at different times: one
+    // with no open connections returns at once while another is still streaming
+    // a Flight SQL result. `join!` waits for all three, so the database outlives
+    // every surface that reads it. Each carries its own drain deadline
+    // (`shutdown_timeout`), so this cannot wait for ever.
     let (http_res, grpc_res, flight_res) = tokio::join!(http_handle, grpc_handle, flight_handle);
     match http_res {
         Err(e) => error!(%e, "HTTP server task panicked"),
@@ -814,13 +879,10 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
     // ── Graceful shutdown ──────────────────────────────────────────────
     info!("shutting down...");
 
-    // Stop cluster components first
-    #[cfg(feature = "cluster")]
-    if let Some(state) = cluster_state {
-        match state {
-            ClusterState::Meta(s) => crate::cluster::stop_meta_node(s).await,
-            ClusterState::Data(s) => crate::cluster::stop_data_node(s).await,
-        }
+    // Extensions first, in reverse start order: they were started last.
+    for ext in started.iter().rev() {
+        ext.stop().await;
+        info!(extension = ext.name(), "extension stopped");
     }
 
     // Stop connectors
@@ -873,7 +935,7 @@ pub async fn run(mut config: ServerConfig) -> Result<(), ServerError> {
 /// `route_inventory` reads the router out of this source and a nest whose
 /// prefix is applied in two places is an inventory that can disagree with
 /// itself.
-fn admin_group(
+pub fn admin_group(
     state: &AppState,
     action: chronix_security::authz::ChronixAction,
     routes: Router<AppState>,
@@ -885,13 +947,33 @@ fn admin_group(
 }
 
 /// Build the axum router with all REST endpoints.
-#[allow(clippy::needless_pass_by_value)] // auth_state moves into middleware closures
 pub fn build_router(
     state: AppState,
     metrics_path: &str,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     max_body_size: usize,
     auth_state: Option<crate::auth::AuthState>,
+) -> Router {
+    build_router_with(
+        state,
+        metrics_path,
+        metrics_handle,
+        max_body_size,
+        auth_state,
+        Vec::new(),
+    )
+}
+
+/// [`build_router`], with extension routes merged inside the
+/// authentication, authorization and namespace layers.
+#[allow(clippy::needless_pass_by_value)] // auth_state moves into middleware closures
+pub fn build_router_with(
+    state: AppState,
+    metrics_path: &str,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    max_body_size: usize,
+    auth_state: Option<crate::auth::AuthState>,
+    extension_routes: Vec<Router<AppState>>,
 ) -> Router {
     let metrics_path_owned = metrics_path.to_string();
     let state_for_metrics = state.clone();
@@ -950,17 +1032,16 @@ pub fn build_router(
         .route("/write", post(http::write_influx_handler))
         .route("/api/v2/write", post(http::write_influx_handler))
         .route("/api/v1/write/influx", post(http::write_influx_handler))
-        // Chronix's own JSON query API.
-        //
-        // It used to live at `/api/v1/query`, which is where a Grafana
-        // Prometheus datasource pointed at this server's base URL looks for
-        // the *Prometheus* API — so the two collided and the Prometheus one
-        // had to hide under `/api/v1/prom/`, which no client derives. The
-        // native API moved instead: `/api/v1/query` now means what every
-        // Prometheus client expects it to mean.
+        // Chronix's own JSON query API, under `/api/v1/chronix/`: `/api/v1/query`
+        // is the Prometheus API, where a Grafana Prometheus data source pointed at
+        // the base URL looks for it.
         .route("/api/v1/chronix/query", post(http::query_handler))
         .route("/api/v1/chronix/query/explain", post(http::query_explain_handler))
         .route("/api/v1/chronix/sql", post(http::sql_handler))
+        .route(
+            "/api/v1/chronix/promql/explain",
+            post(http::promql_explain_handler),
+        )
         // PromQL — at the paths a Prometheus client derives from a base URL,
         // and on both methods, because Grafana POSTs a form body by default.
         .route(
@@ -985,6 +1066,7 @@ pub fn build_router(
         )
         .route("/api/v1/metadata", get(http::prom_metadata_handler))
         .route("/api/v1/status/buildinfo", get(http::prom_buildinfo_handler))
+        .route("/api/v1/status/tsdb", get(http::prom_status_tsdb_handler))
         .route("/api/v1/rules", get(http::prom_empty_rules_handler))
         .route("/api/v1/alerts", get(http::prom_empty_alerts_handler))
         .route("/api/v1/query_exemplars", get(http::prom_empty_exemplars_handler))
@@ -1065,6 +1147,11 @@ pub fn build_router(
             post(http::refresh_rollup_handler),
         )
         .route("/api/v1/rollups/{name}", delete(http::delete_rollup_handler))
+        .route(
+            "/api/v1/detectors",
+            get(http::list_detectors_handler).post(http::declare_detector_handler),
+        )
+        .route("/api/v1/detectors/{name}", delete(http::drop_detector_handler))
         .route(
             "/api/v1/export/parquet",
             post(http::export_parquet_handler),
@@ -1162,68 +1249,26 @@ pub fn build_router(
                 ),
         ));
 
-    // Cluster administration is compiled with `--features cluster`. Three
-    // capabilities rather than one: reading topology is not rebalancing.
-    #[cfg(feature = "cluster")]
-    {
+    for routes in extension_routes {
+        router = router.merge(routes);
+    }
+
+    // The console — a static shell with no data in it. Exempt from
+    // authentication (a browser navigation cannot send a bearer token) and
+    // from the namespace layer; every call the page makes is neither.
+    #[cfg(feature = "console")]
+    if state.config.console.enabled {
         router = router
-            .merge(admin_group(
-                &state,
-                chronix_security::authz::ChronixAction::ManageNodes,
-                axum::Router::new()
-                    .route(
-                        "/api/v1/admin/nodes",
-                        post(crate::admin::register_node_handler)
-                            .get(crate::admin::list_nodes_handler)
-                            .delete(crate::admin::deregister_node_handler),
-                    )
-                    .route(
-                        "/api/v1/admin/heartbeat",
-                        post(crate::admin::heartbeat_handler),
-                    )
-                    .route(
-                        "/api/v1/admin/nodes/{id}/decommission",
-                        post(crate::admin::decommission_node_handler),
-                    ),
-            ))
-            .merge(admin_group(
-                &state,
-                chronix_security::authz::ChronixAction::ManageRegions,
-                axum::Router::new()
-                    .route(
-                        "/api/v1/admin/regions",
-                        post(crate::admin::create_region_handler),
-                    )
-                    .route(
-                        "/api/v1/admin/regions/{id}/state",
-                        put(crate::admin::update_region_state_handler),
-                    ),
-            ))
-            .merge(admin_group(
-                &state,
-                chronix_security::authz::ChronixAction::ViewCluster,
-                axum::Router::new()
-                    .route(
-                        "/api/v1/admin/routing",
-                        get(crate::admin::get_routing_handler),
-                    )
-                    .route(
-                        "/api/v1/admin/health",
-                        get(crate::admin::cluster_health_handler),
-                    )
-                    .route(
-                        "/api/v1/admin/topology",
-                        get(crate::admin::cluster_topology_handler),
-                    ),
-            ))
-            .merge(admin_group(
-                &state,
-                chronix_security::authz::ChronixAction::ManageCluster,
-                axum::Router::new().route(
-                    "/api/v1/admin/rebalance",
-                    post(crate::admin::rebalance_handler),
-                ),
-            ));
+            .route("/console", get(crate::console::shell))
+            .route("/console/", get(crate::console::slash))
+            .route("/console/{file}", get(crate::console::asset));
+    }
+
+    // MCP — inside the layers below, so a tool call is authenticated,
+    // namespaced and authorised (`Read`) like every other request.
+    #[cfg(feature = "mcp")]
+    if state.config.mcp.enabled {
+        router = router.route_service("/mcp", crate::mcp::http_service(state.clone()));
     }
 
     // Namespace resolution middleware — applied BEFORE auth layer so that
@@ -1429,20 +1474,13 @@ pub fn setup_prometheus() -> Result<metrics_exporter_prometheus::PrometheusHandl
 
 /// The one shutdown signal, shared by every server task.
 ///
-/// Each of the three servers used to build its own `shutdown_signal()` future
-/// over the OS signal, which coordinated a `SIGTERM` correctly and nothing
-/// else. Two things need the same broadcast:
-///
-/// - **A server that stops on its own must stop the others.** A gRPC listener
-///   that cannot bind used to leave `chronixd` running as an HTTP-only server
-///   with an error in the log, because the outer wait was a `select!` that
-///   noticed the first exit and the process then closed the database under the
-///   two survivors. Now the exit of any server — clean, failed or panicking —
-///   triggers this, so the others drain and the shutdown sequence is the same
-///   one a `SIGTERM` takes.
-/// - **Nothing may close the database before the last server has drained.**
-///   That is the caller's job (`join!` on all three handles), and it is only
-///   sound because every server is reachable by this signal.
+/// - **A server that stops on its own stops the others.** The exit of any
+///   server — clean, failed or panicking — triggers this, so the others drain
+///   and the shutdown sequence is the one a `SIGTERM` takes; a gRPC listener
+///   that cannot bind never leaves an HTTP-only server running.
+/// - **Nothing closes the database before the last server has drained.** That
+///   is the caller's job (`join!` on all three handles), and it is sound
+///   because every server is reachable by this signal.
 #[derive(Clone, Debug)]
 pub struct Shutdown(tokio::sync::watch::Sender<bool>);
 
@@ -1646,14 +1684,9 @@ fn build_trigger_pipeline(
     Ok(Some(pipeline))
 }
 
-/// Refuse a configuration section this binary cannot honour.
-///
-/// A section that parses and then does nothing is the same defect as a
-/// documented environment variable nothing reads: no failure, and the
-/// operator finds out from a graph that never fills. `[cold_archive]` has
-/// always refused this way; `[kafka]` and `[mqtt]` did not, and instead
-/// registered a connector that logged "enable the feature" and then reported
-/// itself healthy for ever.
+/// Refuse a configuration section this binary cannot honour: a section that
+/// parses and then does nothing fails silently, and the operator finds out
+/// from a graph that never fills.
 ///
 /// # Errors
 ///
@@ -1755,12 +1788,8 @@ fn spawn_cold_archiver(
 }
 
 /// Without the `object-store` feature there is nothing to archive with, so a
-/// configuration asking for it is a **startup error** rather than a section
-/// the binary quietly ignores.
-///
-/// A configured-and-ignored setting is the defect class this tree has just
-/// spent a pass removing: nothing fails, and the operator finds out when the
-/// disk fills.
+/// configuration asking for it is a startup error, not a section the binary
+/// quietly ignores while the disk fills.
 #[cfg(not(feature = "object-store"))]
 fn spawn_cold_archiver(
     config: &crate::config::ServerConfig,
@@ -1785,13 +1814,9 @@ fn spawn_cold_archiver(
 mod unbuildable_section_tests {
     use super::reject_unbuildable_sections;
 
-    /// A `[kafka]` section is accepted or refused according to the build,
-    /// and the refusal names the flag.
-    ///
-    /// Asserted in both directions because the whole defect was a state that
-    /// only existed in one of them: without the feature the connector used
-    /// to register, log "enable the feature", and then report itself healthy
-    /// while ingesting nothing.
+    /// A `[kafka]` section is accepted or refused according to the build, and
+    /// the refusal names the flag. Asserted in both directions: without the
+    /// feature, no connector may register and report itself healthy.
     #[test]
     fn a_connector_section_needs_its_feature() {
         let mut config = crate::config::ServerConfig::default();

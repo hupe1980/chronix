@@ -179,14 +179,14 @@ impl Chronix {
     /// Returns [`DbError::PromQl`] for a query that does not parse or
     /// evaluate.
     pub fn promql(&self, query: &str, at_ns: i64) -> Result<crate::promql::ast::PromQLValue> {
-        let expr = crate::promql::parse(query).map_err(|e| DbError::PromQl(e.to_string()))?;
+        let expr = crate::promql::parse(query).map_err(DbError::from)?;
         let params = crate::promql::eval::QueryParams {
             time: at_ns,
             ..Default::default()
         };
         crate::promql::PromQLEvaluator::new(Arc::new(self.clone()))
             .instant_query(&expr, &params)
-            .map_err(|e| DbError::PromQl(e.0))
+            .map_err(|e| DbError::promql(e.0))
     }
 
     /// Evaluate a PromQL range query over `[start_ns, end_ns]` at `step_ns`.
@@ -204,7 +204,7 @@ impl Chronix {
         end_ns: i64,
         step_ns: i64,
     ) -> Result<crate::promql::ast::PromQLValue> {
-        let expr = crate::promql::parse(query).map_err(|e| DbError::PromQl(e.to_string()))?;
+        let expr = crate::promql::parse(query).map_err(DbError::from)?;
         let params = crate::promql::eval::QueryParams {
             time: end_ns,
             start: Some(start_ns),
@@ -214,7 +214,58 @@ impl Chronix {
         };
         crate::promql::PromQLEvaluator::new(Arc::new(self.clone()))
             .range_query(&expr, &params)
-            .map_err(|e| DbError::PromQl(e.0))
+            .map_err(|e| DbError::promql(e.0))
+    }
+
+    /// The query as a tree of sub-expressions; with `analyze`, each one
+    /// evaluated on its own and annotated with the series and samples it
+    /// produced.
+    ///
+    /// `step_ns` makes it a range query over `[start_ns, end_ns]`; `None`
+    /// evaluates at `end_ns`. A range-vector node (`m[5m]`, a subquery) has
+    /// no value at every step, so under a range query it is evaluated at
+    /// `end_ns`.
+    ///
+    /// ```rust,no_run
+    /// # let db = chronix::Chronix::open_small("./data").unwrap();
+    /// let t = 1_700_000_000_000_000_000;
+    /// let plan = db.promql_explain("sum by (host) (rate(cpu_usage[5m]))", t, t, None, true)?;
+    /// println!("{}", serde_json::to_string_pretty(&plan.tree).unwrap());
+    /// # Ok::<(), chronix::DbError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The query does not parse. An evaluation error under `analyze` is
+    /// reported on its node, not returned.
+    pub fn promql_explain(
+        &self,
+        query: &str,
+        start_ns: i64,
+        end_ns: i64,
+        step_ns: Option<i64>,
+        analyze: bool,
+    ) -> Result<crate::promql::PromqlExplain> {
+        let expr = crate::promql::parse(query).map_err(DbError::from)?;
+        let evaluator = crate::promql::PromQLEvaluator::new(Arc::new(self.clone()));
+        let params = crate::promql::eval::QueryParams {
+            time: end_ns,
+            ..Default::default()
+        };
+        let range = step_ns.map(|step| crate::promql::eval::QueryParams {
+            time: end_ns,
+            start: Some(start_ns),
+            end: Some(end_ns),
+            step: Some(step),
+            ..Default::default()
+        });
+        Ok(crate::promql::explain_tree(
+            &evaluator,
+            &expr,
+            &params,
+            range.as_ref(),
+            analyze,
+        ))
     }
 
     #[cfg(feature = "sql")]
@@ -341,20 +392,13 @@ impl Chronix {
 
     /// Measurement names this namespace holds series for.
     ///
-    /// `None` means unscoped — every measurement, which is what a
-    /// single-tenant deployment wants and what the embedded API always
-    /// wants.
+    /// `None` means unscoped — every measurement, which is what a single-tenant
+    /// deployment and the embedded API want.
     ///
-    /// The SQL catalog answers from this rather than from the process-wide
-    /// schema registry, which listed **every** tenant's measurement names:
-    /// `SELECT * FROM another_tenants_measurement` returned zero rows where a
-    /// name that does not exist errors, so a tenant could enumerate the
-    /// others by probing.
-    /// A measurement pending a whole-measurement drop is filtered out of
-    /// **both** branches. It used to be filtered out of the unscoped one
-    /// only, so a drop with a grace period configured was invisible on a
-    /// single-tenant server and fully listed on a tenanted one — one
-    /// question, two answers, in one function.
+    /// The SQL catalog answers from this, not from the process-wide schema
+    /// registry, so a tenant cannot enumerate other tenants' measurements by
+    /// probing names. A measurement pending a whole-measurement drop is filtered
+    /// out on both branches.
     #[must_use]
     pub fn measurement_names_in(&self, namespace: Option<&str>) -> Vec<String> {
         let pending = self.catalog.read().pending_measurement_drops().clone();
@@ -382,11 +426,8 @@ impl Chronix {
 
     /// Whether `namespace` holds any series of `measurement`.
     ///
-    /// `None` means unscoped, and then only the measurement's existence
-    /// matters. A measurement pending a drop exists for nobody, on either
-    /// branch — the scoped one used to say yes, so under tenancy a dropped
-    /// table still planned and answered zero rows where a name that does not
-    /// exist is a planning error.
+    /// `None` means unscoped, and then only the measurement's existence matters.
+    /// A measurement pending a drop exists for nobody, on either branch.
     #[must_use]
     pub fn has_measurement_in(&self, namespace: Option<&str>, measurement: &str) -> bool {
         if self.is_measurement_pending_drop(measurement) {
@@ -398,6 +439,31 @@ impl Chronix {
                 .namespace_measurements
                 .get(namespace)
                 .is_some_and(|set| set.contains(measurement)),
+        }
+    }
+
+    /// What `err`, raised for `query`, is about and what was probably meant.
+    ///
+    /// As [`DbError::diagnosis`], plus a suggestion for an unknown SQL table,
+    /// drawn from the tables `namespace` may see (`None`: all of them) — so a
+    /// near name that exists only in another namespace is never offered.
+    #[must_use]
+    pub fn diagnose(
+        &self,
+        err: &DbError,
+        query: &str,
+        namespace: Option<&str>,
+    ) -> crate::diagnostics::Diagnosis {
+        match err {
+            #[cfg(feature = "sql")]
+            DbError::Sql(e) => {
+                let tables = self.measurement_names_in(namespace);
+                crate::sql::diagnose::sql_diagnosis(e, query, Some(&tables))
+            }
+            other => {
+                let _ = namespace;
+                other.diagnosis(query)
+            }
         }
     }
 
@@ -534,12 +600,9 @@ impl Chronix {
         Ok(reader)
     }
 
-    /// Where this database's segment files live.
-    ///
-    /// Every [`SegmentFile`](chronix_core::SegmentFile) in the catalog is
-    /// relative to this, so a reader that wants to open one resolves it here
-    /// — which is the whole reason the catalog no longer stores an absolute
-    /// path.
+    /// Where this database's segment files live. Every
+    /// [`SegmentFile`](chronix_core::SegmentFile) in the catalog is relative to
+    /// this, so a moved data directory still opens.
     #[must_use]
     pub(crate) fn segments_dir(&self) -> std::path::PathBuf {
         super::segments_dir_of(&self.config.data_dir)
@@ -669,6 +732,95 @@ pub(super) fn index_by_namespace(
         record_series(&index, key.as_str());
     }
     index
+}
+
+impl Chronix {
+    /// Limit a namespace's series and measurements.
+    ///
+    /// Takes effect on the next batch. Series the namespace already holds
+    /// stay writable when a limit is lowered below its usage; only new series
+    /// are refused, and [`namespace_usage`](Self::namespace_usage) reports
+    /// the usage above the limit as it is. A namespace without limits is
+    /// bounded only by the database's cardinality budget, and a series with
+    /// no `__namespace__` tag is never namespace-limited.
+    ///
+    /// Limits are configuration, not data: they are not persisted, and a
+    /// host sets them again after opening — `chronixd` does so from its
+    /// namespace registry before it accepts a connection.
+    pub fn set_namespace_limits(&self, namespace: &str, limits: crate::tenancy::NamespaceLimits) {
+        if namespace.is_empty() {
+            return;
+        }
+        self.namespace_limits.insert(namespace.to_string(), limits);
+    }
+
+    /// Remove a namespace's limits.
+    pub fn clear_namespace_limits(&self, namespace: &str) {
+        self.namespace_limits.remove(namespace);
+    }
+
+    /// A namespace's usage — exact, from the set admission compares against.
+    ///
+    /// `series` is the number of known series tagged with the namespace,
+    /// released by a whole-series delete, a dropped measurement and a
+    /// retention pass; `measurements` the measurements it has written to and
+    /// not dropped. Reading it takes no lock.
+    #[must_use]
+    pub fn namespace_usage(&self, namespace: &str) -> crate::tenancy::NamespaceUsage {
+        crate::tenancy::NamespaceUsage {
+            series: self
+                .namespace_series
+                .get(namespace)
+                .map_or(0, |n| *n as u64),
+            measurements: self
+                .namespace_measurements
+                .get(namespace)
+                .map_or(0, |set| u32::try_from(set.len()).unwrap_or(u32::MAX)),
+        }
+    }
+
+    /// Re-derive the per-namespace series counts from `known_series`, under
+    /// the admission lock so no concurrent admission is lost.
+    ///
+    /// Called by the passes that remove many series at once — a dropped
+    /// measurement, the cardinality repair — where decrementing one by one
+    /// would mean collecting what was removed.
+    pub(super) fn recount_namespace_series(&self) {
+        let _admission = self.admission.lock();
+        let fresh = count_by_namespace(&self.known_series);
+        self.namespace_series
+            .retain(|namespace, _| fresh.contains_key(namespace));
+        for (namespace, count) in fresh {
+            self.namespace_series.insert(namespace, count);
+        }
+    }
+
+    /// Release one series from its namespace's count — the whole-series
+    /// delete, which removes series one at a time.
+    pub(super) fn release_namespace_series(&self, canonical: &str) {
+        let Some((_, namespace)) = split_canonical(canonical) else {
+            return;
+        };
+        let _admission = self.admission.lock();
+        if let Some(mut count) = self.namespace_series.get_mut(namespace) {
+            *count = count.saturating_sub(1);
+        }
+        self.namespace_series
+            .remove_if(namespace, |_, count| *count == 0);
+    }
+}
+
+/// The number of known series per namespace, built in one pass over the set.
+pub(super) fn count_by_namespace(
+    known_series: &dashmap::DashSet<String>,
+) -> dashmap::DashMap<String, usize> {
+    let counts = dashmap::DashMap::new();
+    for key in known_series.iter() {
+        if let Some((_, namespace)) = split_canonical(key.as_str()) {
+            *counts.entry(namespace.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// Record one canonical series key in the index.

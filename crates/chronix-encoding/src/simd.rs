@@ -15,11 +15,8 @@
 //! computation, leading-zero counting, trailing-zero counting — can be
 //! pre-computed in batch for better CPU pipeline utilization.
 //!
-//! The largest encoding speedup comes from the [`BitWriter`](crate::delta::BitWriter)
-//! rewrite (u64 word accumulator vs. per-bit function calls) rather than
-//! from explicit SIMD intrinsics on the serial XOR chain. These batch
-//! functions provide infrastructure for future encoders and parallelizable
-//! operations.
+//! The serial XOR chain itself is not vectorised; the word-at-a-time
+//! [`BitWriter`](crate::delta::BitWriter) is where encoding speed comes from.
 //!
 //! # Compiler Hints
 //!

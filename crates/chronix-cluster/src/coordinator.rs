@@ -389,15 +389,14 @@ impl ClusterCoordinator {
         // Batch-replicate all out-of-band heartbeats through Raft
         // so followers (and future leaders) stay warm.
         let heartbeats = self.meta_store.state_machine().heartbeat_data();
-        if !heartbeats.is_empty() {
-            if let Err(e) = client
+        if !heartbeats.is_empty()
+            && let Err(e) = client
                 .propose(MetaCommand::BatchHeartbeat {
                     entries: heartbeats,
                 })
                 .await
-            {
-                warn!(error = %e, "coordinator: failed to replicate batch heartbeats");
-            }
+        {
+            warn!(error = %e, "coordinator: failed to replicate batch heartbeats");
         }
 
         let result = self.check_health();

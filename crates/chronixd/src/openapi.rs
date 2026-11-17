@@ -121,6 +121,60 @@ fn limit_param() -> utoipa::openapi::path::Parameter {
     )
 }
 
+/// `?explain_empty=`, on both PromQL query routes.
+fn explain_empty_param() -> utoipa::openapi::path::Parameter {
+    query_param(
+        "explain_empty",
+        "`true` explains an **empty** result: for each selector that matched \
+         nothing, a `warnings` entry names the matcher that removed the last \
+         series and lists the values that label does have. Ignored when the \
+         result is not empty. Any value other than `true`, `false`, `1` or `0` \
+         is a 400.",
+    )
+}
+
+/// The error body every chronix route answers with.
+fn error_schema() -> RefOr<Schema> {
+    use utoipa::openapi::schema::{ObjectBuilder, Type};
+    let span = ObjectBuilder::new()
+        .description(Some(
+            "Half-open byte offsets into the query as sent: `query[start..end]` is \
+             the text the error is about.",
+        ))
+        .property("start", ObjectBuilder::new().schema_type(Type::Integer))
+        .property("end", ObjectBuilder::new().schema_type(Type::Integer))
+        .required("start")
+        .required("end");
+    RefOr::T(Schema::Object(
+        ObjectBuilder::new()
+            .property(
+                "error",
+                ObjectBuilder::new()
+                    .schema_type(Type::String)
+                    .description(Some("One sentence, complete on its own, hint included.")),
+            )
+            .property(
+                "code",
+                ObjectBuilder::new()
+                    .schema_type(Type::String)
+                    .description(Some("Machine-readable error code.")),
+            )
+            .property(
+                "hint",
+                ObjectBuilder::new()
+                    .schema_type(Type::String)
+                    .description(Some(
+                        "What the request probably meant, e.g. `did you mean \"cpu_usage\"?`. \
+                     Absent when there is nothing to suggest.",
+                    )),
+            )
+            .property("span", span)
+            .required("error")
+            .required("code")
+            .build(),
+    ))
+}
+
 fn obj_schema() -> RefOr<Schema> {
     RefOr::T(Schema::Object(
         utoipa::openapi::schema::ObjectBuilder::new().build(),
@@ -245,6 +299,51 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
 
+    paths = paths.path(
+        "/api/v1/chronix/promql/explain",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Query")
+                .summary(Some("Explain a PromQL query as a tree"))
+                .description(Some(
+                    "The query as a tree of sub-expressions. With `analyze: true` each node \
+                     is evaluated on its own and reports the series and samples it produced. \
+                     Body: `query`, and `time` for an instant query or `start`, `end` and \
+                     `step` for a range query.",
+                ))
+                .request_body(Some(json_body("Explain request", obj_schema())))
+                .response("200", ok_json("`{\"tree\": …}`", obj_schema()))
+                .response(
+                    "400",
+                    ok_json(
+                        "The query does not parse, or the range is invalid",
+                        error_schema(),
+                    ),
+                )
+                .build(),
+        ),
+    );
+
+    paths = paths.path(
+        "/mcp",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("MCP")
+                .summary(Some("Model Context Protocol (streamable HTTP)"))
+                .description(Some(
+                    "JSON-RPC for MCP clients: eight read-only tools (`list_metrics`, \
+                     `label_values`, `query_promql`, `query_sql`, `explain`, `cardinality`, \
+                     `forecast`, `detect_anomalies`). Authorised as `Read`. Configured by \
+                     `[mcp]`.",
+                ))
+                .request_body(Some(json_body("A JSON-RPC message", obj_schema())))
+                .response("200", ok_json("A JSON-RPC response", obj_schema()))
+                .build(),
+        ),
+    );
+
     // ── SQL ────────────────────────────────────────────────────────
     paths = paths.path(
         "/api/v1/chronix/sql",
@@ -258,6 +357,13 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 ))
                 .request_body(Some(json_body("SQL query", obj_schema())))
                 .response("200", ok_json("SQL results with columns and rows", obj_schema()))
+                .response(
+                    "400",
+                    ok_json(
+                        "The query did not plan; `hint` and `span` say what it got wrong",
+                        error_schema(),
+                    ),
+                )
                 .build(),
         ),
     );
@@ -271,8 +377,11 @@ fn build_openapi(server_url: &str) -> OpenApi {
                 .tag("Prometheus")
                 .summary(Some("Instant query (PromQL)"))
                 .description(Some(
-                    "Evaluate a PromQL expression at a single point in time.",
+                    "Evaluate a PromQL expression at a single point in time. An empty \
+                     result whose metric or label name is one edit from an existing one \
+                     carries a `did you mean` entry in `warnings`.",
                 ))
+                .parameter(explain_empty_param())
                 .parameter(
                     ParameterBuilder::new()
                         .name("query")
@@ -291,7 +400,11 @@ fn build_openapi(server_url: &str) -> OpenApi {
             OperationBuilder::new()
                 .tag("Prometheus")
                 .summary(Some("Range query (PromQL)"))
-                .description(Some("Evaluate a PromQL expression over a time range."))
+                .description(Some(
+                    "Evaluate a PromQL expression over a time range. Empty results are \
+                     explained as on the instant query.",
+                ))
+                .parameter(explain_empty_param())
                 .parameter(
                     ParameterBuilder::new()
                         .name("query")
@@ -608,6 +721,55 @@ fn build_openapi(server_url: &str) -> OpenApi {
         ),
     );
 
+    // ── Declared detectors ─────────────────────────────────────────
+    paths = paths.path(
+        "/api/v1/detectors",
+        PathItem::new(
+            HttpMethod::Get,
+            OperationBuilder::new()
+                .tag("Detectors")
+                .summary(Some("List declared detectors"))
+                .description(Some(
+                    "Every detector the store keeps and advances, with its watermark, the \
+                     series it has a baseline for, late points and status.",
+                ))
+                .response("200", ok_json("Declared detectors", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/detectors",
+        PathItem::new(
+            HttpMethod::Post,
+            OperationBuilder::new()
+                .tag("Detectors")
+                .summary(Some("Declare a detector"))
+                .description(Some(
+                    "Declare an anomaly detector on a source measurement: a seasonal \
+                     baseline per series and slot, a z-score and/or CUSUM test, verdicts \
+                     written to `<name>_verdicts`. Idempotent for an identical \
+                     declaration; 409 if the name holds a different one.",
+                ))
+                .request_body(Some(json_body("Detector declaration", obj_schema())))
+                .response("201", ok_json("Detector declared", obj_schema()))
+                .build(),
+        ),
+    );
+    paths = paths.path(
+        "/api/v1/detectors/{name}",
+        PathItem::new(
+            HttpMethod::Delete,
+            OperationBuilder::new()
+                .tag("Detectors")
+                .summary(Some("Drop a detector"))
+                .description(Some(
+                    "Removes the declaration and its state; verdicts stay.",
+                ))
+                .response("204", ok_empty("Detector dropped"))
+                .build(),
+        ),
+    );
+
     // ── CDC / Streaming ────────────────────────────────────────────
     paths = paths.path(
         "/api/v1/cdc/stream",
@@ -625,51 +787,6 @@ fn build_openapi(server_url: &str) -> OpenApi {
     );
 
     // ── Admin ──────────────────────────────────────────────────────
-    paths = paths.path(
-        "/api/v1/admin/nodes",
-        PathItem::new(
-            HttpMethod::Post,
-            OperationBuilder::new()
-                .tag("Admin")
-                .summary(Some("Register a node"))
-                .request_body(Some(json_body("Node registration", obj_schema())))
-                .response("201", ok_json("Node registered", obj_schema()))
-                .build(),
-        ),
-    );
-    paths = paths.path(
-        "/api/v1/admin/routing",
-        PathItem::new(
-            HttpMethod::Get,
-            OperationBuilder::new()
-                .tag("Admin")
-                .summary(Some("Get routing table"))
-                .response("200", ok_json("Routing table", obj_schema()))
-                .build(),
-        ),
-    );
-    paths = paths.path(
-        "/api/v1/admin/health",
-        PathItem::new(
-            HttpMethod::Get,
-            OperationBuilder::new()
-                .tag("Admin")
-                .summary(Some("Cluster health"))
-                .response("200", ok_json("Cluster health status", obj_schema()))
-                .build(),
-        ),
-    );
-    paths = paths.path(
-        "/api/v1/admin/topology",
-        PathItem::new(
-            HttpMethod::Get,
-            OperationBuilder::new()
-                .tag("Admin")
-                .summary(Some("Cluster topology"))
-                .response("200", ok_json("Full cluster topology", obj_schema()))
-                .build(),
-        ),
-    );
     paths = paths.path(
         "/api/v1/admin/backup",
         PathItem::new(
@@ -707,17 +824,6 @@ fn build_openapi(server_url: &str) -> OpenApi {
                     obj_schema(),
                 )))
                 .response("200", ok_json("Restore manifest", obj_schema()))
-                .build(),
-        ),
-    );
-    paths = paths.path(
-        "/api/v1/admin/rebalance",
-        PathItem::new(
-            HttpMethod::Post,
-            OperationBuilder::new()
-                .tag("Admin")
-                .summary(Some("Trigger cluster rebalance"))
-                .response("202", ok_json("Rebalance accepted", obj_schema()))
                 .build(),
         ),
     );
@@ -839,6 +945,14 @@ fn build_openapi(server_url: &str) -> OpenApi {
             "Prometheus",
             "Build information",
             "Version and revision, in the shape a Prometheus client expects.",
+        ),
+        (
+            "/api/v1/status/tsdb",
+            "Prometheus",
+            "Cardinality statistics",
+            "Series per metric, label and label pair, as Prometheus reports them, plus the \
+             series budget, its use and the headroom left. `limit` (1–10000, default 10) caps \
+             each list.",
         ),
         (
             "/api/v1/rules",

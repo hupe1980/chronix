@@ -62,12 +62,8 @@ impl SchemaProvider for ChronixSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        // Scoped, because "the table resolves" is itself an answer. Both of
-        // these used to consult the process-wide schema registry, so
-        // `SELECT * FROM another_tenants_measurement` returned zero rows
-        // where a name that genuinely does not exist errors — an existence
-        // oracle a tenant could use to enumerate every other tenant's
-        // measurement names.
+        // Scoped, because "the table resolves" is itself an answer: an unscoped
+        // lookup would let a tenant enumerate other tenants' measurement names.
         self.db.has_measurement_in(self.namespace.as_deref(), name)
     }
 
@@ -128,20 +124,13 @@ pub fn create_namespaced_session_context(db: Arc<Chronix>, namespace: &str) -> S
 
 fn build_session_context(db: &Arc<Chronix>, namespace: Option<String>) -> SessionContext {
     let config = db.config();
-    let target_partitions = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
+    // DataFusion plans for as many partitions as the database's
+    // parallelism budget allows — one under `Parallelism::Serial`.
+    let target_partitions = db.executor.budget();
 
-    // `information_schema` is on, which is what makes `SHOW TABLES`,
-    // `SHOW COLUMNS` and the catalog views work — the first thing anybody
-    // types in a SQL shell, and previously an error telling them to enable a
-    // setting they cannot reach.
-    //
-    // It was off to prevent "catalog structure leakage", and that was the
-    // right call while `table_names()` answered from the process-wide schema
-    // registry: it would have listed every tenant's measurements. The
-    // catalog is now scoped to the session's namespace, so what these views
-    // enumerate is the caller's own data.
+    // `information_schema` is on, so `SHOW TABLES`, `SHOW COLUMNS` and the
+    // catalog views work. The catalog is scoped to the session's namespace, so
+    // these views enumerate the caller's own data only.
     let mut session_config = SessionConfig::new()
         .with_default_catalog_and_schema("chronix", "public")
         .with_information_schema(true)
@@ -165,10 +154,16 @@ fn build_session_context(db: &Arc<Chronix>, namespace: Option<String>) -> Sessio
         .sql_parser
         .parse_float_as_decimal = true;
 
+    // **Where** an unresolved name is. Off by default in `DataFusion`; on, a
+    // planning error carries the span of the table, column or function it
+    // could not resolve, which is what lets an error point at the typo
+    // rather than only name it.
+    session_config.options_mut().sql_parser.collect_spans = true;
+
     // Configure RuntimeEnv with spill-to-disk and a bounded
     // memory pool so that large GROUP BY / ORDER BY queries spill instead
     // of OOM-killing the process.
-    let spill_dir = config.data_dir.join("spill");
+    let spill_dir = db.spill_dir();
     let runtime_env = RuntimeEnvBuilder::new()
         .with_disk_manager_builder(
             DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir])),
@@ -210,13 +205,14 @@ fn build_session_context(db: &Arc<Chronix>, namespace: Option<String>) -> Sessio
     ctx.register_catalog("chronix", catalog);
 
     // Register custom SQL functions, bounded by the configured analytics
-    // limits — which used to be read nowhere at all.
+    // limits.
     register_udfs(
         &ctx,
         super::functions::ForecastLimits {
             max_horizon: db.config().analytics.max_forecast_horizon,
             max_training_points: db.config().analytics.max_training_points,
         },
+        crate::db::exec::ExecHandle(Arc::clone(&db.executor)),
     );
 
     // Register runtime UDFs added via db.register_udf() / db.register_udaf()

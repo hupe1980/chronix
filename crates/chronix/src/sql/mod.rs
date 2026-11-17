@@ -37,6 +37,7 @@ mod batch;
 #[cfg(feature = "object-store")]
 pub mod cold_tier;
 mod context;
+pub(crate) mod diagnose;
 mod epoch_literals;
 mod exec;
 mod functions;
@@ -47,7 +48,6 @@ pub use asof_join::{AsofJoinExec, execute_asof_join};
 #[cfg(feature = "object-store")]
 pub(crate) use batch::to_archive_batch;
 pub use context::{create_namespaced_session_context, create_session_context};
-pub use functions::register_udfs;
 #[cfg(feature = "object-store")]
 pub(crate) use provider::measurement_schema_to_archive_arrow;
 pub use provider::measurement_schema_to_arrow;

@@ -1570,3 +1570,23 @@ fn at_start_and_end_resolve_to_the_range_querys_bounds() {
     let values: Vec<f64> = moving[0].iter().map(|(_, v)| *v).collect();
     assert_eq!(values, vec![100.0, 120.0, 140.0, 160.0, 180.0, 200.0]);
 }
+
+/// `first_over_time` (stable since Prometheus 3.14) returns the oldest sample
+/// in the window and keeps `__name__`, as `last_over_time` does — the float
+/// half of upstream's case, whose histogram half the vendored runner skips.
+#[test]
+fn first_over_time_returns_the_oldest_sample_and_keeps_the_name() {
+    let key = SeriesKey::new("data", tags! { "type" => "numbers" }).unwrap();
+    let points: Vec<Point> = [(0, 2.0), (10, 0.0), (20, 3.0)]
+        .iter()
+        .map(|&(t, v)| Point::new(key.clone(), fields! { "value" => v }, t * SEC).unwrap())
+        .collect();
+    let db = db_with(&points);
+    let r = instant(&db, "first_over_time(data[2m])", 60 * SEC);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].1, 2.0);
+    assert!(
+        r[0].0
+            .contains(&("__name__".to_string(), "data".to_string()))
+    );
+}

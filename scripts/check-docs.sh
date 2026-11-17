@@ -25,12 +25,12 @@ note() { printf '  %s\n' "$1"; fail=1; }
 # corrected on the site alone. A guard's question is as narrow as its scope.
 #
 # `CHANGELOG.md` is deliberately not here: a changelog's job is to name the
-# ports, crates and subsystems that were removed. `specs/` holds third-party
-# protocol documents, which are not ours to keep current.
+# ports, crates and subsystems that were removed. `concepts/reference/` holds
+# third-party protocol documents, which are not ours to keep current.
 PUBLISHED="site/content README.md CONTRIBUTING.md dashboards/README.md sdks/python/README.md"
 
-# `CHANGELOG.md` ships too — `publish-crate.sh` copies it into the crate
-# for the upload — but it is **not** in `PUBLISHED`, and the distinction is
+# `CHANGELOG.md` is published too — the README and the facade's rustdoc link
+# it — but it is **not** in `PUBLISHED`, and the distinction is
 # the point. Most checks here ask "is this still true?", and a changelog
 # exists to record states that are deliberately no longer true: adding it
 # to `PUBLISHED` immediately flagged a 2024 entry describing the release
@@ -88,8 +88,8 @@ for pair in "default_http_addr:HTTP" "default_grpc_addr:gRPC" "default_flight_ad
   fn=${pair%%:*}; label=${pair##*:}
   port=$(grep -A 2 "fn ${fn}()" "$cfg" | grep -oE '0\.0\.0\.0:[0-9]+' | cut -d: -f2 | head -1)
   [ -n "$port" ] || { note "could not read ${label} default port from ${cfg}"; continue; }
-  if ! grep -rqF "$port" site/content/docs/getting-started.md; then
-    note "${label} default port ${port} is not mentioned in the Getting Started page"
+  if ! grep -rqF "$port" site/content/learn/server.md; then
+    note "${label} default port ${port} is not mentioned in the server quickstart"
   fi
 done
 # Ports the docs used to claim, none of which the server has ever bound.
@@ -114,14 +114,13 @@ consumer of the published crate reads it"
 # The README is the **crates.io** front page. docs.rs renders the crate's own
 # rustdoc, and that is where a reader lands after `cargo update` moved them a
 # minor version — so the link has to be in `lib.rs` too. The design partner
-# reported this as "the changelog is not in the published tarball", which is
-# true, deliberate and not the fixable part: `cargo package` includes nothing
-# from outside a package directory. What was fixable is that the crate's own
-# front page linked it nowhere. A guard's scope is part of its question, and
-# this one's scope was one file short.
+# asked for the changelog in the published tarball; the answer is one
+# changelog at the repository root, reached by link. A guard's scope is part
+# of its question.
 grep -qF 'blob/main/CHANGELOG.md' crates/chronix/src/lib.rs \
   || note "crates/chronix/src/lib.rs must link CHANGELOG.md by absolute URL — \
 docs.rs renders this file, not the README"
+# One changelog, at the repository root: no crate carries one of its own.
 for extra in $(find crates -name CHANGELOG.md 2>/dev/null); do
   note "$extra: there is one changelog, at the repository root"
 done
@@ -148,6 +147,44 @@ grep -rhoE 'crates/chronix/examples/[a-z_0-9]+\.rs' site/content 2>/dev/null \
 for f in README.md CONTRIBUTING.md; do
   [ -f "$f" ] || note "$f is missing"
 done
+
+# ── The README's code is a program that runs ───────────────────────────
+# The first code a reader meets is copied, so it must run: a fence preceded by
+# `<!-- example: PATH -->` is byte-identical to PATH, which CI runs. And the
+# code comes first — a reader who has to scroll past an argument to find it
+# has already been lost.
+echo "checking the README's runnable example…"
+example_fences_match() {
+  # $1: a Markdown file. Prints a line per fence that differs from its source.
+  awk -v md="$1" '
+    /^<!-- example: .* -->$/ { src = $3; want = 1; next }
+    want && /^```/ { inside = 1; want = 0; body = ""; next }
+    inside && /^```$/ {
+      inside = 0
+      cmd = "cat \"" src "\" 2>/dev/null"; file = ""
+      while ((cmd | getline line) > 0) file = file line "\n"
+      close(cmd)
+      if (file != body) print md ": the fence after <!-- example: " src " --> differs from " src
+      next
+    }
+    inside { body = body $0 "\n" }
+  ' "$1"
+}
+mismatch=$(example_fences_match README.md)
+[ -z "$mismatch" ] || note "$mismatch"
+first_rust=$(grep -n '^```rust' README.md | head -1 | cut -d: -f1)
+if [ -z "$first_rust" ] || [ "$first_rust" -gt 30 ]; then
+  note "README.md: the first \`\`\`rust fence is at line ${first_rust:-none}; it must be within the first 30 lines"
+fi
+# The check above must be able to fail: a copy with one changed line differs.
+selftest=$(mktemp -d)
+mkdir -p "$selftest/crates/chronix/examples"
+sed '1s/^/\/\/ drift\n/' crates/chronix/examples/readme.rs > "$selftest/crates/chronix/examples/readme.rs"
+cp README.md "$selftest/README.md"
+if [ -z "$(cd "$selftest" && example_fences_match README.md)" ]; then
+  note "check-docs self-test: a README fence differing from its example was not caught"
+fi
+rm -rf "$selftest"
 
 echo "checking the README feature table…"
 # Each row names a crate and one or more flags; the crate's manifest must
@@ -178,10 +215,14 @@ $rows
 EOF
 
 echo "checking for internal references…"
-if grep -rn 'concepts/' \
+# `specs/`, `.specify/` and `.claude/` are the Spec Kit feature specifications
+# and the machinery that writes them — gitignored like `concepts/`, and a dead
+# end for the same reader. The leading boundary keeps `foo-specs/` and the like
+# from matching.
+if grep -rnE '(^|[^A-Za-z0-9_-])(concepts/|specs/|\.specify/|\.claude/)' \
      $PUBLISHED_REACHABLE \
      Cargo.toml crates .github 2>/dev/null; then
-  note "a published artifact references the internal architecture notes"
+  note "a published artifact references the internal architecture notes or feature specifications"
 fi
 # The same reference without the directory. `See ROADMAP.md` in a file that
 # ships inside the crate sends a reader to a document that is not in it, and
@@ -196,6 +237,12 @@ fi
 if grep -rnE '\b[DR][0-9]{1,3}\b' --include='*.rs' crates 2>/dev/null; then
   note "a doc comment cites a D/R identifier, which resolves only in concepts/"
 fi
+# A manifest ships in the tarball too, and a `##` line in `[features]` is
+# rendered on docs.rs by `document-features` — `(D6)` there reached the crate
+# page. Same rule, the scope `*.rs` did not cover.
+if grep -rnE '\b[DR][0-9]{1,3}\b' --include='Cargo.toml' crates 2>/dev/null; then
+  note "a manifest cites a D/R identifier, which resolves only in concepts/"
+fi
 # The same citation in prose is the same defect: `concepts/` is not published,
 # so "see D41" sends a reader nowhere. Scanned separately because the cluster
 # pages legitimately draw R1/R2/R3 as *region* names in ASCII diagrams, which
@@ -203,6 +250,52 @@ fi
 if grep -rnE '\((D[0-9]{1,3}(, ?[DR][0-9]{1,3})*)\)|\bsee [DR][0-9]{1,3}\b' \
      README.md CONTRIBUTING.md site/content 2>/dev/null; then
   note "a published document cites a D/R identifier, which resolves only in concepts/"
+fi
+
+# ── 4b. Every documented install line must work ──────────────────────
+# `cargo install chronixd` was documented for a release in which `chronixd`
+# was not on crates.io, so the first command a server user copied failed. A
+# `cargo install chronix…` line must name a crate the workspace publishes.
+echo "checking install lines…"
+publishable=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+  | python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"] if p.get("publish") is None))')
+unpublished_installs() {
+  grep -rhoE 'cargo install chronix[a-z0-9_-]*' "$@" 2>/dev/null \
+    | awk '{print $3}' | sort -u \
+    | while read -r crate; do grep -qx "$crate" <<<"$publishable" || echo "$crate"; done
+}
+for crate in $(unpublished_installs $PUBLISHED_REACHABLE); do
+  note "docs say 'cargo install $crate', and $crate is not published"
+done
+# The guard guards itself: a line naming an unpublished crate must be caught.
+selftest=$(mktemp)
+echo 'cargo install chronixd-cluster' > "$selftest"
+[ -n "$(unpublished_installs "$selftest")" ] \
+  || note "the install-line check no longer catches an unpublished crate"
+rm -f "$selftest"
+
+# ── 4b. Published docs describe the present, not a history or a backlog ─
+# A page states what Chronix does now. "Used to", "since 0.x", audit-pass
+# numbers and "planned for" belong in CHANGELOG.md (not scanned) or nowhere. The phrases are narrow on purpose: "not yet materialised" is a
+# state, "not yet implemented" is a backlog. Rust is scanned only in doc
+# comments (`//!`, `///`), which docs.rs renders.
+echo "checking that published docs carry no history or backlog…"
+history_re='\b(used to (be|have|say|return|accept|refuse|read|write|keep|run|ship|scan|work|live|default|treat|mean|count|report|answer|cite|name|claim|list|print|document)|since v?0\.[0-9]|was changed|coming soon|will be added|on the roadmap|(audit )?pass [0-9]{2}|not yet (implemented|supported|available|built)|no longer (supported|exists|exist|available|works|work|needed)|planned for|in a future (release|version))\b'
+history_hits=$(
+  { grep -rniE "$history_re" site/content README.md CONTRIBUTING.md \
+      dashboards/README.md sdks/python/README.md 2>/dev/null || true
+    grep -niE "$history_re" Cargo.toml crates/*/Cargo.toml 2>/dev/null || true
+    # Published crates only, and only their `src/`: tests, examples and the
+    # frozen tier are not rendered on docs.rs.
+    for c in $(scripts/publish-order.sh 2>/dev/null); do
+      grep -rnE '^\s*//[!/]' --include='*.rs' "crates/$c/src" 2>/dev/null \
+        | grep -iE "$history_re" || true
+    done
+  }
+)
+if [ -n "$history_hits" ]; then
+  printf '%s\n' "$history_hits" | sed 's/^/    /' | head -40
+  note "published docs narrate history or a backlog — state the current behaviour"
 fi
 
 # ── 5. Deleted subsystems must stay deleted in prose ────────────────────
@@ -261,11 +354,11 @@ config_fields=$(
     | sed -E 's/^[[:space:]]+pub //; s/://' | sort -u
 )
 
-# The cluster tier is frozen and its guide documents the frozen design;
-# `api-reference.md` shows Telegraf's own output config, which is not ours.
-for page in site/content/docs/*.md; do
+# The cluster tier is frozen; `guides/ingest.md` shows Telegraf's own output
+# config, which is not ours.
+for page in $(find site/content -name '*.md' | sort); do
   case "$page" in
-    */cluster.md|*/api-reference.md) continue ;;
+    */cluster.md|*/ingest.md) continue ;;
   esac
   [ -f "$page" ] || continue
   keys=$(awk '/^```toml/ {t=1; next} /^```/ {t=0} t' "$page" \
@@ -287,9 +380,9 @@ done
 # changed no behaviour and raised no error. That is the failure mode of every
 # setting: it does not fail, it is simply ignored.
 echo "checking that documented settings are read…"
-for page in site/content/docs/*.md; do
+for page in $(find site/content -name '*.md' | sort); do
   case "$page" in
-    */cluster.md|*/api-reference.md) continue ;;
+    */cluster.md|*/ingest.md) continue ;;
   esac
   [ -f "$page" ] || continue
   keys=$(awk '/^```toml/ {t=1; next} /^```/ {t=0} t' "$page" \

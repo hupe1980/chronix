@@ -82,23 +82,17 @@ impl super::Chronix {
     /// Insert points **outside** the out-of-order window.
     ///
     /// Live ingestion is held to `±ooo_shard_tolerance` shards of the newest
-    /// write, which is what keeps segments time-partitioned and the number
-    /// of open memtables bounded. Importing history — a migration, a
-    /// device's offline backlog, a rollup being materialised for a closed
-    /// window — is the one legitimate reason to write far into the past,
-    /// and it is a different operation with a different cost: the shards it
-    /// touches are opened, flushed and later compacted like any other, and
-    /// a query over that time range merges the new segments with the old.
+    /// write, which keeps segments time-partitioned and open memtables bounded.
+    /// Importing history — a migration, a device's offline backlog, a rollup
+    /// materialised for a closed window — goes through here instead; the shards
+    /// it touches are opened, flushed and compacted like any other.
     ///
-    /// Everything else — admission control, the cardinality budget, the
-    /// schema, one WAL record per call — is exactly as for
-    /// [`insert_batch`](Self::insert_batch), and so is the result: the only
-    /// per-point rejection here is a timestamp beyond
-    /// `future_write_tolerance`, and it is reported, not swallowed.
-    ///
-    /// Backfilling a rollup's source below its watermark marks those
-    /// buckets for re-materialisation; see
-    /// [`materialise_rollups`](Self::materialise_rollups).
+    /// Admission control, the cardinality budget, the schema and one WAL record
+    /// per call apply exactly as for [`insert_batch`](Self::insert_batch). The
+    /// only per-point rejection is a timestamp beyond `future_write_tolerance`,
+    /// and it is reported. Backfilling a rollup's source below its watermark
+    /// marks those buckets for re-materialisation (see
+    /// [`materialise_rollups`](Self::materialise_rollups)).
     ///
     /// # Errors
     ///
@@ -148,6 +142,7 @@ impl super::Chronix {
         field: &str,
         column_type: chronix_core::ColumnType,
     ) -> Result<()> {
+        self.ensure_writable("declaring a field")?;
         self.check_open()?;
         let actions = self.schema.declare_field(measurement, field, column_type)?;
         if !actions.is_empty() {
@@ -184,6 +179,7 @@ impl super::Chronix {
     /// The write path. `enforce_window` is the only difference between a
     /// live insert and a backfill.
     fn write_batch(&self, points: &[Point], enforce_window: bool) -> Result<InsertResult> {
+        self.ensure_writable("insert")?;
         let start = std::time::Instant::now();
         self.check_open()?;
         if points.is_empty() {
@@ -194,11 +190,9 @@ impl super::Chronix {
 
         // ── 1. Admission, per point, before anything is durable ────────
         //
-        // A timestamp ahead of the wall clock is refused first, whether or
-        // not the window is enforced: admitting one would anchor the
-        // out-of-order window there and reject every real write that
-        // follows — one device with a broken clock used to brick ingestion
-        // until the next restart.
+        // A timestamp ahead of the wall clock is refused first, whether or not the
+        // window is enforced: admitting one would anchor the out-of-order window
+        // there and reject every real write after it.
         let future_limit = Self::now_ns().saturating_add(
             i64::try_from(self.config.future_write_tolerance.as_nanos()).unwrap_or(i64::MAX),
         );
@@ -265,14 +259,26 @@ impl super::Chronix {
         };
 
         // ── 3. WAL: one record, one acknowledgement ────────────────────
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(admitted.len());
-        for point in &admitted {
-            payloads.push(
-                wal_encode_write_point(point).map_err(|e| {
+        // An encrypted column's values are sealed before they reach the
+        // log, so the WAL never holds them in the clear.
+        #[cfg(feature = "field-encryption")]
+        let sealed = match &self.field_encryption {
+            Some(e) => super::wal_seal::seal_batch(&admitted, &e.writer)?,
+            None => None,
+        };
+        #[cfg(not(feature = "field-encryption"))]
+        let sealed: Option<Vec<Vec<u8>>> = None;
+        let payloads: Vec<Vec<u8>> = if let Some(sealed) = sealed {
+            sealed
+        } else {
+            let mut payloads = Vec::with_capacity(admitted.len());
+            for point in &admitted {
+                payloads.push(wal_encode_write_point(point).map_err(|e| {
                     DbError::Internal(format!("Failed to serialize WAL entry: {e}"))
-                })?,
-            );
-        }
+                })?);
+            }
+            payloads
+        };
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         // The write epoch covers the gap between the WAL append and the
         // memtable insert. A flush computing the WAL floor takes it for
@@ -325,6 +331,10 @@ impl super::Chronix {
         // it, importing history or replaying a device's offline backlog
         // left the rollup tiers silently stale for ever, and retention then
         // dropped the raw data they were supposed to summarise.
+        // A detector judges each point once, when it has settled; one that
+        // lands at or below a detector's watermark is never judged, and is
+        // counted so the silence is visible.
+        self.count_late_detector_points(&admitted);
         if !enforce_window {
             self.invalidate_rollups_for(&admitted);
         }
@@ -370,11 +380,9 @@ impl super::Chronix {
     /// `spawn_blocking` or `block_in_place` so a tokio worker is not
     /// stalled.
     fn apply_backpressure(&self) {
-        // The count that compaction can reduce: the most segments any one
-        // (shard, measurement) currently has. It used to be the catalog's
-        // *total* segment count, which grows by one per shard forever, so
-        // a database with a couple of days of hourly shards slept 500 ms on
-        // every write batch, permanently, with nothing to compact.
+        // The count that compaction can reduce: the most segments any one (shard,
+        // measurement) has. The catalog's total only grows, one per shard, so it
+        // would throttle writes with nothing to compact.
         let l0_count = {
             let catalog = self.catalog.read();
             catalog.max_segments_per_shard_measurement()
@@ -441,25 +449,97 @@ impl super::Chronix {
         Ok(())
     }
 
-    /// Admit the net-new series of a batch against the cardinality budget,
-    /// atomically: either every new series is registered or none is.
+    /// Admit the net-new series of a batch against the namespace limits and
+    /// the cardinality budget, atomically: either every new series is
+    /// registered or none is.
     ///
     /// `known_series` is the only cardinality bookkeeping in the engine, and
     /// it is exact — rebuilt from the segment sidecars at open and kept in
     /// step by writes and whole-series deletes, which rewrite the sidecars
-    /// so the count survives a restart.
+    /// so the count survives a restart. A namespace's usage is the same set
+    /// counted by its `__namespace__` tag, so the two limits can never
+    /// disagree about what exists.
+    ///
+    /// A batch whose series are all known — every steady-state write — does
+    /// the containment check and returns, taking no lock. Otherwise the
+    /// admission lock is held from recomputing the new set to inserting it:
+    /// without it two batches could each see room and both insert.
     fn check_cardinality(&self, points: &[&Point]) -> Result<()> {
-        let mut new_canonicals: HashSet<&str> = HashSet::new();
-        for point in points {
-            let canonical = point.series_key().canonical_form();
-            if !self.known_series.contains(canonical) {
-                new_canonicals.insert(canonical);
-            }
+        let is_new = |p: &&&Point| !self.known_series.contains(p.series_key().canonical_form());
+        if !points.iter().any(|p| is_new(&p)) {
+            return Ok(());
         }
+        let _admission = self.admission.lock();
+
+        // Recomputed under the lock: another writer may have admitted some.
+        let new_canonicals: HashSet<&str> = points
+            .iter()
+            .filter(is_new)
+            .map(|p| p.series_key().canonical_form())
+            .collect();
         if new_canonicals.is_empty() {
             return Ok(());
         }
 
+        // ── Namespace limits first: the refusal a writer can act on ──
+        if !self.namespace_limits.is_empty() {
+            let mut per_namespace: HashMap<&str, (u64, HashSet<&str>)> = HashMap::new();
+            for canonical in &new_canonicals {
+                let Some((measurement, namespace)) =
+                    crate::db::accessors::split_canonical(canonical)
+                else {
+                    continue;
+                };
+                if namespace.is_empty() {
+                    continue; // an untagged series is never namespace-limited
+                }
+                let entry = per_namespace.entry(namespace).or_default();
+                entry.0 += 1;
+                let known = self
+                    .namespace_measurements
+                    .get(namespace)
+                    .is_some_and(|set| set.contains(measurement));
+                if !known {
+                    entry.1.insert(measurement);
+                }
+            }
+            for (namespace, (new_series, new_measurements)) in &per_namespace {
+                let Some(limits) = self.namespace_limits.get(*namespace).map(|l| *l) else {
+                    continue;
+                };
+                let current = self
+                    .namespace_series
+                    .get(*namespace)
+                    .map_or(0, |n| *n as u64);
+                if current + new_series > limits.max_series {
+                    counter!("chronix_namespace_quota_refusals_total", "resource" => "series_count")
+                        .increment(1);
+                    return Err(DbError::NamespaceQuotaExceeded {
+                        namespace: (*namespace).to_string(),
+                        resource: crate::error::QuotaResource::SeriesCount,
+                        current,
+                        limit: limits.max_series,
+                    });
+                }
+                let current = self
+                    .namespace_measurements
+                    .get(*namespace)
+                    .map_or(0, |set| set.len() as u64);
+                let limit = u64::from(limits.max_measurements);
+                if !new_measurements.is_empty() && current + new_measurements.len() as u64 > limit {
+                    counter!("chronix_namespace_quota_refusals_total", "resource" => "measurements")
+                        .increment(1);
+                    return Err(DbError::NamespaceQuotaExceeded {
+                        namespace: (*namespace).to_string(),
+                        resource: crate::error::QuotaResource::Measurements,
+                        current,
+                        limit,
+                    });
+                }
+            }
+        }
+
+        // ── Then the database budget ──
         let limit = self.config.max_series_cardinality;
         let current = self.known_series.len();
         let new_total = current + new_canonicals.len();
@@ -468,11 +548,17 @@ impl super::Chronix {
         }
         Self::cardinality_early_warning(new_total, limit);
         for canonical in new_canonicals {
-            // The namespace index is derived from the same set, so it is
+            // The namespace indexes are derived from the same set, so they are
             // maintained at the one point a series becomes known rather than
             // recomputed — otherwise the SQL planner's per-reference lookup
             // would be a scan of every series.
             crate::db::accessors::record_series(&self.namespace_measurements, canonical);
+            if let Some((_, namespace)) = crate::db::accessors::split_canonical(canonical) {
+                *self
+                    .namespace_series
+                    .entry(namespace.to_string())
+                    .or_insert(0) += 1;
+            }
             self.known_series.insert(canonical.to_string());
         }
         Ok(())

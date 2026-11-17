@@ -57,6 +57,15 @@ fn fixture(dir: &tempfile::TempDir) -> Arc<Chronix> {
             )
             .unwrap(),
         );
+        // The demo, as getting-started shows it: `pv_power_w`.
+        points.push(
+            Point::new(
+                SeriesKey::new("pv", tags! { "device" => "pv", "site" => "demo" }).unwrap(),
+                fields! { "power_w" => 4200.0 + i as f64 },
+                ts,
+            )
+            .unwrap(),
+        );
         // The landing page: `power,meter=main watts=…`.
         points.push(
             Point::new(
@@ -135,8 +144,9 @@ fn fixture(dir: &tempfile::TempDir) -> Arc<Chronix> {
 }
 
 /// Every PromQL query the published documentation shows, with where it came
-/// from: ```promql fences, and the `query=` parameter of a `curl` example.
-fn documented_queries() -> Vec<(String, String)> {
+/// from: ```promql fences, and the `query=` parameter of a `curl` example —
+/// and, apart, the queries shown beside `explain_empty=true`.
+fn documented_queries() -> (Vec<(String, String)>, Vec<String>) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -157,6 +167,7 @@ fn documented_queries() -> Vec<(String, String)> {
     }
 
     let mut out = Vec::new();
+    let mut explained_empty = Vec::new();
     for path in files {
         let text = std::fs::read_to_string(&path).expect("readable markdown");
         let name = path
@@ -171,9 +182,10 @@ fn documented_queries() -> Vec<(String, String)> {
         {
             out.push((format!("{name} [{i}]"), q));
         }
+        explained_empty.extend(explained_empty_queries(&text));
     }
     out.sort();
-    out
+    (out, explained_empty)
 }
 
 /// Each non-comment line of every ```promql fence. The fences hold one query
@@ -197,6 +209,15 @@ fn fenced_promql(text: &str) -> Vec<String> {
 /// The `query=…` parameter of every `curl` example.
 ///
 /// The query ends at the quote that opened the URL, not at the first quote:
+/// A `curl` line that asks for `explain_empty=true` documents an empty result
+/// on purpose: its query must still parse, and may answer nothing.
+fn explained_empty_queries(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| l.contains("explain_empty=true"))
+        .flat_map(curl_queries)
+        .collect()
+}
+
 /// `curl 'http://…?query=cpu_usage{host="srv1"}&time=…'` is one argument, and
 /// cutting at the inner `"` yields a fragment that cannot parse.
 fn curl_queries(text: &str) -> Vec<String> {
@@ -254,7 +275,7 @@ fn every_documented_promql_query_returns_something() {
     let db = fixture(&dir);
     let ev = PromQLEvaluator::new(db);
 
-    let queries = documented_queries();
+    let (queries, explained_empty) = documented_queries();
     assert!(
         queries.len() >= 6,
         "the extractor found only {} queries, so it is not working",
@@ -263,6 +284,12 @@ fn every_documented_promql_query_returns_something() {
 
     let mut failures = Vec::new();
     for (origin, query) in &queries {
+        if explained_empty.contains(query) {
+            if let Err(e) = promql::parse(query) {
+                failures.push(format!("{origin}: {query}\n    parse error: {e}"));
+            }
+            continue;
+        }
         let params = promql::eval::QueryParams {
             time: NOW,
             ..Default::default()

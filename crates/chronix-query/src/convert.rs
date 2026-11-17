@@ -92,10 +92,9 @@ pub fn points_to_record_batch(points: &[Point]) -> Result<RecordBatch> {
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
 
     for col in &columns {
-        // The role is known right here and used to be dropped: a tag and a
-        // string field are both `Utf8`, so a schema built from types alone
-        // cannot be classified afterwards without guessing — and four
-        // consumers guessed, three of them differently.
+        // The role is known right here and must be kept: a tag and a string field
+        // are both `Utf8`, so a schema built from types alone cannot be classified
+        // afterwards without guessing.
         let meta = role_metadata(col.role);
         match col.role {
             ColumnRole::Timestamp => {

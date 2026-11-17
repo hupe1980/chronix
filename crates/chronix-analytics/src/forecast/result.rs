@@ -166,6 +166,25 @@ pub enum ModelParams {
 }
 
 impl ForecastResult {
+    /// Clamp the point forecast and both interval bounds at `min`.
+    ///
+    /// For a quantity that cannot go below a known floor — power, a count, a
+    /// fill level — a symmetric normal interval can still reach past it. The
+    /// clamp is the caller's statement about the domain, never inferred here,
+    /// and NaN values are left as they are.
+    pub fn clamp_below(&mut self, min: f64) {
+        for v in self
+            .values
+            .iter_mut()
+            .chain(self.confidence_lower.iter_mut())
+            .chain(self.confidence_upper.iter_mut())
+        {
+            if *v < min {
+                *v = min;
+            }
+        }
+    }
+
     /// Rescale the prediction interval to a different confidence level.
     ///
     /// Every model in this crate builds a **symmetric normal** interval —
@@ -231,6 +250,22 @@ mod tests {
             confidence_upper: vec![12.0, 24.0],
             confidence_level: 0.95,
         }
+    }
+
+    #[test]
+    fn clamp_below_raises_point_and_both_bounds_to_the_floor() {
+        let mut r = ForecastResult {
+            values: vec![-100.0, 5.0, f64::NAN],
+            timestamps: vec![1, 2, 3],
+            confidence_lower: vec![-1000.0, -2.0, 1.0],
+            confidence_upper: vec![-50.0, 9.0, 2.0],
+            confidence_level: 0.95,
+        };
+        r.clamp_below(0.0);
+        assert_eq!(r.values[..2], [0.0, 5.0]);
+        assert!(r.values[2].is_nan(), "NaN is left as it is");
+        assert_eq!(r.confidence_lower, vec![0.0, 0.0, 1.0]);
+        assert_eq!(r.confidence_upper, vec![0.0, 9.0, 2.0]);
     }
 
     #[test]

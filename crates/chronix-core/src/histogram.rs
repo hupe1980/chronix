@@ -1,61 +1,31 @@
 //! Native histograms — a whole distribution as one sample.
 //!
-//! A classic Prometheus histogram is a *family* of series: `foo_bucket` once
-//! per boundary, plus `foo_sum` and `foo_count`, with the boundaries fixed by
-//! whoever instrumented the code. Getting a useful quantile means guessing the
-//! right boundaries in advance, and getting them wrong means re-instrumenting
-//! and losing the history. A **native histogram** is one sample carrying the
-//! whole distribution, with buckets that are implied by a *schema* rather than
-//! enumerated — so the resolution is a number, the buckets are sparse, and
-//! nothing has to be guessed up front.
-//!
-//! Prometheus made them stable in **v3.8**. They arrive over remote write with
-//! `send_native_histograms`, and OTLP carries the same idea as an exponential
-//! histogram. A scrape configured for them reaches a database that cannot
-//! store them as data that is simply lost, which is why this type exists.
+//! A classic Prometheus histogram is a family of series (`foo_bucket` per
+//! boundary, `foo_sum`, `foo_count`) with boundaries fixed in advance. A
+//! **native histogram** is one sample whose buckets are implied by a *schema*,
+//! so the resolution is a number and the buckets are sparse. This type follows
+//! the Prometheus specification exactly; it is what remote write and OTLP
+//! exponential histograms are stored as.
 //!
 //! # The model
 //!
-//! This follows the Prometheus specification exactly, because the whole point
-//! is to be the thing a Prometheus writes to:
+//! - **`schema`** fixes the resolution: for `-4 ..= 8` each bucket's upper
+//!   bound is the previous one's times `2^(2^-schema)`.
+//!   [`CUSTOM_BUCKETS_SCHEMA`] (`-53`) lists the boundaries explicitly in
+//!   [`custom_values`](Histogram::custom_values); a classic histogram converts
+//!   into this form.
+//! - **The zero bucket** counts observations in `[-zero_threshold,
+//!   +zero_threshold]`, which an exponential scheme cannot otherwise represent.
+//! - **Positive and negative buckets** are sparse `(index, count)` pairs,
+//!   sorted by index with no zero counts — the one in-memory form, established
+//!   by [`canonicalise`](Histogram::canonicalise) and required by
+//!   [`validate`](Histogram::validate). Counts are absolute, not deltas.
+//! - **`count`** and **`sum`** are the totals; `sum` may be `NaN`.
 //!
-//! - **`schema`** fixes the resolution. For `-4 ..= 8`, bucket boundaries are
-//!   powers of `2^(2^-schema)`: each bucket's upper bound is the previous
-//!   one's times that factor, so schema *n* has twice the resolution of *n*−1.
-//!   [`CUSTOM_BUCKETS_SCHEMA`] (`-53`) means the boundaries are listed
-//!   explicitly in [`custom_values`](Histogram::custom_values) — which is what
-//!   a *classic* histogram converts into, so it is the bridge rather than an
-//!   extra.
-//! - **The zero bucket** counts observations in the closed interval
-//!   `[-zero_threshold, +zero_threshold]`. It exists because an exponential
-//!   scheme has no bucket for zero and infinitely many just above it.
-//! - **Positive and negative buckets** are sparse: only the indices that were
-//!   observed are stored.
-//! - **`count`** and **`sum`** are the totals, and `sum` may be any float
-//!   including `NaN` — a `NaN` observation poisons it, which is a fact
-//!   [`quantile`](Histogram::quantile) has to know about.
-//!
-//! # Two decisions worth knowing about
-//!
-//! **Buckets hold absolute counts, not deltas, and are `(index, count)` pairs
-//! rather than spans.** The wire format carries spans plus deltas because that
-//! is a compression trick; `chronix-encoding` does better than that with pco,
-//! and re-deriving the absolutes on every quantile would be work done for
-//! nothing. Spans also have a normalisation question in them — a span may name
-//! a bucket whose count is zero — and two representations of one value is how
-//! the canonical series form went wrong once already. There is exactly one
-//! in-memory form: **sorted by index, no zero counts**, which
-//! [`canonicalise`](Histogram::canonicalise) establishes and
-//! [`validate`](Histogram::validate) requires.
-//!
-//! **Counts are `f64`.** Prometheus distinguishes integer histograms (a
-//! scrape) from float histograms (a recording rule's output, which arrives
-//! over remote write just the same), and supporting only the first would
-//! refuse ordinary traffic. One representation covers both, and the exactness
-//! that matters is *checked* rather than assumed: [`validate`](Histogram::validate)
-//! refuses a count above [`MAX_EXACT_COUNT`] — 2⁵³, where `f64` stops
-//! representing consecutive integers — so an integer histogram is exact by
-//! construction or refused, never silently rounded.
+//! Counts are `f64`, so integer and float histograms share one type.
+//! [`validate`](Histogram::validate) refuses a count above
+//! [`MAX_EXACT_COUNT`] (2⁵³), so an integer histogram is exact or refused,
+//! never rounded.
 
 use serde::{Deserialize, Serialize};
 

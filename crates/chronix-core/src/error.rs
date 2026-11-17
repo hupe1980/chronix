@@ -94,6 +94,35 @@ pub enum WalError {
         detail: String,
     },
 
+    /// A WAL record seals encrypted column values under a key this process
+    /// was not given.
+    ///
+    /// Refused rather than skipped: replaying the record without those
+    /// values would acknowledge a write and then lose part of it.
+    #[error(
+        "WAL record {sequence} seals encrypted column values under key '{key_id}', which is \
+         not configured — supply that key (field_encryption.keys) and reopen"
+    )]
+    MissingKey {
+        /// The key the record names.
+        key_id: String,
+        /// The record's sequence number.
+        sequence: u64,
+    },
+
+    /// A sealed section of a WAL record failed to authenticate: tampered,
+    /// moved from another record, or opened with the wrong key bytes.
+    #[error(
+        "WAL record {sequence}: a sealed section under key '{key_id}' does not authenticate \
+         (tampered, moved from another record, or the wrong key bytes)"
+    )]
+    SealBroken {
+        /// The key the section names.
+        key_id: String,
+        /// The record's sequence number.
+        sequence: u64,
+    },
+
     /// Payload exceeds the maximum allowed size per WAL record.
     #[error("WAL payload too large: {size} bytes exceeds limit of {limit}")]
     PayloadTooLarge {
@@ -175,6 +204,18 @@ pub enum SchemaError {
     /// Point has no fields.
     #[error("Point must have at least one field")]
     EmptyFields,
+
+    /// A start timestamp later than the sample it belongs to.
+    #[error(
+        "start timestamp {start} is after the sample's timestamp {timestamp}: a series cannot \
+         start after it was observed"
+    )]
+    StartAfterSample {
+        /// The start timestamp, nanoseconds since the epoch.
+        start: i64,
+        /// The sample's timestamp, nanoseconds since the epoch.
+        timestamp: i64,
+    },
 
     /// Too many fields on a single point.
     #[error("Too many fields: {count} exceeds maximum of {max}")]

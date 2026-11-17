@@ -7,7 +7,7 @@ name = "chronix-client"
 dynamic = ["version"]
 description = "Python client for Chronix time-series database"
 readme = "README.md"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 requires-python = ">=3.10"
 authors = [{ name = "Chronix Authors" }]
 keywords = ["timeseries", "database", "client", "chronix"]
@@ -15,6 +15,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

@@ -276,8 +276,7 @@ mod cell_tests {
 
     #[test]
     fn a_type_storage_cannot_hold_is_an_error_not_a_silent_drop() {
-        // The defect this exists for: `_ => None` read as "no value here"
-        // for a column that in fact held one.
+        // `_ => None` would read as "no value here" for a column that holds one.
         let arr = arrow::array::Int32Array::from(vec![1]);
         let err = arrow_cell_to_field_value(&arr, 0).unwrap_err();
         assert!(
@@ -288,8 +287,8 @@ mod cell_tests {
 
     #[test]
     fn a_negative_scale_is_an_error_not_a_dropped_column() {
-        // Legal in Arrow, unrepresentable in storage. It used to be read
-        // into a `u8`, fail, and take the whole cell with it.
+        // Legal in Arrow, unrepresentable in storage: refuse the cell rather than
+        // fail the whole row.
         let arr = Decimal128Array::from(vec![123_i128])
             .with_precision_and_scale(10, -2)
             .unwrap();

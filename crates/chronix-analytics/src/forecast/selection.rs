@@ -105,6 +105,9 @@ pub struct AutoForecastOptions {
     pub metric: SelectionMetric,
     /// Cap on the ARIMA orders searched.
     pub max_order: usize,
+    /// Clamp the winner's forecast and interval at this floor (see
+    /// [`ForecastResult::clamp_below`]). Selection is unaffected.
+    pub lower_bound: Option<f64>,
 }
 
 impl Default for AutoForecastOptions {
@@ -120,6 +123,7 @@ impl Default for AutoForecastOptions {
             folds: 3,
             metric: SelectionMetric::default(),
             max_order: 2,
+            lower_bound: None,
         }
     }
 }
@@ -175,6 +179,9 @@ pub struct AutoForecast {
     pub result: ForecastResult,
     /// Why that model won.
     pub selection: ModelSelection,
+    /// The floor the forecast was clamped at, when
+    /// [`AutoForecastOptions::lower_bound`] asked for one.
+    pub clamped_below: Option<f64>,
 }
 
 type Factory = Box<dyn Fn() -> Box<dyn ForecastModel> + Send + Sync>;
@@ -488,8 +495,15 @@ pub fn auto_forecast(
 
     let mut model = (winner.factory)();
     model.fit(timestamps, values)?;
-    let result = model.predict(horizon)?;
-    Ok(AutoForecast { result, selection })
+    let mut result = model.predict(horizon)?;
+    if let Some(min) = options.lower_bound {
+        result.clamp_below(min);
+    }
+    Ok(AutoForecast {
+        result,
+        selection,
+        clamped_below: options.lower_bound,
+    })
 }
 
 #[cfg(test)]

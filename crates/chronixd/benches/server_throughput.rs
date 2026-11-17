@@ -91,8 +91,6 @@ fn bench_http_write(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -101,11 +99,13 @@ fn bench_http_write(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -181,8 +181,6 @@ fn bench_http_query(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -191,11 +189,13 @@ fn bench_http_query(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -539,8 +539,6 @@ fn bench_scale_http_write_10k(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -549,11 +547,13 @@ fn bench_scale_http_write_10k(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -613,8 +613,6 @@ fn bench_scale_multi_measurement(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -623,11 +621,13 @@ fn bench_scale_multi_measurement(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -719,8 +719,6 @@ fn bench_scale_targeted_query(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -729,11 +727,13 @@ fn bench_scale_targeted_query(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -795,8 +795,6 @@ fn bench_tsbs_devops_workload(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -805,11 +803,13 @@ fn bench_tsbs_devops_workload(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -882,8 +882,6 @@ fn bench_replicated_write_throughput(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -892,11 +890,13 @@ fn bench_replicated_write_throughput(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -993,7 +993,6 @@ fn bench_multi_tenant_100ns(c: &mut Criterion) {
                 chronix_core::NamespaceQuota {
                     max_series_count: 10_000,
                     max_ingestion_rate: 10_000,
-                    max_storage_bytes: 1024 * 1024 * 1024,
                     max_measurements: 100,
                     max_request_rps: 0,
                     max_request_burst: 0,
@@ -1008,8 +1007,6 @@ fn bench_multi_tenant_100ns(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: registry.clone(),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -1018,11 +1015,13 @@ fn bench_multi_tenant_100ns(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();
@@ -1123,8 +1122,6 @@ fn bench_large_scale_targeted_query(c: &mut Criterion) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -1133,11 +1130,13 @@ fn bench_large_scale_targeted_query(c: &mut Criterion) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_builder = metrics_exporter_prometheus::PrometheusBuilder::new();

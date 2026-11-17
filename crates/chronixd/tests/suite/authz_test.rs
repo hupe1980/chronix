@@ -80,8 +80,6 @@ async fn start_server(policies: &str, roles: Vec<String>) -> (String, TempDir) {
         connector_manager: None,
         sql_contexts,
         auth_state: Some(auth_state.clone()),
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -90,11 +88,13 @@ async fn start_server(policies: &str, roles: Vec<String>) -> (String, TempDir) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_handle = chronixd::server::prometheus_builder()
@@ -143,6 +143,10 @@ fn ungated_by_design(path: &str) -> Option<&'static str> {
         }
         "/metrics" => "the scrape is server-level and carries no tenant rows",
         "/api/v1/openapi.json" => "the API's own description, identical for every caller",
+        "/console" | "/console/" | "/console/{file}" => {
+            "the console's static shell: the same bytes for every caller, no data; \
+             every request the page makes is gated"
+        }
         _ => return None,
     })
 }
@@ -273,6 +277,20 @@ fn a_posted_read_asks_to_read_and_a_posted_delete_asks_to_delete() {
     assert_eq!(
         chronixd::namespace::action_for_route("/api/v1/rollups", &Method::POST),
         Some(ChronixAction::Write)
+    );
+    // Declared detectors are administered exactly as rollups are.
+    for (method, action) in [
+        (Method::GET, ChronixAction::Read),
+        (Method::POST, ChronixAction::Write),
+    ] {
+        assert_eq!(
+            chronixd::namespace::action_for_route("/api/v1/detectors", &method),
+            Some(action)
+        );
+    }
+    assert_eq!(
+        chronixd::namespace::action_for_route("/api/v1/detectors/{name}", &Method::DELETE),
+        chronixd::namespace::action_for_route("/api/v1/rollups/{name}", &Method::DELETE),
     );
 }
 
@@ -422,8 +440,6 @@ async fn a_namespace_bound_admin_key_reaches_the_admin_routes() {
         connector_manager: None,
         sql_contexts,
         auth_state: Some(auth_state.clone()),
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -434,11 +450,13 @@ async fn a_namespace_bound_admin_key_reaches_the_admin_routes() {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
     let metrics_handle = chronixd::server::prometheus_builder()
         .expect("bucket config")
@@ -656,8 +674,6 @@ async fn a_permissive_policy_does_not_grant_the_admin_capability() {
         connector_manager: None,
         sql_contexts,
         auth_state: Some(auth_state.clone()),
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -666,11 +682,13 @@ async fn a_permissive_policy_does_not_grant_the_admin_capability() {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
     let metrics_handle = chronixd::server::prometheus_builder()
         .expect("bucket config")
@@ -723,15 +741,15 @@ fn every_action_is_issued_by_some_surface() {
     const NAMESPACE: &str = include_str!("../../src/namespace.rs");
     const GRPC: &str = include_str!("../../src/grpc.rs");
     const FLIGHT: &str = include_str!("../../src/flight.rs");
+    // The cluster capabilities are issued by the cluster binary's routes.
+    const CLUSTER: &str = include_str!("../../../chronixd-cluster/src/lib.rs");
 
     let mut unissued = Vec::new();
     for action in ChronixAction::ALL {
         let needle = format!("ChronixAction::{}", action.name());
-        let issued = [SERVER, NAMESPACE, GRPC, FLIGHT]
+        let issued = [SERVER, NAMESPACE, GRPC, FLIGHT, CLUSTER]
             .iter()
             .any(|src| src.contains(&needle));
-        // The cluster capabilities are behind `--features cluster`; their
-        // route groups are in `server.rs` either way, so the scan sees them.
         if !issued {
             unissued.push(action.name());
         }

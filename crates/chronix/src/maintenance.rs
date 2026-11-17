@@ -119,11 +119,9 @@ fn run(
             maintenance: true,
         };
 
-        // A panic in one pass used to end the thread, and with it every
-        // flush, compaction, rollup and retention pass for the life of the
-        // process. Catching it costs a counter and keeps the *other* passes
-        // running; `AliveGuard` still covers the case where the loop leaves
-        // for a reason this does not catch.
+        // A panic in one pass must not end the thread and with it every
+        // later flush, compaction, rollup and retention pass. `AliveGuard`
+        // covers the loop leaving for any reason this does not catch.
         let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             one_pass(
                 &db,
@@ -178,9 +176,17 @@ fn one_pass(
         if let Err(e) = db.gc() {
             warn!(error = %e, "maintenance: gc failed");
         }
-        // Every configured rule, not only a global one: a database that
-        // sets a retention for one measurement, or a rollup that
-        // declares its own, used to expire nothing whatsoever.
+        // After compaction, which materialises the rollups: a detector may
+        // watch a rollup's target, and it should see this pass's buckets.
+        #[cfg(feature = "analytics")]
+        match db.advance_detectors() {
+            Ok(n) if n > 0 => debug!(verdicts = n, "maintenance: detectors advanced"),
+            Ok(_) => {}
+            Err(crate::error::DbError::Closed) => return true,
+            Err(e) => warn!(error = %e, "maintenance: detector pass failed"),
+        }
+        // Every configured rule, not only a global one: per-measurement
+        // retention and a rollup's own retention are enforced here too.
         if db.has_retention_rules() {
             match db.enforce_configured_retention() {
                 Ok(r) if r.segments_deleted > 0 => {
@@ -361,8 +367,7 @@ mod tests {
         db.close().unwrap();
     }
 
-    /// The configured retention is enforced by the background pass — the
-    /// only pass there is. It used to be enforced by nothing.
+    /// The configured retention is enforced by the background pass.
     #[test]
     fn the_configured_retention_is_enforced_by_the_thread() {
         let tmp = TempDir::new().unwrap();

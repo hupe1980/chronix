@@ -5,31 +5,17 @@
 //!
 //! # One fetch, one conversion
 //!
-//! Both selectors need the same three things — a scan over a window, a
-//! conversion of Arrow batches into labelled samples, and a window filter —
-//! and they differ only in which window they ask for and how much of it they
-//! keep. They therefore share [`fetch_scan`](PromQLEvaluator::fetch_scan) and
-//! [`collect_series`]; two copies of a hundred lines of batch decoding is
-//! exactly the shape of divergence that has produced wrong answers here
-//! before.
+//! Instant and range selectors share [`fetch_scan`](PromQLEvaluator::fetch_scan)
+//! and [`collect_series`]; they differ only in the window they ask for and how
+//! much of it they keep.
 //!
 //! # One metric, one field
 //!
 //! A selector names a *metric*, and a metric is one `(measurement, field)`
-//! pair — [`crate::promql::metric`] owns that mapping and is the only place
-//! that knows it. A selector that names nothing storable resolves to no
-//! targets and evaluates to an empty vector, which is what PromQL expects of
-//! an unknown metric.
-//!
-//! The scheme this replaced named a series after its *measurement* when the
-//! measurement held one field and after `measurement_field` when it held
-//! more. Three things followed, and all three were wrong: writing a second
-//! field renamed the first one's whole history; the `measurement_field` names
-//! a query returned could not be typed back in, because a `__name__` matcher
-//! only ever resolved a measurement; and a bare measurement selector produced
-//! one series per field with identical labels, so `sum(cpu)` added a
-//! percentage to a load average and `rate(cpu[5m])` returned a vector holding
-//! duplicate label sets — which PromQL cannot represent.
+//! pair — [`crate::promql::metric`] owns that mapping. A selector that names
+//! nothing storable resolves to no targets and evaluates to an empty vector,
+//! as PromQL expects of an unknown metric. Every returned name can be typed
+//! back into a query, and one label set is one series.
 //!
 //! # Window boundaries
 //!
@@ -45,7 +31,8 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 
 use crate::promql::ast::{
-    AtModifier, Duration, Expr, LabelMatcher, MatchOp, PromQLValue, Sample, Series,
+    AtModifier, DurationExpr, Expr, LabelMatcher, MatchOp, PromQLValue, RangeModifier, Sample,
+    Series,
 };
 use crate::promql::metric::{self, ClassicView, MetricRef};
 
@@ -270,19 +257,28 @@ impl PromQLEvaluator {
         &self,
         name: &Option<String>,
         matchers: &[LabelMatcher],
-        offset: &Option<Duration>,
+        offset: Option<&DurationExpr>,
         at: Option<AtModifier>,
+        smoothed: bool,
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
         let targets = self.resolve_targets(name, matchers)?;
-        let offset_ns = offset.map_or(0, |d| d.as_nanos());
+        let offset_ns = offset.map_or(0, DurationExpr::as_nanos);
         let eval_time = pinned_eval_time(params, at).saturating_sub(offset_ns);
         let lookback_start = eval_time - params.lookback_delta;
+        // `smoothed` interpolates between the samples either side of the
+        // evaluation time, so it also reads one lookback past it.
+        let (right_reach, window_end) = if smoothed {
+            (params.lookback_delta, eval_time + params.lookback_delta)
+        } else {
+            (0, eval_time)
+        };
 
         let fetch = fetch_window(
             params,
             offset_ns,
             params.lookback_delta,
+            right_reach,
             lookback_start,
             eval_time,
             at.is_some(),
@@ -296,9 +292,28 @@ impl PromQLEvaluator {
                 matchers,
                 &post_filters,
                 fetch,
-                (lookback_start, eval_time),
+                (lookback_start, window_end),
                 params.deadline,
             )?;
+            if smoothed {
+                for (labels, samples) in series_map {
+                    if !samples.histograms.is_empty() {
+                        return Err(EvalError(
+                            "smoothed modifier is not supported with histograms".into(),
+                        ));
+                    }
+                    if let Some(value) = super::extended::smoothed_at(&samples.floats, eval_time) {
+                        result.push(Series::floats(
+                            labels,
+                            vec![Sample {
+                                timestamp: params.time,
+                                value,
+                            }],
+                        ));
+                    }
+                }
+                continue;
+            }
             // An instant vector is the newest sample in the lookback window.
             result.extend(
                 series_map
@@ -310,56 +325,127 @@ impl PromQLEvaluator {
         Ok(PromQLValue::Vector(result))
     }
 
-    #[allow(clippy::trivially_copy_pass_by_ref)] // &Duration keeps call sites uniform
+    /// A range selector evaluated on its own: `m[5m]`, `m[5m] anchored`.
     pub(crate) fn eval_matrix_selector(
         &self,
         vector: &Expr,
-        range: &Duration,
+        range: &DurationExpr,
+        modifier: Option<RangeModifier>,
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
+        let window = self.read_range(vector, range, modifier, params)?;
+        let Some(modifier) = modifier else {
+            return Ok(PromQLValue::Matrix(window.series));
+        };
+        let smoothed = modifier == RangeModifier::Smoothed;
+        let mut out = Vec::with_capacity(window.series.len());
+        for s in window.series {
+            if s.is_histogram() {
+                return Err(EvalError(format!(
+                    "{} modifier is not supported with histograms",
+                    modifier_name(modifier)
+                )));
+            }
+            let samples = super::extended::extend_floats(
+                &s.samples,
+                window.range_start,
+                window.range_end,
+                smoothed,
+            );
+            if !samples.is_empty() {
+                out.push(Series::floats(s.labels, samples));
+            }
+        }
+        Ok(PromQLValue::Matrix(out))
+    }
+
+    /// The samples a range selector reads: `(range_start, range_end]`, widened
+    /// by one lookback to the left for `anchored` and `smoothed`, and to the
+    /// right for `smoothed` — the raw input of upstream's extended functions.
+    pub(crate) fn read_range(
+        &self,
+        vector: &Expr,
+        range: &DurationExpr,
+        modifier: Option<RangeModifier>,
+        params: &QueryParams,
+    ) -> Result<RangeWindow, EvalError> {
         let Expr::VectorSelector {
             name,
             matchers,
             offset,
             at,
+            smoothed: _,
         } = vector
         else {
             return Err(EvalError("matrix selector requires vector selector".into()));
         };
 
         let targets = self.resolve_targets(name, matchers)?;
-        let offset_ns = offset.map_or(0, |d| d.as_nanos());
+        let offset_ns = offset.as_ref().map_or(0, DurationExpr::as_nanos);
         let eval_time = pinned_eval_time(params, *at).saturating_sub(offset_ns);
-        let range_start = eval_time - range.as_nanos();
+        let range_ns = range.as_nanos();
+        let range_start = eval_time - range_ns;
+        let lookback = params.lookback_delta;
+        let (left_extra, right_extra) = match modifier {
+            None => (0, 0),
+            Some(RangeModifier::Anchored) => (lookback, 0),
+            Some(RangeModifier::Smoothed) => (lookback, lookback),
+        };
 
         let fetch = fetch_window(
             params,
             offset_ns,
-            range.as_nanos(),
-            range_start,
+            range_ns + left_extra,
+            right_extra,
+            range_start - left_extra,
             eval_time,
             at.is_some(),
         );
         let post_filters = compile_post_filters(matchers)?;
 
-        let mut result = Vec::new();
+        let mut series = Vec::new();
         for target in &targets {
             let series_map = self.read_metric(
                 target,
                 matchers,
                 &post_filters,
                 fetch,
-                (range_start, eval_time),
+                (range_start - left_extra, eval_time + right_extra),
                 params.deadline,
             )?;
-            result.extend(
+            series.extend(
                 series_map
                     .into_iter()
                     .map(|(labels, samples)| samples.all(labels)),
             );
         }
 
-        Ok(PromQLValue::Matrix(result))
+        Ok(RangeWindow {
+            series,
+            range_start,
+            range_end: eval_time,
+            range_secs: range.as_secs(),
+        })
+    }
+}
+
+/// What [`PromQLEvaluator::read_range`] read, with the range it is about.
+pub(crate) struct RangeWindow {
+    /// Every series, its samples sorted by time.
+    pub(crate) series: Vec<Series>,
+    /// The range's start (exclusive), after `offset` and `@`.
+    pub(crate) range_start: i64,
+    /// The range's end (inclusive), after `offset` and `@`.
+    pub(crate) range_end: i64,
+    /// The range's length in seconds.
+    pub(crate) range_secs: f64,
+}
+
+/// `anchored` or `smoothed`, as upstream spells it in messages.
+pub(crate) fn modifier_name(m: RangeModifier) -> &'static str {
+    match m {
+        RangeModifier::Anchored => "anchored",
+        RangeModifier::Smoothed => "smoothed",
     }
 }
 
@@ -383,16 +469,18 @@ fn fetch_window(
     params: &QueryParams,
     offset_ns: i64,
     reach_ns: i64,
+    right_reach_ns: i64,
     window_start: i64,
     eval_time: i64,
     pinned: bool,
 ) -> (i64, i64) {
+    let eval_end = eval_time.saturating_add(right_reach_ns);
     // A selector pinned with `@` reads one fixed window whatever the step, and
     // that window is usually *outside* the range query's prefetch span — so
     // widening to the prefetch window would miss the data entirely. Its own
     // window is also the cheapest scan available, since it is read once.
     if pinned {
-        return (window_start, eval_time.saturating_add(1));
+        return (window_start, eval_end.saturating_add(1));
     }
     match (params.range_fetch_start, params.range_fetch_end) {
         // `range_fetch_start` is `query_start - lookback_delta`; recover the
@@ -403,10 +491,12 @@ fn fetch_window(
                 query_start
                     .saturating_sub(reach_ns)
                     .saturating_sub(offset_ns),
-                re.saturating_sub(offset_ns).saturating_add(1),
+                re.saturating_sub(offset_ns)
+                    .saturating_add(right_reach_ns)
+                    .saturating_add(1),
             )
         }
-        _ => (window_start, eval_time + 1),
+        _ => (window_start, eval_end.saturating_add(1)),
     }
 }
 

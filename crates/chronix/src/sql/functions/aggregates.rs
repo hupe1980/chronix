@@ -287,28 +287,15 @@ impl AggregateUDFImpl for RateUdaf {
 ///
 /// # Why this buffers instead of folding
 ///
-/// `rate` is **order-dependent**: the counter-reset rule ("a drop means the
-/// counter restarted, so the new value *is* the increase") is defined over
-/// *adjacent* samples in time. Two earlier designs tried to summarise a
-/// partition into a fixed-size state and both were wrong:
-///
-/// - folding each incoming state on arrival skipped the boundary between the
-///   last partial of one `merge_batch` call and the first of the next, so
-///   `rate()` came back low by exactly that increase;
-/// - keeping the partials and concatenating them in `first_time` order is
-///   correct only if the runs are **disjoint**. They are not. DataFusion puts
-///   a `RoundRobinBatch(N)` repartition below the partial aggregate, so with
-///   more than `N` scan batches a partition receives batches 0, N, 2N… — its
-///   run spans the whole range with holes in it, and every other partition's
-///   run overlaps it. Concatenating two interleaved runs reads the second
-///   run's first value as a counter reset. Measured on a perfect 1 sample/s
-///   counter over 40 batches: `rate()` returned **13.5** where the answer is
-///   1.0.
-///
-/// No fixed-size summary can be right, because reconstructing adjacency needs
-/// the samples. So the samples are kept and sorted once, at `evaluate` —
-/// which is what the forecast aggregates in this module already do, and is
-/// why `size()` reports the buffer to DataFusion's memory pool.
+/// `rate` is order-dependent: the counter-reset rule ("a drop means the
+/// counter restarted, so the new value is the increase") is defined over
+/// adjacent samples in time. DataFusion repartitions round-robin below the
+/// partial aggregate, so one partition's batches are interleaved with every
+/// other partition's, and no fixed-size summary can reconstruct adjacency:
+/// concatenating two interleaved runs reads a run's first value as a reset.
+/// The samples are kept and sorted once, at `evaluate`, as the forecast
+/// aggregates here do, and `size()` reports the buffer to DataFusion's memory
+/// pool.
 #[derive(Debug, Default)]
 struct RateAccumulator {
     timestamps: Vec<i64>,
@@ -959,13 +946,18 @@ impl AggregateUDFImpl for MultivariateForecastUdaf {
 pub(super) struct AutoForecastUdaf {
     signature: Signature,
     limits: super::ForecastLimits,
+    executor: crate::db::exec::ExecHandle,
 }
 
 impl AutoForecastUdaf {
-    pub(super) fn new(limits: super::ForecastLimits) -> Self {
+    pub(super) fn new(
+        limits: super::ForecastLimits,
+        executor: crate::db::exec::ExecHandle,
+    ) -> Self {
         Self {
             signature: Signature::new(TypeSignature::Any(3), Volatility::Volatile),
             limits,
+            executor,
         }
     }
 }
@@ -984,10 +976,9 @@ impl AggregateUDFImpl for AutoForecastUdaf {
     }
 
     fn accumulator(&self, _acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
-        Ok(Box::new(SeriesAccumulator::new(
-            ForecastKind::Auto,
-            self.limits,
-        )))
+        let mut acc = SeriesAccumulator::new(ForecastKind::Auto, self.limits);
+        acc.executor = Some(self.executor.clone());
+        Ok(Box::new(acc))
     }
 
     fn state_fields(&self, _args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
@@ -1017,6 +1008,9 @@ struct SeriesAccumulator {
     covariates: Vec<f64>,
     horizon: usize,
     limits: super::ForecastLimits,
+    /// Where `auto_forecast`'s model search runs; `None` means the caller's
+    /// current rayon context.
+    executor: Option<crate::db::exec::ExecHandle>,
 }
 
 impl SeriesAccumulator {
@@ -1028,6 +1022,7 @@ impl SeriesAccumulator {
             covariates: Vec::new(),
             horizon: 0,
             limits,
+            executor: None,
         }
     }
 
@@ -1164,11 +1159,14 @@ impl SeriesAccumulator {
                         "auto_forecast: need at least 8 non-null rows".into(),
                     ));
                 }
-                let chosen =
-                    auto_forecast(&ts, &values, self.horizon, &AutoForecastOptions::default())
-                        .map_err(|e| {
-                            datafusion::common::DataFusionError::Execution(e.to_string())
-                        })?;
+                let horizon = self.horizon;
+                let search =
+                    || auto_forecast(&ts, &values, horizon, &AutoForecastOptions::default());
+                let chosen = match &self.executor {
+                    Some(exec) => exec.0.run(search),
+                    None => search(),
+                }
+                .map_err(|e| datafusion::common::DataFusionError::Execution(e.to_string()))?;
                 Ok(chosen.result.values)
             }
             ForecastKind::Multivariate => {

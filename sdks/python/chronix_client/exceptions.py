@@ -21,6 +21,10 @@ class ChronixError(Exception):
             ``CARDINALITY_EXCEEDED``, …), or ``None`` for a transport failure.
         retry_after: Seconds the server asked the client to wait, from the
             ``Retry-After`` header, or ``None`` when it did not say.
+        hint: What the request probably meant, e.g.
+            ``did you mean "cpu_usage"?``, or ``None``.
+        span: ``(start, end)`` byte offsets into the query as sent —
+            ``query[start:end]`` is the text the error is about — or ``None``.
     """
 
     def __init__(
@@ -30,11 +34,15 @@ class ChronixError(Exception):
         status_code: int | None = None,
         code: str | None = None,
         retry_after: float | None = None,
+        hint: str | None = None,
+        span: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.retry_after = retry_after
+        self.hint = hint
+        self.span = span
 
     @property
     def retryable(self) -> bool:
@@ -68,6 +76,8 @@ class QueryError(ChronixError):
 class BackpressureError(ChronixError):
     """The server is temporarily unable to accept the request.
 
+    ``429 RATE_LIMITED`` / ``NAMESPACE_RATE_LIMITED`` (a request or ingest rate
+    is spent),
     ``503 BACKPRESSURE`` (the memtable is at capacity and the flush that
     clears it is already running), ``503 OVERLOADED`` (a condition that needs
     an operator), ``503 DATABASE_CLOSED`` (the server is shutting down) and

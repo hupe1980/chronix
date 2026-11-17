@@ -96,11 +96,21 @@ impl SegmentStamp {
         let mut buf = [0u8; crate::segment::header::HEADER_SIZE];
         let mut file = std::fs::File::open(segment_path)?;
         file.read_exact(&mut buf)?;
-        let header = crate::segment::header::SegmentHeader::from_bytes(&buf).map_err(|e| {
-            IndexError::Corrupt {
-                detail: format!("segment header: {e}"),
-            }
-        })?;
+        // A header from another format generation is a version mismatch,
+        // not corruption — the rule `crate::format` exists for. Mapping every
+        // header error to `Corrupt` sent an operator who had just upgraded
+        // looking for a failing disk.
+        let header =
+            crate::segment::header::SegmentHeader::from_bytes(&buf).map_err(|e| match e {
+                crate::segment::SegmentError::UnsupportedVersion { .. } => {
+                    IndexError::UnsupportedVersion {
+                        detail: e.to_string(),
+                    }
+                }
+                other => IndexError::Corrupt {
+                    detail: format!("segment header: {other}"),
+                },
+            })?;
         Ok(Self::of(&header))
     }
 }

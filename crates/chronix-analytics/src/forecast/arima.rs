@@ -2,37 +2,25 @@
 //!
 //! # Estimation
 //!
-//! Both models are estimated by **conditional sum of squares** (CSS), the
-//! standard fast alternative to full maximum likelihood:
+//! Both are estimated by **conditional sum of squares** (CSS), the standard
+//! fast alternative to full maximum likelihood:
 //!
 //! 1. The series is differenced — seasonally first (`D` times at lag `m`),
 //!    then regularly (`d` times).
-//! 2. The autoregressive part is **seeded** by the Burg algorithm, which
-//!    always returns a stable AR polynomial and behaves well on short series.
-//! 3. Every block is then refined **together** by minimising the sum of
-//!    squared one-step innovations — φ and θ for `ArimaModel`, φ, Φ, θ and Θ
-//!    for `SarimaModel`. Jointly, because the blocks interact: the seasonal
-//!    and non-seasonal AR parts multiply, and an MA term drags the lag-1
-//!    autocorrelation away from φ, so a Burg AR fitted to mixed data answers
-//!    a different number and an MA optimised against it fits the residue of
-//!    the wrong model. `ArimaModel` used to do exactly that and returned
-//!    φ = 0.22, θ = -0.02 on 2 000 points of an ARMA(1,1) whose maximum
-//!    likelihood is 0.571 and -0.367.
-//! 4. The search runs over **unconstrained** reals, mapped to coefficients by
-//!    the Jones (1980) reparameterisation: `tanh` gives partial
-//!    autocorrelations in `(-1, 1)`, and the Levinson–Durbin recursion turns
-//!    those into a polynomial whose roots lie outside the unit circle for any
-//!    order. Stationarity and invertibility therefore hold **by
-//!    construction** rather than by a box on each coefficient, which is
-//!    neither sufficient (`φ = (0.99, 0.012)` has a root at 0.9985) nor
-//!    necessary (`φ = (1.2, -0.4)` is an ordinary stationary AR(2) outside
-//!    it).
+//! 2. The autoregressive part is seeded by the Burg algorithm, which always
+//!    returns a stable AR polynomial and behaves well on short series.
+//! 3. Every block is refined **together** by minimising the sum of squared
+//!    one-step innovations. Jointly, because the blocks interact: an MA term
+//!    drags the lag-1 autocorrelation away from φ, so fitting the MA against a
+//!    fixed Burg AR fits the residue of the wrong model.
+//! 4. The search runs over unconstrained reals mapped to coefficients by the
+//!    Jones (1980) reparameterisation — `tanh` to partial autocorrelations in
+//!    `(-1, 1)`, then Levinson–Durbin — so stationarity and invertibility hold
+//!    by construction for any order.
 //!
-//! The first `max(deg φ*, deg θ*)` innovations are **conditioned away**: they
-//! are computed from pre-sample history the model does not have, and for
-//! `ARIMA(p,0,q)` the first of them is the raw first observation, so counting
-//! them would make the residual variance measure the series' level rather than
-//! its noise. That is what "conditional" in CSS means.
+//! The first `max(deg φ*, deg θ*)` innovations are conditioned away: they need
+//! pre-sample history the model does not have, and counting them would make
+//! the residual variance measure the series' level rather than its noise.
 //!
 //! # Seasonality
 //!
@@ -42,10 +30,9 @@
 //! φ(B)·Φ(Bᵐ)·(1-B)ᵈ·(1-Bᵐ)ᴰ·xₜ = θ(B)·Θ(Bᵐ)·εₜ
 //! ```
 //!
-//! into a single AR polynomial of degree `p + P·m` and a single MA polynomial
-//! of degree `q + Q·m`, then runs the ordinary ARMA recursion over them. One
-//! recursion and one forecast path, so the seasonal orders reach the forecast
-//! by construction.
+//! into one AR polynomial of degree `p + P·m` and one MA polynomial of degree
+//! `q + Q·m`, then runs the ordinary ARMA recursion over them, so the seasonal
+//! orders reach the forecast by construction.
 
 use crate::forecast::error::ForecastError;
 use crate::forecast::result::{ForecastResult, ModelParams, ModelType};
@@ -356,25 +343,15 @@ fn constrain_invertible(unconstrained: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// Minimise the conditional sum of squares over **every** AR and MA block at
+/// Minimise the conditional sum of squares over every AR and MA block at
 /// once, and return the parameter vector.
 ///
 /// `expand` maps a parameter vector to the `(AR, MA)` polynomials the
 /// innovations recursion runs over: the identity for ARIMA, the
 /// multiplicative expansion for SARIMA. Brent below two parameters,
-/// Nelder–Mead above, over the unconstrained parameters.
-///
-/// **Jointly is the whole point.** `ArimaModel` used to fix the AR part at its
-/// Burg estimate and optimise only the MA coefficients against it, and a Burg
-/// AR fitted to mixed ARMA data is biased — the moving-average term drags the
-/// lag-1 autocorrelation away from φ, so Burg answers a different number and
-/// the MA search then fits the residue of the wrong model. On 2 000 points of
-/// `x = 0.6x[t-1] + e - 0.4e[t-1]` it returned φ = 0.22, θ = -0.02 where
-/// `SarimaModel` — the sibling, which had always optimised its blocks
-/// together — returned 0.571 and -0.367, matching statsmodels' maximum
-/// likelihood to four decimals. Pure AR and pure MA were unaffected, which is
-/// why the defect survived: the two orders anybody tests by hand are the two
-/// that have nothing to interact with.
+/// Nelder–Mead above, over the unconstrained parameters. Joint estimation
+/// matches statsmodels' maximum likelihood to four decimals on mixed
+/// ARMA data, where a fixed Burg AR is biased.
 fn minimise_css<F>(w: &[f64], x0: &[f64], expand: F) -> Vec<f64>
 where
     F: Fn(&[f64]) -> (Vec<f64>, Vec<f64>),
@@ -1552,16 +1529,16 @@ pub fn auto_arima(
 
     let (order, best, mut candidates, evals) = match opts.strategy {
         SearchStrategy::Exhaustive => {
-            use rayon::prelude::*;
             let grid: Vec<(usize, usize)> = (0..=max_p)
                 .flat_map(|p| (0..=max_q).map(move |q| (p, q)))
                 .filter(|&(p, q)| p + q > 0)
                 .take(max_evals)
                 .collect();
-            let found: Vec<(usize, usize, usize, f64)> = grid
-                .par_iter()
-                .filter_map(|&(p, q)| score(p, q).map(|a| (p, d, q, a)))
-                .collect();
+            let found: Vec<(usize, usize, usize, f64)> =
+                crate::par::map(&grid, |&(p, q)| score(p, q).map(|a| (p, d, q, a)))
+                    .into_iter()
+                    .flatten()
+                    .collect();
             let evals = found.len();
             let best = found
                 .iter()
@@ -2384,17 +2361,8 @@ mod tests {
 
     #[test]
     fn a_stochastic_seasonal_level_is_differenced() {
-        // Each season's level is a random walk across cycles, so the series
-        // has a seasonal unit root and `D = 1` is the textbook answer.
-        //
-        // This used to assert `0`, under the name "the strength measure is
-        // blind to a stochastic seasonal level", with a note asking whoever
-        // saw it change to check which test was being used before calling it
-        // an improvement. It was not the measure that changed: the STL under
-        // it padded the low-pass filter by repeating the first and last
-        // cycle, which is right only for a series that is already periodic,
-        // and a seasonal level that wanders is exactly the series that is
-        // not.
+        // Each season's level is a random walk across cycles, so the series has a
+        // seasonal unit root and `D = 1` is the textbook answer.
         let m = 24usize;
         let mut values = vec![0.0f64; 12 * m];
         let mut season_level = vec![0.0f64; m];

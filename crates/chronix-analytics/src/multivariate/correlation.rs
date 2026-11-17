@@ -40,23 +40,15 @@ impl CorrelationMethod for PearsonCorrelation {
 impl PearsonCorrelation {
     /// Compute Pearson correlation between two equal-length slices.
     ///
-    /// `NaN` pairs are deleted pairwise — `rolling_corr` does the same within
-    /// each window. When either series has **zero variance** the correlation
-    /// is undefined and the result is `NaN`, not `0.0`: `0.0` asserts "these
-    /// series are uncorrelated" where the truth is "there is nothing to
-    /// correlate", and a caller acts on the first.
-    ///
-    /// That sentence used to claim `rolling_corr` shared this convention
-    /// while `rolling_corr` folded a `NaN` into a sliding accumulator and
-    /// nulled the rest of its partition. A doc comment asserting that two
-    /// implementations agree is worth a test that they do; see
-    /// `chronix/tests/analytics_null_semantics.rs`.
+    /// `NaN` pairs are deleted pairwise, as `rolling_corr` does within each
+    /// window. When either series has zero variance the correlation is undefined
+    /// and the result is `NaN`, not `0.0`: `0.0` would assert "uncorrelated" where
+    /// the truth is "nothing to correlate".
     ///
     /// # Errors
     ///
     /// [`MultivariateError::DimensionMismatch`] on unequal lengths, and
-    /// [`MultivariateError::InsufficientData`] with fewer than two usable
-    /// pairs.
+    /// [`MultivariateError::InsufficientData`] with fewer than two usable pairs.
     pub fn compute(x: &[f64], y: &[f64]) -> Result<f64, MultivariateError> {
         if x.len() != y.len() {
             return Err(MultivariateError::DimensionMismatch {
@@ -361,21 +353,8 @@ impl RollingCorrelation {
                     .sum();
             }
 
-            // Emit NaN until the window is full, and for an
-            // undefined correlation.
-            //
-            // This function previously reported a value computed from a
-            // *partial* window for the first `window - 1` rows, and `0.0`
-            // when either series had zero variance. Both are wrong and they
-            // disagreed with `preprocess::rolling_corr`, which returns NaN in
-            // exactly those cases — two functions with the same name and
-            // purpose gave different answers for the same input.
-            //
-            // NaN is also the semantically correct value: `0.0` claims "these
-            // series are uncorrelated" when the truth is "correlation is
-            // undefined here". This matches pandas
-            // `rolling(window).corr()`, whose `min_periods` defaults to the
-            // window size.
+            // Emit NaN until the window is full, and for an undefined correlation —
+            // as `preprocess::rolling_corr` and pandas `rolling(window).corr()` do.
             if i + 1 < self.window {
                 result.push(f64::NAN);
                 continue;

@@ -216,19 +216,10 @@ pub struct MetaSmStore {
 }
 
 /// Raft-level metadata that must be captured atomically for snapshots.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct SmRaftState {
     last_applied_log: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
-}
-
-impl Default for SmRaftState {
-    fn default() -> Self {
-        Self {
-            last_applied_log: None,
-            last_membership: StoredMembership::default(),
-        }
-    }
 }
 
 impl MetaSmStore {

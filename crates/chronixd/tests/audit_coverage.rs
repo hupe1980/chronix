@@ -27,26 +27,37 @@ use chronix_security::audit::AuditAction;
 /// be undone. An embedded consumer with an erasure obligation records its own
 /// successes through the public `AuditLogger`, which is what
 /// `examples/audit_logging.rs` shows.
-const SOURCES: &[(&str, &str)] = &[
-    ("chronixd", include_str!("../src/auth.rs")),
-    ("chronixd", include_str!("../src/admin.rs")),
-    ("chronixd", include_str!("../src/namespace.rs")),
-    ("chronixd", include_str!("../src/server.rs")),
-    ("chronixd", include_str!("../src/http/management.rs")),
-    ("chronixd", include_str!("../src/http/triggers.rs")),
-    ("chronix", include_str!("../../chronix/src/pipeline.rs")),
-    (
-        "example",
-        include_str!("../../chronix/examples/audit_logging.rs"),
-    ),
-];
+fn sources() -> Vec<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Every chronixd source file, read at run time: this was a list of six,
+    // and a producer in a seventh (`http/detectors.rs`) was invisible.
+    let mut out = Vec::new();
+    let mut stack = vec![root.join("src")];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)
+            .expect("readable source dir")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(std::fs::read_to_string(&path).expect("readable source"));
+            }
+        }
+    }
+    out.push(include_str!("../../chronix/src/pipeline.rs").to_string());
+    out.push(include_str!("../../chronix/examples/audit_logging.rs").to_string());
+    out
+}
 
 #[test]
 fn every_audit_action_has_a_producer() {
+    let sources = sources();
     let mut unproduced = Vec::new();
     for action in AuditAction::ALL {
         let needle = format!("AuditAction::{action:?}");
-        let produced = SOURCES.iter().any(|(_, src)| src.contains(&needle));
+        let produced = sources.iter().any(|src| src.contains(&needle));
         if !produced {
             unproduced.push(format!("{action:?}"));
         }
@@ -63,10 +74,11 @@ fn every_audit_action_has_a_producer() {
 /// the first of them. `Deny` must appear.
 #[test]
 fn a_refusal_is_recorded_somewhere() {
-    let denials = SOURCES
+    // The last two sources are the embedded crate and its example.
+    let all = sources();
+    let denials = all[..all.len() - 2]
         .iter()
-        .filter(|(origin, _)| *origin == "chronixd")
-        .filter(|(_, src)| src.contains("AuditDecision::Deny"))
+        .filter(|src| src.contains("AuditDecision::Deny"))
         .count();
     assert!(
         denials >= 2,

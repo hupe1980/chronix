@@ -110,10 +110,8 @@ pub struct RollupBuilder {
     timezone: Option<String>,
     origin: Option<String>,
     /// Set by [`RollupBuilder::bucket`], which supplies a bucket that is
-    /// already complete. It takes precedence over the three strings above:
-    /// decomposing it into `width` + `timezone` and re-parsing used to drop
-    /// its origin, so a tier declared through a protocol handler silently
-    /// bucketed from the 1st however the caller had asked.
+    /// already complete. It takes precedence over the three strings above,
+    /// so its origin is never lost to a re-parse.
     bucket: Option<TimeBucket>,
     aggregations: Vec<RollupAggFn>,
     group_by_tags: Vec<String>,
@@ -957,11 +955,14 @@ impl<'a> RollupAccumulator<'a> {
 
         let schema = batch.schema();
         // Every numeric field, not just `Float64`: an integer meter reading
-        // is exactly the thing a rollup exists for, and skipping it used to
-        // produce no rollup, no error, and then a retention pass that
-        // dropped the raw data anyway.
+        // is exactly what a rollup is for, and retention will drop the raw
+        // data whether or not the tier holds it.
         for f in schema.fields() {
+            // The start timestamp is not a value: a bucket has no single
+            // start (a reset inside it would be later than the bucket's own
+            // timestamp), so a rollup carries none rather than inventing one.
             let is_candidate = f.name() != chronix_core::TIME_COLUMN
+                && f.name() != chronix_core::START_COLUMN
                 && f.name() != "series_key_hash"
                 && !self.config.group_by_tags.contains(f.name())
                 && f.metadata().get("role").map(String::as_str) != Some("tag");
@@ -986,6 +987,7 @@ impl<'a> RollupAccumulator<'a> {
             .enumerate()
             .filter(|(_, f)| {
                 f.name() != chronix_core::TIME_COLUMN
+                    && f.name() != chronix_core::START_COLUMN
                     && f.name() != "series_key_hash"
                     && !self.config.group_by_tags.contains(f.name())
                     && matches!(
@@ -1301,11 +1303,8 @@ pub fn record_batch_to_points(
 /// A thin wrapper over [`chronix_query::points_to_record_batch`] that keeps
 /// the `Option` shape the rollup materialiser expects: `None` for no points.
 ///
-/// It used to be a second implementation, and the two had drifted: this one
-/// built every field column as `Float64` and stamped no role metadata, so a
-/// rollup whose target held anything else — a string field, a count, an
-/// exact decimal — wrote a column of nulls where the values should have
-/// been. One conversion, one set of types.
+/// One conversion for the whole crate, so a rollup keeps every column type
+/// and its role metadata.
 #[must_use]
 pub fn points_to_record_batch(
     points: &[chronix_core::Point],

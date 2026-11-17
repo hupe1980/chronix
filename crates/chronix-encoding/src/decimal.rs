@@ -2,11 +2,8 @@
 //!
 //! A decimal column stores `mantissa × 10⁻ˢᶜᵃˡᵉ` with the scale held once in
 //! the column's metadata, so what reaches this codec is a column of plain
-//! integers. That is the whole argument for the type: the README's
-//! compression section already observes that most float columns are decimals
-//! that went through an `f64`, and that ALP and pco spend their first stage
-//! *recovering* the integer. A decimal column hands that integer over
-//! directly — nothing to recover, nothing lost recovering it.
+//! integers — the integer that ALP and pco would otherwise have to recover
+//! from an `f64`.
 //!
 //! # Two physical forms
 //!

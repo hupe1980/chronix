@@ -42,12 +42,9 @@ pub struct AuthContext {
     pub admin: bool,
     /// Cedar roles this credential carries, as `Chronix::Role` memberships.
     ///
-    /// Resolved **once**, here, from whichever credential authenticated —
-    /// a key's `roles` list or the JWT claim named by `auth.jwt.role_claim`.
-    /// They used to be re-derived inside the administrative gate alone, so
-    /// the same role granted an admin operation and matched nothing in a
-    /// namespace policy, and an API key had no roles at all: every policy in
-    /// the documentation is written `principal in Chronix::Role::"…"`.
+    /// Resolved once, here, from whichever credential authenticated — a key's
+    /// `roles` list or the JWT claim named by `auth.jwt.role_claim` — so an
+    /// administrative gate and a namespace policy see the same roles.
     pub roles: Vec<String>,
     /// Namespaces this credential may act in; empty means unrestricted.
     ///

@@ -23,10 +23,10 @@ use chronix::prelude::*;
 
 /// The Prometheus release this surface is stated against.
 ///
-/// Bump it only after re-reading that release's changelog for new functions,
-/// and record what was found even when the answer is "nothing" — the point of
-/// the obligation is that "we looked" is a result.
-const CONFORMS_TO: &str = "3.14";
+/// Bump it only after re-reading that release's changelog, re-vendoring the
+/// upstream test files under `tests/promqltest/`, and re-sorting every entry
+/// below. Re-read 2026-11-17 against 3.16.0, the current release.
+const CONFORMS_TO: &str = "3.16";
 
 /// Functions chronix implements, grouped as upstream documents them.
 const IMPLEMENTED: &[&str] = &[
@@ -49,10 +49,9 @@ const IMPLEMENTED: &[&str] = &[
     "stddev_over_time",
     "stdvar_over_time",
     "last_over_time",
+    "first_over_time",
     "present_over_time",
     "absent_over_time",
-    "mad_over_time",
-    "double_exponential_smoothing",
     // instant-vector and scalar
     "abs",
     "absent",
@@ -93,8 +92,6 @@ const IMPLEMENTED: &[&str] = &[
     "label_replace",
     "sort",
     "sort_desc",
-    "sort_by_label",
-    "sort_by_label_desc",
     // histograms — classic `le` buckets and native, dispatched on whether
     // the series carries histogram samples
     "histogram_quantile",
@@ -134,16 +131,55 @@ const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("ts_of_max_over_time", "experimental upstream"),
     ("ts_of_last_over_time", "experimental upstream"),
     ("ts_of_first_over_time", "experimental upstream"),
-    ("first_over_time", "experimental upstream"),
     ("start_timestamp", "experimental upstream"),
-    // Duration functions (3.12) — experimental, and they are expression-level
-    // rather than sample-level, which is a parser change as well.
-    ("start", "experimental upstream"),
-    ("end", "experimental upstream"),
-    ("range", "experimental upstream"),
-    ("step", "experimental upstream"),
-    ("min_of", "experimental upstream"),
-    ("max_of", "experimental upstream"),
+    ("integral", "experimental upstream"),
+    // As scalar functions these are experimental; inside a duration position
+    // (`[...]`, `offset (...)`) they are stable and accepted — see
+    // EXTENDED_SYNTAX.
+    ("start", "experimental upstream as a scalar function"),
+    ("end", "experimental upstream as a scalar function"),
+    (
+        "range",
+        "experimental upstream as a scalar function; accepted inside a duration",
+    ),
+    (
+        "step",
+        "experimental upstream as a scalar function; accepted inside a duration",
+    ),
+    (
+        "min_of",
+        "experimental upstream as a scalar function; accepted inside a duration",
+    ),
+    (
+        "max_of",
+        "experimental upstream as a scalar function; accepted inside a duration",
+    ),
+];
+
+/// Functions chronix implements that upstream still marks experimental at
+/// [`CONFORMS_TO`]. Kept, because removing working, documented functions to
+/// mirror a feature flag breaks dashboards; listed, so the state is visible.
+const IMPLEMENTED_AHEAD_OF_UPSTREAM: &[(&str, &str)] = &[
+    (
+        "double_exponential_smoothing",
+        "experimental upstream at 3.16",
+    ),
+    ("mad_over_time", "experimental upstream at 3.16"),
+    ("sort_by_label", "experimental upstream at 3.16"),
+    ("sort_by_label_desc", "experimental upstream at 3.16"),
+];
+
+/// Syntax that is stable at [`CONFORMS_TO`]: duration expressions (3.14) and
+/// extended range selectors (3.16). Each must parse and evaluate.
+const EXTENDED_SYNTAX: &[&str] = &[
+    "rate(m[5m*2])",
+    "m offset (1h/2)",
+    "m offset 1h / 2",
+    "rate(m[1m] anchored)",
+    "rate(m[1m] smoothed)",
+    "m smoothed",
+    "max_over_time(m[range() + 1m] @ end())",
+    "sum_over_time(m[29s+1s:5s+5s])",
 ];
 
 /// A small database, with the temporary directory that owns it.
@@ -195,6 +231,7 @@ fn call(name: &str) -> String {
         "absent_over_time",
         "mad_over_time",
         "first_over_time",
+        "integral",
         "ts_of_min_over_time",
         "ts_of_max_over_time",
         "ts_of_last_over_time",
@@ -300,4 +337,33 @@ fn the_surface_names_the_version_it_conforms_to() {
         all.len(),
         "a function is either implemented or it is not; one cannot be in both lists"
     );
+}
+
+#[test]
+fn every_function_implemented_ahead_of_upstream_is_accepted() {
+    let (_dir, db) = db();
+    let at = 1_700_000_004_000_000_000;
+    for (name, why) in IMPLEMENTED_AHEAD_OF_UPSTREAM {
+        assert!(!why.is_empty());
+        assert!(
+            !IMPLEMENTED.contains(name) && !NOT_IMPLEMENTED.iter().any(|(n, _)| n == name),
+            "`{name}` belongs to exactly one list"
+        );
+        if let Err(e) = db.promql(&call(name), at) {
+            assert!(
+                !refused_by_name(&e.to_string(), name),
+                "`{name}` is listed as implemented ahead of upstream and was refused: {e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_syntax_stable_at_the_pin_parses_and_evaluates() {
+    let (_dir, db) = db();
+    let at = 1_700_000_004_000_000_000;
+    for query in EXTENDED_SYNTAX {
+        db.promql(query, at)
+            .unwrap_or_else(|e| panic!("`{query}` is stable upstream at {CONFORMS_TO}: {e}"));
+    }
 }

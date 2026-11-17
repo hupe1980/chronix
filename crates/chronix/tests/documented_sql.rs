@@ -75,8 +75,45 @@ fn fixture(dir: &tempfile::TempDir) -> Arc<Chronix> {
             tags! { "device" => "main" },
             fields! { "reading" => "1234.5678".parse::<chronix_core::Decimal>().unwrap() },
             ts,
+        ); // A remote-write counter carrying start timestamps, the shape the
+        // `_start` column is documented with.
+        db.insert(
+            &Point::new(
+                SeriesKey::new("http_requests_total", tags! { "job" => "api" }).unwrap(),
+                fields! { "value" => i as f64 },
+                ts,
+            )
+            .unwrap()
+            .with_start_timestamp(now - 60_000_000_000)
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    // A declared detector's verdicts, produced by the real pass rather than
+    // inserted by hand, so the documented queries meet the shape the engine
+    // writes.
+    db.declare_detector(
+        chronix::detector::DetectorDeclaration::builder("roof_health")
+            .source("pv_ratio", "value")
+            .zscore(4.0)
+            .cusum(1.0, 5.0)
+            .settle(std::time::Duration::ZERO)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    for i in 0..5i64 {
+        insert(
+            "pv_ratio",
+            tags! { "array" => "south" },
+            fields! { "value" => 0.8 + i as f64 * 0.001 },
+            now + i * 60_000_000_000,
         );
     }
+    assert!(
+        db.advance_detectors().unwrap() > 0,
+        "the fixture's detector judged nothing"
+    );
     db
 }
 

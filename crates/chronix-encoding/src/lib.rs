@@ -2,13 +2,14 @@
 //!
 //! Column-oriented encoding and compression for the Chronix time-series database.
 //!
-//! This crate provides type-specific encoders that exploit the statistical
-//! properties of time-series data to achieve high compression ratios:
+//! Type-specific, lossless encoders for time-series columns. Pcodec (pco) is
+//! the default for timestamps and floats; the others compete per block.
 //!
 //! | Column type | Encoder | Typical ratio |
 //! |-------------|---------|---------------|
 //! | Timestamps | [`PcoEncoder`] — mode recovery + delta + binned ANS | 2.7–1092× |
 //! | Timestamps | [`DeltaOfDeltaEncoder`] — delta-of-delta + bit-packing | 0.9–63× |
+//! | Floats | [`PcoEncoder`] — mode recovery + delta + binned ANS | 5–29× |
 //! | Floats | [`AlpEncoder`] — decimal reconstruction + FOR bit-packing | 4–20× |
 //! | Floats | [`ChimpEncoder`] / [`GorillaEncoder`] — XOR-based | 1.3–4× |
 //! | Integers | [`IntegerEncoder`] — delta + ZigZag + bit-packing | 4–16× |

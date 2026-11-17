@@ -1,20 +1,14 @@
 //! ALP — Adaptive Lossless floating-Point compression (SIGMOD 2024).
 //!
 //! Afroozeh, Kuffo & Boncz, *"ALP: Adaptive Lossless floating-Point
-//! Compression"*, Proc. ACM Manag. Data 2(1), SIGMOD 2024. The scheme DuckDB
-//! adopted, and the current state of the art for lossless `f64` columns —
-//! better ratios than Chimp/Patas/Gorilla on real data and an order of
-//! magnitude faster to decode.
+//! Compression"*, Proc. ACM Manag. Data 2(1), SIGMOD 2024. A candidate codec
+//! for `f64` columns; the adaptive selector keeps it where it beats pco.
 //!
 //! # The idea
 //!
-//! XOR-based codecs (Gorilla, Chimp, Patas) treat a double as an opaque bit
-//! pattern and hope consecutive values share a prefix. But most doubles in a
-//! time-series database never had 15 digits of precision to begin with: they
-//! are *decimals* that a sensor, meter or price feed produced with two or
-//! three fractional digits and that IEEE-754 then stored approximately.
-//! `231.45` is not a random 64-bit pattern — it is the integer `23145` with a
-//! known scale.
+//! Most doubles in a time-series database are decimals stored approximately:
+//! `231.45` is the integer `23145` with a known scale, not a random bit
+//! pattern.
 //!
 //! ALP recovers that integer. For a block it picks one exponent pair
 //! `(e, f)` and encodes each value as
@@ -39,14 +33,9 @@
 //!
 //! # Scope
 //!
-//! Only the decimal scheme is implemented. The paper's second scheme,
-//! `ALP_RD`, targets columns of genuinely non-decimal doubles (scientific
-//! measurements, hashes) by splitting the bit pattern into a dictionary-coded
-//! left part and a packed right part. Chronix already has three XOR codecs
-//! that cover exactly that shape, and [`AdaptiveSelector`](crate::AdaptiveSelector)
-//! picks between them by trial encoding — so ALP joins the competition and
-//! loses gracefully on data it is not for, rather than duplicating a fallback
-//! that already exists.
+//! Only the decimal scheme is implemented, not the paper's `ALP_RD` for
+//! non-decimal doubles; the XOR codecs cover that shape, and
+//! [`AdaptiveSelector`](crate::AdaptiveSelector) picks by trial encoding.
 //!
 //! # Wire format
 //!

@@ -25,18 +25,33 @@ use crate::route_scan;
 
 const SERVER_SRC: &str = include_str!("../../src/server.rs");
 
-/// Every module a route handler can live in.
-const HANDLER_SOURCES: &[(&str, &str)] = &[
-    ("management", include_str!("../../src/http/management.rs")),
-    ("query", include_str!("../../src/http/query.rs")),
-    ("write", include_str!("../../src/http/write.rs")),
-    ("prom", include_str!("../../src/http/prom.rs")),
-    ("streaming", include_str!("../../src/http/streaming.rs")),
-    ("triggers", include_str!("../../src/http/triggers.rs")),
-    ("prometheus", include_str!("../../src/wire/prometheus.rs")),
-    ("otlp", include_str!("../../src/wire/otlp.rs")),
-    ("openapi", include_str!("../../src/openapi.rs")),
-];
+/// Every module a route handler can live in: everything under `src/http`
+/// and `src/wire`, and `src/openapi.rs`, read at run time.
+///
+/// This was a list of `include_str!`s, and a handler in a module added after
+/// it was "signature not found" — the guard's scope was the list, not the
+/// tree.
+fn handler_sources() -> Vec<String> {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = vec![std::fs::read_to_string(src.join("openapi.rs")).expect("openapi.rs")];
+    for dir in ["http", "wire"] {
+        let mut stack = vec![src.join(dir)];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d)
+                .expect("readable source dir")
+                .flatten()
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(std::fs::read_to_string(&path).expect("readable source"));
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Handlers that need no namespace, each with the reason.
 ///
@@ -88,13 +103,13 @@ fn quoted(s: &str) -> Option<&str> {
 }
 
 /// The body of `pub async fn <name>(` up to its opening brace.
-fn handler_signature(name: &str) -> Option<&'static str> {
+fn handler_signature(name: &str) -> Option<String> {
     let needle = format!("pub async fn {name}(");
-    for (_, src) in HANDLER_SOURCES {
+    for src in &handler_sources() {
         if let Some(at) = src.find(&needle) {
             let rest = &src[at..];
             let end = rest.find(" {")?;
-            return Some(&rest[..end]);
+            return Some(rest[..end].to_string());
         }
     }
     None

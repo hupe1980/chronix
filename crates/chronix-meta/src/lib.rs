@@ -24,6 +24,10 @@
 //! Every metadata mutation is replicated via Raft consensus — the state
 //! machine is deterministic so all replicas converge to the same state.
 
+// openraft's `StorageError` and `RPCError` are large by its own design, and
+// its storage and network traits fix them as the error type, so boxing them
+// here would only move the conversion into every trait impl of a frozen tier.
+#![allow(clippy::result_large_err)]
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]

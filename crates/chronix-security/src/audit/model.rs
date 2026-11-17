@@ -77,6 +77,10 @@ pub enum AuditAction {
     CreateRollup,
     /// Rollup rule dropped.
     DropRollup,
+    /// Detector declared.
+    CreateDetector,
+    /// Detector dropped.
+    DropDetector,
     /// Trigger created.
     TriggerCreate,
     /// Trigger dropped.
@@ -106,6 +110,8 @@ impl AuditAction {
         Self::QuotaChange,
         Self::CreateRollup,
         Self::DropRollup,
+        Self::CreateDetector,
+        Self::DropDetector,
         Self::TriggerCreate,
         Self::TriggerDrop,
         Self::SignalFired,
@@ -130,6 +136,8 @@ impl fmt::Display for AuditAction {
             Self::QuotaChange => write!(f, "quota_change"),
             Self::CreateRollup => write!(f, "create_rollup"),
             Self::DropRollup => write!(f, "drop_rollup"),
+            Self::CreateDetector => write!(f, "create_detector"),
+            Self::DropDetector => write!(f, "drop_detector"),
             Self::TriggerCreate => write!(f, "trigger_create"),
             Self::TriggerDrop => write!(f, "trigger_drop"),
             Self::SignalFired => write!(f, "signal_fired"),

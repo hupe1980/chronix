@@ -62,12 +62,47 @@ pub enum DbError {
     Sql(#[from] datafusion::error::DataFusionError),
 
     /// PromQL parse or evaluation error.
-    #[error("PromQL error: {0}")]
-    PromQl(String),
+    ///
+    /// `span` is the bytes of the query the error is about, and `hint` what
+    /// the query probably meant; both are already in `message`.
+    #[error("PromQL error: {message}")]
+    PromQl {
+        /// One sentence: what is wrong, and the suggestion when there is one.
+        message: String,
+        /// The bytes of the query the error is about.
+        span: Option<crate::diagnostics::Span>,
+        /// What the query probably meant: `did you mean "rate"?`.
+        hint: Option<String>,
+    },
 
     /// Database is closed.
     #[error("Database is closed")]
     Closed,
+
+    /// The database was opened with
+    /// [`read_only`](crate::prelude::ChronixConfig::read_only), and this would write.
+    #[error(
+        "this database is open read-only, so {operation} is refused — \
+         open it without `read_only` to change it"
+    )]
+    ReadOnly {
+        /// What was refused, e.g. `"insert"`.
+        operation: &'static str,
+    },
+
+    /// A read-only open was asked for a directory a running process holds.
+    #[error(
+        "{path} is in use by process {pid} on {host}; query that process \
+         (its server, or its `/mcp` endpoint) instead of opening its directory"
+    )]
+    DirectoryLive {
+        /// The data directory.
+        path: String,
+        /// The holder's process id.
+        pid: u32,
+        /// The holder's host.
+        host: String,
+    },
 
     /// File lock acquisition failed.
     #[error("Failed to acquire database lock on {path}: another process holds the lock")]
@@ -114,9 +149,7 @@ pub enum DbError {
     /// Declaring the same rollup on every start is idempotent by nature —
     /// the registry is persisted, so every run after the first meets its own
     /// tier — and a caller has to be able to tell "already there" from
-    /// "failed" without matching on a message. It used to arrive as
-    /// `Internal("rollup registration failed: rollup 'x' already exists")`,
-    /// which is a redacted `500`.
+    /// "failed" without matching on a message.
     #[error("{kind} {name:?} already exists")]
     Conflict {
         /// What kind of object already exists.
@@ -135,6 +168,31 @@ pub enum DbError {
         current: usize,
         /// Configured maximum.
         limit: usize,
+    },
+
+    /// A namespace is at one of its limits, and this write would cross it.
+    ///
+    /// Raised by the same admission step as
+    /// [`CardinalityExceeded`](Self::CardinalityExceeded), against the same
+    /// exact set of known series, and checked **before** it: a batch over both
+    /// is refused with this one, because it names the limit the writer can
+    /// act on. The batch is refused whole and registers nothing. `chronixd`
+    /// renders it `400 NAMESPACE_QUOTA_EXCEEDED` — not `429`, because a
+    /// retry of the same batch can only fail the same way.
+    #[error(
+        "namespace {namespace:?} is at its {} quota ({current} of {limit}); {}",
+        resource.noun(),
+        resource.remedy()
+    )]
+    NamespaceQuotaExceeded {
+        /// The namespace whose limit refused the write.
+        namespace: String,
+        /// Which limit.
+        resource: QuotaResource,
+        /// The namespace's usage before this batch.
+        current: u64,
+        /// The configured limit.
+        limit: u64,
     },
 
     /// Query execution exceeded the configured timeout.
@@ -178,17 +236,10 @@ pub enum DbError {
     },
 }
 
-// `is_transient()` used to live here: a public predicate documented as
-// "callers can use this to decide whether to retry", with **no callers**
-// anywhere in the tree — including `chronixd`, the caller that most needed
-// one, which flattened every variant into `500 DATABASE_ERROR: an internal
-// error occurred` instead. A boolean could not have carried the answer
-// anyway: "retry in a second" (a memtable being flushed), "retry in a
-// minute, and page somebody" (a poisoned WAL) and "never retry, fix the
-// query" (a cardinality limit) are three different instructions, and it
-// lumped `Io` — which is where `ENOSPC` arrives — in with the first.
-// Classification now lives in one exhaustive match in `chronixd::error`,
-// where adding a variant here is a compile error rather than a silent 500.
+// There is deliberately no `is_transient()`: "retry in a second", "retry
+// later and page somebody" and "never retry, fix the request" are three
+// different answers. Classification is one exhaustive match in
+// `chronixd::error`, so a new variant here is a compile error there.
 
 /// Outcome of a batch insert.
 ///
@@ -245,3 +296,92 @@ impl InsertResult {
 
 /// A specialized `Result` type for Chronix database operations.
 pub type Result<T> = std::result::Result<T, DbError>;
+
+/// Which namespace limit refused a write — see
+/// [`DbError::NamespaceQuotaExceeded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QuotaResource {
+    /// Distinct series in the namespace (`max_series_count`).
+    SeriesCount,
+    /// Measurements the namespace has written to (`max_measurements`).
+    Measurements,
+}
+
+impl QuotaResource {
+    /// The quota's name as it appears in configuration.
+    #[must_use]
+    pub const fn setting(self) -> &'static str {
+        match self {
+            Self::SeriesCount => "max_series_count",
+            Self::Measurements => "max_measurements",
+        }
+    }
+
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::SeriesCount => "series",
+            Self::Measurements => "measurement",
+        }
+    }
+
+    const fn remedy(self) -> &'static str {
+        match self {
+            Self::SeriesCount => "raise max_series_count or reduce cardinality",
+            Self::Measurements => "raise max_measurements or write to an existing measurement",
+        }
+    }
+}
+
+impl std::fmt::Display for QuotaResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.setting())
+    }
+}
+
+impl DbError {
+    /// A PromQL error with nothing to point at.
+    #[must_use]
+    pub fn promql(message: impl Into<String>) -> Self {
+        Self::PromQl {
+            message: message.into(),
+            span: None,
+            hint: None,
+        }
+    }
+
+    /// What the error is about in `query`, and what was probably meant.
+    ///
+    /// For a PromQL error, its own span and hint. For a SQL error, what
+    /// `DataFusion` knows — the span of the name it could not resolve — with
+    /// the suggestion and the one-line message rewritten the same way for
+    /// tables, columns and functions. Unknown *tables* get no suggestion here,
+    /// because which tables a caller may be offered depends on its namespace:
+    /// [`Chronix::diagnose`](crate::Chronix::diagnose) adds them.
+    #[must_use]
+    pub fn diagnosis(&self, query: &str) -> crate::diagnostics::Diagnosis {
+        match self {
+            Self::PromQl { span, hint, .. } => crate::diagnostics::Diagnosis {
+                message: None,
+                hint: hint.clone(),
+                span: *span,
+            },
+            #[cfg(feature = "sql")]
+            Self::Sql(e) => crate::sql::diagnose::sql_diagnosis(e, query, None),
+            _ => {
+                let _ = query;
+                crate::diagnostics::Diagnosis::default()
+            }
+        }
+    }
+}
+
+impl From<crate::promql::ParseError> for DbError {
+    fn from(e: crate::promql::ParseError) -> Self {
+        Self::PromQl {
+            message: e.to_string(),
+            span: e.span,
+            hint: e.hint,
+        }
+    }
+}

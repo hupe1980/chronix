@@ -167,24 +167,24 @@ impl AutoScaler {
         let mut plans = Vec::new();
 
         for (&region_id, info) in regions {
-            if let Some(metrics) = region_metrics.get(&region_id) {
-                if let Some(reason) = self.should_split(metrics) {
-                    info!(
-                        region_id,
-                        measurement = %info.measurement,
-                        %reason,
-                        "Region eligible for split"
-                    );
-                    let new_region_a = next_id();
-                    let new_region_b = next_id();
-                    plans.push(SplitPlan {
-                        source_region_id: region_id,
-                        new_region_a,
-                        new_region_b,
-                        measurement: info.measurement.clone(),
-                        reason,
-                    });
-                }
+            if let Some(metrics) = region_metrics.get(&region_id)
+                && let Some(reason) = self.should_split(metrics)
+            {
+                info!(
+                    region_id,
+                    measurement = %info.measurement,
+                    %reason,
+                    "Region eligible for split"
+                );
+                let new_region_a = next_id();
+                let new_region_b = next_id();
+                plans.push(SplitPlan {
+                    source_region_id: region_id,
+                    new_region_a,
+                    new_region_b,
+                    measurement: info.measurement.clone(),
+                    reason,
+                });
             }
         }
 

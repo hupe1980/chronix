@@ -280,8 +280,6 @@ impl DerivedSeriesEngine {
         &self,
         ctx: &mut MultiSeriesContext,
     ) -> Result<HashMap<String, Vec<f64>>, MultivariateError> {
-        use rayon::prelude::*;
-
         let _start = std::time::Instant::now();
         let levels = self.topological_sort_levels()?;
         let mut results = HashMap::new();
@@ -295,14 +293,13 @@ impl DerivedSeriesEngine {
                 results.insert(def.name.clone(), vals);
             } else {
                 // Multiple independent nodes — evaluate in parallel.
-                let wave_results: Vec<Result<(String, Vec<f64>), MultivariateError>> = level
-                    .par_iter()
-                    .map(|&idx| {
+                let shared: &MultiSeriesContext = ctx;
+                let wave_results: Vec<Result<(String, Vec<f64>), MultivariateError>> =
+                    crate::par::map(level, |&idx| {
                         let def = &self.definitions[idx];
-                        let vals = def.expression.evaluate(ctx)?;
+                        let vals = def.expression.evaluate(shared)?;
                         Ok((def.name.clone(), vals))
-                    })
-                    .collect();
+                    });
 
                 // Merge wave results into context (sequential).
                 for result in wave_results {

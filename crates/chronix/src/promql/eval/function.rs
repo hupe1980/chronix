@@ -52,6 +52,7 @@ pub(crate) const FUNCTIONS: &[&str] = &[
     "deriv",
     "double_exponential_smoothing",
     "exp",
+    "first_over_time",
     "floor",
     "histogram_avg",
     "histogram_count",
@@ -117,6 +118,11 @@ impl PromQLEvaluator {
         args: &[Expr],
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
+        // `anchored` / `smoothed` change what a range means, so only the
+        // functions upstream defines them for may receive one.
+        if let Some(modifier) = args.iter().find_map(range_modifier_of) {
+            return self.eval_extended(func, args, modifier, params);
+        }
         match func {
             "rate" => {
                 if args.len() != 1 {
@@ -459,6 +465,14 @@ impl PromQLEvaluator {
             "last_over_time" => {
                 eval_over_time_fn_opt(self, args, params, MetricName::Keep, |samples| {
                     samples.last().map(|s| s.value)
+                })
+            }
+            // The oldest sample in the window; like `last_over_time`, it
+            // returns a sample of the series rather than a value computed
+            // from it, so it keeps `__name__`.
+            "first_over_time" => {
+                eval_over_time_fn_opt(self, args, params, MetricName::Keep, |samples| {
+                    samples.first().map(|s| s.value)
                 })
             }
             // Presence, not numerosity: a window holding only NaN samples
@@ -1464,16 +1478,10 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 
 /// What an `*_over_time` function does with `NaN` samples.
 ///
-/// Prometheus does not have one rule here and neither can we. `min_over_time`
-/// and `max_over_time` skip `NaN` unless every sample is `NaN`; every other
-/// member of the family sees the raw values, so `NaN` propagates through
-/// `avg`/`sum`/`stddev` and is *counted* by `count_over_time`.
-///
-/// This used to be a single blanket filter applied to all of them, which made
-/// `count_over_time` under-report by the number of `NaN` samples and made
-/// `present_over_time` return nothing at all for a series whose samples were
-/// all `NaN` — the one function whose entire job is to answer "was anything
-/// here?".
+/// Prometheus has no single rule here. `min_over_time` and `max_over_time`
+/// skip `NaN` unless every sample is `NaN`; every other member of the family
+/// sees the raw values, so `NaN` propagates through `avg`/`sum`/`stddev` and
+/// is counted by `count_over_time` and `present_over_time`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NanPolicy {
     /// Pass every sample through; `NaN` propagates into the result.
@@ -1610,6 +1618,98 @@ fn is_valid_label_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The `anchored` / `smoothed` modifier of a range-selector argument.
+fn range_modifier_of(expr: &Expr) -> Option<crate::promql::ast::RangeModifier> {
+    match expr {
+        Expr::MatrixSelector { modifier, .. } => *modifier,
+        _ => None,
+    }
+}
+
+impl PromQLEvaluator {
+    /// A function whose range argument is `anchored` or `smoothed`.
+    fn eval_extended(
+        &self,
+        func: &str,
+        args: &[Expr],
+        modifier: crate::promql::ast::RangeModifier,
+        params: &QueryParams,
+    ) -> Result<PromQLValue, EvalError> {
+        use crate::promql::ast::RangeModifier;
+        let allowed: &[&str] = match modifier {
+            RangeModifier::Anchored => &["changes", "delta", "increase", "rate", "resets"],
+            RangeModifier::Smoothed => &["delta", "increase", "rate"],
+        };
+        let name = super::selector::modifier_name(modifier);
+        if !allowed.contains(&func) {
+            return Err(EvalError(format!(
+                "{name} modifier can only be used with: {} - not with {func}",
+                allowed.join(", ")
+            )));
+        }
+        let [
+            Expr::MatrixSelector {
+                vector,
+                range,
+                modifier: _,
+            },
+        ] = args
+        else {
+            return Err(EvalError(format!("{func}() requires exactly 1 argument")));
+        };
+        let window = self.read_range(vector, range, Some(modifier), params)?;
+        let smoothed = modifier == RangeModifier::Smoothed;
+
+        let mut out = Vec::with_capacity(window.series.len());
+        for s in window.series {
+            if s.is_histogram() {
+                return Err(EvalError(format!(
+                    "{name} modifier is not supported with histograms"
+                )));
+            }
+            let f = &s.samples;
+            let value = match func {
+                "rate" | "increase" | "delta" => super::extended::extended_rate(
+                    f,
+                    window.range_start,
+                    window.range_end,
+                    window.range_secs,
+                    smoothed,
+                    func != "delta",
+                    func == "rate",
+                ),
+                // `resets` / `changes`: from the anchor through the range.
+                _ => super::extended::anchored_first(f, window.range_start).map(|first| {
+                    let pairs = f[first..].windows(2);
+                    let n = if func == "resets" {
+                        pairs.filter(|w| w[1].value < w[0].value).count()
+                    } else {
+                        pairs
+                            .filter(|w| {
+                                w[0].value != w[1].value
+                                    && !(w[0].value.is_nan() && w[1].value.is_nan())
+                            })
+                            .count()
+                    };
+                    n as f64
+                }),
+            };
+            if let Some(value) = value {
+                let mut labels = s.labels;
+                labels.retain(|(k, _)| k != "__name__");
+                out.push(Series::floats(
+                    labels,
+                    vec![Sample {
+                        timestamp: params.time,
+                        value,
+                    }],
+                ));
+            }
+        }
+        Ok(PromQLValue::Vector(out))
+    }
+}
+
 pub(crate) fn extract_range_ns(expr: &Expr) -> Option<i64> {
     // A subquery is a range vector too, and its `[range:step]` is the range —
     // so `rate(x[5m:15s])` extrapolates over five minutes exactly as
@@ -1627,7 +1727,9 @@ pub(crate) fn extract_offset_ns(expr: &Expr) -> i64 {
     if let Expr::MatrixSelector { vector, .. } = expr
         && let Expr::VectorSelector { offset, .. } = vector.as_ref()
     {
-        return offset.map(|d| d.as_nanos()).unwrap_or(0);
+        return offset
+            .as_ref()
+            .map_or(0, crate::promql::ast::DurationExpr::as_nanos);
     }
     0
 }
@@ -1688,17 +1790,11 @@ pub(crate) fn compute_rate(
 
             // Prometheus `extrapolatedRate` (promql/functions.go).
             //
-            // The observed increase covers `dt`, which is almost never the
-            // whole range: the first sample lands somewhere after the range
-            // start and the last somewhere before the evaluation time. The
-            // increase is therefore scaled *up* by
-            // `extrapolate_to / dt`, and `rate` then divides by the range —
-            // which for an evenly scraped counter recovers the true slope.
-            //
-            // This used to scale by `range / extrapolate_to`, which
-            // is neither of those things. With 15 s scrapes and `[1m]` it
-            // under-reported by 25%, and the only test covering this branch
-            // asserted just `> 0 && is_finite`.
+            // The observed increase covers `dt`, which is almost never the whole range:
+            // the first sample lands after the range start and the last before the
+            // evaluation time. The increase is scaled up by `extrapolate_to / dt`, and
+            // `rate` then divides by the range, which recovers the true slope of an
+            // evenly scraped counter.
             let value = if let Some(rng) = range_ns {
                 let range_secs = rng as f64 / 1_000_000_000.0;
                 let n = s.samples.len() as f64;
@@ -2109,7 +2205,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::promql::ast::{Duration, LabelMatcher};
+    use crate::promql::ast::{DurationExpr, LabelMatcher};
 
     #[test]
     fn test_compute_rate() {
@@ -2502,6 +2598,7 @@ mod tests {
             ],
             offset: None,
             at: None,
+            smoothed: false,
         });
         // Should include job=api but NOT __name__ and NOT regex matchers
         assert_eq!(labels.len(), 1);
@@ -2652,10 +2749,12 @@ mod tests {
             vector: Box::new(Expr::VectorSelector {
                 name: Some("metric".into()),
                 matchers: vec![],
-                offset: Some(Duration(600.0)), // 10 minutes
+                offset: Some(DurationExpr::Literal(600.0)), // 10 minutes
                 at: None,
+                smoothed: false,
             }),
-            range: Duration(300.0), // 5 minutes
+            range: DurationExpr::Literal(300.0), // 5 minutes
+            modifier: None,
         };
         assert_eq!(extract_offset_ns(&expr), 600_000_000_000);
 
@@ -2666,8 +2765,10 @@ mod tests {
                 matchers: vec![],
                 offset: None,
                 at: None,
+                smoothed: false,
             }),
-            range: Duration(300.0),
+            range: DurationExpr::Literal(300.0),
+            modifier: None,
         };
         assert_eq!(extract_offset_ns(&expr_no_offset), 0);
 

@@ -388,7 +388,10 @@ impl RegionMigrator {
         // the watermark.  If an iteration returns no new data, the
         // region has converged and we proceed to switchover.
         progress.set_phase(MigrationPhase::CatchUp);
-        let mut catchup_watermark: Option<i64> = source_points.iter().map(|p| p.timestamp()).max();
+        let mut catchup_watermark: Option<i64> = source_points
+            .iter()
+            .map(chronix_core::Point::timestamp)
+            .max();
         let mut total_catchup_points: u64 = 0;
 
         // Only run catch-up if there was actual data (and thus a valid
@@ -409,7 +412,7 @@ impl RegionMigrator {
                 }
                 let new_max = delta_points
                     .iter()
-                    .map(|p| p.timestamp())
+                    .map(chronix_core::Point::timestamp)
                     .max()
                     .unwrap_or(*watermark);
                 let batch_len = delta_points.len() as u64;
@@ -498,14 +501,14 @@ impl RegionMigrator {
 
         // ── Step 5: Remove from source (if local) ──────────────────
         progress.set_phase(MigrationPhase::Cleanup);
-        if plan.source_node_id == self.local_node_id {
-            if let Err(e) = self.region_manager.remove_region(plan.region_id) {
-                warn!(
-                    region_id = plan.region_id,
-                    error = %e,
-                    "failed to remove source region (may already be removed)"
-                );
-            }
+        if plan.source_node_id == self.local_node_id
+            && let Err(e) = self.region_manager.remove_region(plan.region_id)
+        {
+            warn!(
+                region_id = plan.region_id,
+                error = %e,
+                "failed to remove source region (may already be removed)"
+            );
         }
 
         #[allow(clippy::cast_possible_truncation)]

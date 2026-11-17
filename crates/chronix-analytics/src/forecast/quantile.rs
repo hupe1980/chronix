@@ -1,47 +1,32 @@
 //! Quantile forecasting via empirical residual quantiles.
 //!
-//! The built-in models produce *Gaussian* prediction intervals from a single
-//! in-sample `residual_std`: `ŷ ± z·σ·f(h)`. That makes two assumptions that
-//! do not hold for the workloads Chronix targets:
+//! The built-in models give Gaussian intervals from one in-sample
+//! `residual_std` (`ŷ ± z·σ·f(h)`), which assumes symmetric errors and one
+//! error scale for every horizon. Energy series — PV generation, household
+//! load, state of charge — are skewed and heteroscedastic, and forecast error
+//! grows with the horizon at a rate the data decides.
 //!
-//! 1. **Symmetric, normal errors.** Energy series (PV generation, household
-//!    load, battery state of charge) are heavily skewed and heteroscedastic.
-//!    A symmetric interval under-covers the long tail while wasting width on
-//!    the short one.
-//! 2. **A single error scale for every horizon.** Forecast error grows with
-//!    the horizon, and how it grows depends on the model and the data, not on
-//!    a closed-form factor.
-//!
-//! Note that empirical residual quantiles are *additive* offsets, so they do
-//! not by themselves respect a physical domain: a series bounded at zero can
-//! still receive a negative lower bound where the point forecast is noisy.
-//! Set [`QuantileConfig::lower_bound`] / [`upper_bound`] for that — learning
-//! the residual shape and declaring the domain are separate jobs.
+//! [`QuantileForecaster`] calibrates on the **empirical distribution of
+//! walk-forward residuals, bucketed per horizon step**, so the interval is
+//! asymmetric where the data is and widens as fast as the data does.
+//! Residual quantiles are additive offsets and do not respect a physical
+//! domain by themselves: set [`QuantileConfig::lower_bound`] /
+//! [`upper_bound`] for that.
 //!
 //! [`upper_bound`]: QuantileConfig::upper_bound
-//!
-//! [`QuantileForecaster`] drops both assumptions. It calibrates on the
-//! **empirical distribution of walk-forward residuals, bucketed per horizon
-//! step**, so the interval shape is learned from the data: asymmetric where
-//! the data is asymmetric, and widening at whatever rate the data actually
-//! widens.
 //!
 //! ## Calibration is strictly out-of-sample
 //!
 //! Residuals come from rolling-origin evaluation (Hyndman & Athanasopoulos,
-//! *FPP3* §5.10): the model is refit — or replayed — on data up to each
-//! origin, then asked for `horizon` steps, and only genuinely unseen points
-//! contribute residuals. In-sample residuals would be optimistically small
-//! and the intervals correspondingly too narrow.
+//! *FPP3* §5.10): only points unseen at each origin contribute. In-sample
+//! residuals would be too small and the intervals too narrow.
 //!
 //! ## Optional conformal calibration
 //!
-//! With [`QuantileConfig::conformal`] enabled the residual quantile is taken
-//! at the finite-sample-corrected rank `⌈(n+1)(1-α)⌉/n` (Vovk et al.;
-//! Gibbs & Candès, *Adaptive Conformal Inference*, NeurIPS 2021). Under
-//! exchangeability that yields marginal coverage of at least `1-α` rather
-//! than merely asymptotic coverage — the difference matters at the small
-//! calibration sizes an embedded gateway actually has.
+//! With [`QuantileConfig::conformal`], the residual quantile is taken at the
+//! finite-sample-corrected rank `⌈(n+1)(1-α)⌉/n` (Vovk et al.; Gibbs & Candès,
+//! NeurIPS 2021), which under exchangeability gives marginal coverage of at
+//! least `1-α` at the small calibration sizes a gateway has.
 
 use crate::forecast::error::ForecastError;
 use crate::forecast::result::ForecastResult;
@@ -502,28 +487,12 @@ fn record(residuals: &mut [Vec<f64>], predicted: &[f64], actual: &[f64], avail: 
 /// Empirical quantile of a sorted sample using linear interpolation
 /// (Hyndman & Fan type 7, the R/NumPy default).
 ///
-/// With `conformal`, the rank is moved **outward** by the split-conformal
-/// finite-sample correction: `⌈(n+1)q⌉/n` for an upper quantile, and its
-/// mirror image `1 − ⌈(n+1)(1−q)⌉/n` for a lower one. Returns 0.0 for an
-/// empty sample, which degrades the interval to the point forecast rather
-/// than inventing a spread.
-///
-/// # The mirror is the whole point
-///
-/// `⌈(n+1)q⌉/n` is derived for the upper tail, and applying it to both tails
-/// moves the *lower* bound up rather than down — it made the correction
-/// **narrow** the interval on the low side. At `n = 40` and `q = 0.05` the
-/// rank went from 0.05 to 0.075, so a nominal 90 % interval lost coverage
-/// below exactly where the conformal argument was supposed to add it. The
-/// only test on this asserted the upper tail (`conformal_correction_widens_
-/// the_upper_tail`), and the coverage test allowed 0.70 against a nominal
-/// 0.90, so neither could see it — a numeric result checked only for a loose
-/// bound is uncovered (QUALITY rule 2).
-///
-/// The consequence was not confined to statistics: forecast-deviation
-/// triggers fire on an observation falling outside the interval, so a
-/// silently narrow lower bound raises the alert rate below the forecast above
-/// its nominal level, for every trigger built on one.
+/// With `conformal`, the rank moves **outward** by the split-conformal
+/// finite-sample correction: `⌈(n+1)q⌉/n` for an upper quantile and its mirror
+/// `1 − ⌈(n+1)(1−q)⌉/n` for a lower one. Applying the upper form to both tails
+/// would narrow the interval on the low side and raise the alert rate of every
+/// forecast-deviation trigger. Returns 0.0 for an empty sample, which degrades
+/// the interval to the point forecast rather than inventing a spread.
 fn empirical_quantile(sorted: &[f64], q: f64, conformal: bool) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -932,10 +901,8 @@ mod tests {
             qf.model.update(ts[i], vals[i]).expect("update");
         }
         let coverage = f64::from(covered) / f64::from(total);
-        // A 90 % interval is asserted near 90 %, not merely above 70 %. The
-        // looser bar was satisfied by an interval whose lower bound the
-        // conformal correction was actively tightening, which is what let
-        // that defect sit under a passing coverage test.
+        // A 90 % interval is asserted near 90 %, not merely above 70 %: a loose
+        // bound cannot see a lower bound that is too narrow.
         assert!(
             coverage >= 0.85,
             "90% interval covered only {coverage:.2} of held-out points"

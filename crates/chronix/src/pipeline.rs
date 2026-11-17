@@ -542,11 +542,9 @@ impl Pipeline {
             }
         }
 
-        // A `DELIVER webhook(…)` names a channel that has to exist before the
-        // trigger can fire into it. Registering it here — before the trigger
-        // is accepted — is what makes the clause mean something: it used to be
-        // parsed, stored on the trigger as a string, and never turned into a
-        // channel, so every webhook trigger fired into nothing.
+        // A `DELIVER webhook(…)` names a channel that must exist before the
+        // trigger can fire into it, so it is registered before the trigger is
+        // accepted.
         if let TriggerStatement::Create(create) = &stmt {
             self.register_delivery_channels(&create.deliver)?;
         }
@@ -617,12 +615,10 @@ impl Pipeline {
         let Some(ns) = namespace else {
             return self.execute_signal_sql(sql);
         };
-        // `NamespaceId` validation already excludes control characters, so
-        // this cannot fire today. It is checked here anyway because the
-        // separator is what keeps two tenants' key spaces apart, and an
-        // invariant enforced three layers away is one that a later caller
-        // forgets — which is how every namespace defect in this tree has
-        // happened.
+        // `NamespaceId` validation already excludes control characters, so this
+        // cannot fire today. It is checked here anyway because the separator is what
+        // keeps two tenants' key spaces apart, and an invariant enforced three layers
+        // away is one a later caller forgets.
         if ns.contains(NAMESPACE_SEPARATOR) {
             return Err(
                 chronix_streaming::signal::error::SignalError::InvalidConfig(

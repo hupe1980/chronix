@@ -7,7 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Frozen tier / dev tooling — not part of the release (D8).
+# Frozen tier / dev tooling — not part of the release.
 publish = false
 
 [lib]

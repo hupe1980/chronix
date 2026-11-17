@@ -9,7 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["timeseries", "database", "lsm", "storage", "tsdb"]
 categories = ["database-implementations"]
-homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
@@ -28,7 +27,7 @@ default = ["field-encryption"]
 ## AES-256-GCM encryption support in the segment layer.
 field-encryption = ["dep:aes-gcm"]
 ## S3/GCS/Azure object storage backend for cold-data tiering.
-object-store = ["dep:object_store", "dep:url", "dep:parquet"]
+object-store = ["dep:object_store", "dep:url", "dep:parquet", "dep:futures"]
 
 [dependencies]
 chronix-core.workspace = true
@@ -36,7 +35,7 @@ chronix-encoding.workspace = true
 
 # Columnar interop
 arrow.workspace = true
-# Parquet is the cold-tier format (D6); only pulled in with `object-store`.
+# Parquet is the cold-tier format; only pulled in with `object-store`.
 parquet = { workspace = true, optional = true }
 
 # Compression & integrity
@@ -52,7 +51,7 @@ crossbeam-skiplist.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
-futures.workspace = true
+futures = { workspace = true, optional = true }
 
 # Serialization
 postcard.workspace = true

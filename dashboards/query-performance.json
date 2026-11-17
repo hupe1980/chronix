@@ -1,14 +1,4 @@
 {
-  "__inputs": [
-    {
-      "name": "DS_PROMETHEUS",
-      "label": "Prometheus",
-      "description": "Prometheus data source scraping Chronix metrics",
-      "type": "datasource",
-      "pluginId": "prometheus",
-      "pluginName": "Prometheus"
-    }
-  ],
   "annotations": {
     "list": [
       {
@@ -32,7 +22,7 @@
   "links": [],
   "panels": [
     {
-      "title": "Query Latency \u2014 native scan",
+      "title": "Query Latency — native scan",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -42,7 +32,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -75,7 +65,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -108,7 +98,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -126,7 +116,7 @@
         },
         {
           "expr": "rate(chronix_promql_scans_total[5m])",
-          "legendFormat": "PromQL scans/s"
+          "legendFormat": "PromQL {{kind}} scans/s"
         }
       ]
     },
@@ -141,7 +131,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -170,7 +160,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -199,7 +189,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -226,7 +216,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -238,7 +228,7 @@
       "targets": [
         {
           "expr": "rate(chronix_promql_scan_cache_hits_total[5m]) / clamp_min(rate(chronix_promql_scans_total[5m]), 1e-9)",
-          "legendFormat": "hit ratio"
+          "legendFormat": "{{kind}} hit ratio"
         }
       ]
     },
@@ -253,7 +243,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "fieldConfig": {
         "defaults": {
@@ -275,7 +265,21 @@
     "performance"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "options": []
+      }
+    ]
   },
   "time": {
     "from": "now-1h",
@@ -283,8 +287,8 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Chronix \u2014 Query Performance",
+  "title": "Chronix — Query Performance",
   "uid": "chronix-query-performance",
   "version": 1,
-  "description": "Single-node query and write performance. The cluster tier is frozen and excluded from the default build, so its scatter-gather latencies live in Chronix \u2014 Cluster Overview rather than here."
+  "description": "Single-node query and write performance. The cluster tier is frozen and excluded from the default build, so its scatter-gather latencies live in Chronix — Cluster Overview rather than here."
 }

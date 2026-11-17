@@ -200,10 +200,8 @@ impl ShardRouter {
     /// registration succeeded — see
     /// [`FlushController::flush_frozen_with`].
     ///
-    /// The router lock is released before the write starts: it used to be
-    /// held for the whole segment write, and parking_lot's writer-preferring
-    /// `RwLock` then queued every insert behind the first write that needed
-    /// a new shard.
+    /// The router lock is released before the write starts, so inserts are not
+    /// queued behind a segment write.
     ///
     /// # Errors
     ///
@@ -314,6 +312,15 @@ impl ShardRouter {
             }
         }
         out
+    }
+
+    /// The oldest and newest timestamp held in memory, across every shard,
+    /// or `None` when nothing is unflushed.
+    #[must_use]
+    pub fn time_bounds(&self) -> Option<(Timestamp, Timestamp)> {
+        self.shards.read().values().fold(None, |acc, entry| {
+            super::flush::merge_bounds(acc, entry.controller.time_bounds())
+        })
     }
 
     /// Every `(tag key, tag value)` pair held in memory, across every shard.

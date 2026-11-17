@@ -187,30 +187,17 @@ impl KeyProvider for FileKeyProvider {
 
 /// Key provider that reads from environment variables.
 ///
-/// # Design Note
+/// The variable is read on every call to
+/// [`current_key()`](KeyProvider::current_key), so a key rotates by updating
+/// the variable, with no restart; the cost is negligible beside the AES-GCM
+/// work that follows.
 ///
-/// The environment variable is read on **every call** to
-/// [`current_key()`](KeyProvider::current_key) rather than being cached at
-/// construction time. This is intentional: it allows key rotation by
-/// updating the env var (e.g. via a sidecar or init-container) without
-/// restarting the process. The overhead of `std::env::var` is negligible
-/// compared to the AES-GCM operations that follow.
-///
-/// # Cached Fallback
-///
-/// If the environment variable is temporarily unset (e.g. during key
-/// rotation), the provider falls back to the last successfully loaded
-/// key for up to [`grace_period`](EnvKeyProvider::with_grace_period)
-/// (default **5 s**). After the grace period expires, the
-/// missing-variable error is propagated.
-///
-/// # Hardening
-///
-/// * Grace period reduced from 30 s → 5 s (configurable).
-/// * [`clear_cache`](EnvKeyProvider::clear_cache) lets operators
-///   explicitly discard the cached key once rotation is complete.
-/// * Every cache-fallback hit emits the `chronix_auth_env_key_grace_hit`
-///   counter so operators can detect prolonged rotation windows.
+/// If the variable is briefly unset during a rotation, the last loaded key is
+/// used for up to [`grace_period`](EnvKeyProvider::with_grace_period)
+/// (default 5 s), and every such fallback counts
+/// `chronix_auth_env_key_grace_hit`. After the grace period the
+/// missing-variable error is returned. [`clear_cache`](EnvKeyProvider::clear_cache)
+/// discards the cached key once a rotation is complete.
 pub struct EnvKeyProvider {
     env_var: String,
     key_id: String,

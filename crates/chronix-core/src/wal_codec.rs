@@ -14,6 +14,7 @@
 //! Discriminants:
 //! - `0x00` → `WalEntry::Write { point }`
 //! - `0x01` → retired (was `Delete`; tombstones are catalog state)
+//! - `0x02` → `WalEntry::Sealed { sections }`
 //!
 //! Schema changes are not WAL entries: the catalog manifest is their
 //! durable record, and it is written before the data that needs them.
@@ -31,6 +32,8 @@ const DISC_WRITE: u8 = 0x00;
 /// is fsynced first. The number is not reused, so an old log decodes as an
 /// unknown discriminant rather than as something else.
 const _RETIRED_DISC_DELETE: u8 = 0x01;
+/// `WalEntry::Sealed` — encrypted column values, sealed per key.
+const DISC_SEALED: u8 = 0x02;
 
 /// Errors produced by the WAL codec.
 #[derive(Debug)]
@@ -89,6 +92,11 @@ pub fn encode(entry: &WalEntry) -> Result<Vec<u8>, CodecError> {
             let data = postcard::to_stdvec(point)?;
             buf.extend_from_slice(&data);
         }
+        WalEntry::Sealed { sections } => {
+            buf.push(DISC_SEALED);
+            let data = postcard::to_stdvec(sections)?;
+            buf.extend_from_slice(&data);
+        }
     }
 
     Ok(buf)
@@ -141,6 +149,9 @@ pub fn decode(data: &[u8]) -> Result<WalEntry, CodecError> {
             let point: Point = postcard::from_bytes(payload)?;
             Ok(WalEntry::Write { point })
         }
+        DISC_SEALED => Ok(WalEntry::Sealed {
+            sections: postcard::from_bytes(payload)?,
+        }),
         d => Err(CodecError::UnknownDiscriminant(d)),
     }
 }
@@ -184,7 +195,9 @@ mod tests {
         let decoded = decode(&encode(&entry).unwrap()).unwrap();
         assert_eq!(entry, decoded);
 
-        let WalEntry::Write { point } = decoded;
+        let WalEntry::Write { point } = decoded else {
+            panic!("a write decodes as a write");
+        };
         // Equality alone would pass if both sides had lost the same digits.
         match point.field("z1nb") {
             Some(FieldValue::Decimal(d)) => {
@@ -249,5 +262,16 @@ mod tests {
     #[test]
     fn decode_unknown_discriminant_returns_error() {
         assert!(decode(&[WAL_BINARY_V1, 0xFF, 0x00]).is_err());
+    }
+
+    #[test]
+    fn a_sealed_entry_round_trips() {
+        let entry = WalEntry::Sealed {
+            sections: vec![crate::types::SealedSection {
+                key_id: "phi".into(),
+                sealed: vec![1, 2, 3],
+            }],
+        };
+        assert_eq!(decode(&encode(&entry).unwrap()).unwrap(), entry);
     }
 }

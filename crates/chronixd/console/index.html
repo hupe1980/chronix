@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Chronix console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='none' stroke='%230b6bcb' stroke-width='3'/%3E%3Cpath d='M16 8v8l6 3' fill='none' stroke='%230b6bcb' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="console/uplot.min.css">
+<link rel="stylesheet" href="console/app.css">
+<script src="console/uplot.min.js" defer></script>
+<script type="module" src="console/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#editor">Skip to the query</a>
+
+<header class="top">
+  <a class="brand" href="console" aria-label="Chronix console">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="3"/><path d="M16 9v7l5 3" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span class="brand-name">Chronix</span><span class="brand-sub">console</span>
+  </a>
+
+  <div class="range" role="group" aria-label="Time range">
+    <button type="button" data-range="15m">15m</button>
+    <button type="button" data-range="1h">1h</button>
+    <button type="button" data-range="6h">6h</button>
+    <button type="button" data-range="24h">24h</button>
+    <button type="button" data-range="7d">7d</button>
+    <button type="button" class="range-custom" id="range-custom" hidden title="Back to the last preset"></button>
+  </div>
+
+  <label class="step">
+    <span>Step</span>
+    <select id="step" aria-label="Resolution">
+      <option value="auto">auto</option>
+      <option value="10s">10s</option>
+      <option value="30s">30s</option>
+      <option value="1m">1m</option>
+      <option value="5m">5m</option>
+      <option value="15m">15m</option>
+      <option value="1h">1h</option>
+    </select>
+  </label>
+
+  <div class="top-actions">
+    <button type="button" class="icon-btn" id="help-btn" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
+    </button>
+    <button type="button" class="icon-btn" id="key-btn" aria-label="API key" title="API key and namespace">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 8.7-8.7M16 7l2.5 2.5M14 9l1.8 1.8"/></svg>
+      <span class="dot" id="key-dot" hidden></span>
+    </button>
+    <button type="button" class="icon-btn" id="theme-btn" aria-label="Theme: system" title="Theme">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" class="fill"/></svg>
+    </button>
+  </div>
+  <div class="progress" id="progress" hidden></div>
+</header>
+
+<div class="layout">
+  <aside class="rail" id="rail" aria-label="Measurements">
+    <div class="rail-head">
+      <h2>Data</h2>
+      <span class="rail-count" id="rail-count"></span>
+    </div>
+    <input id="filter" class="filter" type="search" placeholder="Filter measurements" aria-label="Filter measurements" autocomplete="off" spellcheck="false">
+    <ul id="measurements" class="tree"></ul>
+  </aside>
+
+  <main class="work" id="main">
+    <section class="card editor-card" aria-label="Query">
+      <div class="editor-bar">
+        <div class="seg" role="tablist" aria-label="Query language">
+          <button type="button" role="tab" data-lang="promql" aria-selected="true">PromQL</button>
+          <button type="button" role="tab" data-lang="sql" aria-selected="false">SQL</button>
+        </div>
+        <span class="keys" aria-hidden="true"><kbd id="mod-key">Ctrl</kbd><kbd>↵</kbd></span>
+        <button type="button" class="btn primary" id="run">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5v14l11-7z"/></svg>Run
+        </button>
+      </div>
+      <div class="editor-wrap">
+        <textarea id="editor" rows="1" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Query" aria-autocomplete="list" aria-controls="complete"></textarea>
+        <ul id="complete" class="complete" role="listbox" aria-label="Suggestions" hidden></ul>
+      </div>
+      <div id="diag" class="diag" aria-live="polite"></div>
+    </section>
+
+    <section class="card result" aria-label="Result">
+      <div class="result-bar">
+        <div class="tabs" role="tablist" aria-label="View">
+          <button type="button" role="tab" data-tab="chart" aria-selected="true">Chart</button>
+          <button type="button" role="tab" data-tab="table" aria-selected="false">Table</button>
+          <button type="button" role="tab" data-tab="explain" aria-selected="false">Explain</button>
+          <button type="button" role="tab" data-tab="cardinality" aria-selected="false">Cardinality</button>
+        </div>
+        <div class="result-actions">
+          <label class="switch" id="fc-wrap"><input type="checkbox" id="fc"><span class="track" aria-hidden="true"></span><span>Forecast</span></label>
+          <label class="switch" id="an-wrap"><input type="checkbox" id="an"><span class="track" aria-hidden="true"></span><span>Anomalies</span></label>
+          <button type="button" class="btn" id="code-btn" title="Copy as Rust, Python or curl">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></svg>Copy as code
+          </button>
+        </div>
+      </div>
+      <div class="panels">
+        <div class="panel" id="panel-chart" role="tabpanel" aria-label="Chart"></div>
+        <div class="panel" id="panel-table" role="tabpanel" aria-label="Table" hidden></div>
+        <div class="panel" id="panel-explain" role="tabpanel" aria-label="Explain" hidden></div>
+        <div class="panel" id="panel-cardinality" role="tabpanel" aria-label="Cardinality" hidden></div>
+      </div>
+      <footer class="status" id="status" aria-live="polite"></footer>
+    </section>
+  </main>
+</div>
+
+<dialog id="key-dialog" aria-labelledby="key-title">
+  <h2 id="key-title">Connection</h2>
+  <p class="muted">The key is kept in this tab's memory only. It is never stored or put in the URL.</p>
+  <form id="key-form" novalidate>
+  <label class="field"><span>API key</span><input id="key-input" type="password" autocomplete="current-password" spellcheck="false" placeholder="Bearer token"></label>
+  <label class="field"><span>Namespace</span><input id="ns-input" type="text" autocomplete="off" spellcheck="false" placeholder="default"></label>
+  <p class="dialog-error" id="key-error" hidden></p>
+  <div class="dialog-actions">
+    <button type="button" class="btn ghost" id="key-clear">Forget key</button>
+    <span class="spacer"></span>
+    <button type="button" class="btn" id="key-cancel">Cancel</button>
+    <button type="submit" class="btn primary" id="key-save">Save</button>
+  </div>
+  </form>
+</dialog>
+
+<dialog id="code-dialog" class="wide" aria-labelledby="code-title">
+  <div class="dialog-head">
+    <h2 id="code-title">Copy as code</h2>
+    <div class="seg" role="tablist" aria-label="Language">
+      <button type="button" role="tab" data-code="rust" aria-selected="true">Rust</button>
+      <button type="button" role="tab" data-code="python" aria-selected="false">Python</button>
+      <button type="button" role="tab" data-code="curl" aria-selected="false">curl</button>
+    </div>
+  </div>
+  <p class="muted" id="code-note"></p>
+  <pre class="code" id="code-out"></pre>
+  <div class="dialog-actions">
+    <span class="spacer"></span>
+    <button type="button" class="btn" id="code-close">Close</button>
+    <button type="button" class="btn primary" id="code-copy">Copy</button>
+  </div>
+</dialog>
+
+<dialog id="help-dialog" aria-labelledby="help-title">
+  <h2 id="help-title">Keyboard</h2>
+  <dl class="keys-list">
+    <dt><kbd class="mod">Ctrl</kbd> <kbd>↵</kbd></dt><dd>Run the query</dd>
+    <dt><kbd>/</kbd></dt><dd>Focus the editor</dd>
+    <dt><kbd>Esc</kbd></dt><dd>Close suggestions, or cancel a running query</dd>
+    <dt><kbd>Tab</kbd> <kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Accept or move through suggestions</dd>
+    <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Shift the range back or forward by its width</dd>
+    <dt><kbd>1</kbd>–<kbd>4</kbd></dt><dd>Chart, Table, Explain, Cardinality</dd>
+    <dt><kbd>?</kbd></dt><dd>This sheet</dd>
+  </dl>
+  <p class="muted">Drag across the chart to zoom into a range. The address bar always holds the whole view: copy it to share what you see.</p>
+  <div class="dialog-actions"><span class="spacer"></span><button type="button" class="btn primary" id="help-close">Done</button></div>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

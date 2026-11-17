@@ -9,13 +9,12 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["timeseries", "database", "tsdb", "embedded", "analytics"]
 categories = ["database-implementations", "database", "embedded"]
-homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
+# Upstream Prometheus test data: run by the test suite, not part of the product.
+exclude = ["tests/promqltest/**"]
 
-# docs.rs builds with default features unless told otherwise, which would
-# publish documentation with the feature-gated surface missing entirely — the
-# cold tier, the security modules and Flight are all off by default.
+# Document every feature-gated item on docs.rs.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -26,91 +25,39 @@ doctest = false
 [features]
 default = ["analytics", "sql", "field-encryption"]
 
-## Statistical analytics in-process: forecasting, anomaly detection,
-## preprocessing, the model registry, and the SQL kernels built on them.
-##
-## **On by default.** It is the wedge ([`OVERVIEW`]), so a consumer who does
-## not name a feature gets it. Turn it off for the smallest targets: it is the
-## largest crate in the workspace and it carries `rayon` — a work-stealing
-## thread pool — plus `sha2` and `rand`, which a gateway that never forecasts
-## has no use for.
-##
-## It was unconditional until somebody asked why. Every other engine crate is
-## either gated (`security`, `streaming`) or load-bearing for a write
-## (`core`, `encoding`, `engine`, `query`); this one is neither, and the
-## design partner — an aarch64 box building `default-features = false` —
-## carried all of it while using rollups and nothing else. The mirror of
-## D225's rule: a gateway should not carry a Cedar engine, and it should not
-## carry a thread pool it never schedules on.
-##
-## `sql` implies it, because the SQL window functions and forecast aggregates
-## are thin wrappers over these kernels.
+## Forecasting, anomaly detection, declared detectors, preprocessing and the model
+## registry. On by default; `sql` implies it. Turning it off removes four packages
+## (`chronix-analytics`, `sha2`, `digest`, `const-oid`); `rayon` stays for the scan.
 analytics = ["dep:chronix-analytics"]
 
-## SQL through DataFusion: `db.sql()`, `session_context()`, the analytics
-## functions, `EXPLAIN`, and the cold tier's read half.
-##
-## **On by default. Turn it off to halve your build, not to shrink your
-## binary** — the measurements say those are different questions:
-##
-## | | `default-features = false` | with `sql` |
-## |---|---|---|
-## | clean debug build of a small consumer | 131 s | 227 s |
-## | stripped release binary, SQL unused | 11.74 MiB | 12.08 MiB |
-## | stripped release binary, SQL used | — | 73.19 MiB |
-## | peak heap, same aggregate | baseline | +0.86 MiB |
-##
-## DataFusion is ~52 MiB of object code, but the linker discards all of it
-## when nothing calls it, so the *gate* is worth 0.34 MiB and cutting the
-## dependency is worth 96 seconds a build. Memory is not a reason either way.
-##
-## Without it, writes, the native query API, PromQL, rollups, retention,
-## analytics, triggers and the cold *archive* all still work — the PromQL
-## evaluator never touches DataFusion.
-sql = ["dep:datafusion", "analytics"]
+## SQL through DataFusion: `db.sql()`, `session_context()`, the SQL analytics
+## functions, `EXPLAIN` and the cold tier's read half. On by default. Turning it off
+## cuts a small consumer's clean debug build from 227 s to 131 s; an unused SQL engine
+## adds only 0.34 MiB to a stripped binary. Writes, PromQL, rollups and analytics work
+## without it.
+sql = ["dep:datafusion", "analytics", "dep:futures", "dep:async-stream", "dep:async-trait"]
 
-## Per-column AES-256-GCM in the `.csx` segment format, declared by
-## `ChronixConfig::field_encryption` — or `[database.field_encryption]` in
-## `chronixd`.
-##
-## **On by default.** It costs `aes-gcm` in the dependency graph and nothing
-## at run time: a database that declares no column resolves no key, builds no
-## provider and takes no extra branch in the block path. Without it the
-## configuration is accepted and has no effect.
+## Per-column AES-256-GCM, declared by `ChronixConfig::field_encryption`. On by
+## default; costs nothing at run time when no column is declared.
 field-encryption = ["chronix-engine/field-encryption"]
 
-## Change-data-capture: `Chronix::subscribe`, the event bus every write
-## publishes to, and the signal/trigger engine.
-##
-## **Off by default.** It adds an HTTP client and a TLS stack for webhook
-## delivery, and an embedded consumer that opens a database and writes to it
-## subscribes to nothing.
+## Change data capture: `Chronix::subscribe`, the event bus and the trigger engine.
+## Off by default; it adds an HTTP client and a TLS stack for webhooks.
 streaming = ["dep:chronix-streaming"]
 
-## Authentication, Cedar authorization, the audit trail and the namespace
-## registry.
-##
-## **Off by default.** It adds a JWT library, Argon2, `aes-gcm`, Cedar and a
-## whole TLS stack, none of which an embedded `Chronix::open` touches.
-##
-## `chronixd` enables it unconditionally: a server without authentication,
-## authorization and an audit trail is not a build anybody should be able to
-## produce by accident.
+## Authentication, Cedar authorization, the audit trail and namespaces. Off by
+## default; `chronixd` always enables it.
 security = ["dep:chronix-security"]
 
-## The real-time pipeline: CDC → triggers → delivery, streaming anomaly
-## detection and continuous forecasting, with audit and authorization wired
-## through. Needs both halves above, plus webhook delivery.
-pipeline = ["streaming", "security"]
+## The real-time pipeline: change data capture → triggers → delivery, with streaming
+## anomaly detection and continuous forecasting. Implies `streaming` and `security`.
+pipeline = ["streaming", "security", "dep:uuid"]
 
-## `TryFrom` conversions between `chronix::Decimal` and
-## `rust_decimal::Decimal` — see `chronix-core`'s feature of the same name.
+## `TryFrom` conversions between `chronix::Decimal` and `rust_decimal::Decimal`.
 rust_decimal = ["chronix-core/rust_decimal"]
 
-## Parquet cold tier on S3/GCS/Azure, queryable through SQL (D6).
-##
-## Implies `sql`: the read half registers a DataFusion listing table, so a
-## cold tier without SQL could be written and never read.
+## Parquet cold tier on S3, GCS or Azure, queryable through SQL and readable by
+## DuckDB, Polars and Spark. Implies `sql`.
 object-store = ["sql", "chronix-engine/object-store", "dep:object_store", "dep:url"]
 
 [dependencies]
@@ -126,11 +73,11 @@ base64.workspace = true
 dashmap.workspace = true
 datafusion = { workspace = true, optional = true }
 fs2.workspace = true
-futures.workspace = true
-async-stream.workspace = true
+futures = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
 parking_lot.workspace = true
 parquet.workspace = true
-async-trait.workspace = true
+async-trait = { workspace = true, optional = true }
 thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -138,7 +85,8 @@ postcard.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 metrics.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, optional = true }
+# Public: `Chronix::open_with_pool` takes the host's `rayon::ThreadPool`.
 rayon.workspace = true
 regex.workspace = true
 
@@ -147,11 +95,12 @@ object_store = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 chrono.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
-# The catalog's own framing, so a test can build a record the replay scanner
-# will accept — which is what makes "a fragment with a valid record after it"
-# reproducible without reaching into the engine.
+# The catalog's framing, so tests can build records the replay scanner accepts.
 crc32c.workspace = true
 proptest.workspace = true
 criterion = { workspace = true }
@@ -161,19 +110,20 @@ name = "chronix_bench"
 harness = false
 required-features = ["sql"]
 
-# Examples are auto-discovered from `examples/`; only the feature-gated ones
-# need a declaration. They must live inside the crate: `cargo package` cannot
-# include a `path = "../../examples/..."` target, so the published crate would
-# declare sources it does not ship.
+# Examples are auto-discovered; only feature-gated ones are declared. They live
+# inside the crate so the published package ships them.
 [[example]]
 name = "cold_tier"
 required-features = ["object-store"]
 
-# Targets that exercise the SQL surface. `required-features` rather than a
-# `#![cfg]` inside each file: cargo then *skips* them for a build without the
-# feature, instead of compiling an empty test binary that reports success.
+# SQL targets: `required-features` makes cargo skip them without the feature
+# instead of compiling an empty binary that reports success.
 [[example]]
 name = "quickstart"
+required-features = ["sql"]
+
+[[example]]
+name = "readme"
 required-features = ["sql"]
 
 [[example]]
@@ -278,10 +228,8 @@ required-features = ["sql"]
 name = "analytics_limits"
 required-features = ["sql"]
 
-# Targets that exercise the streaming, security and pipeline surfaces, which
-# are off by default so an embedded build does not carry a JWT library and a
-# TLS stack. Same idiom as `sql` above: cargo skips the target rather than
-# compiling an empty binary that reports success.
+# Streaming, security and pipeline targets (features off by default); skipped
+# without the feature, like the SQL ones.
 [[example]]
 name = "audit_logging"
 required-features = ["security"]
@@ -296,7 +244,6 @@ required-features = ["security"]
 
 [[example]]
 name = "tenant_isolation"
-required-features = ["security"]
 
 [[example]]
 name = "signal_triggers"
@@ -332,6 +279,10 @@ required-features = ["analytics"]
 [[example]]
 name = "anomaly_detection"
 required-features = ["analytics"]
+
+[[example]]
+name = "declared_detector"
+required-features = ["analytics", "sql"]
 
 [[example]]
 name = "compute_engine"

@@ -47,6 +47,7 @@ impl super::Chronix {
     /// target. A rollup that fails keeps its watermark, so nothing is
     /// skipped; retention will not drop the raw data it needs.
     pub fn materialise_rollups(&self) -> Result<usize> {
+        self.ensure_writable("materialising rollups")?;
         self.check_open()?;
 
         let configs: Vec<RollupConfig> = self
@@ -260,7 +261,11 @@ impl super::Chronix {
             let bytes = postcard::to_stdvec(state)
                 .map_err(|e| DbError::Internal(format!("encoding rollup state: {e}")))?;
             catalog
-                .set_rollup_state(name, bytes)
+                .set_declared_state(
+                    chronix_engine::index::catalog::DeclaredKind::Rollup,
+                    name,
+                    bytes,
+                )
                 .map_err(|e| DbError::Internal(format!("persisting rollup state: {e}")))?;
         }
         Ok(())
@@ -286,6 +291,7 @@ impl super::Chronix {
     /// Returns an error if `name` is not a rollup, or if the recomputation
     /// fails.
     pub fn refresh_rollup(&self, name: &str, start: i64, end: i64) -> Result<usize> {
+        self.ensure_writable("refreshing a rollup")?;
         self.check_open()?;
         let config = {
             let reg = self.rollup_registry.read();
@@ -565,6 +571,7 @@ impl super::Chronix {
     ///
     /// Returns an error if the database is closed or validation fails.
     pub fn create_rollup(&self, config: RollupConfig) -> Result<()> {
+        self.ensure_writable("creating a rollup")?;
         self.check_open()?;
         if config.source_measurement == config.target_measurement {
             return Err(DbError::Internal(
@@ -610,7 +617,11 @@ impl super::Chronix {
         }
         self.catalog
             .write()
-            .set_rollup(&name, bytes)
+            .set_declared(
+                chronix_engine::index::catalog::DeclaredKind::Rollup,
+                &name,
+                bytes,
+            )
             .map_err(|e| DbError::Internal(format!("rollup persistence failed: {e}")))?;
         Ok(())
     }
@@ -650,12 +661,13 @@ impl super::Chronix {
     /// Returns an error if the database is closed or the rollup
     /// doesn't exist.
     pub fn delete_rollup(&self, name: &str) -> Result<bool> {
+        self.ensure_writable("deleting a rollup")?;
         self.check_open()?;
         let removed = self.rollup_registry.write().remove(name).is_some();
         if removed {
             self.catalog
                 .write()
-                .remove_rollup(name)
+                .remove_declared(chronix_engine::index::catalog::DeclaredKind::Rollup, name)
                 .map_err(|e| DbError::Internal(format!("rollup persistence failed: {e}")))?;
         }
         Ok(removed)

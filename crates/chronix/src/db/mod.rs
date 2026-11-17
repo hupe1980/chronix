@@ -8,17 +8,22 @@ mod accessors;
 #[cfg(feature = "analytics")]
 mod analytics_api;
 mod backup;
+mod cardinality;
 mod delete;
+mod detector;
 #[cfg(feature = "field-encryption")]
 mod encryption;
+pub(crate) mod exec;
 pub(crate) mod leases;
 mod lifecycle;
 mod query;
 mod rollup;
 mod stream;
+mod wal_seal;
 mod write;
 
 pub use accessors::SegmentInfo;
+pub use cardinality::{CardinalityScope, CardinalityStats, MAX_CARDINALITY_LIMIT, NameCount};
 pub use query::{ROLE_KEY, role_metadata};
 pub use stream::BatchStream;
 
@@ -33,9 +38,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::lock_order::{BloomsLock, CatalogLock, RollupRegistryLock, TombstonesLock};
 
-use chronix_core::{
-    ChronixConfig, SchemaRegistry, SegmentState, ShardId, TombstoneSet, WalEntry, wal_decode,
-};
+use chronix_core::{ChronixConfig, SchemaRegistry, SegmentState, ShardId, TombstoneSet};
 use chronix_engine::cache::SegmentCache;
 use chronix_engine::cache::lvc::LastValueCache;
 use chronix_engine::index::{SegmentCatalog, SeriesBloomFilter, TagInvertedIndex};
@@ -267,6 +270,28 @@ pub struct DbInner {
     /// because the SQL planner asks it for every table reference.
     pub(super) namespace_measurements: DashMap<String, DashSet<String>>,
 
+    /// Distinct known series per namespace — exactly the number of
+    /// `known_series` entries carrying each `__namespace__` value, kept at
+    /// every point that set changes (admission, whole-series delete, a
+    /// dropped measurement, the cardinality repair). A namespace's series
+    /// quota is checked against this, so usage is never a second counter
+    /// that a delete forgets to move.
+    pub(super) namespace_series: DashMap<String, usize>,
+
+    /// The limits the host has set per namespace
+    /// ([`Chronix::set_namespace_limits`]).
+    pub(super) namespace_limits: DashMap<String, crate::tenancy::NamespaceLimits>,
+
+    /// Held from computing a batch's new series to registering them, and by
+    /// every pass that removes series. A batch whose series are all known
+    /// never takes it. Without it two batches could each see room for their
+    /// new series and both insert, overshooting the database budget and a
+    /// namespace's quota alike.
+    pub(super) admission: parking_lot::Mutex<()>,
+
+    /// Where a call's parallel work runs — see [`exec`].
+    pub(crate) executor: Arc<exec::Executor>,
+
     /// Cached disk usage: when it was measured, and what it was.
     ///
     /// Measuring means walking the data directory, and `statistics()` runs
@@ -282,6 +307,18 @@ pub struct DbInner {
     pub(super) segment_leases: Arc<leases::SegmentLeases>,
     /// Rollup registry for managing rollup definitions.  Level-5 ordered lock.
     pub(super) rollup_registry: Arc<RollupRegistryLock<RollupRegistry>>,
+    /// Declared detectors' watermarks by source measurement, so the write
+    /// path can count a point no detector will ever judge without reading
+    /// the catalog. Not an ordered lock: `DashMap` shards are never held
+    /// across another acquisition.
+    pub(super) detector_marks: DashMap<String, Vec<(String, Option<i64>)>>,
+    /// Late points counted since a detector's last pass, folded into its
+    /// persisted state by the next one.
+    pub(super) detector_late: DashMap<String, u64>,
+    /// Serialises detector passes with declare and drop. Taken **before**
+    /// the catalog and never while holding it, so it sits outside the
+    /// ordered hierarchy without being able to invert it.
+    pub(super) detector_pass: parking_lot::Mutex<()>,
     /// Compaction picker for selecting segments to compact.
     pub(super) compaction_picker: CompactionPicker,
     /// CDC event bus for streaming change events.
@@ -325,7 +362,11 @@ pub struct DbInner {
     /// each other's half-done state is how records fell below it.
     pub(super) flush_gate: parking_lot::Mutex<()>,
     /// Lock file handle — dropped on close to release lock.
-    pub(super) _lock_file: std::fs::File,
+    /// `None` for a read-only open, which takes no lock.
+    pub(super) _lock_file: Option<std::fs::File>,
+    /// The WAL writer's directory for a read-only open, removed with the
+    /// handle.
+    pub(super) _scratch: Option<ScratchDir>,
     /// Closed flag.
     pub(super) closed: AtomicBool,
     /// Runtime-registered scalar UDFs (available after `register_udf`).
@@ -413,17 +454,125 @@ impl Chronix {
     ///
     /// Returns an error if the lock cannot be acquired, the directory is
     /// unreadable, or WAL replay fails.
-    #[allow(clippy::too_many_lines)]
     pub fn open(config: ChronixConfig) -> Result<Self> {
+        let executor = exec::Executor::new(config.parallelism);
+        Self::open_with_executor(config, executor)
+    }
+
+    /// Open a database whose queries and analytics run on the host's rayon
+    /// pool, instead of one chronix builds from
+    /// [`parallelism`](ChronixConfig::parallelism).
+    ///
+    /// The pool's size is the budget; `config.parallelism` is ignored.
+    /// Chronix never configures rayon's global pool.
+    ///
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use chronix::prelude::{Chronix, ChronixConfig};
+    /// let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+    /// let db = Chronix::open_with_pool(ChronixConfig::small("/var/lib/chronix"), pool).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Same failure modes as [`Chronix::open`].
+    pub fn open_with_pool(config: ChronixConfig, pool: Arc<rayon::ThreadPool>) -> Result<Self> {
+        Self::open_with_executor(config, exec::Executor::injected(pool))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_with_executor(config: ChronixConfig, executor: exec::Executor) -> Result<Self> {
         let data_dir = &config.data_dir;
+        let read_only = config.read_only;
+        if read_only {
+            Self::check_read_only_target(data_dir)?;
+        }
+        let lock_file = if read_only {
+            None
+        } else {
+            Some(Self::take_lock(data_dir)?)
+        };
+
+        info!(data_dir = %data_dir.display(), read_only, "Opening Chronix database");
+
+        // Ensure sub-directories exist
+        let wal_dir = wal_dir_of(data_dir);
+        let segments_dir = segments_dir_of(data_dir);
+        let catalog_dir = catalog_dir_of(data_dir);
+        if !read_only {
+            std::fs::create_dir_all(&wal_dir)?;
+            std::fs::create_dir_all(&segments_dir)?;
+            std::fs::create_dir_all(&catalog_dir)?;
+        }
+
+        // Open catalog
+        let catalog = if read_only {
+            SegmentCatalog::open_read_only(&catalog_dir)?
+        } else {
+            SegmentCatalog::open(&catalog_dir)?
+        };
+
+        // ── Orphaned segment cleanup ──────────────────────────────────
+        // A crash between writing a segment file and registering it leaves an
+        // orphan. Segments live in `segments/shard_<id>/`, so the sweep descends
+        // one level. A read-only open leaves orphans alone: the catalog does not
+        // name them, so no query reads them.
+        if !read_only {
+            Self::remove_orphaned_segments(&segments_dir, &catalog);
+        }
+        Self::refuse_dangling_entries(&segments_dir, &catalog)?;
+
+        // Rebuild the indexes and the series set from the catalog and the
+        // per-segment series sidecars — no segment is decoded here.
+        let (blooms, tag_index, known_series) =
+            Self::load_catalog_state(&catalog, &segments_dir, !read_only);
+
+        // Open WAL. A read-only open never writes one, but the handle needs a
+        // writer: it gets a private scratch directory, removed with the
+        // handle, and every write is refused before it could reach it.
+        let scratch = if read_only {
+            Some(ScratchDir::new()?)
+        } else {
+            None
+        };
+        let wal = WalWriter::open(
+            scratch
+                .as_ref()
+                .map_or(wal_dir.as_path(), |s| s.0.as_path()),
+            config.wal.clone(),
+        )?;
+        let wal = Arc::new(wal);
+        // `Periodic` is only a policy if something does the syncing. A no-op
+        // under the other policies.
+        if !read_only {
+            wal.start_periodic_sync();
+        }
+        Self::finish_open(
+            config,
+            executor,
+            lock_file,
+            scratch,
+            catalog,
+            wal,
+            (blooms, tag_index),
+            known_series,
+        )
+    }
+
+    /// Take the directory's exclusive lock and write the holder record.
+    fn take_lock(data_dir: &Path) -> Result<std::fs::File> {
         std::fs::create_dir_all(data_dir)?;
 
         // Acquire exclusive file lock
         let lock_path = data_dir.join("LOCK");
-        let lock_file = std::fs::OpenOptions::new()
+        // Not `truncate(true)`: that would empty the file *before* the lock is
+        // taken, so a second process that then fails to lock would still have
+        // wiped the holder record of the process that owns the directory.
+        let mut lock_file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
+            .read(true)
             .write(true)
-            .truncate(true)
             .open(&lock_path)?;
 
         lock_file
@@ -432,39 +581,57 @@ impl Chronix {
                 path: lock_path.display().to_string(),
             })?;
 
-        info!(data_dir = %data_dir.display(), "Opening Chronix database");
+        // Who holds the directory, for `inspect`: a clean close empties it
+        // again, so a record left behind means the holder stopped without
+        // closing. Rewritten on every open; not a durable format.
+        {
+            use std::io::{Seek, Write};
+            lock_file.set_len(0)?;
+            lock_file.seek(std::io::SeekFrom::Start(0))?;
+            lock_file.write_all(crate::inspect::LockHolder::current().render().as_bytes())?;
+            lock_file.sync_data()?;
+        }
+        Ok(lock_file)
+    }
 
-        // Ensure sub-directories exist
-        let wal_dir = wal_dir_of(data_dir);
-        let segments_dir = segments_dir_of(data_dir);
-        let catalog_dir = catalog_dir_of(data_dir);
-        std::fs::create_dir_all(&wal_dir)?;
-        std::fs::create_dir_all(&segments_dir)?;
-        std::fs::create_dir_all(&catalog_dir)?;
+    /// A read-only open needs a chronix directory nobody is running.
+    fn check_read_only_target(data_dir: &Path) -> Result<()> {
+        if !catalog_dir_of(data_dir).is_dir() {
+            return Err(DbError::InvalidRequest(format!(
+                "{} is not a chronix data directory (it has no catalog); a read-only \
+                 open creates nothing",
+                data_dir.display()
+            )));
+        }
+        if let Some(holder) = crate::inspect::live_holder(data_dir) {
+            return Err(DbError::DirectoryLive {
+                path: data_dir.display().to_string(),
+                pid: holder.pid,
+                host: holder.host,
+            });
+        }
+        Ok(())
+    }
 
-        // Open catalog
-        let mut catalog = SegmentCatalog::open(&catalog_dir)?;
-
-        // ── Orphaned segment cleanup ──────────────────────────────────
-        // A crash between writing a segment file and registering it leaves
-        // an orphan. Segments live in `segments/shard_<id>/`, so the sweep
-        // has to descend one level: it used to list only the top directory,
-        // which holds nothing but those subdirectories, and removed nothing.
-        Self::remove_orphaned_segments(&segments_dir, &catalog);
-        Self::refuse_dangling_entries(&segments_dir, &catalog)?;
-
-        // Rebuild the indexes and the series set from the catalog and the
-        // per-segment series sidecars — no segment is decoded here.
+    /// Everything after the catalog, the indexes and the WAL writer exist:
+    /// schemas, WAL replay, rollups, and the handle itself.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn finish_open(
+        config: ChronixConfig,
+        executor: exec::Executor,
+        lock_file: Option<std::fs::File>,
+        scratch: Option<ScratchDir>,
+        mut catalog: SegmentCatalog,
+        wal: Arc<WalWriter>,
+        (blooms, tag_index): (BTreeMap<u64, SeriesBloomFilter>, TagInvertedIndex),
+        mut known_series: HashSet<String>,
+    ) -> Result<Self> {
+        let read_only = config.read_only;
+        let data_dir = config.data_dir.clone();
+        let wal_dir = wal_dir_of(&data_dir);
+        let segments_dir = segments_dir_of(&data_dir);
         let namespace_measurements;
-        let (blooms, tag_index, mut known_series) =
-            Self::load_catalog_state(&catalog, &segments_dir);
-
-        // Open WAL
-        let wal = WalWriter::open(&wal_dir, config.wal.clone())?;
-        let wal = Arc::new(wal);
-        // `Periodic` is only a policy if something does the syncing. A no-op
-        // under the other policies.
-        wal.start_periodic_sync();
+        let namespace_series;
 
         // Build schema registry from catalog
         let schema = Arc::new(SchemaRegistry::new());
@@ -527,16 +694,19 @@ impl Chronix {
         // it is in a segment already; replaying it would re-insert — and at
         // the next flush re-write — data that is already on disk.
         let wal_floor = catalog.wal_floor();
-        let wal_records = chronix_engine::wal::replay_range(&wal_dir, wal_floor, u64::MAX)?;
+        // A read-only open of a directory that was never written has no WAL
+        // directory, and creates none.
+        let wal_records = if wal_dir.is_dir() {
+            chronix_engine::wal::replay_range(&wal_dir, wal_floor, u64::MAX)?
+        } else {
+            Vec::new()
+        };
         let replayed_count = wal_records.len();
         let mut replay_series: HashSet<String> = HashSet::new();
 
-        // Tombstones come from the catalog, which is their only durable
-        // record — and the only place they have ever needed to come from.
-        // A delete used to write a WAL record too; it could not be reached,
-        // because `execute_delete` flushes first, so every point a tombstone
-        // covers is already in a segment and below the floor this replay
-        // starts after.
+        // Tombstones come from the catalog, their only durable record. A delete
+        // flushes first, so every point a tombstone covers is already in a segment
+        // below the floor this replay starts after.
         let replay_tombstones = catalog.tombstones().clone();
         for record in wal_records {
             // A record may contain a single WAL entry OR an atomic batch.
@@ -547,17 +717,14 @@ impl Chronix {
                     None => vec![record.payload],
                 };
 
-            for payload in &payloads {
-                match wal_decode(payload) {
-                    Ok(WalEntry::Write { point }) => {
-                        replay_series.insert(point.series_key().canonical_form().to_string());
-                        if let Err(e) = shards.insert_replay(&point, record.sequence_no) {
-                            warn!(seq = record.sequence_no, error = %e, "Skipping WAL record during replay");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(seq = record.sequence_no, error = %e, "Skipping unparseable WAL record");
-                    }
+            #[cfg(feature = "field-encryption")]
+            let keys = field_encryption.as_ref().map(|e| e.reader.as_ref());
+            #[cfg(not(feature = "field-encryption"))]
+            let keys = None;
+            for point in wal_seal::open_record(&payloads, record.sequence_no, keys)? {
+                replay_series.insert(point.series_key().canonical_form().to_string());
+                if let Err(e) = shards.insert_replay(&point, record.sequence_no) {
+                    warn!(seq = record.sequence_no, error = %e, "Skipping WAL record during replay");
                 }
             }
         }
@@ -566,7 +733,7 @@ impl Chronix {
         // carries exists whether or not the manifest remembers it. Fold every
         // active segment's column list into the registry — and persist any
         // repair — so the SQL schema can never lag the data on disk.
-        Self::reconcile_schema_with_segments(&schema, &mut catalog);
+        Self::reconcile_schema_with_segments(&schema, &mut catalog, !read_only);
 
         if replayed_count > 0 {
             info!(
@@ -593,11 +760,7 @@ impl Chronix {
         }
 
         // Rollup definitions and watermarks come from the catalog, which is
-        // fsynced, CRC'd and carried forward by every snapshot. They used to
-        // live in a JSON file written without an fsync, and a failure to
-        // parse it was logged and swallowed — leaving a database that
-        // believed it had no rollups at all, whose next retention pass
-        // dropped the raw data those rollups existed to preserve.
+        // fsynced, CRC'd and carried forward by every snapshot.
         let rollup_registry = {
             let mut registry = RollupRegistry::new();
             for (name, record) in catalog.rollups() {
@@ -644,17 +807,27 @@ impl Chronix {
                 blooms: Arc::new(BloomsLock::new(blooms)),
                 known_series: {
                     let set: DashSet<String> = known_series.into_iter().collect();
+                    // After WAL replay has extended the set, so a replayed
+                    // series is counted and never admitted twice.
                     namespace_measurements = crate::db::accessors::index_by_namespace(&set);
+                    namespace_series = crate::db::accessors::count_by_namespace(&set);
                     Arc::new(set)
                 },
                 tombstones: Arc::new(TombstonesLock::new(replay_tombstones)),
                 lvc: LastValueCache::new(),
                 namespace_measurements,
+                namespace_series,
+                namespace_limits: DashMap::new(),
+                admission: parking_lot::Mutex::new(()),
+                executor: Arc::new(executor),
                 disk_usage: parking_lot::RwLock::new(None),
                 segment_cache: Arc::new(SegmentCache::new(segment_cache_size)),
                 tag_index: Arc::new(tag_index),
                 segment_leases: Arc::new(leases::SegmentLeases::default()),
                 rollup_registry: Arc::new(RollupRegistryLock::new(rollup_registry)),
+                detector_marks: DashMap::new(),
+                detector_late: DashMap::new(),
+                detector_pass: parking_lot::Mutex::new(()),
                 compaction_picker: CompactionPicker::default(),
                 #[cfg(feature = "streaming")]
                 cdc_bus: EventBus::new(cdc_capacity),
@@ -670,6 +843,7 @@ impl Chronix {
                 write_epoch: parking_lot::RwLock::new(()),
                 flush_gate: parking_lot::Mutex::new(()),
                 _lock_file: lock_file,
+                _scratch: scratch,
                 closed: AtomicBool::new(false),
                 #[cfg(feature = "sql")]
                 custom_udfs: Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -688,10 +862,18 @@ impl Chronix {
         // Replay bypasses the memtable cap — an acknowledged record is not
         // something to refuse — so a WAL larger than the cap lands in memory
         // whole. Flush it down before anything else runs.
-        if replayed_count > 0 && db.shards.total_memory() > db.config.memtable_flush_threshold {
+        // A read-only open keeps it all in memory instead: it writes nothing,
+        // and a copied directory is small enough to have come off a device.
+        if !read_only
+            && replayed_count > 0
+            && db.shards.total_memory() > db.config.memtable_flush_threshold
+        {
             db.flush()?;
         }
-        crate::maintenance::spawn(&db);
+        db.load_detector_marks();
+        if !read_only {
+            crate::maintenance::spawn(&db);
+        }
         Ok(db)
     }
 
@@ -778,7 +960,11 @@ impl Chronix {
 impl Chronix {
     /// Ensure every column an active segment carries is in the registry,
     /// persisting the repair to the catalog when one was needed.
-    fn reconcile_schema_with_segments(schema: &SchemaRegistry, catalog: &mut SegmentCatalog) {
+    fn reconcile_schema_with_segments(
+        schema: &SchemaRegistry,
+        catalog: &mut SegmentCatalog,
+        persist: bool,
+    ) {
         use chronix_core::schema::{ColumnDef, ColumnRole, ColumnType, MeasurementSchema};
         use chronix_engine::segment::metadata::{data_types, roles};
 
@@ -830,6 +1016,9 @@ impl Chronix {
             }
         }
         for measurement in repaired {
+            if !persist {
+                continue;
+            }
             warn!(
                 measurement,
                 "schema repaired from segment metadata — the manifest was missing columns the data carries"
@@ -877,6 +1066,44 @@ impl Drop for Chronix {
         if result.is_err() {
             // Swallow the panic — logging may itself be unavailable here.
             eprintln!("chronix: panic during Chronix::drop suppressed to avoid abort");
+        }
+    }
+}
+
+impl Chronix {
+    /// Where a query spills to disk: `spill/` in the data directory, or in
+    /// the scratch directory of a read-only open, which writes nothing to
+    /// the data directory.
+    #[cfg(feature = "sql")]
+    pub(crate) fn spill_dir(&self) -> std::path::PathBuf {
+        match &self._scratch {
+            Some(scratch) => scratch.0.join("spill"),
+            None => self.config.data_dir.join("spill"),
+        }
+    }
+}
+
+/// A private temporary directory, removed when the handle that owns it is
+/// dropped. A read-only open points its (never used) WAL writer here.
+pub(super) struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new() -> Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "chronix-read-only-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            debug!(path = %self.0.display(), error = %e, "could not remove a read-only scratch directory");
         }
     }
 }
@@ -2791,16 +3018,9 @@ mod tests {
         db.close().unwrap();
     }
 
-    /// A reclaim pass immediately after a delete must reclaim nothing.
-    ///
-    /// This test replaces one that asserted the exact opposite —
-    /// `compact_tombstones()` was expected to remove the tombstone right after
-    /// `delete_series()`, and did, because the rule was "drop the tombstone
-    /// once its series has left `known_series`" and the delete had just
-    /// removed it from there. The rows were still on disk, so the delete came
-    /// undone the first time any background pass ran. A test can pin a defect
-    /// as easily as a property; this one had pinned the defect for as long as
-    /// it had existed.
+    /// A reclaim pass immediately after a delete must reclaim nothing: the rows
+    /// are still on disk, so dropping the tombstone would undo the delete the
+    /// first time a background pass ran.
     #[test]
     fn reclaiming_immediately_after_a_delete_reclaims_nothing() {
         let tmp = TempDir::new().unwrap();

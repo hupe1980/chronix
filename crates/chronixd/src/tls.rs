@@ -1,29 +1,16 @@
 //! TLS configuration for HTTP and gRPC endpoints.
 //!
-//! ## Certificate Rotation
+//! ## Certificate rotation
 //!
-//! TLS certificates loaded by this module are **not** refreshed automatically
-//! at the point of load. However, the HTTP endpoint supports **hot-reload**
-//! via the companion [`tls_watcher`](crate::tls_watcher) module, which polls
-//! cert/key file modification times and atomically swaps the live
-//! `rustls::ServerConfig` when changes are detected. Enable it by setting
-//! `--tls-reload-interval` (or `CHRONIXD_TLS_RELOAD_INTERVAL`) to a
-//! non-zero number of seconds.
+//! The [`tls_watcher`](crate::tls_watcher) polls the certificate and key
+//! files and swaps the live configuration without a restart: the HTTP
+//! endpoint's `rustls::ServerConfig`, and for gRPC and Flight SQL the
+//! `CertifiedKey` inside [`ReloadableCertResolver`], so new connections use
+//! the rotated certificate at once.
 //!
-//! The gRPC and Flight SQL (tonic) endpoints use a custom
-//! [`ReloadableCertResolver`] that implements `rustls::server::ResolvesServerCert`.
-//! When the TLS watcher detects file changes it atomically swaps the
-//! `CertifiedKey` inside the resolver, so new gRPC/Flight connections
-//! immediately use the rotated certificate — no restart required.
-//!
-//! ## TLS reload is disabled by default
-//!
-//! The `reload_interval_secs` field in [`TlsConfig`]
-//! defaults to **0**, meaning hot-reload is **silently disabled** unless
-//! explicitly configured. Operators must set `--tls-reload-interval` to a
-//! non-zero value (e.g. 300 for 5-minute polling) to enable automatic
-//! certificate rotation. Without this, certificate renewal (e.g. via
-//! cert-manager) requires a full process restart.
+//! The interval is `[tls] reload_interval_secs` (default 60 seconds) or
+//! `--tls-reload-interval-secs` / `CHRONIXD_TLS_RELOAD_INTERVAL`; `0`
+//! disables reloading.
 
 use std::io::BufReader;
 use std::path::Path;
@@ -399,16 +386,12 @@ pub enum TlsError {
 mod pem_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    //! Coverage for the PEM loaders.
+    //! Coverage for the PEM loaders (`rustls-pki-types`). A certificate loader
+    //! that returns the wrong thing fails as a handshake rejection at the far end
+    //! of a deployment, not loudly here.
     //!
-    //! These had no tests at all, which mattered when the parsing moved off
-    //! `rustls-pemfile` (unmaintained; its functionality now lives in
-    //! `rustls-pki-types`, RUSTSEC-2025-0134). A certificate loader that
-    //! silently returns the wrong thing does not fail loudly — it fails as a
-    //! handshake rejection at the far end of a deployment.
-    //!
-    //! The keys below are throwaway fixtures generated for this test file and
-    //! are not used to secure anything.
+    //! The keys below are throwaway fixtures generated for this file and secure
+    //! nothing.
 
     use super::*;
     use std::io::Write;

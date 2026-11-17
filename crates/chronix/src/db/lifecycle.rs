@@ -32,6 +32,7 @@ impl super::Chronix {
     /// lost by a failed flush.
     #[must_use = "flush errors may indicate data not persisted"]
     pub fn flush(&self) -> Result<Vec<FlushResult>> {
+        self.ensure_writable("flush")?;
         let start = std::time::Instant::now();
         self.check_open()?;
         let _gate = self.flush_gate.lock();
@@ -60,26 +61,19 @@ impl super::Chronix {
         }
     }
 
-    /// Record in the catalog that every WAL record below the oldest
-    /// unflushed one is in a segment, and drop the WAL files that hold
-    /// nothing newer.
+    /// Record in the catalog that every WAL record below the oldest unflushed
+    /// one is in a segment, and drop the WAL files that hold nothing newer.
     ///
-    /// **The floor is derived from what is unflushed, never from what was
-    /// just flushed.** `floor = min_unflushed_seq − 1`, or the newest
-    /// sequence number when nothing is unflushed. "Unflushed" covers every
-    /// memtable — active or frozen, in any shard — and every write between
-    /// its WAL append and its memtable insert, which the write epoch
-    /// excludes by construction: writers hold the epoch for read across
-    /// that gap, and this takes it for write.
+    /// **The floor is derived from what is unflushed, never from what was just
+    /// flushed:** `floor = min_unflushed_seq − 1`, or the newest sequence number
+    /// when nothing is unflushed. "Unflushed" covers every memtable — active or
+    /// frozen, in any shard — and every write between its WAL append and its
+    /// memtable insert, which the write epoch excludes: writers hold it for read
+    /// across that gap, and this takes it for write. A record below the floor is
+    /// never replayed, so the floor must never pass an acknowledged write.
     ///
-    /// Deriving it from what was *just flushed* instead cannot see a frozen
-    /// memtable another flush is still writing, nor a write appended but not
-    /// yet inserted. Either lets the floor pass an acknowledged record, and
-    /// a record below the floor is never replayed.
-    ///
-    /// The floor lives in the catalog because truncation cannot express it:
-    /// the active WAL file is never deleted, so without a recorded floor
-    /// every open replayed it in full.
+    /// The floor lives in the catalog because the active WAL file is never
+    /// deleted; without it every open would replay that file in full.
     pub(super) fn raise_wal_floor_to_unflushed(&self) {
         let floor = {
             let _no_writer_in_flight = self.write_epoch.write();
@@ -113,6 +107,13 @@ impl super::Chronix {
     pub fn close(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(()); // Already closed
+        }
+        // A read-only open wrote nothing and holds no lock, so closing it
+        // flushes, rotates and snapshots nothing either.
+        if self.config.read_only {
+            self.closed.store(true, Ordering::Release);
+            info!("Chronix database closed (read-only)");
+            return Ok(());
         }
 
         info!("Closing Chronix database");
@@ -172,8 +173,14 @@ impl super::Chronix {
         // A closed database is not this process's any more: release the
         // directory lock now rather than when the last handle drops, so
         // `close()` followed by `open()` of the same directory works.
-        if let Err(e) = fs2::FileExt::unlock(&self._lock_file) {
-            warn!(error = %e, "Failed to release the database lock file");
+        // An empty LOCK is how `inspect` tells a clean close from a crash.
+        if let Some(lock_file) = &self._lock_file {
+            if let Err(e) = lock_file.set_len(0).and_then(|()| lock_file.sync_data()) {
+                warn!(error = %e, "Failed to clear the database lock file's holder record");
+            }
+            if let Err(e) = fs2::FileExt::unlock(lock_file) {
+                warn!(error = %e, "Failed to release the database lock file");
+            }
         }
 
         info!("Chronix database closed");
@@ -182,29 +189,20 @@ impl super::Chronix {
 
     /// Whether the database can accept writes at all, and why not.
     ///
-    /// **Persistent** conditions only: closed, a WAL poisoned by a failed
-    /// `fsync`, or a maintenance thread that has ended — each refuses every
-    /// write until the database is reopened. Transient back-pressure — a full
-    /// memtable waiting on a flush — is deliberately not unready: that is the
-    /// moment to keep serving and let back-pressure work, not the moment to
-    /// leave the load balancer.
-    ///
-    /// The maintenance thread is here because a database that has lost it
-    /// looks perfectly healthy right up to the moment it stops accepting
-    /// writes for ever: nothing flushes, compacts, materialises a rollup or
-    /// expires a shard again, and the memtable fills at whatever rate the
-    /// workload writes. Reporting it while writes still succeed is what gives
-    /// an orchestrator time to restart the process instead of discovering it
-    /// through a wall of refusals.
-    ///
-    /// `chronixd`'s `/ready` is the caller.
+    /// Persistent conditions only: closed, a WAL poisoned by a failed `fsync`,
+    /// or a maintenance thread that has ended — each refuses every write until
+    /// the database is reopened. A full memtable waiting on a flush is transient
+    /// back-pressure and is not reported. A lost maintenance thread is reported
+    /// while writes still succeed, so an orchestrator can restart the process
+    /// before nothing flushes and the memtable fills. `chronixd`'s `/ready` is the
+    /// caller.
     ///
     /// # Errors
     ///
-    /// [`DbError::Closed`] or [`DbError::PersistentOverload`], with the
-    /// reason.
+    /// [`DbError::Closed`] or [`DbError::PersistentOverload`], with the reason.
     pub fn check_writable(&self) -> Result<()> {
         self.check_open()?;
+        self.ensure_writable("writing")?;
         if self.wal.is_poisoned() {
             return Err(DbError::PersistentOverload {
                 reason: "the WAL writer is poisoned after a failed fsync; the \
@@ -219,6 +217,15 @@ impl super::Chronix {
                          database must be closed and reopened"
                     .into(),
             });
+        }
+        Ok(())
+    }
+
+    /// Refuse `operation` on a database opened
+    /// [`read_only`](chronix_core::ChronixConfig::read_only).
+    pub(super) fn ensure_writable(&self, operation: &'static str) -> Result<()> {
+        if self.config.read_only {
+            return Err(DbError::ReadOnly { operation });
         }
         Ok(())
     }
@@ -314,23 +321,21 @@ impl super::Chronix {
         &self,
         retention: std::time::Duration,
     ) -> Result<retention::RetentionResult> {
+        self.ensure_writable("enforcing retention")?;
         let ns = i64::try_from(retention.as_nanos()).unwrap_or(i64::MAX);
         self.enforce_retention_inner(Some(ns))
     }
 
     /// Enforce every configured retention rule — the global one if there is
-    /// one, plus every per-measurement and per-rollup rule.
-    ///
-    /// This is what the maintenance thread calls. It used to call
-    /// `enforce_retention` only when a *global* retention was configured,
-    /// so a database that set a rule for one measurement, or a rollup that
-    /// declared its own `retention_ns`, expired nothing at all.
+    /// one, plus every per-measurement and per-rollup rule. The maintenance
+    /// thread calls this.
     ///
     /// # Errors
     ///
     /// Returns an error if the database is closed.
     #[must_use = "retention errors must be handled"]
     pub fn enforce_configured_retention(&self) -> Result<retention::RetentionResult> {
+        self.ensure_writable("enforcing retention")?;
         let global = self
             .config
             .retention
@@ -364,16 +369,9 @@ impl super::Chronix {
             warn!(error = %e, "retention: rollup materialisation failed — raw data that feeds a rollup is preserved");
         }
 
-        // Shard bounds and the segments in each shard come from **one**
-        // snapshot of the catalog, taken under one lock.
-        //
-        // They used to come from different places: the bounds from the time
-        // index and the segment list from the catalog, read one after the
-        // other. A flush or a compaction landing between the two put a
-        // segment in the catalog that the index did not know about, so its
-        // shard looked entirely expired and the pass deleted a segment
-        // newer than the cutoff. Deriving both from the same snapshot makes
-        // the window unrepresentable rather than merely unlikely.
+        // Shard bounds and the segments in each shard come from one snapshot of
+        // the catalog, taken under one lock: a flush or compaction can never put a
+        // segment in a shard this pass believes is entirely expired.
         let (shard_bounds, segments_by_shard) = {
             let catalog = self.catalog.read();
             let mut bounds: BTreeMap<ShardId, (i64, i64)> = BTreeMap::new();
@@ -440,13 +438,8 @@ impl super::Chronix {
 
         let mut total_segments: usize = 0;
         let mut total_bytes: u64 = 0;
-        // Shards this pass actually removed, and segments it declined to
-        // remove because a rollup still needs them. `shards_dropped` used to
-        // be `expired.len()` — the shards the pass *looked at* — so an
-        // operator watching a disk that would not shrink read
-        // "Retention enforced, shards=13" on every pass, for ever, while the
-        // pass deleted nothing. The tell for this class is a number that is
-        // always the same.
+        // Shards this pass actually removed, and segments it kept because a rollup
+        // still needs them — what was done, not what was looked at.
         let mut shards_dropped: usize = 0;
         let mut segments_preserved: usize = 0;
         let mut segments_awaiting_readers: usize = 0;
@@ -645,6 +638,8 @@ impl super::Chronix {
         if released == 0 {
             return;
         }
+        // A released series releases its namespace's quota too.
+        self.recount_namespace_series();
 
         // The last-value cache is a copy of each series' newest row, so it
         // has to forget the series the data no longer holds — otherwise a
@@ -710,6 +705,7 @@ impl super::Chronix {
     /// Returns an error if the database is closed or I/O fails.
     #[allow(clippy::too_many_lines)]
     pub fn compact(&self) -> Result<usize> {
+        self.ensure_writable("compaction")?;
         self.check_open()?;
 
         // Prevent concurrent compaction runs. If another thread
@@ -1179,6 +1175,7 @@ impl super::Chronix {
     ///
     /// Returns an error if the database is closed.
     pub fn gc(&self) -> Result<usize> {
+        self.ensure_writable("garbage collection")?;
         self.check_open()?;
 
         let retired: Vec<SegmentCatalogEntry> = {
@@ -1261,6 +1258,7 @@ impl super::Chronix {
     /// The deadline is measured against the same reference retention uses,
     /// not the raw wall clock: see the comment in the body.
     pub fn gc_pending_measurement_drops(&self) -> Result<usize> {
+        self.ensure_writable("garbage collection")?;
         // The same reference retention measures age from, for the same
         // reason: this pass is irreversible, and a soft delete's whole
         // purpose is to leave a window in which a mistake can be undone.
@@ -1320,6 +1318,7 @@ impl super::Chronix {
     /// Returns an error if the database is closed, or the manifest cannot be
     /// written.
     pub fn restore_measurement(&self, measurement: &str) -> Result<bool> {
+        self.ensure_writable("restoring a measurement")?;
         self.check_open()?;
         let was_pending = self
             .catalog
@@ -1345,6 +1344,7 @@ impl super::Chronix {
     /// frozen for the next attempt and removes the files of this attempt.
     #[allow(clippy::too_many_lines)]
     pub fn flush_shard(&self, shard_id: ShardId) -> Result<Vec<FlushResult>> {
+        self.ensure_writable("flush")?;
         let shard_flush_start = std::time::Instant::now();
         let outcome = self.shards.flush_shard_with(shard_id, |results| {
             self.register_flushed(shard_id, results)

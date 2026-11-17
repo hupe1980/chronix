@@ -438,12 +438,8 @@ impl AuditLogger {
 
     /// Continue an existing chain instead of starting a new one.
     ///
-    /// A restart used to reset the sequence to 1 and the previous hash to
-    /// `None`, so every restart began a fresh chain in the same file. A
-    /// verifier then could not tell a restart from a truncation: both look
-    /// like an event whose `prev_hash` is `None` in the middle of the log.
-    /// Anchoring on the last event already on disk makes the file one
-    /// chain across the whole life of the deployment.
+    /// Anchoring on the last event already on disk makes the file one chain
+    /// across restarts, so a verifier can tell a restart from a truncation.
     #[must_use]
     pub fn resume_from(self, last_id: u64, last_hash: Option<String>) -> Self {
         self.sequence.store(last_id + 1, Ordering::Relaxed);
@@ -1377,10 +1373,9 @@ mod durability_tests {
             .expect("the chain must verify straight through the restart");
     }
 
-    /// Without the key, the chain detects corruption but not tampering:
-    /// anyone who can rewrite the file can recompute a plain SHA-256 chain.
-    /// `log` used to seal without the key while `log_strict` sealed with it,
-    /// so a mixed log verified under neither.
+    /// Without the key, the chain detects corruption but not tampering: anyone
+    /// who can rewrite the file can recompute a plain SHA-256 chain. `log` and
+    /// `log_strict` therefore seal the same way.
     #[test]
     fn a_keyed_chain_verifies_only_with_its_key() {
         let key = b"seal".to_vec();

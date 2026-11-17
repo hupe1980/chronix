@@ -1134,7 +1134,7 @@ impl Drop for WalWriter {
 /// List all WAL files in a directory, sorted by starting sequence number.
 ///
 /// Returns `(starting_sequence, path)` pairs.
-pub(crate) fn list_wal_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError> {
+pub fn list_wal_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, WalError> {
     let mut files = Vec::new();
 
     if !dir.exists() {

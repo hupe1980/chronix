@@ -72,15 +72,24 @@ pub trait ComputeEngine: Send + Sync {
 
 /// CPU compute engine using SIMD and rayon parallelism.
 ///
-/// Owns a dedicated [`rayon::ThreadPool`] so that the `cpu_threads`
-/// configuration is always honoured, regardless of whether any other
-/// code has already initialised the rayon global pool.  Operations
-/// that benefit from data-parallelism (autocorrelation, dot product
-/// on large vectors) are dispatched onto this pool when the input
-/// exceeds `PARALLEL_THRESHOLD`.
+/// Large inputs (autocorrelation, dot products) fan out on the engine's
+/// pool: a dedicated one sized by [`ComputeConfig::cpu_threads`]
+/// ([`new`](Self::new)), a pool the host already owns
+/// ([`with_pool`](Self::with_pool)), or none at all
+/// ([`serial`](Self::serial)). Rayon's global pool is never used.
+///
+/// ```
+/// use std::sync::Arc;
+/// use chronix_analytics::compute::CpuEngine;
+///
+/// let host = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+/// let engine = CpuEngine::with_pool(Arc::clone(&host));
+/// assert_eq!(engine.num_threads(), 2);
+/// assert_eq!(CpuEngine::serial().num_threads(), 1);
+/// ```
 pub struct CpuEngine {
     config: ComputeConfig,
-    pool: Arc<rayon::ThreadPool>,
+    pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl CpuEngine {
@@ -109,20 +118,41 @@ impl CpuEngine {
 
         Ok(Self {
             config,
-            pool: Arc::new(pool),
+            pool: Some(Arc::new(pool)),
         })
     }
 
-    /// Returns a reference to the owned thread pool.
+    /// An engine that runs on `pool` — typically the one the host passed to
+    /// `Chronix::open_with_pool` — instead of starting threads of its own.
     #[must_use]
-    pub fn thread_pool(&self) -> &rayon::ThreadPool {
-        &self.pool
+    pub fn with_pool(pool: Arc<rayon::ThreadPool>) -> Self {
+        Self {
+            config: ComputeConfig {
+                cpu_threads: pool.current_num_threads(),
+            },
+            pool: Some(pool),
+        }
     }
 
-    /// Returns the number of threads in the pool.
+    /// An engine that computes on the caller's thread and starts none.
+    #[must_use]
+    pub fn serial() -> Self {
+        Self {
+            config: ComputeConfig { cpu_threads: 1 },
+            pool: None,
+        }
+    }
+
+    /// The engine's pool, or `None` for a [`serial`](Self::serial) engine.
+    #[must_use]
+    pub fn thread_pool(&self) -> Option<&rayon::ThreadPool> {
+        self.pool.as_deref()
+    }
+
+    /// How many threads the engine may use (1 when serial).
     #[must_use]
     pub fn num_threads(&self) -> usize {
-        self.pool.current_num_threads()
+        self.pool.as_ref().map_or(1, |p| p.current_num_threads())
     }
 
     /// Compute z-scores for a batch of values.
@@ -161,7 +191,7 @@ impl std::fmt::Debug for CpuEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CpuEngine")
             .field("config", &self.config)
-            .field("num_threads", &self.pool.current_num_threads())
+            .field("num_threads", &self.num_threads())
             .finish()
     }
 }
@@ -177,7 +207,7 @@ impl ComputeEngine for CpuEngine {
         metrics::counter!("chronix_compute_batch_operations_total", "operation" => "dot_product", "backend" => "cpu").increment(1);
 
         // For large vectors, split into chunks and sum partial dot products in parallel.
-        if a.len() >= PARALLEL_THRESHOLD {
+        if let Some(pool) = self.pool.as_ref().filter(|_| a.len() >= PARALLEL_THRESHOLD) {
             // Validate dimensions up-front so chunk-level errors are impossible.
             if a.len() != b.len() {
                 return Err(ComputeError::DimensionMismatch {
@@ -185,8 +215,8 @@ impl ComputeEngine for CpuEngine {
                     got: b.len(),
                 });
             }
-            let chunk_size = (a.len() / self.pool.current_num_threads()).max(1024);
-            let result: Result<f64, ComputeError> = self.pool.install(|| {
+            let chunk_size = (a.len() / pool.current_num_threads()).max(1024);
+            let result: Result<f64, ComputeError> = pool.install(|| {
                 a.par_chunks(chunk_size)
                     .zip(b.par_chunks(chunk_size))
                     .map(|(ca, cb)| simd_dot_product(ca, cb))
@@ -297,8 +327,11 @@ impl ComputeEngine for CpuEngine {
 
         // Parallelize across lags when work is large enough.
         // Total work ≈ n * effective_max, so parallelize when that exceeds threshold.
-        let acf = if n * effective_max >= PARALLEL_THRESHOLD {
-            let pool = &self.pool;
+        let acf = if let Some(pool) = self
+            .pool
+            .as_ref()
+            .filter(|_| n * effective_max >= PARALLEL_THRESHOLD)
+        {
             pool.install(|| {
                 (0..=effective_max)
                     .into_par_iter()
@@ -725,6 +758,35 @@ mod tests {
         let config = ComputeConfig { cpu_threads: 2 };
         let e = CpuEngine::new(config).unwrap();
         assert_eq!(e.num_threads(), 2);
+    }
+
+    #[test]
+    fn a_serial_engine_and_a_host_pool_engine_agree_with_the_dedicated_one() {
+        let n = super::PARALLEL_THRESHOLD + 1000;
+        let a: Vec<f64> = (0..n).map(|i| (i as f64) * 0.001).collect();
+        let b: Vec<f64> = (0..n).map(|i| ((n - i) as f64) * 0.002).collect();
+        let host = std::sync::Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .thread_name(|i| format!("host-{i}"))
+                .build()
+                .unwrap(),
+        );
+        let shared = CpuEngine::with_pool(std::sync::Arc::clone(&host));
+        assert_eq!(shared.num_threads(), 2);
+        assert!(std::ptr::eq(shared.thread_pool().unwrap(), &*host));
+        let serial = CpuEngine::serial();
+        assert!(serial.thread_pool().is_none());
+        let reference = engine().batch_dot_product(&a, &b).unwrap();
+        for e in [&shared, &serial] {
+            let got = e.batch_dot_product(&a, &b).unwrap();
+            assert!((got - reference).abs() <= reference.abs() * 1e-12);
+        }
+        let series: Vec<f64> = (0..20_000).map(|i| (f64::from(i) * 0.1).sin()).collect();
+        assert_eq!(
+            serial.batch_autocorrelation(&series, 50).unwrap().len(),
+            shared.batch_autocorrelation(&series, 50).unwrap().len()
+        );
     }
 
     #[test]

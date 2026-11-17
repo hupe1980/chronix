@@ -1,42 +1,66 @@
 //! `PromQL` parser — builds an AST from a token stream.
 
+use crate::diagnostics::Span;
 use crate::promql::ast::{
-    AggregationModifier, AggregationOp, AtModifier, BinaryOp, Duration, Expr, LabelMatcher,
-    MatchOp, UnaryOp, VectorMatching, VectorMatchingCardinality,
+    AggregationModifier, AggregationOp, AtModifier, BinaryOp, DurationExpr, DurationOp, Expr,
+    LabelMatcher, MatchOp, RangeModifier, UnaryOp, VectorMatching, VectorMatchingCardinality,
 };
-use crate::promql::lexer::{Token, lex};
+use crate::promql::lexer::{Token, lex_spanned};
 
 use std::fmt;
 
 /// Parse error with context.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
-    /// Error description.
+    /// Error description: one sentence, with the suggestion when there is one.
     pub msg: String,
-    /// Token position where the error occurred.
+    /// Index of the token the error is at.
     pub pos: usize,
+    /// The bytes of the query the error is about.
+    pub span: Option<Span>,
+    /// What the query probably meant: `did you mean "rate"?`.
+    pub hint: Option<String>,
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "parse error at token {}: {}", self.pos, self.msg)
+        write!(f, "parse error: {}", self.msg)
     }
 }
 
 impl std::error::Error for ParseError {}
 
 /// Parse a `PromQL` expression string into an AST.
+///
+/// A failure carries the byte [`span`](ParseError::span) of the token it is
+/// at, so a client can draw a caret under it.
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
-    let tokens = lex(input).map_err(|e| ParseError {
-        msg: e.msg,
-        pos: e.pos,
+    let (tokens, spans) = lex_spanned(input).map_err(|e| {
+        let end = input[e.pos..]
+            .chars()
+            .next()
+            .map_or(e.pos, |c| e.pos + c.len_utf8());
+        ParseError {
+            msg: e.msg,
+            pos: 0,
+            span: Some(Span { start: e.pos, end }),
+            hint: None,
+        }
     })?;
     let mut parser = Parser::new(tokens);
-    let expr = parser.parse_expr()?;
-    if !parser.at_eof() {
-        return Err(parser.error(format!("unexpected token: {}", parser.peek())));
-    }
-    Ok(expr)
+    let result = parser.parse_expr().and_then(|expr| {
+        if parser.at_eof() {
+            Ok(expr)
+        } else {
+            Err(parser.error(format!("unexpected token: {}", parser.peek())))
+        }
+    });
+    result.map_err(|mut e| {
+        if e.span.is_none() {
+            e.span = spans.get(e.pos).or_else(|| spans.last()).copied();
+        }
+        e
+    })
 }
 
 struct Parser {
@@ -68,12 +92,24 @@ impl Parser {
         if &tok == expected {
             Ok(())
         } else {
-            Err(self.error(format!("expected {expected}, got {tok}")))
+            // At the token found, which `advance` has already stepped past.
+            let mut e = self.error(format!(
+                "expected {}, found {}",
+                quoted(expected),
+                quoted(&tok)
+            ));
+            e.pos -= 1;
+            Err(e)
         }
     }
 
     fn error(&self, msg: String) -> ParseError {
-        ParseError { msg, pos: self.pos }
+        ParseError {
+            msg,
+            pos: self.pos,
+            span: None,
+            hint: None,
+        }
     }
 
     // ── Expression parsing (precedence climbing) ───────────────────────
@@ -221,7 +257,7 @@ impl Parser {
         // Matrix selector: metric[5m] or subquery: expr[5m:1m]
         if matches!(self.peek(), Token::LeftBracket) {
             self.advance();
-            let range = self.parse_duration()?;
+            let range = self.parse_duration_expr()?;
 
             // Check for subquery step: [5m:1m] or [5m:]
             if matches!(self.peek(), Token::Colon) {
@@ -229,9 +265,9 @@ impl Parser {
                 let step = if matches!(self.peek(), Token::RightBracket) {
                     None // [5m:] — use the default step
                 } else {
-                    Some(self.parse_duration()?) // [5m:1m]
+                    Some(self.parse_duration_expr()?) // [5m:1m]
                 };
-                self.expect(&Token::RightBracket)?;
+                self.expect_closing_bracket()?;
                 let mut sub = Expr::Subquery {
                     expr: Box::new(expr),
                     range,
@@ -239,11 +275,11 @@ impl Parser {
                     offset: None,
                     at: None,
                 };
-                self.parse_modifiers(&mut sub)?;
+                self.parse_subquery_modifiers(&mut sub)?;
                 return Ok(sub);
             }
 
-            self.expect(&Token::RightBracket)?;
+            self.expect_closing_bracket()?;
 
             // If expr was a VectorSelector, wrap it as a MatrixSelector
             match &expr {
@@ -252,10 +288,11 @@ impl Parser {
                     // where the evaluator reads them from — the same shape as
                     // Prometheus, whose `MatrixSelector` delegates to its
                     // `VectorSelector`'s offset and timestamp.
-                    self.parse_modifiers(&mut expr)?;
+                    let modifier = self.parse_modifiers(&mut expr)?;
                     expr = Expr::MatrixSelector {
                         vector: Box::new(expr),
                         range,
+                        modifier,
                     };
                 }
                 _ => {
@@ -268,16 +305,66 @@ impl Parser {
                         offset: None,
                         at: None,
                     };
-                    self.parse_modifiers(&mut sub)?;
+                    self.parse_subquery_modifiers(&mut sub)?;
                     return Ok(sub);
                 }
             }
+            return Ok(expr);
         }
 
-        // `offset` / `@` on a bare selector.
-        self.parse_modifiers(&mut expr)?;
+        // `offset` / `@` / `smoothed` on a bare selector.
+        let pos = self.pos;
+        match self.parse_modifiers(&mut expr)? {
+            None => {}
+            Some(RangeModifier::Smoothed) => {
+                if let Expr::VectorSelector { smoothed, .. } = &mut expr {
+                    *smoothed = true;
+                }
+            }
+            Some(RangeModifier::Anchored) => {
+                return Err(ParseError {
+                    msg: "`anchored` applies to a range selector: write `metric[5m] anchored`"
+                        .into(),
+                    pos,
+                    span: None,
+                    hint: None,
+                });
+            }
+        }
 
         Ok(expr)
+    }
+
+    /// `]`, with a pointed message when a range modifier sits inside it.
+    fn expect_closing_bracket(&mut self) -> Result<(), ParseError> {
+        if let Token::Ident(word) = self.peek()
+            && let Some(m) = range_modifier(word)
+        {
+            let word = match m {
+                RangeModifier::Anchored => "anchored",
+                RangeModifier::Smoothed => "smoothed",
+            };
+            return Err(self.error(format!(
+                "`{word}` goes after the closing bracket: `metric[5m] {word}`"
+            )));
+        }
+        self.expect(&Token::RightBracket)
+    }
+
+    /// Modifiers after a subquery: `offset` and `@`, never a range modifier.
+    fn parse_subquery_modifiers(&mut self, sub: &mut Expr) -> Result<(), ParseError> {
+        let pos = self.pos;
+        if self.parse_modifiers(sub)?.is_some() {
+            return Err(ParseError {
+                msg: "extended range selectors (`anchored`, `smoothed`) are not supported on \
+                      subqueries"
+                    .into(),
+                pos,
+                span: None,
+                hint: None,
+            });
+        }
+        Ok(())
     }
 
     /// Consume any `offset` and `@` modifiers and attach them to `expr`.
@@ -287,23 +374,38 @@ impl Parser {
     /// and dropping it would make `rate(m[5m]) offset 5m` run unshifted, which
     /// is a wrong answer wearing the shape of a right one.
     ///
-    /// Either modifier may appear at most once, in either order.
-    fn parse_modifiers(&mut self, expr: &mut Expr) -> Result<(), ParseError> {
+    /// Either modifier may appear at most once, in either order. A range
+    /// modifier (`anchored`, `smoothed`) is returned for the caller to place,
+    /// because where it is valid depends on what it follows.
+    fn parse_modifiers(&mut self, expr: &mut Expr) -> Result<Option<RangeModifier>, ParseError> {
         let mut seen_offset = false;
         let mut seen_at = false;
+        let mut range_mod = None;
 
         loop {
+            if let Token::Ident(word) = self.peek()
+                && let Some(m) = range_modifier(word)
+            {
+                if range_mod.is_some() {
+                    return Err(self.error("duplicate range modifier".into()));
+                }
+                range_mod = Some(m);
+                self.advance();
+                continue;
+            }
             match self.peek() {
                 Token::Offset => {
                     if seen_offset {
                         return Err(ParseError {
                             msg: "duplicate offset modifier".into(),
                             pos: self.pos,
+                            span: None,
+                            hint: None,
                         });
                     }
                     seen_offset = true;
                     self.advance();
-                    let d = self.parse_signed_duration()?;
+                    let d = self.parse_offset_duration()?;
                     Self::attach_offset(expr, d, self.pos)?;
                 }
                 Token::At => {
@@ -311,6 +413,8 @@ impl Parser {
                         return Err(ParseError {
                             msg: "duplicate @ modifier".into(),
                             pos: self.pos,
+                            span: None,
+                            hint: None,
                         });
                     }
                     seen_at = true;
@@ -318,12 +422,12 @@ impl Parser {
                     let at = self.parse_at_modifier()?;
                     Self::attach_at(expr, at, self.pos)?;
                 }
-                _ => return Ok(()),
+                _ => return Ok(range_mod),
             }
         }
     }
 
-    fn attach_offset(expr: &mut Expr, d: Duration, pos: usize) -> Result<(), ParseError> {
+    fn attach_offset(expr: &mut Expr, d: DurationExpr, pos: usize) -> Result<(), ParseError> {
         match expr {
             Expr::VectorSelector { offset, .. } | Expr::Subquery { offset, .. } => {
                 *offset = Some(d);
@@ -334,6 +438,8 @@ impl Parser {
                       vector selector or a subquery"
                     .into(),
                 pos,
+                span: None,
+                hint: None,
             }),
         }
     }
@@ -349,6 +455,8 @@ impl Parser {
                       selector or a subquery"
                     .into(),
                 pos,
+                span: None,
+                hint: None,
             }),
         }
     }
@@ -370,8 +478,13 @@ impl Parser {
                     other => Err(ParseError {
                         msg: format!("expected a timestamp after `@ -`, found {other}"),
                         pos: self.pos,
+                        span: None,
+                        hint: None,
                     }),
                 }
+            }
+            Token::LeftParen => {
+                Err(self.error("duration expressions are not supported in the `@` modifier".into()))
             }
             Token::Ident(name) if name == "start" || name == "end" => {
                 self.advance();
@@ -386,28 +499,148 @@ impl Parser {
             other => Err(ParseError {
                 msg: format!("expected a timestamp, start() or end() after `@`, found {other}"),
                 pos: self.pos,
+                span: None,
+                hint: None,
             }),
         }
     }
 
-    /// A duration that may be negative.
+    /// The duration after `offset`.
     ///
-    /// `offset -5m` shifts the window **forward**, which is how a query
-    /// compares a value against one from the future of its own evaluation
-    /// time — used by recording rules that backfill, and unconditional in
-    /// Prometheus 3.x.
-    fn parse_signed_duration(&mut self) -> Result<Duration, ParseError> {
-        if matches!(self.peek(), Token::Minus) {
-            self.advance();
-            let d = self.parse_duration()?;
-            return Ok(Duration(-d.0));
+    /// Without parentheses only a signed primary is the offset — a literal, a
+    /// number of seconds or a duration function — so `m offset 1h / 2` is
+    /// `(m offset 1h) / 2`, as upstream parses it. A whole expression needs
+    /// parentheses: `m offset (1h / 2)`.
+    fn parse_offset_duration(&mut self) -> Result<DurationExpr, ParseError> {
+        match self.peek() {
+            Token::Minus => {
+                self.advance();
+                Ok(DurationExpr::Neg(Box::new(self.parse_offset_duration()?)))
+            }
+            Token::Plus => {
+                self.advance();
+                self.parse_offset_duration()
+            }
+            _ => self.parse_duration_primary(),
         }
-        self.parse_duration()
+    }
+
+    /// A duration expression: arithmetic over durations, numbers (seconds),
+    /// `step()`, `range()`, `min_of(a, b)` and `max_of(a, b)`.
+    fn parse_duration_expr(&mut self) -> Result<DurationExpr, ParseError> {
+        let mut lhs = self.parse_duration_term()?;
+        loop {
+            let op = match self.peek() {
+                Token::Plus => DurationOp::Add,
+                Token::Minus => DurationOp::Sub,
+                _ => return Ok(lhs),
+            };
+            self.advance();
+            let rhs = self.parse_duration_term()?;
+            lhs = DurationExpr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+    }
+
+    fn parse_duration_term(&mut self) -> Result<DurationExpr, ParseError> {
+        let mut lhs = self.parse_duration_unary()?;
+        loop {
+            let op = match self.peek() {
+                Token::Star => DurationOp::Mul,
+                Token::Slash => DurationOp::Div,
+                Token::Percent => DurationOp::Mod,
+                _ => return Ok(lhs),
+            };
+            self.advance();
+            let rhs = self.parse_duration_unary()?;
+            lhs = DurationExpr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+    }
+
+    /// Unary minus binds looser than `^`: `-2 ^ 2` is `-(2 ^ 2)`.
+    fn parse_duration_unary(&mut self) -> Result<DurationExpr, ParseError> {
+        match self.peek() {
+            Token::Minus => {
+                self.advance();
+                Ok(DurationExpr::Neg(Box::new(self.parse_duration_unary()?)))
+            }
+            Token::Plus => {
+                self.advance();
+                self.parse_duration_unary()
+            }
+            _ => self.parse_duration_power(),
+        }
+    }
+
+    /// `^` is right-associative: `2 ^ 3 ^ 2` is `2 ^ 9`.
+    fn parse_duration_power(&mut self) -> Result<DurationExpr, ParseError> {
+        let base = self.parse_duration_primary()?;
+        if matches!(self.peek(), Token::Caret) {
+            self.advance();
+            let exp = self.parse_duration_unary()?;
+            return Ok(DurationExpr::Binary {
+                op: DurationOp::Pow,
+                lhs: Box::new(base),
+                rhs: Box::new(exp),
+            });
+        }
+        Ok(base)
+    }
+
+    fn parse_duration_primary(&mut self) -> Result<DurationExpr, ParseError> {
+        match self.peek().clone() {
+            Token::Duration(secs) | Token::Number(secs) => {
+                self.advance();
+                Ok(DurationExpr::Literal(secs))
+            }
+            Token::LeftParen => {
+                self.advance();
+                let inner = self.parse_duration_expr()?;
+                self.expect(&Token::RightParen)?;
+                Ok(inner)
+            }
+            Token::Ident(name) => {
+                let lower = name.to_ascii_lowercase();
+                let Some(arity) = duration_function_arity(&lower) else {
+                    return Err(self.error(format!(
+                        "expected a duration, found `{name}`; a duration is a literal such as \
+                         `5m`, a number of seconds, or `step()`, `range()`, `min_of` or `max_of`"
+                    )));
+                };
+                self.advance();
+                self.expect(&Token::LeftParen)?;
+                let mut args = Vec::with_capacity(arity);
+                for i in 0..arity {
+                    if i > 0 {
+                        self.expect(&Token::Comma)?;
+                    }
+                    args.push(self.parse_duration_expr()?);
+                }
+                self.expect(&Token::RightParen)?;
+                let mut args = args.into_iter();
+                let mut arg = || Box::new(args.next().unwrap_or(DurationExpr::Literal(0.0)));
+                Ok(match lower.as_str() {
+                    "step" => DurationExpr::Step,
+                    "range" => DurationExpr::Range,
+                    "min_of" => DurationExpr::MinOf(arg(), arg()),
+                    _ => DurationExpr::MaxOf(arg(), arg()),
+                })
+            }
+            other => Err(self.error(format!("expected a duration, found {other}"))),
+        }
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         match self.peek().clone() {
-            Token::Number(n) => {
+            // A duration where a float is expected is that many seconds.
+            Token::Number(n) | Token::Duration(n) => {
                 self.advance();
                 Ok(Expr::NumberLiteral(n))
             }
@@ -436,6 +669,8 @@ impl Parser {
                         msg: "vector selector must contain at least one non-empty matcher"
                             .to_string(),
                         pos: self.pos,
+                        span: None,
+                        hint: None,
                     });
                 }
                 Ok(Expr::VectorSelector {
@@ -443,6 +678,7 @@ impl Parser {
                     matchers,
                     offset: None,
                     at: None,
+                    smoothed: false,
                 })
             }
             Token::Ident(name) => {
@@ -464,10 +700,38 @@ impl Parser {
                         // execution error. A misspelled function is one of
                         // the most ordinary things a query editor sends, and
                         // clients branch on the difference.
-                        if !crate::promql::eval::function::is_known_function(&name) {
+                        let lower = name.to_ascii_lowercase();
+                        if duration_function_arity(&lower).is_some() {
                             return Err(ParseError {
-                                msg: format!("unknown function with name \"{name}\""),
+                                msg: format!(
+                                    "`{lower}()` is a duration function, unsupported as an \
+                                     expression; use it inside `[...]` or `offset (...)`"
+                                ),
                                 pos: self.pos,
+                                span: None,
+                                hint: None,
+                            });
+                        }
+                        if !crate::promql::eval::function::is_known_function(&name) {
+                            // Upstream's wording, so it is the sentence people
+                            // search for, then what was probably meant. Every
+                            // aggregation operator is a candidate too: `summ(x)`
+                            // means `sum`.
+                            let candidates = crate::promql::eval::function::FUNCTIONS
+                                .iter()
+                                .copied()
+                                .chain(AggregationOp::NAMES.iter().copied());
+                            let hint = crate::diagnostics::suggest(&name, candidates).hint();
+                            let msg = match &hint {
+                                Some(h) => format!("unknown function with name \"{name}\" — {h}"),
+                                None => format!("unknown function with name \"{name}\""),
+                            };
+                            // The name, not the parenthesis after it.
+                            return Err(ParseError {
+                                msg,
+                                pos: self.pos - 1,
+                                span: None,
+                                hint,
                             });
                         }
                         self.advance();
@@ -483,6 +747,7 @@ impl Parser {
                             matchers,
                             offset: None,
                             at: None,
+                            smoothed: false,
                         })
                     }
                     _ => {
@@ -492,6 +757,7 @@ impl Parser {
                             matchers: vec![],
                             offset: None,
                             at: None,
+                            smoothed: false,
                         })
                     }
                 }
@@ -605,55 +871,32 @@ impl Parser {
         self.expect(&Token::RightBrace)?;
         Ok(matchers)
     }
+}
 
-    /// Parse a `PromQL` duration like `5m`, `1h30m`, `2d`.
-    fn parse_duration(&mut self) -> Result<Duration, ParseError> {
-        // A duration is a sequence of <number><unit> pairs
-        let mut total_secs = 0.0;
-        let mut parsed_any = false;
-
-        while let Token::Number(n) = self.peek() {
-            let n = *n;
-            self.advance();
-            // Next should be an ident that's a duration unit
-            if let Token::Ident(unit) = self.peek() {
-                let unit = unit.clone();
-                let mult = duration_unit_to_secs(&unit)
-                    .ok_or_else(|| self.error(format!("invalid duration unit: {unit}")))?;
-                total_secs += n * mult;
-                self.advance();
-                parsed_any = true;
-            } else {
-                if parsed_any {
-                    // The number isn't part of the duration (put it back by decrementing pos)
-                    self.pos -= 1;
-                    break;
-                }
-                return Err(self.error("expected duration unit after number".to_string()));
-            }
-        }
-
-        if !parsed_any {
-            // Maybe the duration is a single ident like "5m" already split into Number(5) + Ident("m")
-            // That's handled above. If we're here, it's an error.
-            return Err(self.error("expected duration".to_string()));
-        }
-
-        Ok(Duration(total_secs))
+/// `anchored` or `smoothed`.
+fn range_modifier(word: &str) -> Option<RangeModifier> {
+    match word {
+        "anchored" => Some(RangeModifier::Anchored),
+        "smoothed" => Some(RangeModifier::Smoothed),
+        _ => None,
     }
 }
 
-/// Convert a duration unit string to seconds multiplier.
-fn duration_unit_to_secs(unit: &str) -> Option<f64> {
-    match unit {
-        "ms" => Some(0.001),
-        "s" => Some(1.0),
-        "m" => Some(60.0),
-        "h" => Some(3600.0),
-        "d" => Some(86400.0),
-        "w" => Some(604800.0),
-        "y" => Some(31536000.0),
+/// The duration functions valid inside a duration position, by arity.
+fn duration_function_arity(lower: &str) -> Option<usize> {
+    match lower {
+        "step" | "range" => Some(0),
+        "min_of" | "max_of" => Some(2),
         _ => None,
+    }
+}
+
+/// A token as a message names it: `"]"`, and a string literal as written.
+fn quoted(tok: &Token) -> String {
+    match tok {
+        Token::String(_) => tok.to_string(),
+        Token::Eof => "the end of the query".to_string(),
+        other => format!("\"{other}\""),
     }
 }
 
@@ -670,6 +913,7 @@ mod tests {
                 matchers,
                 offset,
                 at: _,
+                smoothed: _,
             } => {
                 assert_eq!(name, Some("http_requests_total".into()));
                 assert!(matchers.is_empty());
@@ -701,7 +945,7 @@ mod tests {
     fn parse_range_vector() {
         let expr = parse("http_requests_total[5m]").unwrap();
         match expr {
-            Expr::MatrixSelector { vector, range } => {
+            Expr::MatrixSelector { vector, range, .. } => {
                 assert_eq!(range.as_secs(), 300.0);
                 match *vector {
                     Expr::VectorSelector { name, .. } => {
@@ -929,5 +1173,122 @@ mod tests {
             }
             _ => panic!("expected BinaryExpr"),
         }
+    }
+
+    // ── Duration expressions (stable in Prometheus 3.14) ─────────────────
+
+    /// The range of `m[<expr>]`, resolved with no step and no range.
+    fn range_of(q: &str) -> f64 {
+        match parse(q).unwrap() {
+            Expr::Call { args, .. } => match &args[0] {
+                Expr::MatrixSelector { range, .. } => range.resolve(0.0, 0.0).unwrap(),
+                other => panic!("expected a range selector, got {other:?}"),
+            },
+            Expr::MatrixSelector { range, .. } => range.resolve(0.0, 0.0).unwrap(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duration_expressions_follow_arithmetic_precedence() {
+        assert_eq!(range_of("rate(m[2m*(10+5)])"), 1800.0);
+        assert_eq!(range_of("rate(m[1h30m % 1h])"), 1800.0);
+        assert_eq!(range_of("rate(m[30m1s-30m1s % 1m])"), 1800.0);
+        assert_eq!(range_of("rate(m[-5m+35m])"), 1800.0);
+        // `^` is right-associative and binds tighter than unary minus.
+        assert_eq!(range_of("rate(m[2^3^1 * 1s])"), 8.0);
+        assert_eq!(range_of("rate(m[-2^2 + 10])"), 6.0);
+    }
+
+    #[test]
+    fn duration_functions_resolve_against_the_query() {
+        let Expr::Call { args, .. } = parse("rate(m[min_of(step()+1, 1h)])").unwrap() else {
+            panic!()
+        };
+        let Expr::MatrixSelector { range, .. } = &args[0] else {
+            panic!()
+        };
+        assert_eq!(range.resolve(5.0, 10.0).unwrap(), 6.0);
+        // Case-insensitive, as upstream.
+        assert!(parse("rate(m[STep()])").is_ok());
+        assert!(parse("max_over_time(m[range():1s])").is_ok());
+    }
+
+    #[test]
+    fn an_unparenthesised_offset_takes_one_primary() {
+        // `m offset 1h / 2` is `(m offset 1h) / 2`.
+        match parse("m offset 1h / 2").unwrap() {
+            Expr::BinaryExpr { op, lhs, .. } => {
+                assert_eq!(op, BinaryOp::Div);
+                assert!(matches!(
+                    *lhs,
+                    Expr::VectorSelector {
+                        offset: Some(_),
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected a division, got {other:?}"),
+        }
+        assert!(parse("m offset (1h / 2)").is_ok());
+        assert!(parse("m offset min_of(step(), 1s) + 8000").is_ok());
+        assert!(parse("m offset 100").is_ok(), "a bare number of seconds");
+    }
+
+    #[test]
+    fn duration_functions_are_refused_outside_a_duration() {
+        let err = parse("step()").unwrap_err();
+        assert!(err.msg.contains("duration function"), "{}", err.msg);
+        let err = parse("m @ (start() + 1)").unwrap_err();
+        assert!(
+            err.msg.contains("not supported in the `@` modifier"),
+            "{}",
+            err.msg
+        );
+    }
+
+    // ── Extended range selectors (stable in Prometheus 3.16) ─────────────
+
+    #[test]
+    fn range_modifiers_attach_to_the_selector_they_follow() {
+        match parse("rate(m[1m] anchored)").unwrap() {
+            Expr::Call { args, .. } => assert!(matches!(
+                args[0],
+                Expr::MatrixSelector {
+                    modifier: Some(RangeModifier::Anchored),
+                    ..
+                }
+            )),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse("m smoothed").unwrap(),
+            Expr::VectorSelector { smoothed: true, .. }
+        ));
+        assert!(parse("m offset -100 smoothed + 0").is_ok());
+    }
+
+    #[test]
+    fn range_modifiers_are_refused_where_they_have_no_meaning() {
+        let err = parse("rate(m[5m:1m] smoothed)").unwrap_err();
+        assert!(
+            err.msg.contains("not supported on subqueries"),
+            "{}",
+            err.msg
+        );
+        let err = parse("m anchored").unwrap_err();
+        assert!(err.msg.contains("range selector"), "{}", err.msg);
+        let err = parse("rate(m[5m smoothed])").unwrap_err();
+        assert!(
+            err.msg.contains("goes after the closing bracket"),
+            "{}",
+            err.msg
+        );
+    }
+
+    #[test]
+    fn modifier_words_remain_valid_metric_names() {
+        assert!(parse(r#"anchored{job="x"}"#).is_ok());
+        assert!(parse("smoothed").is_ok());
     }
 }

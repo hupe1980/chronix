@@ -20,13 +20,19 @@ const SURFACE: &[&str] = &[
     // ── Modules ────────────────────────────────────────────────────
     "mod db",
     "mod delete",
+    "mod detector",
+    "mod diagnostics",
     "mod error",
     "mod export",
+    "mod inspect",
     "mod macros",
     "mod prelude",
     "mod promql",
     "mod retention",
     "mod rollup",
+    "mod tenancy",
+    // ── Re-exported crates ──────────────────────────────────────────
+    "mod arrow",
     // ── Re-exported engine crates (tier 3) ─────────────────────────
     "mod chronix_core",
     "mod chronix_encoding",
@@ -34,13 +40,26 @@ const SURFACE: &[&str] = &[
     "mod chronix_query",
     // ── Types and macros at the crate root (tier 1) ────────────────
     "BackupManifest",
+    "CardinalityScope",
+    "CardinalityStats",
     "Chronix",
     "DatabaseStatistics",
+    "MAX_CARDINALITY_LIMIT",
+    "NameCount",
     "DbError",
     "DeleteBuilder",
     "DeleteOutcome",
     "DeleteRequest",
+    "DetectorBuilder",
+    "DetectorDeclaration",
+    "DetectorInfo",
+    "DetectorStatus",
+    "QuotaResource",
+    "Season",
     "InsertResult",
+    "NamespaceLimits",
+    "NamespaceUsage",
+    "Parallelism",
     "ParquetCompression",
     "ParquetExportConfig",
     "SegmentInfo",
@@ -253,6 +272,7 @@ fn the_prelude_is_the_one_that_was_reviewed() {
         "FsyncPolicy",
         "InsertResult",
         "MeasurementSchema",
+        "Parallelism",
         "Point",
         "QueryBuilder",
         "QueryPlan",
@@ -329,12 +349,17 @@ fn the_prelude_is_the_one_that_was_reviewed() {
 
 /// Every inherent method on `Chronix`, sorted.
 const HANDLE_SURFACE: &[&str] = &[
+    "advance_detectors",
+    "detectors",
+    "drop_detector",
     // lifecycle
     "close",
     "open",
     "open_small",
+    "open_with_pool",
     // write
     "backfill",
+    "declare_detector",
     "declare_field",
     "insert",
     "insert_batch",
@@ -344,8 +369,10 @@ const HANDLE_SURFACE: &[&str] = &[
     "execute_stream",
     "execute_with_stats",
     "last_value",
+    "diagnose",
     "promql",
     "promql_range",
+    "promql_explain",
     "query",
     "sql",
     "sql_async",
@@ -356,6 +383,7 @@ const HANDLE_SURFACE: &[&str] = &[
     "measurement_names_in",
     "schema",
     "schema_registry",
+    "cardinality",
     "segment_count",
     "segments",
     "segments_of",
@@ -391,10 +419,15 @@ const HANDLE_SURFACE: &[&str] = &[
     "rollup_where",
     // analytics
     "auto_forecast",
+    "auto_forecast_at_step",
     "detect_anomalies",
     "fetch_series_data",
     "forecast",
     "preprocess",
+    // tenancy
+    "clear_namespace_limits",
+    "namespace_usage",
+    "set_namespace_limits",
     // backup
     "backup",
     "restore",
@@ -423,18 +456,19 @@ const HANDLE_SURFACE: &[&str] = &[
 /// handle's, and the first draft of this scanner conflated the two.
 fn handle_methods() -> Vec<String> {
     let mut out = Vec::new();
-    for src in [
-        include_str!("../src/db/accessors.rs"),
-        include_str!("../src/db/analytics_api.rs"),
-        include_str!("../src/db/backup.rs"),
-        include_str!("../src/db/delete.rs"),
-        include_str!("../src/db/lifecycle.rs"),
-        include_str!("../src/db/mod.rs"),
-        include_str!("../src/db/query.rs"),
-        include_str!("../src/db/rollup.rs"),
-        include_str!("../src/db/stream.rs"),
-        include_str!("../src/db/write.rs"),
-    ] {
+    // Every file under `src/db`, read at run time. This was a hard-coded
+    // list of `include_str!`s, and a method in a file added after it —
+    // `db/detector.rs`, `db/wal_seal.rs` — was public and unreviewed: the
+    // guard's scope was the list, not the directory.
+    let db_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db");
+    let mut sources: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&db_dir).expect("src/db is readable") {
+        let path = entry.expect("directory entry").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            sources.push(std::fs::read_to_string(&path).expect("source is readable"));
+        }
+    }
+    for src in &sources {
         let mut in_chronix_impl = false;
         for line in src.lines() {
             // Blocks start at column 0, so a line with no indentation that

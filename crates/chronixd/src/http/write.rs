@@ -141,6 +141,7 @@ pub async fn write_handler(
 
     crate::util::insert_batch_with_mode(
         &state.db,
+        &state.namespace_ingest_limiter,
         scope.as_deref(),
         points,
         state.write_timeout,
@@ -233,6 +234,7 @@ pub async fn write_influx_handler(
 
     crate::util::insert_batch_with_mode(
         &state.db,
+        &state.namespace_ingest_limiter,
         scope.as_deref(),
         parsed.points,
         state.write_timeout,

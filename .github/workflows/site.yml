@@ -40,7 +40,7 @@ jobs:
       - name: Install Zola
         run: |
           set -euo pipefail
-          VERSION=v0.23.4
+          VERSION=v0.23.6
           curl -sSL "https://github.com/getzola/zola/releases/download/${VERSION}/zola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C /usr/local/bin zola
           zola --version
@@ -60,7 +60,7 @@ jobs:
       # host that does not serve it.
       - name: Build
         working-directory: site
-        run: zola build --base-url "${{ steps.pages.outputs.base_url }}"
+        run: ./build.sh --base-url "${{ steps.pages.outputs.base_url }}"
 
       - uses: actions/upload-pages-artifact@v3
         with:

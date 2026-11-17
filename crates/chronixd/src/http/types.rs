@@ -232,9 +232,6 @@ pub struct SharedState {
     pub sql_contexts: crate::namespace::SqlContexts,
     /// Optional authentication state for key management.
     pub auth_state: Option<crate::auth::AuthState>,
-    /// Optional cluster meta client for admin operations.
-    #[cfg(feature = "cluster")]
-    pub meta_client: Option<Arc<dyn chronix_cluster::MetaClient>>,
     /// The namespace registry.
     ///
     /// **Not an `Option`.** It was one, and `run()` is the only thing that
@@ -263,6 +260,9 @@ pub struct SharedState {
     pub audit_logger: Option<Arc<chronix_security::audit::AuditLogger>>,
     /// Per-namespace rate limiter for tenant-level request throttling.
     pub namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter,
+    /// Per-namespace ingestion-rate limits (points per second), shared with
+    /// the gRPC and Flight SQL services and the connectors.
+    pub namespace_ingest_limiter: crate::rate_limit::NamespaceIngestLimiter,
     /// Optional write deduplication cache for idempotency keys.
     pub write_dedup_cache: Option<WriteDedupCache>,
     /// Signal-trigger pipeline, when `[triggers]` is configured.
@@ -278,9 +278,50 @@ pub struct SharedState {
     /// configuration, so a process running two servers (or a test harness
     /// starting several) must not serve the first one's spec for all of them.
     pub openapi_json: std::sync::OnceLock<String>,
+    /// Slots bounding concurrently executing queries —
+    /// `server.max_concurrent_queries`.
+    pub query_slots: crate::query_slots::QuerySlots,
 }
 
 impl SharedState {
+    /// State for serving `db` without a listening server: no authentication,
+    /// no connectors, no triggers, an in-memory namespace registry.
+    ///
+    /// For `chronixd mcp --data-dir`, which answers a local process over
+    /// stdio through the same handlers the HTTP routes use.
+    #[must_use]
+    pub fn standalone(db: Arc<Chronix>, config: crate::config::ServerConfig) -> AppState {
+        let query_slots = crate::query_slots::QuerySlots::for_server(
+            config.server.max_concurrent_queries,
+            db.config().parallelism.budget(),
+        );
+        Arc::new(Self {
+            sql_contexts: crate::namespace::SqlContexts::new(db.clone()),
+            db,
+            start_time: std::time::Instant::now(),
+            connector_manager: None,
+            auth_state: None,
+            namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
+            model_catalog: Arc::new(parking_lot::RwLock::new(
+                chronix::chronix_analytics::forecast::ModelCatalog::new(),
+            )),
+            sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            write_timeout: std::time::Duration::from_secs(config.server.write_timeout_secs),
+            authz_engine: None,
+            audit_logger: None,
+            namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+            namespace_ingest_limiter: crate::rate_limit::NamespaceIngestLimiter::new(),
+            write_dedup_cache: WriteDedupCache::new(
+                config.server.dedup_window_secs,
+                config.server.max_dedup_entries,
+            ),
+            pipeline: None,
+            openapi_json: std::sync::OnceLock::new(),
+            query_slots,
+            config,
+        })
+    }
+
     /// SQL session context scoped to `namespace`.
     ///
     /// Every table it exposes carries a mandatory namespace filter, so the
@@ -469,10 +510,8 @@ mod tests {
         assert!(cache.claim("key-1").is_none(), "committed duplicate");
     }
 
-    /// A write that fails must not poison its idempotency key: the client's
-    /// retry is the whole reason it sent one. The key used to be recorded
-    /// before the write and kept regardless, so a 503 turned every retry
-    /// into a 409 and the data was stored never.
+    /// A write that fails must not poison its idempotency key: the key is
+    /// recorded only once the write succeeds, so the client's retry works.
     #[test]
     fn a_failed_write_releases_its_key() {
         let cache = WriteDedupCache::new(60, 100).unwrap();

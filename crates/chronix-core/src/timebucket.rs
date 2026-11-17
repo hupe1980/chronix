@@ -18,10 +18,6 @@
 //!   transition day, and a month of 28, 29, 30 or 31 days. A fixed span
 //!   cannot be either.
 //!
-//! This is the rule QuestDB's `SAMPLE BY … ALIGN TO CALENDAR TIME ZONE`
-//! settles on, and TimescaleDB's `time_bucket` takes the same timezone
-//! argument.
-//!
 //! ## Why a type and not an `i64`
 //!
 //! `start + width` is not the next bucket when the width is a month, nor on a

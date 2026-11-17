@@ -510,11 +510,17 @@ class ChronixClient:
             return
         status = resp.status_code
         code: str | None = None
+        hint: str | None = None
+        span: tuple[int, int] | None = None
         detail = resp.text
         try:
             body = resp.json()
             detail = body.get("error", resp.text)
             code = body.get("code")
+            hint = body.get("hint")
+            raw = body.get("span")
+            if isinstance(raw, dict):
+                span = (int(raw["start"]), int(raw["end"]))
         except Exception:  # noqa: BLE001
             pass
 
@@ -528,12 +534,20 @@ class ChronixClient:
                 # ignoring it is better than failing the error path.
                 retry_after = None
 
-        kwargs = {"status_code": status, "code": code, "retry_after": retry_after}
+        kwargs = {
+            "status_code": status,
+            "code": code,
+            "retry_after": retry_after,
+            "hint": hint,
+            "span": span,
+        }
 
         if status == 409:
             raise WriteError(
                 f"duplicate write (idempotency conflict): {detail}", **kwargs
             )
+        if status == 429:
+            raise BackpressureError(f"rate limited {status}: {detail}", **kwargs)
         if status in (503, 507):
             raise BackpressureError(f"server unavailable {status}: {detail}", **kwargs)
         if status == 504:

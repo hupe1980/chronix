@@ -9,7 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["forecasting", "anomaly", "timeseries", "analytics", "arima"]
 categories = ["science", "algorithms"]
-homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 

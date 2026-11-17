@@ -1,0 +1,416 @@
++++
+title = "Rust API"
+description = "A map of the chronix crate's public API onto docs.rs: opening a database, writing, querying, analytics, maintenance and errors."
+weight = 100
+aliases = ["/reference/embedded-api/"]
++++
+
+The `chronix` crate's public API is the `Chronix` handle and the types around it. This page maps it by task — open, write, query, analyse, maintain — and links each item to its full documentation on [docs.rs](https://docs.rs/chronix).
+
+## Public API (`chronix` facade)
+
+The `chronix` crate ties all sub-crates together into a single embedded database.
+
+### Module Structure (`db/`)
+
+The `Chronix` struct and its methods are organized into focused submodules:
+
+| Sub-module        | Contents                                              |
+|-------------------|-------------------------------------------------------|
+| `mod.rs`          | `Chronix` struct definition, `open()`, `Drop` impl   |
+| `accessors.rs`    | Getters/setters (schema, config, statistics, UDFs)    |
+| `write.rs`        | `insert`, `insert_batch`, admission control, backpressure |
+| `query.rs`        | `execute`, `execute_stream`, segment reading, projection |
+| `stream.rs`       | `execute_iter` — time-disjoint bucketing for bounded-memory scans |
+| `delete.rs`       | `drop_measurement`, tombstones, hard delete           |
+| `lifecycle.rs`    | `flush`, `close`, `compact`, GC, retention enforcement |
+| `rollup.rs`       | Rollup definitions, materialisation, the real-time view |
+| `backup.rs`       | Checkpoint and restore                                 |
+| `analytics_api.rs`| Anomaly detection, forecast API surface               |
+
+### Lifecycle
+
+```text
+Chronix::open(config)
+    │
+    ├── Create/validate directories
+    ├── Acquire exclusive file lock (fs2)
+    ├── Open segment catalog (manifest + snapshot)
+    ├── load_catalog_state(): time indices, blooms, tag index and the
+    │     series set — all from the .series sidecars, no segment decoded
+    ├── Open WAL writer
+    ├── Restore schemas from catalog, reconcile with segment column lists
+    ├── Replay WAL records above the catalog's WAL floor → memtable
+    │
+    ▼
+  ┌──────────────────────────────────────────────┐
+  │  insert(&Point) / insert_batch() / backfill() │
+  │    → admission: open, capacity, window,       │
+  │      cardinality (per point, nothing durable) │
+  │    → schema: whole batch or nothing,          │
+  │      persisted to the manifest first          │
+  │    → one WAL record for the batch             │
+  │    → memtable insert, unconditionally         │
+  │    → wake the maintenance thread if needed    │
+  └──────────────────────────────────────────────┘
+    │
+    ▼
+  flush()
+    │  for each shard:
+    │    freeze_and_swap active memtable
+    │    write frozen → SegmentWriter → .csx (+ .series sidecar)
+    │    register in catalog (including CatalogColumnStats)
+    │    update bloom and tag index from the writer's series keys
+    │  after ALL shards flushed: raise the WAL floor, truncate WAL,
+    │  retire idle shards below the window
+    │
+    ▼
+  compact()
+    │  flush() first
+    │  filter catalog to Active-only segments
+    │  CompactionPicker::pick() → CompactionTask list
+    │  CompactionExecutor::execute() per task
+    │  register compacted segment in catalog (+ .series sidecar)
+    │  populate bloom and tag index
+    │  retire the input segments (one manifest transition with the output)
+    │  materialise_rollups(): every rollup up to its final bucket
+    │
+    ▼
+  gc()
+    │  unlink the files of retired segments no reader holds any more
+    │  reclaim tombstones whose segments have all left the catalog
+    │  hard-delete measurements whose soft-delete TTL has elapsed
+    │
+    ▼
+  archive_cold_segments(config)          [feature = "object-store"]
+    │  group Active segments by (measurement, shard), keep the cold ones
+    │  skip a group that is incomplete: another segment or an unflushed
+    │    row overlaps it, or its rollups are not materialised past it
+    │  read the group through execute_iter (dedup + tombstones)
+    │  encode Parquet → upload → verify → drop catalog entries → delete files
+    │
+    ▼
+  scan(measurement, min_ts, max_ts)
+    │  query memtable shards
+    │  return Arrow RecordBatch(es)
+    │
+    ▼
+  close()
+    │  flush all shards
+    │  force catalog snapshot
+    │  sync WAL
+```
+
+### Full Query Execution
+
+`db.execute(&plan)` runs a complete query pipeline:
+
+```text
+QueryPlan
+  ├── 1. Scan memtable (all shards matching measurement + time range)
+  ├── 2. Pre-filter segments via tag inverted index (if tag filters present)
+  ├── 3. Prune segments by catalog time range + tag index + bloom + column stats
+  ├── 4. Read segments (projection pushdown via compute_scan_columns)
+  ├── 5. Filter tombstoned rows from segment data
+  ├── 6. Merge memtable + segment batches
+  ├── 7. Sort-merge dedup (last-write-wins, with schema alignment)
+  ├── 8. Time-range + tag-equality filtering
+  ├── 9. Column projection (extract only requested fields)
+  └── 10. Post-processing (aggregate / downsample)
+```
+
+`db.execute_with_stats(&plan)` returns `(RecordBatch, PruningStats)` —
+same pipeline but exposes segment pruning statistics for observability.
+
+**Retired segments** are automatically excluded from all query paths.
+`execute()`, `execute_stream()`, `execute_iter()` and `last_value()` call
+`active_segments_for_measurement()`, which filters out segments in the
+`SoftDeleted` state.
+
+**Empty-result schema preservation:** When a query matches no data, `execute()`
+returns an empty `RecordBatch` with the correct measurement schema (timestamp +
+tag columns + projected field columns) rather than an empty schema. This ensures
+downstream consumers always receive consistent column metadata.
+
+**Projection pushdown:** `compute_scan_columns()` calculates the minimal set of
+columns needed (timestamp + tag filter columns + group-by columns + projected
+fields) and passes them to `SegmentReader::read_projected()`. Only those columns
+are decoded and decompressed from disk — all other column data is skipped
+entirely, reducing I/O proportionally to the fraction of columns queried.
+
+**Unified pruning via `prune_entries()`:** During step 3, a shared helper
+`build_series_key()` extracts the series key and tag filter keys from the query's
+tag filters. These are passed to `prune_entries()`, which applies bloom filter
+pruning (segments that definitely don't contain the series key) and column stats
+pruning (segments where required tag columns are all-null) in a single pass.
+The tag inverted index (step 2) provides an additional pre-filter that narrows
+the candidate set before per-segment bloom/stats checks.
+
+### `execute_stream()`
+
+`db.execute_stream(&plan)` returns `Result<Vec<RecordBatch>>` with genuinely
+streaming semantics:
+
+- **Scan plans:** Each data source (memtable, individual segments) is processed
+  independently and emits its own `RecordBatch`. Results are deduped via
+  `sort_merge_dedup_chunked()` which emits **65,536-row output batches during
+  the k-way merge itself** (volcano-model streaming). This bounds output-path
+  memory to O(chunk_size × columns) regardless of total surviving rows. A memory
+  guard enforces the `max_query_result_bytes` limit on each emitted chunk,
+  preventing OOM on unbounded queries.
+- **Aggregate / Downsample plans:** All data is collected and the aggregation is
+  applied, returning a single `RecordBatch`.
+
+Both `execute()` and `execute_stream()` share the same pruning pipeline via
+`prune_entries()` and the same `build_series_key()` helper, eliminating code
+duplication. The tombstone set is accessed through an `RwLockReadGuard` (no
+clone) for the duration of the stream.
+
+Segment data is read via `read_segment_filtered()`, an extracted helper that
+applies projection pushdown, tombstone filtering, time-range filtering, tag
+equality filtering, and zone-map field predicate pushdown per segment.
+
+### `last_value()` Fast Path
+
+`db.last_value(measurement, tags)` returns the most recent `Point` for a
+specific series without building a full query plan:
+
+1. **Last-value cache** — returned immediately on a hit, after checking the
+   entry against the tombstone set. The cache is opt-in
+   (`enable_last_value_cache`, default `false`); without it this step is
+   skipped and every call pays for the two below
+2. **Memtable scan** — scan all shards for the series key, taking the point
+   with the highest timestamp that no tombstone masks *at that timestamp*.
+   Masking is per timestamp, not per series, so a delete covering one hour of a
+   series leaves its newest surviving point answerable
+3. **Segment scan** — the memtable's newest point is a *candidate*, not the
+   answer: writes are accepted up to ±2 shards out of order, so a late arrival
+   can sit in the memtable behind an already-flushed newer point. Segments are
+   walked newest-first by `max_timestamp` and the walk stops as soon as a
+   segment cannot beat the best so far — when the memtable point really is
+   newest, no segment is opened. Bloom filters skip segments that cannot hold
+   the series without reading any data
+
+A cache hit costs ~400 ns. Without the cache the call is a memtable scan of the
+series, which is hundreds of microseconds at 10K points.
+
+### Cardinality Enforcement
+
+Chronix tracks distinct canonical series keys in a `DashSet<String>` — exactly,
+with no sketch beside it. Before
+every `insert()` or `insert_batch()`, the new series key is checked against the
+configured `max_series_cardinality` limit (default: 1,000,000). If the limit
+would be exceeded, the write is rejected with `CardinalityExceeded`.
+
+Batch inserts are checked atomically — all new keys in the batch are collected
+into a `HashSet<u64>` for O(1) per-key deduplication, then validated against the
+cardinality limit before any are committed.
+
+### Delete and Drop
+
+Both delete entry points resolve to the same implementation:
+`delete_series(measurement, tags)` builds a `DeleteRequest` with the series'
+tags and calls `execute_delete`, so both flush first and both evict the
+last-value cache.
+
+**A delete produces tombstones, and a tombstone is `{ series_canonical,
+time_range, segments }`:**
+
+- **`time_range` is always present.** There is no open-ended "delete this
+  series" tombstone. A delete with no explicit upper bound resolves one *per
+  series*, to the newest timestamp that series actually holds, so the delete
+  covers the data that exists.
+- **`segments` is the tombstone's scope, on the read path as much as for
+  reclaiming it**: the segments active when the delete was issued, plus
+  every compaction output those were merged into since. A row is masked only
+  if it came from one of them.
+
+Two properties follow from the scope:
+
+- **A point written after a delete is visible at once**, even inside the
+  interval the delete covered, because it lands in a newer segment that no
+  tombstone names. Backfilling into a deleted interval behaves the same way.
+- **A delete issued while a compaction is running still applies.** Registering
+  a compaction extends every tombstone that named an input to name the output
+  too, as one durable manifest step.
+
+Memtable rows are never masked, and that is a property rather than an
+omission: a delete flushes before it scans, so everything in a memtable was
+written after every tombstone that exists.
+
+**A whole-series delete also rewrites the series sidecars** of the segments it
+scanned: the cardinality budget is rebuilt from those sidecars at open, so a
+deleted series must not come back into the count at the next restart.
+
+**Durability.** Tombstones are appended to the **catalog manifest** and fsynced
+before `execute_delete` returns. They are *not* kept in the data WAL for
+durability: that WAL is truncated once the memtable it covers has been flushed,
+which is sooner than a tombstone must live. The catalog is the only durable
+record, and there is no WAL record for a delete at all — `execute_delete`
+flushes first, so by the time a tombstone exists every point it could cover is
+already in a segment and below the WAL floor, which replay never reads.
+
+**Tombstone lifecycle.** A tombstone is reclaimed only when **every segment in
+its `segments` set has left the catalog** — which happens when compaction
+rewrites the segment (applying the tombstone as it merges) or when the segment
+is deleted outright. `gc_tombstones()` runs after each compaction pass. Any
+weaker rule reclaims a live tombstone and the deleted rows come back.
+
+**Read paths.** Exactly one predicate is used:
+`TombstoneSet::is_tombstoned(canonical, timestamp)`. The memtable scans do not
+filter at all, because a delete flushes before it scans — so a tombstone can
+only ever refer to data already in a segment. For segment data,
+`filter_tombstoned()` accepts an optional explicit list of tag column names
+(from `MeasurementSchema::tag_names()`) so that string-typed field columns are
+not misidentified as tags. Collision-proof canonical series keys
+(`measurement\0tag1=v1\0tag2=v2`) are computed per row and matched against the
+tombstone set. Supports both plain `Utf8` and dictionary-encoded
+(`Dictionary<Int32, Utf8>`) tag columns.
+- **`drop_measurement(measurement)`** — removes the measurement schema from the
+  `SchemaRegistry`, deletes all catalog entries, segment files (`.csx`), and
+  series sidecar files (`.series`) on disk, and clears the bloom filter
+  entries. This is an atomic, irreversible operation.
+
+### Segment Lifecycle
+
+Segments progress through three states tracked by `SegmentState`:
+
+| State          | Description                                      |
+|----------------|--------------------------------------------------|
+| `Active`       | Normal segment, readable by queries              |
+| `Compacting`   | Being processed by the compaction engine          |
+| `SoftDeleted`  | Retired, and still on disk because a running read holds it |
+
+**A segment leaves the catalog when its rows leave the database; its file is
+unlinked when the last reader that could open it is gone.** Retention, a
+measurement drop, cold-tier archiving and a compaction's inputs all retire
+segments through one path, which removes the catalog entry, clears the derived
+indexes and unlinks the file — in one manifest transition, fsynced once, with
+the unlink after the sync so a crash can only ever leave a file nothing points
+at.
+
+A scan is lazy: it snapshots the catalog and opens each segment when it reaches
+it, so it holds a **lease** on that snapshot for its lifetime. A retirement
+that finds a leased segment marks it `SoftDeleted` instead — invisible to every
+query from that moment, its rows gone, its bytes waiting for `gc()`, which runs
+on every maintenance pass. `Chronix::statistics().leased_segments` reports how
+many segments a running read is holding, and
+`RetentionResult::segments_awaiting_readers` how many a pass had to defer;
+`bytes_freed` counts only what was actually unlinked.
+
+All query paths (`execute()`, `execute_stream()`, `execute_iter()`,
+`last_value()`) filter out retired segments via
+`active_segments_for_measurement()`.
+
+### Cardinality-Based Sort Order
+
+During segment finalization, `SegmentWriter` sorts tag columns by ascending
+cardinality (fewest distinct values first). This groups highly similar rows
+together, maximizing compression ratios for dictionary and run-length encodings.
+The sort key is `(measurement, lowest-cardinality-tag, ..., highest-cardinality-
+tag, timestamp)`.
+
+### Write Backpressure
+
+`insert()` and `insert_batch()` call `apply_backpressure()` at the top of each
+write. This reads the current L0 segment count from the catalog and calls
+`CompactionPicker::backpressure_delay_ms(l0_count)` to compute an incremental
+sleep duration. When compaction catches up and the L0 count drops below the
+trigger threshold, the delay drops to zero and writes resume at full speed.
+No data is ever dropped — only write throughput is throttled.
+
+### Per-Measurement Retention
+
+`enforce_retention()` supports per-measurement retention overrides via the
+`measurement_retention` config map. After applying the global shard-level
+retention, a second pass checks each measurement's individual cutoff and drops
+segments from non-expired shards when a measurement has a shorter retention
+period than the global default. Every cutoff is measured from the same
+reference — `min(wall clock, newest timestamp held)` — so a rule can never
+delete data that is younger than its window *relative to the data itself*.
+
+### Concurrency Model
+
+- `Chronix` is `Send + Sync` — safe to share across threads
+- **Parallel work has one budget**, `ChronixConfig::parallelism`: the segment
+  scan, DataFusion's partitions and the analytics kernels all draw on it.
+  `Serial` (the small preset) runs everything on the caller's thread; `Auto`
+  and `Threads(n)` use a pool chronix builds on first use;
+  `Chronix::open_with_pool` uses the host's pool instead.
+  Rayon's global pool is never configured or used
+- `parking_lot::RwLock` for the catalog and the bloom filter map
+- `parking_lot::RwLock` for `SchemaRegistry` (no poison errors)
+- `AtomicBool` for the `closed` flag
+- File-level exclusive locking (`fs2::FileExt`) prevents multiple processes from
+  opening the same database directory
+
+### Ergonomic Macros
+
+```rust
+let tags = tags! { "host" => "srv-1", "region" => "us-east" };
+let fields = fields! { "usage" => 42.5, "count" => 10_i64 };
+```
+
+Both macros handle the empty case (`tags!{}` → `BTreeMap::new()`) without
+triggering unused `mut` warnings.
+## Parquet Export
+
+`export_parquet()` executes a query plan, then writes the result via
+`parquet::arrow::ArrowWriter` with configurable compression (Snappy, Zstd, LZ4,
+None) and row group size. Round-trip compatible with any Parquet reader.
+
+## Embedded Rust API
+
+Use Chronix as an embedded library without running a server.
+
+```rust
+use chronix::prelude::*;
+
+// Open database
+let config = ChronixConfig::builder()
+    .data_dir("/var/lib/chronix")
+    .build()?;
+let db = Chronix::open(config)?;
+
+// Write
+let key = SeriesKey::new("cpu", [("host", "srv1")])?;
+let fields = [("usage", FieldValue::F64(72.5))].into();
+db.insert(Point::new(key, fields, timestamp_ns())?)?;
+
+// Batch write (single frozen check, single atomic size update)
+let points = vec![point1, point2, point3];
+db.insert_batch(points)?;
+
+// Query
+let plan = db.query()
+    .measurement("cpu")
+    .tag("host", "srv1")
+    .field("usage")
+    .time_range(start_ns, end_ns)
+    .build()?;
+let batch: RecordBatch = db.execute(&plan)?;
+
+// SQL
+let ctx = chronix::sql::create_session_context(Arc::new(db));
+let df = ctx.sql("SELECT avg(usage) FROM cpu GROUP BY host").await?;
+
+// Analytics
+use chronix::chronix_analytics::forecast::{ForecastModel, SesModel};
+let mut model = SesModel::new(Some(0.3));
+model.fit(&timestamps, &values)?;
+let forecast = model.predict(10)?;
+```
+
+### Key Types
+
+| Type | Description |
+|------|-------------|
+| `Chronix` | Main database handle — thread-safe, `Arc`-shareable |
+| `ChronixConfig` | Database configuration (builder pattern) |
+| `Point` | A single write point with series key, fields, timestamp |
+| `SeriesKey` | Measurement name + tag set — identifies a unique series |
+| `FieldValue` | Enum: `F64`, `I64`, `U64`, `Bool`, `String` |
+| `QueryBuilder` | Fluent query construction |
+| `QueryPlan` | Compiled query plan for execution |
+
+---

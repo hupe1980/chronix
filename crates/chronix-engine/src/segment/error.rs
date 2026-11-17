@@ -28,9 +28,7 @@ pub enum SegmentError {
     /// The segment belongs to a different format generation.
     ///
     /// The message is built by [`crate::format::version_mismatch`], so every
-    /// durable format says the same thing in the same words — and names the
-    /// remedy rather than printing a bare number, which is what this used to
-    /// do.
+    /// durable format says the same thing and names the remedy.
     #[error("{detail}")]
     UnsupportedVersion {
         /// The version number found in the file.
@@ -64,11 +62,9 @@ pub enum SegmentError {
         max: usize,
     },
 
-    /// Column not found.
     /// An encrypted column cannot be read because its key is not available.
     ///
-    /// **Not** [`CorruptFile`](Self::CorruptFile), which is what this used to
-    /// be: nothing is wrong with the bytes. The deployment is missing a key,
+    /// Not [`CorruptFile`](Self::CorruptFile): nothing is wrong with the bytes. The deployment is missing a key,
     /// and the two have completely different next steps — one is "restore
     /// from a backup", the other is "set the environment variable". The
     /// commonest way to arrive here is restoring an encrypted backup onto a

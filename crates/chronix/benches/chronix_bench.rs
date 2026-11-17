@@ -142,6 +142,127 @@ fn bench_insert_batch(c: &mut Criterion) {
     group.finish();
 }
 
+/// The steady-state write — every series already known — with and without
+/// a namespace tag and namespace limits in force.
+///
+/// Namespace admission works on *new* series only, so a write whose series
+/// are all known must cost what it cost before quotas were enforced: the
+/// containment check it always did, and no lock. The two cases must agree
+/// within noise; a gap means admission work leaked onto the fast path.
+fn bench_insert_batch_namespaced(c: &mut Criterion) {
+    const N: usize = 10_000;
+    let shift = |points: &[Point], by: i64, namespace: Option<&str>| -> Vec<Point> {
+        points
+            .iter()
+            .map(|p| {
+                let mut tags: BTreeMap<String, String> = p
+                    .series_key()
+                    .tags()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                if let Some(ns) = namespace {
+                    tags.insert(
+                        chronix::chronix_core::NAMESPACE_TAG.to_string(),
+                        ns.to_string(),
+                    );
+                }
+                let key = SeriesKey::new(p.series_key().measurement(), tags).unwrap();
+                let fields: BTreeMap<String, FieldValue> = p
+                    .fields()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+                Point::new(key, fields, p.timestamp() + by).unwrap()
+            })
+            .collect()
+    };
+    let base = make_points(N);
+    let mut group = c.benchmark_group("insert_batch_namespaced");
+    group.throughput(Throughput::Elements(N as u64));
+    // `tenant-b` carries the same tag with no limits set, which separates
+    // the cost of the extra tag (a longer key, one more column) from the cost
+    // of the quota itself.
+    for (label, namespace) in [
+        ("untagged", None),
+        ("namespaced_unlimited", Some("tenant-b")),
+        ("namespaced", Some("tenant-a")),
+    ] {
+        let warm = shift(&base, 0, namespace);
+        let next = shift(&base, 1, namespace);
+        group.bench_function(BenchmarkId::new("existing_series", label), |b| {
+            b.iter_with_setup(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let db = Chronix::open(bench_config(tmp.path())).unwrap();
+                    db.set_namespace_limits(
+                        "tenant-a",
+                        chronix::NamespaceLimits {
+                            max_series: 1_000_000,
+                            max_measurements: 1_000,
+                        },
+                    );
+                    let _ = db.insert_batch(&warm).unwrap();
+                    (db, tmp)
+                },
+                |(db, tmp)| {
+                    let _ = db.insert_batch(black_box(&next)).unwrap();
+                    (db, tmp)
+                },
+            );
+        });
+    }
+    group.finish();
+}
+
+/// `insert_batch` of 10 000 points with and without the field encryption
+/// that seals `usage_idle` in the WAL — the cost of keeping an encrypted
+/// column's plaintext out of the log.
+#[cfg(feature = "field-encryption")]
+fn bench_insert_batch_sealed(c: &mut Criterion) {
+    use base64::Engine as _;
+    // SAFETY: set once, before any benchmark runs, and never changed.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var(
+            "CHRONIX_BENCH_SEAL_KEY",
+            base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+        );
+    }
+    let mut group = c.benchmark_group("insert_batch_sealed");
+    let points = make_points(10_000);
+    group.throughput(Throughput::Elements(10_000));
+    for sealed in [false, true] {
+        let name = if sealed { "encrypted_field" } else { "plain" };
+        group.bench_with_input(BenchmarkId::from_parameter(name), &points, |b, pts| {
+            b.iter_with_setup(
+                || {
+                    let tmp = TempDir::new().unwrap();
+                    let mut builder = ChronixConfig::builder()
+                        .data_dir(tmp.path())
+                        .memtable_flush_threshold(64 * 1024 * 1024);
+                    if sealed {
+                        builder = builder.field_encryption(chronix_core::FieldEncryption {
+                            columns: [("usage_idle".to_string(), "k".to_string())].into(),
+                            keys: [("k".to_string(), "CHRONIX_BENCH_SEAL_KEY".to_string())].into(),
+                        });
+                    }
+                    let db = Chronix::open(builder.build().unwrap()).unwrap();
+                    (db, tmp)
+                },
+                |(db, tmp)| {
+                    let _ = db.insert_batch(black_box(pts)).unwrap();
+                    (db, tmp)
+                },
+            );
+        });
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "field-encryption"))]
+fn bench_insert_batch_sealed(_: &mut Criterion) {}
+
 // ── Flush Benchmark ───────────────────────────────────────────────────
 
 fn bench_flush(c: &mut Criterion) {
@@ -618,6 +739,63 @@ fn bench_query_latency(c: &mut Criterion) {
     db.close().unwrap();
 }
 
+/// The parallelism budget on the read it changes: one time range covered by
+/// eight overlapping segments, read with `Serial` and with `Auto`.
+fn bench_parallelism(c: &mut Criterion) {
+    let tmp = TempDir::new().unwrap();
+    let mut config = ChronixConfig::builder()
+        .data_dir(tmp.path())
+        .maintenance_interval(std::time::Duration::ZERO)
+        .build()
+        .unwrap();
+    config.shard_duration = std::time::Duration::from_secs(30 * 86_400);
+    let db = Chronix::open(config.clone()).unwrap();
+    let base = 1_700_000_000_000_000_000_i64;
+    for batch in 0..8 {
+        let points: Vec<Point> = (0..50_000)
+            .map(|i| {
+                let tags: BTreeMap<String, String> =
+                    [("host".to_string(), format!("host-{batch}-{}", i % 50))]
+                        .into_iter()
+                        .collect();
+                let key = SeriesKey::new("metrics", tags).unwrap();
+                let fields: BTreeMap<String, FieldValue> =
+                    [("value".to_string(), FieldValue::F64(f64::from(i)))]
+                        .into_iter()
+                        .collect();
+                Point::new(key, fields, base + i64::from(i) * 1_000_000_000).unwrap()
+            })
+            .collect();
+        let _ = db.backfill(&points).unwrap();
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+
+    let mut group = c.benchmark_group("parallelism");
+    for (name, parallelism) in [
+        ("overlapping_8_segments/serial", Parallelism::Serial),
+        ("overlapping_8_segments/auto", Parallelism::Auto),
+    ] {
+        let mut config = config.clone();
+        config.parallelism = parallelism;
+        let db = Chronix::open(config).unwrap();
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let plan = db
+                    .query()
+                    .measurement("metrics")
+                    .field("value")
+                    .range(0, i64::MAX)
+                    .build()
+                    .unwrap();
+                black_box(db.execute(&plan).unwrap());
+            });
+        });
+        db.close().unwrap();
+    }
+    group.finish();
+}
+
 /// Compaction benchmark — measure merge-sort compaction throughput.
 fn bench_compaction(c: &mut Criterion) {
     let mut group = c.benchmark_group("compaction");
@@ -833,12 +1011,128 @@ fn bench_sql_parallel_forecast(c: &mut Criterion) {
     group.finish();
 }
 
+/// One maintenance pass of a declared detector at the design partner's
+/// shape: 50 series, one new minute at 1 Hz each (3 000 points), scored
+/// and written as verdicts. Only the pass is timed, not the writes it judges.
+fn bench_detector_pass(c: &mut Criterion) {
+    use chronix::detector::DetectorDeclaration;
+    const MINUTE: i64 = 60_000_000_000;
+    const BASE: i64 = 1_672_531_200_000_000_000; // 2023-01-01, settled
+    let tmp = TempDir::new().unwrap();
+    let db = Chronix::open(
+        ChronixConfig::builder()
+            .data_dir(tmp.path())
+            .maintenance_interval(std::time::Duration::ZERO)
+            .memtable_flush_threshold(64 * 1024 * 1024)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    db.declare_detector(
+        DetectorDeclaration::builder("bench")
+            .source("pv", "power")
+            .zscore(4.0)
+            .cusum(0.5, 5.0)
+            .settle(std::time::Duration::ZERO)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    let mut minute = 0i64;
+    let write_minute = |m: i64| {
+        let points: Vec<Point> = (0..50)
+            .flat_map(|s| {
+                (0..60).map(move |sec| {
+                    let key =
+                        SeriesKey::new("pv", tags! { "inverter" => format!("inv-{s}") }).unwrap();
+                    let v = 1_000.0 + ((m * 60 + sec) % 7) as f64;
+                    Point::new(
+                        key,
+                        chronix::fields! { "power" => v },
+                        BASE + m * MINUTE + sec * 1_000_000_000,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        db.backfill(&points).unwrap().into_complete().unwrap();
+    };
+    // Warm every baseline before measuring.
+    write_minute(minute);
+    db.advance_detectors().unwrap();
+    minute += 1;
+
+    let mut group = c.benchmark_group("detector_pass");
+    group.throughput(Throughput::Elements(3_000));
+    group.bench_function("50_series_x_60_points", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                write_minute(minute);
+                minute += 1;
+                let t = std::time::Instant::now();
+                black_box(db.advance_detectors().unwrap());
+                total += t.elapsed();
+            }
+            total
+        });
+    });
+    group.finish();
+}
+
 // ── Groups ────────────────────────────────────────────────────────────
+
+/// `Chronix::cardinality` over 1 M live series: one pass over the known
+/// series, top 10 of each list. The target is under a second.
+fn bench_cardinality_stats(c: &mut Criterion) {
+    const SERIES: usize = 1_000_000;
+    let dir = TempDir::new().unwrap();
+    let db = Chronix::open(
+        ChronixConfig::builder()
+            .data_dir(dir.path())
+            .max_series_cardinality(SERIES + 1)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    for chunk in (0..SERIES).collect::<Vec<_>>().chunks(50_000) {
+        let points: Vec<Point> = chunk
+            .iter()
+            .map(|&i| {
+                let tags: BTreeMap<String, String> = [
+                    ("device".to_string(), format!("dev-{i}")),
+                    ("region".to_string(), format!("region-{}", i % 20)),
+                    ("model".to_string(), format!("model-{}", i % 300)),
+                ]
+                .into_iter()
+                .collect();
+                let key = SeriesKey::new(format!("metric_{}", i % 50), tags).unwrap();
+                Point::new(
+                    key,
+                    chronix::fields! { "v" => 1.0 },
+                    1_700_000_000_000_000_000,
+                )
+                .unwrap()
+            })
+            .collect();
+        let _ = db.insert_batch(&points).unwrap();
+        db.flush().unwrap();
+    }
+    let mut group = c.benchmark_group("cardinality_stats");
+    group.sample_size(10);
+    group.bench_function("1m_series_limit_10", |b| {
+        b.iter(|| db.cardinality(10, None).unwrap());
+    });
+    group.finish();
+}
 
 criterion_group!(
     benches,
+    bench_cardinality_stats,
     bench_insert_single,
+    bench_insert_batch_namespaced,
     bench_insert_batch,
+    bench_insert_batch_sealed,
     bench_flush,
     bench_range_query,
     bench_filtered_query,
@@ -852,16 +1146,20 @@ criterion_group!(
     bench_concurrent_ingestion,
     bench_compression_ratio,
     bench_query_latency,
+    bench_parallelism,
     bench_compaction,
     bench_sql_select_with_time_range,
     bench_sql_group_by_time_bucket,
     bench_sql_order_limit,
+    bench_latest_n,
     bench_sql_forecast,
     bench_sql_anomaly,
     bench_sql_parallel_forecast,
     bench_promql_instant_rate,
     bench_promql_range_query,
     bench_promql_aggregation,
+    bench_detector_pass,
+    bench_inspect,
 );
 criterion_main!(benches);
 
@@ -944,6 +1242,66 @@ fn bench_sql_order_limit(c: &mut Criterion) {
             });
         });
     });
+}
+
+/// Seed `series` series at one point per minute for `days` days, flushing at
+/// the end of each simulated day so the segments are time-disjoint — the
+/// layout a gateway that has run for a month actually has on disk.
+fn seeded_latest_n_env(
+    series: usize,
+    days: usize,
+) -> (Arc<Chronix>, tokio::runtime::Runtime, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let db = Chronix::open(bench_config(tmp.path())).unwrap();
+    let start = 1_700_000_000_000_000_000_i64;
+    let minute = 60_000_000_000_i64;
+    let keys: Vec<SeriesKey> = (0..series)
+        .map(|s| SeriesKey::new("meter", tags! { "device" => format!("d-{s}") }).unwrap())
+        .collect();
+    for day in 0..days {
+        let mut points = Vec::with_capacity(series * 1440);
+        for m in 0..1440_i64 {
+            let ts = start + (day as i64 * 1440 + m) * minute;
+            for (s, key) in keys.iter().enumerate() {
+                let v = (s as f64) + (m as f64) * 0.01;
+                points
+                    .push(Point::new(key.clone(), chronix::fields! { "value" => v }, ts).unwrap());
+            }
+        }
+        let _ = db.insert_batch(&points).unwrap();
+        db.flush().unwrap();
+    }
+    let db = Arc::new(db);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    (db, rt, tmp)
+}
+
+/// `ORDER BY _time {ASC,DESC} LIMIT 10` over a month of a gateway and three
+/// days of a server: whether "the latest N" stops early or reads everything.
+fn bench_latest_n(c: &mut Criterion) {
+    let mut group = c.benchmark_group("latest_n");
+    group.sample_size(10);
+    for (name, series, days) in [("gateway_30d", 50, 30), ("server_3d", 500, 3)] {
+        let (db, rt, _tmp) = seeded_latest_n_env(series, days);
+        let ctx = create_session_context(db);
+        for (dir, sql) in [
+            ("asc", "SELECT * FROM meter ORDER BY _time ASC LIMIT 10"),
+            ("desc", "SELECT * FROM meter ORDER BY _time DESC LIMIT 10"),
+        ] {
+            group.bench_function(format!("{name}/{dir}"), |b| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let df = ctx.sql(black_box(sql)).await.unwrap();
+                        black_box(df.collect().await.unwrap());
+                    });
+                });
+            });
+        }
+    }
+    group.finish();
 }
 
 // ── PromQL Query Engine Benchmarks ──────────────────────────────────
@@ -1060,4 +1418,87 @@ fn bench_promql_aggregation(c: &mut Criterion) {
             black_box(result.unwrap());
         });
     });
+}
+
+// ── Offline inspection ─────────────────────────────────────────────
+
+/// `inspect_10k_segments`: the report a support thread asks for, on a data
+/// directory of ten thousand segments. Target: under one second.
+fn bench_inspect(c: &mut Criterion) {
+    let tmp = TempDir::new().unwrap();
+    synthetic_dir(tmp.path(), 10_000);
+    let mut group = c.benchmark_group("inspect");
+    group.sample_size(10);
+    group.bench_function("inspect_10k_segments", |b| {
+        b.iter(|| {
+            black_box(
+                chronix::inspect::inspect(tmp.path(), chronix::inspect::InspectOptions::default())
+                    .unwrap(),
+            )
+        });
+    });
+    group.finish();
+}
+
+/// A synthetic data directory of `n` segments: real catalog entries, segment
+/// files that are a valid header and footer around an empty body, and real
+/// `.series` sidecars — everything `inspect` reads, without `n` flushes.
+fn synthetic_dir(root: &std::path::Path, n: u64) {
+    use chronix::chronix_core::{SegmentFile, SegmentId, SegmentState, ShardId};
+    use chronix::chronix_engine::index::{SegmentCatalog, SegmentCatalogEntry, series_index};
+    use chronix::chronix_engine::segment::header::{SegmentFooter, SegmentHeader, VERSION};
+
+    let seg_dir = root.join("segments");
+    let mut cat = SegmentCatalog::new(root.join("catalog")).unwrap();
+    cat.in_one_sync(|cat| {
+        for id in 1..=n {
+            let measurement = format!("m{}", id % 6);
+            let file = SegmentFile::new(ShardId(0), &format!("seg_{id}.csx")).unwrap();
+            let path = file.resolve(&seg_dir);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let header = SegmentHeader {
+                version: VERSION,
+                flags: 0,
+                created_at: id as i64,
+                min_timestamp: id as i64 * 1_000,
+                max_timestamp: id as i64 * 1_000 + 999,
+                row_count: 100,
+                column_count: 3,
+                series_count: 1,
+                compression: 0,
+                sort_order: 1,
+            };
+            let footer = SegmentFooter {
+                metadata_offset: 48,
+                row_group_count: 1,
+                checksum: 0,
+                metadata_checksum: 0,
+            };
+            let mut bytes = header.to_bytes();
+            bytes.extend_from_slice(&footer.to_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            let tags: std::collections::BTreeMap<String, String> =
+                [("unit".to_owned(), format!("u{}", id % 50))].into();
+            let key = chronix::chronix_core::SeriesKey::new(measurement.clone(), tags).unwrap();
+            series_index::write(&path, &[key], series_index::SegmentStamp::of(&header)).unwrap();
+            cat.add_segment(SegmentCatalogEntry {
+                segment_id: SegmentId(id),
+                shard_id: ShardId(0),
+                measurement,
+                file,
+                min_timestamp: header.min_timestamp,
+                max_timestamp: header.max_timestamp,
+                row_count: 100,
+                series_count: 1,
+                byte_size: bytes.len() as u64,
+                row_group_count: 1,
+                column_count: 3,
+                column_stats: Vec::new(),
+                state: SegmentState::Active,
+            })?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    cat.force_snapshot().unwrap();
 }

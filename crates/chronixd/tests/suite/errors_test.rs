@@ -38,8 +38,6 @@ async fn server() -> (String, TempDir) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: std::sync::Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -48,11 +46,13 @@ async fn server() -> (String, TempDir) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_handle = chronixd::server::prometheus_builder()

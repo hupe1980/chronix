@@ -43,7 +43,7 @@ pub use error::SegmentError;
 pub use field_encryption::{
     FieldEncryptionConfig, FieldEncryptionKey, FieldKeyProvider, StaticKeyProvider,
 };
-pub use header::{SegmentFooter, SegmentHeader};
+pub use header::{SegmentFileMeta, SegmentFooter, SegmentHeader, read_meta};
 pub use metadata::{ColumnBlockMeta, ColumnMeta, SegmentMetadata};
 pub use reader::SegmentReader;
 pub use reader::{FieldPredicate, StatsOp};

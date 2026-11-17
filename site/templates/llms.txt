@@ -1,0 +1,10 @@
+# Chronix
+
+> {{ config.description }}
+
+Chronix is a Rust crate (`chronix` on crates.io) and a server (`chronixd`) built on the same engine and file format. The Rust API is documented at {{ config.extra.docsrs_url }}; the source is at {{ config.extra.repo_url }}. The full text of every page below is at {{ get_url(path="llms-full.txt", trailing_slash=false) }}.
+{% for item in config.extra.nav %}{% set s = get_section(path=item.path) %}
+## {{ s.title }}
+
+{% for p in s.pages %}- [{{ p.title }}]({{ p.permalink }}){% if p.description %}: {{ p.description }}{% endif %}
+{% endfor %}{% endfor %}

@@ -1,14 +1,4 @@
 {
-  "__inputs": [
-    {
-      "name": "DS_PROMETHEUS",
-      "label": "Prometheus",
-      "description": "Prometheus data source scraping Chronix metrics",
-      "type": "datasource",
-      "pluginId": "prometheus",
-      "pluginName": "Prometheus"
-    }
-  ],
   "annotations": {
     "list": [
       {
@@ -56,7 +46,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "targets": [
         {
@@ -98,7 +88,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "targets": [
         {
@@ -130,7 +120,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "targets": [
         {
@@ -172,12 +162,12 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "targets": [
         {
           "expr": "rate(chronix_anomaly_detected_total[5m])",
-          "legendFormat": "{{detector}} \u2014 {{measurement}}",
+          "legendFormat": "{{detector}} — {{measurement}}",
           "refId": "A"
         }
       ],
@@ -207,12 +197,12 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "targets": [
         {
           "expr": "rate(chronix_signal_delivery_failed_total[5m])",
-          "legendFormat": "{{channel}} \u2014 {{error}}",
+          "legendFormat": "{{channel}} — {{error}}",
           "refId": "A"
         }
       ],
@@ -244,7 +234,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "targets": [
         {
@@ -267,7 +257,7 @@
     },
     {
       "title": "Signals Dropped (queue full)",
-      "description": "A full queue drops the oldest waiting signal rather than blocking ingestion. Any non-zero rate here means alerts are being discarded \u2014 raise the channel's capacity or fix the channel.",
+      "description": "A full queue drops the oldest waiting signal rather than blocking ingestion. Any non-zero rate here means alerts are being discarded — raise the channel's capacity or fix the channel.",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -277,7 +267,7 @@
       },
       "datasource": {
         "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
+        "uid": "${datasource}"
       },
       "targets": [
         {
@@ -310,7 +300,21 @@
     "anomaly"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1,
+        "regex": "",
+        "includeAll": false,
+        "multi": false,
+        "options": []
+      }
+    ]
   },
   "time": {
     "from": "now-6h",
@@ -318,7 +322,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Chronix \u2014 Signals & Anomalies",
+  "title": "Chronix — Signals & Anomalies",
   "uid": "chronix-signals",
   "version": 1
 }

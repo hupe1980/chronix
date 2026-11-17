@@ -448,3 +448,138 @@ fn a_restore_without_the_key_says_what_is_wrong() {
     );
     plain.close().unwrap();
 }
+
+/// Every byte of every WAL file under `dir`.
+fn all_wal_bytes(dir: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir.join("wal")).unwrap().flatten() {
+        if entry.path().is_file() {
+            out.extend(std::fs::read(entry.path()).unwrap());
+        }
+    }
+    out
+}
+
+/// Write unflushed points under the `phi` key, then die without closing, so
+/// the only copy of them is the WAL. Runs in a child process.
+fn write_then_crash(test: &str, env: &str, dir: &Path, secret: &str) {
+    if let Ok(child_dir) = std::env::var(env) {
+        keys();
+        let db = open_with(
+            Path::new(&child_dir),
+            settings("patient_id", "phi", "CHRONIX_TEST_KEY_PHI"),
+        )
+        .unwrap();
+        assert!(
+            db.insert_batch(&[point(secret, 1_000), point(secret, 2_000)])
+                .unwrap()
+                .is_complete()
+        );
+        std::process::abort();
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture"])
+        .env(env, dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "the child must abort");
+}
+
+/// The write-ahead log does not hold an encrypted column's plaintext, from
+/// the append until the flush — the window this closes.
+#[test]
+fn the_plaintext_is_not_in_the_wal() {
+    keys();
+    let dir = TempDir::new().unwrap();
+    let secret = "PATIENT-1111-WAL-SECRET";
+    let db = open_with(
+        dir.path(),
+        settings("patient_id", "phi", "CHRONIX_TEST_KEY_PHI"),
+    )
+    .unwrap();
+    for ts in 0..50i64 {
+        db.insert(&point(secret, ts * 1_000_000)).unwrap();
+    }
+    let bytes = all_wal_bytes(dir.path());
+    assert!(
+        !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+        "the declared column's plaintext is in the WAL"
+    );
+    // The control: an undeclared tag is plainly there, so the assertion
+    // above detects sealing rather than compression.
+    assert!(
+        bytes.windows(5).any(|w| w == b"north"),
+        "an undeclared tag must be findable in the WAL"
+    );
+    assert_eq!(read_back(&db).len(), 50, "and it reads back before a flush");
+}
+
+/// After a crash the sealed values come back from the WAL with the key.
+#[test]
+fn sealed_wal_records_replay_with_the_key() {
+    let dir = TempDir::new().unwrap();
+    let secret = "PATIENT-2222-REPLAYED";
+    write_then_crash(
+        "sealed_wal_records_replay_with_the_key",
+        "CHRONIX_TEST_SEAL_REPLAY_DIR",
+        dir.path(),
+        secret,
+    );
+    keys();
+    let db = open_with(
+        dir.path(),
+        settings("patient_id", "phi", "CHRONIX_TEST_KEY_PHI"),
+    )
+    .unwrap();
+    assert_eq!(read_back(&db), [secret, secret]);
+}
+
+/// Without the key a sealed record refuses the open by name — replaying the
+/// points without their encrypted values would acknowledge a write and then
+/// lose part of it.
+#[test]
+fn a_sealed_wal_record_without_its_key_refuses_the_open() {
+    let dir = TempDir::new().unwrap();
+    write_then_crash(
+        "a_sealed_wal_record_without_its_key_refuses_the_open",
+        "CHRONIX_TEST_SEAL_NOKEY_DIR",
+        dir.path(),
+        "PATIENT-3333",
+    );
+    let Err(err) = Chronix::open(
+        ChronixConfig::builder()
+            .data_dir(dir.path())
+            .maintenance_interval(Duration::from_secs(86_400 * 365))
+            .build()
+            .unwrap(),
+    ) else {
+        panic!("the open must fail");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'phi'") && msg.contains("not configured"),
+        "{msg}"
+    );
+}
+
+/// The right key id with the wrong key bytes does not open a sealed section.
+#[test]
+fn a_sealed_wal_record_under_the_wrong_key_bytes_refuses_the_open() {
+    let dir = TempDir::new().unwrap();
+    write_then_crash(
+        "a_sealed_wal_record_under_the_wrong_key_bytes_refuses_the_open",
+        "CHRONIX_TEST_SEAL_WRONG_DIR",
+        dir.path(),
+        "PATIENT-4444",
+    );
+    keys();
+    let Err(err) = open_with(
+        dir.path(),
+        settings("patient_id", "phi", "CHRONIX_TEST_KEY_WRONG"),
+    ) else {
+        panic!("the open must fail");
+    };
+    assert!(err.to_string().contains("does not authenticate"), "{err}");
+}

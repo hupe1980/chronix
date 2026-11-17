@@ -269,6 +269,95 @@ impl Iterator for WalReader {
     }
 }
 
+/// What a WAL file's record headers say about the records above a floor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalScan {
+    /// The format version in the file header. When it is not
+    /// [`WAL_VERSION`] nothing else was read and every count is zero.
+    pub version: u16,
+    /// Records whose sequence number is above the floor.
+    pub records_above_floor: u64,
+    /// Bytes those records occupy, headers included.
+    pub bytes_above_floor: u64,
+    /// The first sequence number above the floor.
+    pub seq_first: Option<u64>,
+    /// The last sequence number above the floor.
+    pub seq_last: Option<u64>,
+    /// The file ends inside a record: a write a crash interrupted, which
+    /// replay skips.
+    pub torn_tail: bool,
+}
+
+/// Count the records above `floor` in one WAL file by reading their headers.
+///
+/// Payloads are skipped with a seek, never read or decoded, so the cost is
+/// one 18-byte read per record whatever the records hold. Checksums are not
+/// verified — that needs the payload — so this answers "how much would a
+/// replay read", not "is every record intact".
+///
+/// # Errors
+///
+/// [`WalError::InvalidHeader`] if the file is not a WAL file, or an I/O
+/// error. A file of another format generation is not an error: its
+/// [`WalScan::version`] says so.
+pub fn scan_headers(path: &Path, floor: u64) -> Result<WalScan, WalError> {
+    use std::io::{Seek, SeekFrom};
+    let path_buf = path.to_path_buf();
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut head = [0u8; WAL_HEADER_SIZE];
+    file.read_exact(&mut head)
+        .map_err(|e| WalError::InvalidHeader {
+            path: path_buf.clone(),
+            detail: format!("Failed to read the file header: {e}"),
+        })?;
+    if &head[..4] != WAL_MAGIC {
+        return Err(WalError::InvalidHeader {
+            path: path_buf,
+            detail: format!("Invalid magic bytes: expected CXWL, got {:?}", &head[..4]),
+        });
+    }
+    let mut scan = WalScan {
+        version: u16::from_le_bytes([head[4], head[5]]),
+        ..WalScan::default()
+    };
+    if scan.version != WAL_VERSION {
+        return Ok(scan);
+    }
+
+    let mut offset = WAL_HEADER_SIZE as u64;
+    let mut rec = [0u8; WAL_RECORD_HEADER_SIZE];
+    loop {
+        let remaining = file_len.saturating_sub(offset);
+        if remaining == 0 {
+            break;
+        }
+        if remaining < WAL_RECORD_HEADER_SIZE as u64 {
+            scan.torn_tail = true;
+            break;
+        }
+        file.read_exact(&mut rec)?;
+        let length = u64::from(u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]));
+        let seq = u64::from_le_bytes([
+            rec[8], rec[9], rec[10], rec[11], rec[12], rec[13], rec[14], rec[15],
+        ]);
+        let record_len = WAL_RECORD_HEADER_SIZE as u64 + length;
+        if length > u64::from(MAX_PAYLOAD_SIZE) || record_len > remaining {
+            scan.torn_tail = true;
+            break;
+        }
+        if seq > floor {
+            scan.records_above_floor += 1;
+            scan.bytes_above_floor += record_len;
+            scan.seq_first.get_or_insert(seq);
+            scan.seq_last = Some(seq);
+        }
+        file.seek(SeekFrom::Current(i64::try_from(length).unwrap_or(i64::MAX)))?;
+        offset += record_len;
+    }
+    Ok(scan)
+}
+
 /// Replay all WAL files in a directory in sequence order.
 ///
 /// Reads all `wal_*.cxwl` files sorted by their starting sequence number,
@@ -451,6 +540,46 @@ mod tests {
         assert_eq!(records[0].payload, b"hello");
         assert_eq!(records[1].sequence_no, 2);
         assert_eq!(records[1].payload, b"world");
+    }
+
+    #[test]
+    fn scan_headers_counts_records_above_the_floor_without_reading_payloads() {
+        let dir = TempDir::new().unwrap();
+        let writer = WalWriter::open(dir.path(), test_config()).unwrap();
+        for p in [b"one".as_slice(), b"two", b"three", b"four"] {
+            writer.append(p).unwrap();
+        }
+        writer.sync().unwrap();
+        drop(writer);
+
+        let files = crate::wal::list_wal_files(dir.path()).unwrap();
+        let path = &files.last().unwrap().1;
+        let all = scan_headers(path, 0).unwrap();
+        assert_eq!(all.version, WAL_VERSION);
+        assert_eq!(all.records_above_floor, 4);
+        assert_eq!((all.seq_first, all.seq_last), (Some(1), Some(4)));
+        assert!(!all.torn_tail);
+        let file_len = std::fs::metadata(path).unwrap().len();
+        assert_eq!(all.bytes_above_floor, file_len - WAL_HEADER_SIZE as u64);
+
+        let above = scan_headers(path, 2).unwrap();
+        assert_eq!(above.records_above_floor, 2);
+        assert_eq!((above.seq_first, above.seq_last), (Some(3), Some(4)));
+
+        // A torn tail is reported, and the whole records before it counted.
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, &bytes[..bytes.len() - 2]).unwrap();
+        let torn = scan_headers(path, 0).unwrap();
+        assert!(torn.torn_tail);
+        assert_eq!(torn.records_above_floor, 3);
+
+        // Another generation: the version is reported, nothing counted.
+        let mut foreign = bytes.clone();
+        foreign[4..6].copy_from_slice(&(WAL_VERSION + 1).to_le_bytes());
+        std::fs::write(path, &foreign).unwrap();
+        let other = scan_headers(path, 0).unwrap();
+        assert_eq!(other.version, WAL_VERSION + 1);
+        assert_eq!(other.records_above_floor, 0);
     }
 
     #[test]
@@ -771,10 +900,8 @@ mod tests {
     /// A log from another format generation is its own error, and says what
     /// to do about it.
     ///
-    /// This used to assert `InvalidHeader`, which lumped "the magic bytes are
-    /// wrong" together with "this log is from a different version of
-    /// chronix" — two facts with different remedies. The header here is
-    /// perfectly well formed. See `crate::format`.
+    /// Not `InvalidHeader`: the header is well formed, and the remedy differs.
+    /// See `crate::format`.
     #[test]
     fn a_log_from_another_generation_is_not_an_invalid_header() {
         let dir = TempDir::new().unwrap();

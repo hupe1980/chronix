@@ -157,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             period: Some(period),
             arima_order: Some((1, 1, 1)),
             sarima_order: Some((1, 1, 1, period)),
+            ..Default::default()
         }),
     )?;
     print_forecast("SARIMA", &result);

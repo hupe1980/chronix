@@ -1,0 +1,44 @@
+[package]
+name = "chronixd-cluster"
+description = "chronixd in cluster mode (frozen): Meta and Data nodes over Multi-Raft."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Frozen tier — built from the repository, never published.
+publish = false
+
+[[bin]]
+name = "chronixd-cluster"
+path = "src/main.rs"
+
+[dependencies]
+chronixd.workspace = true
+chronix.workspace = true
+chronix-core.workspace = true
+chronix-meta.workspace = true
+chronix-cluster.workspace = true
+chronix-security.workspace = true
+chronix-query.workspace = true
+openraft.workspace = true
+arrow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing.workspace = true
+
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

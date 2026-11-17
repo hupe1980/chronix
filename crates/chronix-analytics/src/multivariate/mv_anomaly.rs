@@ -271,26 +271,12 @@ enum IsolationNode {
 
 /// Isolation Forest multivariate anomaly detector.
 ///
-/// Recursively partitions data along random features and split values.
-/// Anomalous points are isolated in fewer splits (shorter path length).
-/// Score is normalized to [0, 1] where values close to 1 indicate anomalies.
+/// Recursively partitions data along random features and split values;
+/// anomalous points are isolated in fewer splits. The score is normalised to
+/// [0, 1], where values near 1 indicate anomalies.
 ///
-/// # Deterministic Seeding
-///
-/// The forest uses a **fixed base seed** (42) combined with the tree
-/// index to derive per-tree PRNG streams. This makes results fully
-/// deterministic for a given dataset, which is valuable for
-/// reproducibility and testing.
-///
-/// The seed does **not** incorporate data shape (n_series, n_timestamps)
-/// because the subsample selection and split decisions are already
-/// conditioned on the actual data values. Adding shape to the seed
-/// would change results when the same logical dataset is padded or
-/// truncated, without improving detection quality.
-///
-/// If caller-controlled seeding is needed (e.g. for ensemble
-/// diversity), a `seed` parameter can be added to the constructor
-/// in a future release.
+/// The forest uses a fixed base seed (42) combined with the tree index, so
+/// results are deterministic for a given dataset.
 pub struct IsolationForestDetector {
     n_trees: usize,
     subsample_size: usize,
@@ -335,7 +321,7 @@ impl IsolationForestDetector {
             return 0.0;
         }
         let n = n as f64;
-        2.0 * (n.ln() + 0.5772156649) - 2.0 * (n - 1.0) / n
+        2.0 * (n.ln() + std::f64::consts::EULER_GAMMA) - 2.0 * (n - 1.0) / n
     }
 
     /// Simple deterministic pseudo-random from seed.

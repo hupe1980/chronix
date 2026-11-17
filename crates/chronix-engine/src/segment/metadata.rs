@@ -39,8 +39,6 @@ pub struct ColumnMeta {
     /// codec per block (e.g. Chimp → Gorilla → plain), so the authoritative
     /// encoding for reading is always
     /// [`ColumnBlockMeta::encoding`](crate::segment::metadata::ColumnBlockMeta::encoding).
-    /// The field was previously named `encoding`, which read as a statement of
-    /// fact; nothing decodes from it, but the name invited that mistake.
     pub default_encoding: u8,
     /// Global statistics across all row groups (min, max, null_count,
     /// value_count, sum, distinct_count).  Enables segment-level pruning
@@ -91,10 +89,8 @@ pub struct ColumnMeta {
 impl ColumnMeta {
     /// The Arrow type this column decodes to.
     ///
-    /// The single answer to a question four places in the reader used to
-    /// answer separately, each ending in `_ => DataType::Utf8`. That
-    /// fallback was fine while every non-numeric column was a string; it
-    /// silently turned a decimal column into `Utf8` the moment one existed.
+    /// The one mapping every reader path uses, so a new column type cannot
+    /// fall through to `Utf8` in one of them.
     #[must_use]
     pub fn arrow_data_type(&self) -> arrow::datatypes::DataType {
         use arrow::datatypes::DataType;

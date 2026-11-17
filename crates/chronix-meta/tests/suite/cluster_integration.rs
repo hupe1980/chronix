@@ -68,10 +68,10 @@ async fn build_cluster(n: u64) -> (MetaRouter, BTreeMap<u64, TestNode>) {
 /// Find the current leader ID — polls all nodes.
 async fn find_leader(nodes: &BTreeMap<u64, TestNode>) -> Option<u64> {
     for (id, node) in nodes {
-        if let Some(leader_id) = node.raft.current_leader().await {
-            if leader_id == *id {
-                return Some(*id);
-            }
+        if let Some(leader_id) = node.raft.current_leader().await
+            && leader_id == *id
+        {
+            return Some(*id);
         }
     }
     None
@@ -85,7 +85,11 @@ async fn wait_for_leader(nodes: &BTreeMap<u64, TestNode>) -> u64 {
             return leader;
         }
         if tokio::time::Instant::now() > deadline {
-            panic!("no leader elected within timeout");
+            // A test helper: failing the test is the point.
+            #[allow(clippy::panic)]
+            {
+                panic!("no leader elected within timeout");
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -190,7 +194,7 @@ async fn node_registration_and_region_creation() {
         let resp = propose(
             &nodes,
             leader,
-            MetaCommand::RegisterNode(DataNodeInfo::new(i, &format!("10.0.0.{i}:9001"))),
+            MetaCommand::RegisterNode(DataNodeInfo::new(i, format!("10.0.0.{i}:9001"))),
         )
         .await;
         assert!(

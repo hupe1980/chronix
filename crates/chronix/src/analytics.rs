@@ -22,6 +22,14 @@ pub struct ForecastConfig {
     pub arima_order: Option<(usize, usize, usize)>,
     /// SARIMA seasonal order (P,D,Q,m) — defaults to (1,1,1,period).
     pub sarima_order: Option<(usize, usize, usize, usize)>,
+    /// Fit on the series averaged into `step_ns`-wide buckets instead of on
+    /// the raw samples. See [`Chronix::auto_forecast_at_step`](crate::Chronix::auto_forecast_at_step)
+    /// for how buckets are formed. The horizon and the result are then in
+    /// steps.
+    pub step_ns: Option<i64>,
+    /// Clamp the forecast and its interval at this floor, for a quantity
+    /// that cannot go below it (power, a count). Never inferred.
+    pub lower_bound: Option<f64>,
 }
 
 impl Default for ForecastConfig {
@@ -32,6 +40,8 @@ impl Default for ForecastConfig {
             period: None,
             arima_order: None,
             sarima_order: None,
+            step_ns: None,
+            lower_bound: None,
         }
     }
 }

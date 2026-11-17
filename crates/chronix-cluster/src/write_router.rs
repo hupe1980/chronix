@@ -246,9 +246,7 @@ impl WriteRouter {
                 let target_region = if all_have_ranges {
                     // Range-based routing: find the region whose key_range contains this hash
                     let idx = routes
-                        .partition_point(|r| {
-                            r.key_range.as_ref().map_or(true, |kr| kr.start <= hash)
-                        })
+                        .partition_point(|r| r.key_range.as_ref().is_none_or(|kr| kr.start <= hash))
                         .saturating_sub(1);
                     &routes[idx]
                 } else {
@@ -341,15 +339,15 @@ impl WriteRouter {
 
         for attempt in 0..=self.max_retries {
             // Check dedup cache on retry to avoid double-writes.
-            if attempt > 0 {
-                if let Some(written) = self.dedup_cache.check(&request_id) {
-                    debug!(
-                        region_id,
-                        request_id = %request_id,
-                        "dedup cache hit — returning cached result"
-                    );
-                    return Ok(written);
-                }
+            if attempt > 0
+                && let Some(written) = self.dedup_cache.check(&request_id)
+            {
+                debug!(
+                    region_id,
+                    request_id = %request_id,
+                    "dedup cache hit — returning cached result"
+                );
+                return Ok(written);
             }
 
             if attempt > 0 {
@@ -407,9 +405,9 @@ impl WriteRouter {
                         )
                         .await
                     } else if self.require_raft {
-                        return Err(ClusterError::Internal(
+                        Err(ClusterError::Internal(
                             "Raft manager required but not configured — refusing unreplicated write".into(),
-                        ));
+                        ))
                     } else {
                         warn!(
                             region_id,

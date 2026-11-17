@@ -18,10 +18,8 @@ use super::types::{AppState, NAMESPACE_TAG, TimeRangeRequest, arrow_value_to_jso
 
 /// JSON body for a query request.
 ///
-/// `deny_unknown_fields`: a misspelled or stale key used to be dropped in
-/// silence, so a body carrying `start`/`end` at the top level — which is what
-/// the documentation showed — ran unfiltered and answered the whole
-/// measurement as though it had understood the range.
+/// `deny_unknown_fields`: a misspelled or misplaced key is an error, not a
+/// silently unfiltered query.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryRequest {
@@ -226,6 +224,20 @@ pub async fn query_handler(
     Ok(Json(result))
 }
 
+/// A query that did not plan: a `400`, with what it got wrong and what it
+/// probably meant. Table suggestions come only from the tables `scope` may
+/// see, so a near name in another namespace is never offered.
+fn sql_plan_error(
+    db: &chronix::Chronix,
+    e: datafusion::error::DataFusionError,
+    sql: &str,
+    scope: Option<&str>,
+) -> ServerError {
+    let message = format!("SQL error: {e}");
+    let diagnosis = db.diagnose(&chronix::DbError::Sql(e), sql, scope);
+    ServerError::diagnosed(ServerError::BadRequest(message), diagnosis)
+}
+
 /// Map a DataFusion error to the right status.
 ///
 /// A query that fails *while running* is not automatically the server's
@@ -347,10 +359,9 @@ pub async fn sql_handler(
 ) -> Result<Json<SqlResponse>, ServerError> {
     let sql = body.query;
 
-    // The namespace scopes the *tables*, not just the plan cache: a context
-    // built for one namespace exposes tables that carry a mandatory filter,
-    // so no SQL text can reach another tenant's rows. Scoping only the cache
-    // key — which is what this used to do — left every query unscoped.
+    // The namespace scopes the tables, not just the plan cache: a context built
+    // for one namespace exposes tables that carry a mandatory filter, so no SQL
+    // text can reach another tenant's rows.
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
     let ctx = state.sql_ctx(scope.as_deref());
 
@@ -387,7 +398,7 @@ pub async fn sql_handler(
         // offending plan, so every repeat request re-applied them.
         let plan = chronix::sql::plan_read_only(&ctx, &sql)
             .await
-            .map_err(|e| ServerError::BadRequest(format!("SQL error: {e}")))?;
+            .map_err(|e| sql_plan_error(&state.db, e, &sql, scope.as_deref()))?;
         let df = ctx
             .execute_logical_plan(plan.clone())
             .await
@@ -423,6 +434,12 @@ pub async fn sql_handler(
     // is materialised beyond the max_rows limit.
     use futures::StreamExt;
     let timeout_secs = state.config.server.sql_query_timeout_secs;
+    // Held until this function returns, which is when the stream — and the
+    // DataFusion execution under it — is dropped.
+    let _slot = state
+        .query_slots
+        .acquire(std::time::Duration::from_secs(timeout_secs))
+        .await?;
     let stream_future = df.execute_stream();
     let mut stream = if timeout_secs > 0 {
         tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), stream_future)
@@ -544,12 +561,9 @@ pub async fn query_explain_handler(
 
 /// Convert an Arrow `RecordBatch` to JSON-serializable rows.
 ///
-/// The storage path produces a known, small set of Arrow types, and those get
-/// a pre-resolved fast path so a cell costs no downcast. Anything else — a
-/// type this path does not produce today, or one a future plan node
-/// introduces — goes through [`crate::wire::value::to_json`], the encoding
-/// every surface shares. It used to be *dropped*, silently, leaving the field
-/// simply absent from the row with nothing in the response to say so.
+/// The types the storage path produces get a pre-resolved fast path. Anything
+/// else goes through [`crate::wire::value::to_json`], the encoding every
+/// surface shares, so no column is ever dropped from a row.
 pub(super) fn record_batch_to_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<QueryRow> {
     use arrow::array::*;
     use arrow::datatypes::DataType;
@@ -728,6 +742,7 @@ fn query_plan_to_json(plan: &QueryPlan) -> serde_json::Value {
             time_range,
             namespace_id,
             field_predicates: _,
+            presence: _,
         } => {
             let filters: Vec<serde_json::Value> = tag_filters
                 .iter()

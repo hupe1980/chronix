@@ -32,26 +32,14 @@ use crate::namespace::NamespaceContext;
 
 /// A thread-safe rate limiter with burst tolerance.
 ///
-/// Implemented as **GCRA** (the generic cell rate algorithm — the same
-/// formulation the `governor` crate uses), which keeps the entire state in a
-/// single `u64`: the *theoretical arrival time* (TAT) of the next request that
-/// would be perfectly conforming, in nanoseconds since `epoch`.
-///
-/// A request at `now` is admitted when `now >= tat - burst_ns`; admitting it
-/// pushes the TAT forward by one emission interval. The bucket therefore
-/// starts full (`burst` requests admitted back to back) and refills
-/// continuously at `rps`.
-///
-/// # Why not a token count plus a timestamp
-///
-/// The obvious two-field form — available tokens and the last refill instant —
-/// needs both fields to change together. Updating them with two independent
-/// compare-and-swaps is not atomic: a thread can win the timestamp swap and
-/// lose the token swap, having advanced the clock without ever crediting the
-/// tokens that elapsed. The accrual is then gone for good, so under contention
-/// the limiter drifts *below* its configured rate and rejects traffic it
-/// should have admitted. Encoding the state as one number makes that class of
-/// bug unrepresentable, and needs one CAS instead of two.
+/// Implemented as **GCRA** (the generic cell rate algorithm, as in the
+/// `governor` crate), with the whole state in one `u64`: the theoretical
+/// arrival time (TAT) of the next perfectly conforming request, in
+/// nanoseconds since `epoch`. A request at `now` is admitted when
+/// `now >= tat - burst_ns`, which advances the TAT by one emission interval:
+/// the bucket starts full and refills continuously at `rps`. One number means
+/// one compare-and-swap, so contention cannot lose accrued tokens the way a
+/// separate count and timestamp can.
 #[derive(Debug)]
 pub struct TokenBucket {
     /// Nanoseconds between conforming requests (1e9 / rps).
@@ -116,6 +104,180 @@ impl TokenBucket {
     }
 }
 
+/// Why [`TokenBucket::check_n`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The cost fits the bucket once it refills for this long.
+    Wait(Duration),
+    /// The cost is larger than the bucket can ever hold — retrying the same
+    /// request unchanged can only be refused again.
+    Never,
+}
+
+impl TokenBucket {
+    /// Try to acquire `n` tokens at once: the GCRA with a cost of `n`
+    /// intervals and a tolerance of the whole burst.
+    ///
+    /// All or nothing — a refused request takes no tokens. `n` larger than
+    /// the burst is [`Refusal::Never`], which is what lets a caller tell "back
+    /// off" from "split this".
+    pub fn check_n(&self, n: u64) -> Result<(), Refusal> {
+        let tolerance = self.burst_ns.saturating_add(self.interval_ns);
+        let cost = n.saturating_mul(self.interval_ns);
+        if cost > tolerance {
+            return Err(Refusal::Never);
+        }
+        let now_ns = self.epoch.elapsed().as_nanos() as u64;
+        let mut tat = self.tat_ns.load(Ordering::Acquire);
+        loop {
+            let effective_tat = tat.max(now_ns);
+            let next_tat = effective_tat.saturating_add(cost);
+            let ahead = next_tat - now_ns;
+            if ahead > tolerance {
+                return Err(Refusal::Wait(Duration::from_nanos(ahead - tolerance)));
+            }
+            match self.tat_ns.compare_exchange_weak(
+                tat,
+                next_tat,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => {
+                    tat = observed;
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// Per-namespace **ingestion** limiter: points per second, admitted per
+/// batch before the write runs.
+///
+/// A batch costs one token per point and the bucket holds one second of the
+/// namespace's `max_ingestion_rate`, so a steady writer at the rate is never
+/// refused, a burst above it waits, and a single batch larger than one
+/// second's allowance is refused as unadmittable rather than retried for
+/// ever. It is the one check every write path reaches — HTTP, remote write,
+/// OTLP, gRPC, Flight SQL and the connectors all go through
+/// [`crate::util::insert_batch_with_mode`].
+///
+/// It also counts what it admits, per namespace, so the usage endpoint can
+/// report the observed rate of every namespace, limited or not.
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceIngestLimiter {
+    buckets: Arc<dashmap::DashMap<String, (u64, GlobalLimiter)>>,
+    observed: Arc<dashmap::DashMap<String, RateWindow>>,
+}
+
+/// Points admitted in the current and the previous whole second.
+#[derive(Debug, Default)]
+struct RateWindow {
+    second: u64,
+    current: u64,
+    previous: u64,
+}
+
+/// What [`NamespaceIngestLimiter::admit`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestRefusal {
+    /// Over the rate; the batch fits after this many milliseconds.
+    RetryAfterMs(u64),
+    /// The batch is larger than one second of the rate.
+    BatchTooLarge,
+}
+
+impl NamespaceIngestLimiter {
+    /// An empty limiter: every namespace unlimited.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set a namespace's rate in points per second; `0` removes the limit.
+    pub fn set_limit(&self, namespace: &str, points_per_second: u64) {
+        if points_per_second == 0 {
+            self.buckets.remove(namespace);
+            return;
+        }
+        let burst = u32::try_from(points_per_second).unwrap_or(u32::MAX);
+        if let Some(bucket) = build_limiter(points_per_second, burst) {
+            self.buckets
+                .insert(namespace.to_string(), (points_per_second, bucket));
+        }
+    }
+
+    /// Remove a namespace's limit and its observed rate.
+    pub fn remove(&self, namespace: &str) {
+        self.buckets.remove(namespace);
+        self.observed.remove(namespace);
+    }
+
+    /// The namespace's configured rate, if it has one.
+    #[must_use]
+    pub fn limit(&self, namespace: &str) -> Option<u64> {
+        self.buckets.get(namespace).map(|b| b.0)
+    }
+
+    /// Admit a batch of `points` for `namespace`, or say why not.
+    ///
+    /// # Errors
+    ///
+    /// [`IngestRefusal`] when the namespace is over its rate.
+    pub fn admit(&self, namespace: &str, points: u64) -> Result<(), IngestRefusal> {
+        let bucket = self.buckets.get(namespace).map(|b| Arc::clone(&b.1));
+        if let Some(bucket) = bucket {
+            match bucket.check_n(points) {
+                Ok(()) => {}
+                Err(Refusal::Never) => return Err(IngestRefusal::BatchTooLarge),
+                Err(Refusal::Wait(wait)) => {
+                    let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1);
+                    return Err(IngestRefusal::RetryAfterMs(ms));
+                }
+            }
+        }
+        self.record(namespace, points);
+        Ok(())
+    }
+
+    /// Points admitted for `namespace` over the last whole second.
+    #[must_use]
+    pub fn observed_rate(&self, namespace: &str) -> u64 {
+        let now = unix_second();
+        self.observed.get(namespace).map_or(0, |w| {
+            if w.second == now {
+                w.previous
+            } else if w.second + 1 == now {
+                w.current
+            } else {
+                0
+            }
+        })
+    }
+
+    fn record(&self, namespace: &str, points: u64) {
+        let now = unix_second();
+        let mut window = self.observed.entry(namespace.to_string()).or_default();
+        if window.second != now {
+            window.previous = if window.second + 1 == now {
+                window.current
+            } else {
+                0
+            };
+            window.current = 0;
+            window.second = now;
+        }
+        window.current = window.current.saturating_add(points);
+    }
+}
+
+fn unix_second() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Shared, non-keyed (global) rate limiter.
 pub type GlobalLimiter = Arc<TokenBucket>;
 
@@ -172,6 +334,20 @@ impl NamespaceRateLimiter {
             Ok(_) => Ok(()),
             Err(wait) => Err(wait.as_secs().max(1)),
         }
+    }
+
+    /// As [`check`](Self::check), with the wait to the nanosecond — what
+    /// gRPC's `grpc-retry-pushback-ms` carries.
+    ///
+    /// # Errors
+    ///
+    /// The time until a token is available.
+    pub fn check_wait(&self, namespace: &str) -> std::result::Result<(), Duration> {
+        let limiter = match self.limiters.get(namespace) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => return Ok(()),
+        };
+        limiter.check()
     }
 }
 
@@ -335,6 +511,8 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Response {
                     Json(crate::error::ErrorResponse {
                         error: "Too Many Requests".into(),
                         code: "RATE_LIMITED",
+                        hint: None,
+                        span: None,
                     }),
                 )
                     .into_response();
@@ -361,6 +539,8 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Response {
             Json(crate::error::ErrorResponse {
                 error: format!("Too Many Requests (namespace: {})", ctx.namespace),
                 code: "RATE_LIMITED",
+                hint: None,
+                span: None,
             }),
         )
             .into_response();
@@ -390,6 +570,8 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Response {
             Json(crate::error::ErrorResponse {
                 error: format!("Too Many Requests (user: {})", auth_ctx.principal),
                 code: "RATE_LIMITED",
+                hint: None,
+                span: None,
             }),
         )
             .into_response();
@@ -401,6 +583,81 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bucket(rate: u32) -> TokenBucket {
+        let rate = NonZeroU32::new(rate).unwrap();
+        TokenBucket::new(rate, rate)
+    }
+
+    #[test]
+    fn check_n_admits_within_the_burst_and_takes_nothing_when_refused() {
+        let b = bucket(1000);
+        assert_eq!(b.check_n(600), Ok(()));
+        // 400 left; 500 does not fit and must not consume the 400.
+        assert!(matches!(b.check_n(500), Err(Refusal::Wait(_))));
+        assert_eq!(b.check_n(400), Ok(()));
+    }
+
+    #[test]
+    fn check_n_reports_the_wait_until_the_cost_fits() {
+        let b = bucket(1000);
+        assert_eq!(b.check_n(1000), Ok(()));
+        let Err(Refusal::Wait(wait)) = b.check_n(100) else {
+            panic!("an empty bucket must ask for a wait");
+        };
+        // 100 points at 1000/s refill in ~100 ms.
+        assert!(wait <= Duration::from_millis(101), "{wait:?}");
+        assert!(wait >= Duration::from_millis(90), "{wait:?}");
+    }
+
+    #[test]
+    fn check_n_larger_than_the_burst_is_never_admissible() {
+        let b = bucket(1000);
+        assert_eq!(b.check_n(1001), Err(Refusal::Never));
+        // …and it took nothing.
+        assert_eq!(b.check_n(1000), Ok(()));
+    }
+
+    #[test]
+    fn concurrent_check_n_never_over_admits() {
+        let b = Arc::new(bucket(10_000));
+        let admitted = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let b = Arc::clone(&b);
+                let admitted = Arc::clone(&admitted);
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        if b.check_n(50).is_ok() {
+                            admitted.fetch_add(50, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // One second's burst plus what refilled during the test, which is
+        // milliseconds: never anywhere near the 40 000 attempted.
+        assert!(admitted.load(Ordering::Relaxed) <= 12_000);
+    }
+
+    #[test]
+    fn ingest_limiter_is_per_namespace_and_unlimited_by_default() {
+        let l = NamespaceIngestLimiter::new();
+        assert_eq!(l.admit("free", 1_000_000), Ok(()));
+        l.set_limit("a", 100);
+        assert_eq!(l.admit("a", 100), Ok(()));
+        assert!(matches!(
+            l.admit("a", 10),
+            Err(IngestRefusal::RetryAfterMs(_))
+        ));
+        assert_eq!(l.admit("a", 101), Err(IngestRefusal::BatchTooLarge));
+        assert_eq!(l.admit("b", 1000), Ok(()));
+        l.set_limit("a", 0);
+        assert_eq!(l.admit("a", 1000), Ok(()));
+    }
 
     #[test]
     fn build_limiter_disabled_when_zero() {

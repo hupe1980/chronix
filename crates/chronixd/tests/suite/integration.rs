@@ -37,8 +37,6 @@ pub(crate) async fn start_test_server() -> (String, TempDir) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: std::sync::Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -47,11 +45,13 @@ pub(crate) async fn start_test_server() -> (String, TempDir) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     // Use the metrics builder without installing a global recorder to avoid
@@ -400,6 +400,96 @@ async fn empty_influx_write_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Declared detectors ─────────────────────────────────────────────────
+
+/// The whole lifecycle over HTTP: declare (and re-declare, idempotently),
+/// list, refuse a redefinition and a bad declaration by name, drop.
+#[tokio::test]
+async fn a_detector_is_declared_listed_and_dropped_over_http() {
+    let (base, _tmp) = start_test_server().await;
+    let c = client();
+    let body = serde_json::json!({
+        "name": "pv_health",
+        "source_measurement": "pv",
+        "field": "power",
+        "where": {"site": "roof"},
+        "season": {"slot": "15m", "period": "1d"},
+        "timezone": "Europe/Berlin",
+        "zscore": 3.0,
+        "cusum": {"k": 0.5, "h": 5.0},
+    });
+    for attempt in ["first", "identical again"] {
+        let resp = c
+            .post(format!("{base}/api/v1/detectors"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "{attempt}: {}",
+            resp.text().await.unwrap()
+        );
+    }
+
+    let listed: Value = c
+        .get(format!("{base}/api/v1/detectors"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let d = &listed["items"][0];
+    assert_eq!(d["name"], "pv_health");
+    assert_eq!(d["season"]["slot"], "15m");
+    assert_eq!(d["timezone"], "Europe/Berlin");
+    assert_eq!(d["where"]["site"], "roof");
+    assert_eq!(d["output_measurement"], "pv_health_verdicts");
+    assert_eq!(d["status"]["state"], "inactive", "no data yet: {d}");
+
+    let different = serde_json::json!({
+        "name": "pv_health", "source_measurement": "pv", "field": "power", "zscore": 2.0,
+    });
+    let resp = c
+        .post(format!("{base}/api/v1/detectors"))
+        .json(&different)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let bad = serde_json::json!({
+        "name": "no_test", "source_measurement": "pv", "field": "power",
+    });
+    let resp = c
+        .post(format!("{base}/api/v1/detectors"))
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let out: Value = resp.json().await.unwrap();
+    assert!(
+        out["error"].as_str().unwrap().contains(".zscore"),
+        "the refusal says what to write: {out}"
+    );
+
+    let resp = c
+        .delete(format!("{base}/api/v1/detectors/pv_health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = c
+        .delete(format!("{base}/api/v1/detectors/pv_health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ── Rollups list ───────────────────────────────────────────────────────

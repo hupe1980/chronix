@@ -4,14 +4,10 @@ Async Python client for the [Chronix](https://github.com/hupe1980/chronix) time-
 
 ## Features
 
-- **Async-first** — built on `httpx` for non-blocking I/O
-- **JSON + Line Protocol writes** — both formats supported
-- **Structured queries + SQL** — first-class support for both query APIs
-- **PromQL** — instant & range queries via Prometheus-compatible endpoints
-- **Arrow Flight SQL** — zero-copy queries via ADBC driver
-- **Schema introspection** — list measurements, get column schemas
-- **Multi-tenant** — namespace header support
-- **Typed** — full type annotations with `py.typed` marker
+- Async, on `httpx`
+- Writes as JSON or line protocol, with exact decimals and idempotency keys
+- Structured queries, SQL and PromQL; Arrow Flight SQL through ADBC
+- Schema discovery, namespaces, and full type annotations (`py.typed`)
 
 ## Installation
 
@@ -183,13 +179,13 @@ await client.write(
 
 | Exception | When |
 |-----------|------|
-| `ChronixError` | Base exception (server errors) |
+| `ChronixError` | Base exception. Every error carries `.hint` (what the request probably meant), `.span` (the `(start, end)` byte range of the query it is about) and `.retry_after`, each `None` when the server sent none |
 | `ConnectionError` | Cannot reach server |
 | `WriteError` | Write failure (including idempotency conflict, HTTP 409) |
-| `QueryError` | Query/client error (other 4xx) |
-| `BackpressureError` | HTTP 503/507 — back off and retry; `.retry_after` carries the server's hint |
+| `QueryError` | Any other 4xx |
+| `BackpressureError` | HTTP 429/503/507 — back off and retry; `.retry_after` carries the server's hint |
 | `DeadlineExceeded` | HTTP 504 — the server stopped waiting; the write may still land |
 
 ## License
 
-Apache-2.0 — same as Chronix.
+MIT OR Apache-2.0, at your option — the same as Chronix.

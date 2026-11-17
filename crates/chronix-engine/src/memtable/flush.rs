@@ -195,9 +195,8 @@ impl FlushController {
     /// been flushed yet.
     pub fn freeze_and_swap(&self) -> Result<()> {
         let mut frozen_guard = self.frozen.write();
-        // Nothing to freeze: an empty memtable in the queue would only take
-        // a slot from a real one (after a failed flush, every retry used to
-        // queue one until the queue was full and the retry itself failed).
+        // Nothing to freeze: an empty memtable in the queue would take a slot
+        // from a real one, and repeated retries would fill the queue.
         if self.active.read().is_empty() {
             return Ok(());
         }
@@ -435,6 +434,17 @@ impl FlushController {
         out
     }
 
+    /// The oldest and newest timestamp held in memory by this shard's
+    /// active and frozen memtables, or `None` if they are all empty.
+    #[must_use]
+    pub fn time_bounds(&self) -> Option<(i64, i64)> {
+        let mut bounds = self.active.read().time_bounds();
+        for frozen in self.frozen.read().iter() {
+            bounds = merge_bounds(bounds, frozen.time_bounds());
+        }
+        bounds
+    }
+
     /// Hand every tag pair this shard holds in memory to `f`.
     pub fn visit_tags(&self, f: &mut impl FnMut(&str, &str)) {
         self.active.read().visit_tags(&mut *f);
@@ -462,10 +472,9 @@ impl FlushController {
     /// The smallest WAL sequence number held by a memtable that is not yet
     /// in a segment — active **or** frozen.
     ///
-    /// This is what the WAL floor is capped by. It used to consult the
-    /// active memtable only, so a frozen memtable still being written — or
-    /// left behind by a failed flush — was invisible, and a concurrent
-    /// flush of another shard raised the floor past its records.
+    /// This caps the WAL floor. Frozen memtables count, including one left by
+    /// a failed flush, so a flush of another shard cannot truncate their
+    /// records.
     #[must_use]
     pub fn min_unflushed_wal_seq(&self) -> Option<u64> {
         let frozen = self.frozen.read();
@@ -586,10 +595,8 @@ fn merge_newest_first(sources: Vec<Vec<Point>>) -> Vec<Point> {
         all.extend(src);
     }
 
-    // The key is the canonical form itself, **borrowed**, not a hash of it:
-    // exact, and with no per-point `String`. The old form allocated one
-    // `String` per point *per merge round* and used a `BTreeMap`, so it also
-    // compared those strings O(log n) times each.
+    // The key is the canonical form itself, borrowed, not a hash of it: exact,
+    // and with no per-point allocation.
     let mut seen = std::collections::HashSet::with_capacity(total);
     let mut keep = Vec::with_capacity(total);
     for p in &all {
@@ -621,6 +628,15 @@ fn estimate_max_rows(
     let max_rows = target_segment_size_bytes / est_bytes_per_row;
     // At minimum one row-group worth.
     max_rows.max(min_rows)
+}
+
+/// Widen one optional `(min, max)` range by another.
+#[must_use]
+pub fn merge_bounds(a: Option<(i64, i64)>, b: Option<(i64, i64)>) -> Option<(i64, i64)> {
+    match (a, b) {
+        (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
+        (x, None) | (None, x) => x,
+    }
 }
 
 #[cfg(test)]
@@ -954,9 +970,7 @@ mod tests {
     }
 
     /// A frozen memtable is unflushed until its segment is registered, so
-    /// its records must keep capping the WAL floor. This used to report
-    /// `None` after a freeze, and a concurrent flush of another shard then
-    /// truncated the WAL files holding the frozen records.
+    /// its records must keep capping the WAL floor.
     #[test]
     fn a_frozen_memtable_still_counts_as_unflushed() {
         let fc = FlushController::new(FlushConfig::default());
@@ -974,8 +988,7 @@ mod tests {
     }
 
     /// A flush that fails leaves the memtable frozen for a retry and removes
-    /// the files it managed to write; it used to pop the memtable first and
-    /// drop the only copy of the data on any error.
+    /// the files it managed to write.
     #[test]
     fn a_failed_flush_keeps_the_frozen_memtable() {
         let dir = tempfile::tempdir().unwrap();

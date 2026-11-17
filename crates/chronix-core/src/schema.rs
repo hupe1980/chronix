@@ -21,7 +21,7 @@
 //! - **Query-time safety**: Queries that reference a column not present in
 //!   older segments return zero rows for those segments (no panic).
 //!
-//! ## Current Limitations
+//! ## Limitations
 //!
 //! - **No column removal**: Once a tag or field is added, it cannot be
 //!   dropped.  Obsolete columns simply receive null values in new writes.
@@ -50,6 +50,24 @@ pub enum ColumnRole {
     Tag,
     /// A field/value column (typed, stores the actual metrics).
     Field,
+    /// The start-timestamp system column ([`START_COLUMN`](crate::START_COLUMN)):
+    /// nullable `Int64`, carried like a field but never a value — not a
+    /// PromQL metric, not offered by label discovery, not aggregated by a
+    /// rollup.
+    StartTimestamp,
+}
+
+impl ColumnRole {
+    /// The role a non-tag, non-time column named `name` takes: the
+    /// start-timestamp column by name, every other one a field.
+    #[must_use]
+    pub fn for_field_name(name: &str) -> Self {
+        if name == crate::types::START_COLUMN {
+            Self::StartTimestamp
+        } else {
+            Self::Field
+        }
+    }
 }
 
 impl fmt::Display for ColumnRole {
@@ -58,6 +76,7 @@ impl fmt::Display for ColumnRole {
             Self::Timestamp => write!(f, "timestamp"),
             Self::Tag => write!(f, "tag"),
             Self::Field => write!(f, "field"),
+            Self::StartTimestamp => write!(f, "start_timestamp"),
         }
     }
 }
@@ -373,7 +392,7 @@ impl MeasurementSchema {
 
         if let Some(existing) = self.columns.iter().find(|c| c.name == name) {
             // Check for role conflict (tag with same name as field)
-            if existing.role != ColumnRole::Field {
+            if existing.role != ColumnRole::for_field_name(name) {
                 return Err(SchemaError::TypeConflict {
                     measurement: self.measurement.clone(),
                     field: name.to_string(),
@@ -396,7 +415,7 @@ impl MeasurementSchema {
         self.columns.push(ColumnDef {
             name: name.to_string(),
             column_type: new_type,
-            role: ColumnRole::Field,
+            role: ColumnRole::for_field_name(name),
         });
         self.column_index.insert(name.to_string(), idx);
         Ok(true)
@@ -473,7 +492,7 @@ impl MeasurementSchema {
         column_type: ColumnType,
     ) -> Result<bool, SchemaError> {
         if let Some(existing) = self.columns.iter().find(|c| c.name == name) {
-            if existing.role != ColumnRole::Field {
+            if existing.role != ColumnRole::for_field_name(name) {
                 return Err(SchemaError::TypeConflict {
                     measurement: self.measurement.clone(),
                     field: name.to_string(),
@@ -491,7 +510,11 @@ impl MeasurementSchema {
             }
             return Ok(false);
         }
-        SeriesKey::validate_name(name, "field name")?;
+        // The start-timestamp column is reserved against *users*; the
+        // engine declares it.
+        if name != crate::types::START_COLUMN {
+            SeriesKey::validate_name(name, "field name")?;
+        }
         if let ColumnType::Decimal { scale } = column_type
             && scale > crate::decimal::MAX_DECIMAL_SCALE
         {
@@ -507,7 +530,7 @@ impl MeasurementSchema {
         self.columns.push(ColumnDef {
             name: name.to_string(),
             column_type,
-            role: ColumnRole::Field,
+            role: ColumnRole::for_field_name(name),
         });
         self.column_index.insert(name.to_string(), idx);
         Ok(true)
@@ -745,7 +768,7 @@ impl SchemaRegistry {
                                 column: ColumnDef {
                                     name: field_name.to_string(),
                                     column_type,
-                                    role: ColumnRole::Field,
+                                    role: ColumnRole::for_field_name(field_name.as_ref()),
                                 },
                             });
                         }
@@ -892,7 +915,7 @@ impl SchemaRegistry {
                 column: ColumnDef {
                     name: field.to_string(),
                     column_type,
-                    role: ColumnRole::Field,
+                    role: ColumnRole::for_field_name(field),
                 },
             });
         } else if actions.is_empty() {
@@ -1003,7 +1026,7 @@ impl SchemaRegistry {
                 ColumnRole::Tag => {
                     let _ = schema.add_tag(&column.name);
                 }
-                ColumnRole::Field => {
+                ColumnRole::Field | ColumnRole::StartTimestamp => {
                     // For WAL replay, we push the column definition directly
                     // since we know the type is correct.
                     schema.push_column(column);

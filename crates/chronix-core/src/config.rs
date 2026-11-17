@@ -35,6 +35,126 @@ impl fmt::Display for FsyncPolicy {
     }
 }
 
+/// How many threads chronix may use for one call: the segment scan, the
+/// analytics kernels and SQL's partitions all draw on this one budget.
+///
+/// - `Serial` — run on the caller's thread only; chronix starts no thread for
+///   a query or a forecast. [`ChronixConfig::small`] uses it.
+/// - `Threads(n)` — at most `n` threads, from a pool chronix builds on first
+///   use (or the pool a host injects with `Chronix::open_with_pool`).
+/// - `Auto` — one thread per available core (the default).
+///
+/// A scan fans out only when the budget is above one **and** a query spans
+/// at least four segments; below that the coordination costs more than it
+/// saves.
+///
+/// In TOML: `parallelism = "serial"`, `"auto"` or a thread count.
+///
+/// ```
+/// use chronix_core::{ChronixConfig, Parallelism};
+///
+/// let config = ChronixConfig::builder()
+///     .data_dir("/tmp/chronix-doc")
+///     .parallelism(Parallelism::threads(2))
+///     .build()
+///     .unwrap();
+/// assert_eq!(config.parallelism.budget(), 2);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Parallelism {
+    /// The caller's thread only.
+    Serial,
+    /// At most this many threads (always ≥ 2; one thread is `Serial`).
+    Threads(std::num::NonZeroUsize),
+    /// One thread per available core.
+    #[default]
+    Auto,
+}
+
+impl Parallelism {
+    /// `n` threads; `0` and `1` both mean [`Parallelism::Serial`].
+    #[must_use]
+    pub fn threads(n: usize) -> Self {
+        match std::num::NonZeroUsize::new(n) {
+            Some(n) if n.get() > 1 => Self::Threads(n),
+            _ => Self::Serial,
+        }
+    }
+
+    /// The number of threads this budget allows, resolving `Auto` against
+    /// the machine. Always ≥ 1.
+    #[must_use]
+    pub fn budget(self) -> usize {
+        match self {
+            Self::Serial => 1,
+            Self::Threads(n) => n.get(),
+            Self::Auto => {
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Parallelism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Serial => write!(f, "serial"),
+            Self::Threads(n) => write!(f, "{n}"),
+            Self::Auto => write!(f, "auto"),
+        }
+    }
+}
+
+impl Serialize for Parallelism {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Serial => s.serialize_str("serial"),
+            Self::Threads(n) => s.serialize_u64(n.get() as u64),
+            Self::Auto => s.serialize_str("auto"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Parallelism {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = Parallelism;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, r#"parallelism: "serial", "auto" or a thread count ≥ 1"#)
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Parallelism, E> {
+                match v {
+                    "serial" => Ok(Parallelism::Serial),
+                    "auto" => Ok(Parallelism::Auto),
+                    other => Err(E::custom(format!(
+                        r#"parallelism = "{other}" is not a setting: use "serial", "auto" or a thread count ≥ 1"#
+                    ))),
+                }
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Parallelism, E> {
+                if v < 1 {
+                    return Err(E::custom(format!(
+                        r#"parallelism = {v} is not a thread count: use a number ≥ 1, or "serial""#
+                    )));
+                }
+                self.visit_u64(v.unsigned_abs())
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Parallelism, E> {
+                if v == 0 {
+                    return Err(E::custom(
+                        r#"parallelism = 0 is not a thread count: use a number ≥ 1, or "serial""#,
+                    ));
+                }
+                Ok(Parallelism::threads(
+                    usize::try_from(v).unwrap_or(usize::MAX),
+                ))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 /// Compression codec for segment files.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionCodec {
@@ -57,13 +177,16 @@ impl fmt::Display for CompressionCodec {
     }
 }
 
-/// Float encoding algorithm.
+/// A hint for which XOR codec to trial on `f64` columns.
+///
+/// The encoder trial-encodes pco, ALP and the hinted codec per block and keeps
+/// the smallest, so the stored codec is usually pco, whatever the hint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FloatEncoding {
-    /// Chimp — best compression ratio for time-series floats (default).
+    /// Chimp (default).
     #[default]
     Chimp,
-    /// Gorilla (Facebook) — good compression, wide compatibility.
+    /// Gorilla.
     Gorilla,
     /// Plain IEEE 754 — no compression.
     Plain,
@@ -324,9 +447,9 @@ impl FieldEncryption {
             if crate::types::RESERVED_COLUMN_NAMES.contains(&column.as_str()) {
                 return Err(ConfigError::Validation {
                     message: format!(
-                        "field_encryption.columns: '{column}' is the time column and cannot be \
-                         encrypted — every scan ranges on it and every retention decision \
-                         reads it"
+                        "field_encryption.columns: '{column}' is a column the engine owns and \
+                         cannot be encrypted — every scan ranges on the time column and every \
+                         retention decision reads it"
                     ),
                 });
             }
@@ -411,7 +534,7 @@ pub struct ChronixConfig {
     /// Only meaningful when `compression` is `Zstd`.
     #[serde(default)]
     pub zstd_dict_training: bool,
-    /// Float encoding algorithm (default: Chimp).
+    /// Float codec hint (default: Chimp); see [`FloatEncoding`].
     pub float_encoding: FloatEncoding,
     /// Segment cache size in bytes (default: 512 MB).
     pub segment_cache_size: usize,
@@ -461,6 +584,10 @@ pub struct ChronixConfig {
     /// `QueryTimeout` error to prevent runaway scans.
     #[serde(default = "default_query_timeout")]
     pub query_timeout: Duration,
+    /// How many threads one call may use — see [`Parallelism`]
+    /// (default: `Auto`, one per core; [`ChronixConfig::small`]: `Serial`).
+    #[serde(default)]
+    pub parallelism: Parallelism,
     /// Analytics engine configuration.
     #[serde(default)]
     pub analytics: AnalyticsConfig,
@@ -499,6 +626,15 @@ pub struct ChronixConfig {
     /// for is worse than one that does nothing.
     #[serde(default)]
     pub checkpoints: Checkpoints,
+    /// Open the directory for queries only (default: `false`).
+    ///
+    /// Nothing is created, locked or written: the WAL is replayed into memory
+    /// and left on disk, no maintenance thread starts, and every write is
+    /// refused with `ReadOnly`. A directory a running process holds is
+    /// refused too — query that process instead. For a directory copied off
+    /// a device, where opening it normally would change the evidence.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl Default for ChronixConfig {
@@ -528,6 +664,8 @@ impl ChronixConfig {
     ///   recent writes may be lost on power failure. Choose
     ///   [`FsyncPolicy::PerBatch`] instead if that is not acceptable.
     /// - **Single compaction worker** — bounds background CPU and I/O.
+    /// - **Serial queries and analytics** — [`Parallelism::Serial`]: a scan
+    ///   or forecast runs on the caller's thread and starts no other.
     ///
     /// All fields remain overridable after construction.
     #[must_use]
@@ -537,11 +675,12 @@ impl ChronixConfig {
             .memtable_flush_threshold(8 * 1024 * 1024) // 8 MB
             .max_memtable_memory(24 * 1024 * 1024) // 24 MB
             .segment_cache_size(16 * 1024 * 1024) // 16 MB
-            // 4 096 events ≈ 450 KiB, and at the design partner's 50 points/s
+            // 4 096 events ≈ 450 KiB, and at a gateway's 50 points/s
             // still eighty seconds of tolerance for a slow subscriber. The
             // 65 536 default is a server's number.
             .cdc_capacity(4_096)
             .compaction_concurrency(1)
+            .parallelism(Parallelism::Serial)
             .maintenance_interval(Duration::from_secs(60))
             .wal_fsync_policy(FsyncPolicy::Periodic(Duration::from_secs(5)))
             .wal_max_file_size(8 * 1024 * 1024) // 8 MB — bounded replay on tiny devices
@@ -672,10 +811,12 @@ pub struct ChronixConfigBuilder {
     maintenance_interval: Duration,
     field_encryption: FieldEncryption,
     checkpoints: Checkpoints,
+    read_only: bool,
     max_series_cardinality: usize,
     max_query_result_bytes: usize,
     per_query_memory_limit: usize,
     query_timeout: Duration,
+    parallelism: Parallelism,
     analytics: AnalyticsConfig,
     soft_delete_ttl: Option<Duration>,
     future_write_tolerance: Duration,
@@ -704,10 +845,12 @@ impl Default for ChronixConfigBuilder {
             maintenance_interval: default_maintenance_interval(),
             field_encryption: FieldEncryption::default(),
             checkpoints: Checkpoints::default(),
+            read_only: false,
             max_series_cardinality: 1_000_000,
             max_query_result_bytes: default_max_query_result_bytes(),
             per_query_memory_limit: default_per_query_memory_limit(),
             query_timeout: default_query_timeout(),
+            parallelism: Parallelism::Auto,
             analytics: AnalyticsConfig::default(),
             soft_delete_ttl: None,
             future_write_tolerance: default_future_write_tolerance(),
@@ -838,6 +981,13 @@ impl ChronixConfigBuilder {
         self
     }
 
+    /// Open for queries only — see [`ChronixConfig::read_only`].
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     /// Take a checkpoint on a schedule — see [`Checkpoints`].
     #[must_use]
     pub fn checkpoints(mut self, settings: Checkpoints) -> Self {
@@ -916,6 +1066,13 @@ impl ChronixConfigBuilder {
         self
     }
 
+    /// Set how many threads one call may use — see [`Parallelism`].
+    #[must_use]
+    pub fn parallelism(mut self, parallelism: Parallelism) -> Self {
+        self.parallelism = parallelism;
+        self
+    }
+
     /// Set the analytics engine configuration.
     #[must_use]
     pub fn analytics(mut self, config: AnalyticsConfig) -> Self {
@@ -976,11 +1133,13 @@ impl ChronixConfigBuilder {
             max_query_result_bytes: self.max_query_result_bytes,
             per_query_memory_limit: self.per_query_memory_limit,
             query_timeout: self.query_timeout,
+            parallelism: self.parallelism,
             analytics: self.analytics,
             soft_delete_ttl: self.soft_delete_ttl,
             future_write_tolerance: self.future_write_tolerance,
             field_encryption: self.field_encryption,
             checkpoints: self.checkpoints,
+            read_only: self.read_only,
         };
 
         // Shared structural validation (same checks as from_toml path).
@@ -999,6 +1158,69 @@ impl ChronixConfigBuilder {
 
 #[cfg(test)]
 mod tests {
+    use super::Parallelism;
+
+    #[derive(serde::Deserialize)]
+    struct P {
+        parallelism: Parallelism,
+    }
+
+    fn parse(v: &str) -> Result<Parallelism, String> {
+        toml::from_str::<P>(&format!("parallelism = {v}"))
+            .map(|p| p.parallelism)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn parallelism_parses_the_three_spellings() {
+        assert_eq!(parse(r#""serial""#).unwrap(), Parallelism::Serial);
+        assert_eq!(parse(r#""auto""#).unwrap(), Parallelism::Auto);
+        assert_eq!(parse("4").unwrap(), Parallelism::threads(4));
+        assert_eq!(parse("4").unwrap().budget(), 4);
+    }
+
+    #[test]
+    fn one_thread_is_serial_and_zero_is_refused_by_name() {
+        assert_eq!(parse("1").unwrap(), Parallelism::Serial);
+        assert_eq!(Parallelism::threads(1), Parallelism::Serial);
+        let err = parse("0").unwrap_err();
+        assert!(err.contains("parallelism"), "{err}");
+        let err = parse(r#""lots""#).unwrap_err();
+        assert!(
+            err.contains("parallelism") && err.contains("serial"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn small_is_serial_and_the_default_is_auto() {
+        assert_eq!(
+            super::ChronixConfig::small("/tmp/x").parallelism,
+            Parallelism::Serial
+        );
+        assert_eq!(
+            super::ChronixConfig::default().parallelism,
+            Parallelism::Auto
+        );
+        assert!(Parallelism::Auto.budget() >= 1);
+    }
+
+    #[test]
+    fn parallelism_round_trips_through_toml() {
+        for p in [
+            Parallelism::Serial,
+            Parallelism::Auto,
+            Parallelism::threads(3),
+        ] {
+            #[derive(serde::Serialize)]
+            struct W {
+                parallelism: Parallelism,
+            }
+            let text = toml::to_string(&W { parallelism: p }).unwrap();
+            assert_eq!(toml::from_str::<P>(&text).unwrap().parallelism, p);
+        }
+    }
+
     /// A setting the section does not act on is not a setting it accepts.
     ///
     /// `scripts/check-docs.sh` asks the same question of every config struct
@@ -1031,12 +1253,7 @@ mod tests {
 
     use super::*;
 
-    /// A TOML file may set only what it changes.
-    ///
-    /// `from_toml` used to require **all** of `ChronixConfig`'s fields and
-    /// answered a file that set only `data_dir` with `TOML parse error at
-    /// line 1, column 1` — so it could not load any file a person would
-    /// write, and it had no callers.
+    /// A TOML file may set only what it changes; everything else defaults.
     #[test]
     fn a_partial_toml_file_loads_with_defaults_for_the_rest() {
         let toml = r#"

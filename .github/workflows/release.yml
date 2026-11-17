@@ -245,15 +245,12 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/*.tar.gz*
 
-  # Last, because it cannot be undone. `chronixd` is not here: its `cluster`
-  # feature depends on `publish = false` crates, and cargo requires
-  # a version for every packaged dependency, optional ones included.
+  # Last, because it cannot be undone. `chronixd` goes last: it depends on
+  # every other published crate.
   crates-io:
     name: Publish to crates.io
-    # Only the gate. `chronixd` is `publish = false`, so nothing this job
-    # uploads comes out of the `binaries` matrix — waiting for four release
-    # builds bought no safety for the crates and put them on the critical
-    # path. The gate is what must pass before an irreversible publish.
+    # Only the gate: the binaries are built from the same commit, and a
+    # release build is no extra evidence for a crate upload.
     needs: [ci-passed]
     runs-on: ubuntu-latest
     environment: crates-io
@@ -309,6 +306,12 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: ./scripts/publish-crate.sh chronix
+
+      - name: Publish chronixd
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: ./scripts/publish-crate.sh chronixd
 
   # ── Publish the Python SDK to PyPI ───────────────────────────────────
   # **Last, and only after crates.io.** This ran in parallel with

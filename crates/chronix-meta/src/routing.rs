@@ -168,7 +168,7 @@ impl RoutingTable {
             // Routes are sorted by key_range.start (see rebuild()).
             // Binary search for the last route whose start <= series_hash.
             let idx = routes
-                .partition_point(|r| r.key_range.map_or(false, |kr| kr.start <= series_hash))
+                .partition_point(|r| r.key_range.is_some_and(|kr| kr.start <= series_hash))
                 .saturating_sub(1);
             return Some(routes[idx].clone());
         }

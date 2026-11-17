@@ -51,19 +51,12 @@ pub struct AuthState {
 
 /// The key changes that outlive the process, beside the configured ones.
 ///
-/// **`[[auth.api_keys]]` is a *declaration*, not a record**, and it is
-/// re-read on every start — so both halves of runtime key management used to
-/// last exactly as long as the process. A key minted through the admin API
-/// was shown once, written into a deployment, and stopped working at the next
-/// restart with no way to recover it. A **revocation** was worse: an operator
-/// revoking a leaked credential during an incident was told it was done, and
-/// a restart handed the key back.
-///
-/// This is the record. Revocations are names, so a configured key can be
-/// revoked without editing the config; creations carry the Argon2 PHC hash,
-/// which is the same form `[[auth.api_keys]]` already accepts and is designed
-/// to sit on disk. The raw key is never here — it does not exist after the
-/// response that showed it.
+/// `[[auth.api_keys]]` is a declaration, re-read on every start; this is the
+/// record of runtime changes, so a key minted through the admin API keeps
+/// working and a revoked key stays revoked across restarts. Revocations are
+/// names, so a configured key can be revoked without editing the config;
+/// creations carry the Argon2 PHC hash, the same form `[[auth.api_keys]]`
+/// accepts. The raw key is never stored.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct KeyOverlay {
     /// Keys minted through the admin API.
@@ -125,12 +118,8 @@ impl KeyOverlay {
 
 impl AuthState {
     /// Attach the issuer's published keys, when a JWKS URL is configured.
-    ///
-    /// `jwks_url` used to be accepted by the config and then dropped on the
-    /// floor: nothing built a cache, so an OIDC deployment authenticated
-    /// nobody and the config gave no hint why. Fetching once at startup
-    /// also turns an unreachable issuer into a startup failure instead of a
-    /// wall of 401s.
+    /// Fetching once at startup turns an unreachable issuer into a startup
+    /// failure instead of a wall of 401s.
     ///
     /// # Errors
     ///
@@ -178,10 +167,8 @@ impl AuthState {
     }
 
     /// [`from_config`](Self::from_config), with the directory that holds the
-    /// durable record of runtime key changes.
-    ///
-    /// `None` keeps the old behaviour — configured keys only, nothing
-    /// persisted — which is what a test that never mints one wants.
+    /// durable record of runtime key changes. `None` means configured keys only,
+    /// nothing persisted.
     ///
     /// # Errors
     ///
@@ -236,12 +223,8 @@ impl AuthState {
             }
         }
 
-        // Configure JWT
-        // The key material follows the algorithm family. `public_key_pem`
-        // used to be hard-coded to `None` here, so an RS256 or ES256
-        // deployment had no key to verify with and answered 401 to every
-        // token — configuration the operator could write and the server
-        // would accept while never authenticating anyone.
+        // Configure JWT. The key material follows the algorithm family: a public
+        // key for RS*/PS*/ES*, the secret for HS*.
         let jwt_config = match config.jwt.as_ref() {
             None => None,
             Some(jwt_cfg) => {
@@ -559,10 +542,7 @@ impl Interceptor for GrpcAuthInterceptor {
 /// 2. when a policy engine *is* configured, it must also permit `action` on
 ///    `Chronix::System`.
 ///
-/// Requiring both is why adding Cedar can only ever narrow access. It used
-/// to be an either/or — a configured engine replaced the capability check —
-/// so pointing `authz_policy_dir` at a permissive file widened what every
-/// non-admin credential could do.
+/// Requiring both means adding Cedar can only ever narrow access.
 ///
 /// `action` is the granular capability the route needs, not `Admin`: a
 /// backup credential should not be able to mint API keys. Every
@@ -692,6 +672,20 @@ pub async fn auth_layer(
 
     // Skip auth for exempt paths
     if auth.middleware.is_exempt(&path) {
+        return next.run(req).await;
+    }
+
+    // The console shell: the same bytes for every caller, with no data in
+    // them, and a browser navigation cannot send a bearer token. Only reads;
+    // every request the page then makes is authenticated here like any other.
+    #[cfg(feature = "console")]
+    if state.config.console.enabled
+        && matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        )
+        && (path == crate::console::PATH || path.starts_with("/console/"))
+    {
         return next.run(req).await;
     }
 
@@ -1308,13 +1302,8 @@ mod tests {
         );
     }
 
-    /// A database, with the temporary directory that owns it.
-    ///
-    /// The directory is **returned**, not leaked. This used to end in
-    /// `std::mem::forget(dir)` under a comment saying "so it lives long
-    /// enough" — which is true, and leaves a directory of database files
-    /// behind on every run, on every machine that runs the suite. Returning
-    /// it makes the lifetime the caller's, which is where it belongs.
+    /// A database, with the temporary directory that owns it — returned, so the
+    /// caller's scope removes it.
     fn make_test_db() -> (tempfile::TempDir, std::sync::Arc<chronix::prelude::Chronix>) {
         let dir = tempfile::tempdir().unwrap();
         let config = chronix::prelude::ChronixConfig::builder()
@@ -1327,9 +1316,8 @@ mod tests {
 
     #[test]
     fn a_capability_is_required_even_without_an_engine() {
-        // No policy engine is the default deployment, and it used to mean
-        // "permit" — so any authenticated key could restore a backup over
-        // the live data directory. The capability lives on the credential.
+        // No policy engine is the default deployment; the administrative capability
+        // lives on the credential, so an ordinary key still cannot restore.
         let (_dir, db) = make_test_db();
         let sql_contexts = crate::namespace::SqlContexts::new(db.clone());
         let state = crate::http::SharedState {
@@ -1338,8 +1326,6 @@ mod tests {
             connector_manager: None,
             sql_contexts,
             auth_state: None,
-            #[cfg(feature = "cluster")]
-            meta_client: None,
             namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
             model_catalog: std::sync::Arc::new(parking_lot::RwLock::new(
                 chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -1347,11 +1333,13 @@ mod tests {
             authz_engine: None,
             audit_logger: None,
             namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+            namespace_ingest_limiter: crate::rate_limit::NamespaceIngestLimiter::new(),
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
             pipeline: None,
             openapi_json: std::sync::OnceLock::new(),
+            query_slots: Default::default(),
             write_timeout: std::time::Duration::ZERO,
         };
         let ctx = chronix_security::auth::AuthContext {
@@ -1393,8 +1381,6 @@ mod tests {
             connector_manager: None,
             sql_contexts,
             auth_state: None,
-            #[cfg(feature = "cluster")]
-            meta_client: None,
             namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
             model_catalog: std::sync::Arc::new(parking_lot::RwLock::new(
                 chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -1402,11 +1388,13 @@ mod tests {
             authz_engine: None,
             audit_logger: None,
             namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+            namespace_ingest_limiter: crate::rate_limit::NamespaceIngestLimiter::new(),
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
             pipeline: None,
             openapi_json: std::sync::OnceLock::new(),
+            query_slots: Default::default(),
             write_timeout: std::time::Duration::ZERO,
         };
         assert!(
@@ -1432,8 +1420,6 @@ mod tests {
             connector_manager: None,
             sql_contexts,
             auth_state: None,
-            #[cfg(feature = "cluster")]
-            meta_client: None,
             namespace_registry: Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
             model_catalog: std::sync::Arc::new(parking_lot::RwLock::new(
                 chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -1441,11 +1427,13 @@ mod tests {
             authz_engine: Some(std::sync::Arc::new(engine)),
             audit_logger: None,
             namespace_rate_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+            namespace_ingest_limiter: crate::rate_limit::NamespaceIngestLimiter::new(),
             sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             config: crate::config::ServerConfig::default(),
             write_dedup_cache: None,
             pipeline: None,
             openapi_json: std::sync::OnceLock::new(),
+            query_slots: Default::default(),
             write_timeout: std::time::Duration::ZERO,
         };
         let ctx = chronix_security::auth::AuthContext {

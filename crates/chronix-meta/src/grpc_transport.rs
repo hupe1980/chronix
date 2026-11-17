@@ -62,7 +62,7 @@ pub fn chunk_snapshot(data: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
         return vec![Vec::new()];
     }
     let chunk_size = chunk_size.max(1); // avoid division by zero
-    data.chunks(chunk_size).map(|c| c.to_vec()).collect()
+    data.chunks(chunk_size).map(<[u8]>::to_vec).collect()
 }
 
 /// Reassemble chunks produced by [`chunk_snapshot`] into the original
@@ -72,7 +72,7 @@ pub fn chunk_snapshot(data: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
 /// in order.
 #[must_use]
 pub fn assemble_snapshot_chunks(chunks: &[Vec<u8>]) -> Vec<u8> {
-    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let total: usize = chunks.iter().map(Vec::len).sum();
     let mut out = Vec::with_capacity(total);
     for chunk in chunks {
         out.extend_from_slice(chunk);

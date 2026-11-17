@@ -487,9 +487,9 @@ mod tests {
 
     #[test]
     fn ring_buffer_rolling_stats_converge() {
-        // Verify that detect_point's ring buffer rolling mean converges to the
-        // streaming values, not to a frozen initial state (regression test for
-        // Bug 1 Session 13 — eviction read-after-write).
+        // Verify that detect_point's ring-buffer rolling mean converges to the
+        // streaming values, not to a frozen initial state (eviction is
+        // read-after-write).
         let ts: Vec<i64> = (0..200).map(|i| i * 1_000_000_000).collect();
         let vals: Vec<f64> = vec![50.0; 200];
         let mut det = DynamicThresholdDetector::new(Some(20), Some(3.0));

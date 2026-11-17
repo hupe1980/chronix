@@ -68,12 +68,8 @@ pub struct JwtConfig {
         default
     )]
     pub secret: Option<Zeroizing<String>>,
-    /// Public key PEM for the asymmetric families.
-    ///
-    /// RSA (`RS*`, `PS*`) and elliptic-curve (`ES*`) keys both live here:
-    /// the family comes from `algorithm`, and mixing the two used to mean
-    /// an EC key was parsed as RSA, failed, and left the validator with no
-    /// key at all — which every token then failed against.
+    /// Public key PEM for the asymmetric families: RSA (`RS*`, `PS*`) and
+    /// elliptic-curve (`ES*`). The family comes from `algorithm`.
     #[serde(
         serialize_with = "ser_zeroizing_opt",
         deserialize_with = "de_zeroizing_opt",
@@ -488,14 +484,9 @@ impl JwtValidator {
     /// The roles this token carries, as `Chronix::Role` names.
     ///
     /// Resolved here rather than at a gate, so every gate sees the same set.
-    /// The administrative gate used to do it alone, which is why a role
-    /// granted an admin operation and matched nothing in a namespace policy.
-    ///
-    /// Accepts an array of strings, or a single string — identity providers
-    /// emit both, and a one-element list is often flattened on the way
-    /// through. A space-separated string is *not* split: `scope` is
-    /// space-separated and `roles` is not, and guessing turns one role named
-    /// `"data science"` into two that do not exist.
+    /// Accepts an array of strings or a single string — identity providers emit
+    /// both. A space-separated string is not split: `scope` is space-separated and
+    /// `roles` is not, and splitting would turn `"data science"` into two roles.
     #[must_use]
     pub fn extract_roles(&self, claims: &JwtClaims) -> Vec<String> {
         match resolve_claim_path(&claims.extra, self.role_claim()) {
@@ -1011,9 +1002,8 @@ mod algorithm_family_tests {
         assert_eq!(validated.sub, Some("ec-user".into()));
     }
 
-    /// The shape that used to fail silently: an asymmetric algorithm with a
-    /// `secret`. It built an HMAC key and rejected every real token, so the
-    /// operator saw 401s with a configuration that looked right.
+    /// An asymmetric algorithm with a `secret` is a configuration error, not an
+    /// HMAC key that rejects every real token.
     #[test]
     fn an_asymmetric_algorithm_with_a_secret_is_a_startup_error() {
         let config = JwtConfig {

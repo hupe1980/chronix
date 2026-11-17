@@ -314,6 +314,73 @@ pub(crate) fn decrypt_block(
         })
 }
 
+/// Seal `plaintext` under `key`, bound to `aad`: `[nonce 12][ciphertext][tag 16]`.
+///
+/// The general form of the block encryption, for data that is not a segment
+/// block — the WAL's sealed sections. The nonce is fresh from the operating
+/// system for every call.
+///
+/// # Errors
+///
+/// Only if the cipher refuses the input, which AES-256-GCM does not for any
+/// length this engine writes.
+pub fn seal(plaintext: &[u8], key: &[u8; 32], aad: &[u8]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| SegmentError::CorruptFile {
+        detail: format!("invalid encryption key: {e}"),
+    })?;
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    fill_random(&mut nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| SegmentError::CorruptFile {
+        detail: "nonce must be 12 bytes".into(),
+    })?;
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| SegmentError::CorruptFile {
+            detail: format!("sealing failed: {e}"),
+        })?;
+    let mut out = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Open what [`seal`] produced, under the same key and associated data.
+///
+/// # Errors
+///
+/// When the input is too short, or does not authenticate — tampered, bound
+/// to other associated data, or the wrong key.
+pub fn open_sealed(sealed: &[u8], key: &[u8; 32], aad: &[u8]) -> Result<Vec<u8>> {
+    if sealed.len() < NONCE_SIZE + TAG_SIZE {
+        return Err(SegmentError::CorruptFile {
+            detail: format!("sealed data too short: {} bytes", sealed.len()),
+        });
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| SegmentError::CorruptFile {
+        detail: format!("invalid decryption key: {e}"),
+    })?;
+    let nonce = Nonce::try_from(&sealed[..NONCE_SIZE]).map_err(|_| SegmentError::CorruptFile {
+        detail: "nonce must be 12 bytes".into(),
+    })?;
+    cipher
+        .decrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: &sealed[NONCE_SIZE..],
+                aad,
+            },
+        )
+        .map_err(|e| SegmentError::CorruptFile {
+            detail: format!("sealed data does not authenticate: {e}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +568,21 @@ mod tests {
         )
         .expect("the block reads in its own place");
         assert_eq!(plain, b"readings");
+    }
+
+    #[test]
+    fn a_sealed_section_opens_only_where_it_was_sealed() {
+        let key = test_key();
+        let sealed = seal(b"secret", &key, b"record-a").unwrap();
+        assert_eq!(open_sealed(&sealed, &key, b"record-a").unwrap(), b"secret");
+        // Moved to another record.
+        assert!(open_sealed(&sealed, &key, b"record-b").is_err());
+        // A flipped ciphertext byte.
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(open_sealed(&tampered, &key, b"record-a").is_err());
+        // The wrong key.
+        assert!(open_sealed(&sealed, &[9; 32], b"record-a").is_err());
     }
 }

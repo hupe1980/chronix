@@ -7,6 +7,8 @@ use std::fmt;
 pub enum Token {
     /// Numeric literal.
     Number(f64),
+    /// Duration literal, in seconds: `5m`, `1h30m`, `20s500ms`.
+    Duration(f64),
     /// String literal.
     String(String),
     /// Identifier (metric name, label name, function name, etc.).
@@ -95,6 +97,7 @@ impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Token::Number(n) => write!(f, "{n}"),
+            Token::Duration(secs) => write!(f, "{secs}s"),
             Token::String(s) => write!(f, "\"{s}\""),
             Token::Ident(s) => write!(f, "{s}"),
             Token::LeftParen => write!(f, "("),
@@ -155,13 +158,54 @@ impl fmt::Display for LexError {
 impl std::error::Error for LexError {}
 
 /// Tokenize a `PromQL` input string.
+#[cfg(test)]
 pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
-    let mut tokens = Vec::new();
+    lex_spanned(input).map(|(tokens, _)| tokens)
+}
+
+/// Tokenize, and return each token's byte span in `input` beside it.
+///
+/// The final [`Token::Eof`] spans the empty range at the end of the input.
+pub(crate) fn lex_spanned(
+    input: &str,
+) -> Result<(Vec<Token>, Vec<crate::diagnostics::Span>), LexError> {
     let chars: Vec<char> = input.chars().collect();
+    // Character index → byte offset, with one entry past the end.
+    let bytes: Vec<usize> = input
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(input.len()))
+        .collect();
+    let to_span = |(start, end): (usize, usize)| crate::diagnostics::Span {
+        start: bytes[start],
+        end: bytes[end],
+    };
+    let (tokens, spans) = lex_chars(&chars).map_err(|mut e| {
+        e.pos = bytes[e.pos.min(chars.len())];
+        e
+    })?;
+    Ok((tokens, spans.into_iter().map(to_span).collect()))
+}
+
+/// Tokens, each with its `(start, end)` character range.
+type CharSpanned = (Vec<Token>, Vec<(usize, usize)>);
+
+/// The lexer proper, over characters; spans are character indices.
+#[allow(clippy::too_many_lines)]
+fn lex_chars(chars: &[char]) -> Result<CharSpanned, LexError> {
+    let mut tokens = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let len = chars.len();
     let mut i = 0;
+    // Where the token being lexed began. Every arm below pushes at most a
+    // token or two and advances `i`; the top of the next iteration closes the
+    // span of whatever was pushed, so no arm has to know about spans.
+    let mut token_start = 0;
 
     while i < len {
+        while spans.len() < tokens.len() {
+            spans.push((token_start, i));
+        }
         let c = chars[i];
 
         // Skip whitespace
@@ -178,6 +222,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             continue;
         }
 
+        token_start = i;
         match c {
             '(' => {
                 tokens.push(Token::LeftParen);
@@ -366,30 +411,23 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     }
                 }
 
-                // Check if this is actually a duration (digits followed by duration suffix)
-                // Only if we haven't seen a dot or exponent
                 let num_str: String = chars[start..i].iter().collect();
 
-                // Check if followed by a duration suffix (and the number is an integer)
-                // Duration suffixes are handled contextually by the parser,
-                // so we just emit the number regardless.
+                // A duration literal is one token: `5m`, `1h30m`, `20s500ms`.
+                // Lexing `1h30m` as a number and the identifier `h30m` made
+                // every compound duration a parse error.
+                let integer = num_str.bytes().all(|b| b.is_ascii_digit());
+                if integer && let Some((secs, end)) = lex_duration(chars, start) {
+                    tokens.push(Token::Duration(secs));
+                    i = end;
+                    continue;
+                }
+
                 let val: f64 = num_str.parse().map_err(|_| LexError {
                     msg: format!("invalid number: {num_str}"),
                     pos: start,
                 })?;
                 tokens.push(Token::Number(val));
-
-                // If a duration suffix follows an integer, skip it — the
-                // parser handles duration parsing from separate tokens.
-                if i < len
-                    && is_duration_suffix(chars[i])
-                    && !num_str.contains('.')
-                    && !num_str.contains('e')
-                    && !num_str.contains('E')
-                {
-                    // Duration suffix will be consumed as an ident token
-                    // on the next iteration.
-                }
             }
             _ if is_ident_start(c) => {
                 let start = i;
@@ -438,8 +476,12 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
         }
     }
 
+    while spans.len() < tokens.len() {
+        spans.push((token_start, i));
+    }
     tokens.push(Token::Eof);
-    Ok(tokens)
+    spans.push((len, len));
+    Ok((tokens, spans))
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -450,8 +492,62 @@ fn is_ident_char_with_colon(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == ':'
 }
 
-fn is_duration_suffix(c: char) -> bool {
-    matches!(c, 's' | 'm' | 'h' | 'd' | 'w' | 'y')
+/// The length and size in seconds of a duration unit starting at `chars[i]`.
+fn duration_unit(chars: &[char], i: usize) -> Option<(usize, f64)> {
+    match chars.get(i)? {
+        'm' if chars.get(i + 1) == Some(&'s') => Some((2, 0.001)),
+        's' => Some((1, 1.0)),
+        'm' => Some((1, 60.0)),
+        'h' => Some((1, 3600.0)),
+        'd' => Some((1, 86_400.0)),
+        'w' => Some((1, 604_800.0)),
+        'y' => Some((1, 31_536_000.0)),
+        _ => None,
+    }
+}
+
+/// Lex a duration literal starting at `start`: one or more `<digits><unit>`
+/// pairs. Returns its length in seconds and the index after it, or `None`
+/// when the input is not a duration (a bare number, or `5min`).
+fn lex_duration(chars: &[char], start: usize) -> Option<(f64, usize)> {
+    let mut i = start;
+    let mut secs = 0.0;
+    let mut pairs = 0;
+    loop {
+        let digits_start = i;
+        while chars.get(i).is_some_and(char::is_ascii_digit) {
+            i += 1;
+        }
+        if i == digits_start {
+            break;
+        }
+        let n: f64 = chars[digits_start..i]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()?;
+        let Some((len, unit)) = duration_unit(chars, i) else {
+            // Digits with no unit: the end of the literal only if they are
+            // not part of it, which a well-formed duration never leaves.
+            return None;
+        };
+        secs += n * unit;
+        i += len;
+        pairs += 1;
+        // Another pair follows only if the next character is a digit.
+        if !chars.get(i).is_some_and(char::is_ascii_digit) {
+            break;
+        }
+    }
+    // `5min` is not a duration followed by `in`: the unit must end the word.
+    if pairs == 0
+        || chars
+            .get(i)
+            .is_some_and(|&c| is_ident_char_with_colon(c) && c != ':')
+    {
+        return None;
+    }
+    Some((secs, i))
 }
 
 #[cfg(test)]
@@ -511,12 +607,18 @@ mod tests {
         let tokens = lex("sum by (host) (rate(m[5m]))").unwrap();
         assert_eq!(tokens[0], Token::Ident("sum".into()));
         assert_eq!(tokens[1], Token::By);
-        // "5m" inside brackets: 5 is a number, m is an ident
-        let five_idx = tokens
-            .iter()
-            .position(|t| *t == Token::Number(5.0))
-            .unwrap();
-        assert!(five_idx > 0);
+        assert!(tokens.contains(&Token::Duration(300.0)));
+    }
+
+    #[test]
+    fn lex_compound_durations_as_one_token() {
+        assert_eq!(lex("1h30m").unwrap()[0], Token::Duration(5400.0));
+        assert_eq!(lex("20s500ms").unwrap()[0], Token::Duration(20.5));
+        assert_eq!(lex("30m1s").unwrap()[0], Token::Duration(1801.0));
+        // A unit must end the word: `5min` is a number and an identifier.
+        assert_eq!(lex("5min").unwrap()[0], Token::Number(5.0));
+        // Decimals are never durations.
+        assert_eq!(lex("1.5").unwrap()[0], Token::Number(1.5));
     }
 
     #[test]
@@ -556,5 +658,24 @@ mod tests {
             }
             other => panic!("expected String token, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn every_token_knows_its_bytes() {
+        // Non-ASCII in a string literal must not shift anything after it.
+        let q = r#"rate(m{x="ü"}[5m]) + 1h30m"#;
+        let (tokens, spans) = lex_spanned(q).unwrap();
+        let text: Vec<&str> = spans.iter().map(|s| &q[s.start..s.end]).collect();
+        assert_eq!(
+            text,
+            [
+                "rate", "(", "m", "{", "x", "=", r#""ü""#, "}", "[", "5m", "]", ")", "+", "1h30m",
+                ""
+            ]
+        );
+        assert_eq!(tokens.len(), spans.len());
+        // A lex error reports a byte offset, after the two-byte `ü`.
+        let err = lex_spanned("\"ü\" $").unwrap_err();
+        assert_eq!(err.pos, "\"ü\" ".len());
     }
 }

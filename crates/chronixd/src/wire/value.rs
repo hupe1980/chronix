@@ -1,11 +1,8 @@
 //! The one Arrow → JSON encoding, shared by every Chronix wire surface.
 //!
-//! The `match` over [`DataType`] has **no `_` arm**. `DataType` is not
+//! The `match` over [`DataType`] has no `_` arm. `DataType` is not
 //! `#[non_exhaustive]`, so an Arrow release that adds a variant breaks this
-//! build rather than quietly degrading a response — coverage is a compile
-//! error, not a promise. Every surface used to carry its own table over a
-//! different subset, and a type nobody had enumerated reached the client as
-//! the string `"<unsupported: Date32>"` under `200 OK`.
+//! build rather than quietly degrading a response.
 //!
 //! Each value is rendered losslessly, and the column's `data_type` in the
 //! response says how to read it back:

@@ -36,20 +36,12 @@ fn deny_mutations() -> SQLOptions {
 
 /// The plan `EXPLAIN`, `EXPLAIN ANALYZE` or `DESCRIBE` wraps, if any.
 ///
-/// These three used to be refused outright as "information disclosure",
-/// which cost the user the only way to find out whether a time filter
-/// pushed down — the single most important operational question about a
-/// query against a time-series database — and bought nothing. The scan
-/// node's display is `measurement`, the time range, a filter count and a
-/// limit: the caller's own query, echoed back. There are no file paths, no
-/// catalog layout and no cross-tenant statistics in it, and under
-/// multi-tenancy the table provider the plan names is already scoped to the
-/// caller's namespace.
-///
-/// So they are permitted, and what they wrap is verified exactly as a
-/// bare query would be. `EXPLAIN ANALYZE` executes, which is why the inner
-/// plan has to pass the same check rather than a weaker one: without it,
-/// `EXPLAIN ANALYZE INSERT …` would be a write with a fig leaf.
+/// These are permitted: they are how a user finds out whether a time filter
+/// pushed down, and the scan node's display is the caller's own query echoed
+/// back — no file paths, no catalog layout, no cross-tenant statistics, and
+/// the table provider is already scoped to the caller's namespace. What they
+/// wrap is verified exactly as a bare query would be, because `EXPLAIN
+/// ANALYZE` executes: `EXPLAIN ANALYZE INSERT …` is refused like `INSERT`.
 fn wrapped_plan(plan: &LogicalPlan) -> Option<&LogicalPlan> {
     match plan {
         LogicalPlan::Explain(explain) => Some(&explain.plan),
@@ -173,17 +165,10 @@ mod tests {
         create_session_context(db)
     }
 
-    /// The regression that motivated this module: `SET` used to be applied
-    /// to the shared session before the handler could reject it. Because
-    /// `chronixd` shares one context across every request, tenant and
-    /// namespace, that made a read-only caller able to change execution
-    /// settings for everyone, permanently.
-    ///
-    /// The observable is a setting a `SET` would change, checked before and
-    /// after. It used to be `information_schema`, which is now on by
-    /// default — the catalog is namespace-scoped, so the views enumerate the
-    /// caller's own data — so the proof moved to a setting still at its
-    /// default.
+    /// `SET` must be refused before it reaches the session: `chronixd` shares one
+    /// context across every request, tenant and namespace, so an applied `SET`
+    /// would change execution settings for everyone. The check reads a setting
+    /// before and after.
     #[tokio::test]
     async fn set_variable_is_rejected_without_taking_effect() {
         let dir = tempfile::tempdir().expect("tmp");

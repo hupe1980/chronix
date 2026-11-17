@@ -77,6 +77,10 @@ pub struct ChronixGrpcService {
     /// answers "was this attempted?", and an answer that depends on which
     /// port the attempt came in on is not one.
     audit: Option<std::sync::Arc<chronix_security::audit::AuditLogger>>,
+    /// Per-namespace request-rate limits — the same map the HTTP layer reads.
+    request_limiter: crate::rate_limit::NamespaceRateLimiter,
+    /// Per-namespace ingestion-rate limits, charged per point on every write.
+    ingest: crate::rate_limit::NamespaceIngestLimiter,
 }
 
 /// Default max dedup entries.
@@ -101,6 +105,8 @@ impl ChronixGrpcService {
             multi_tenancy: false,
             authz: None,
             audit: None,
+            request_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+            ingest: crate::rate_limit::NamespaceIngestLimiter::new(),
         }
     }
 
@@ -128,7 +134,22 @@ impl ChronixGrpcService {
             multi_tenancy: false,
             authz: None,
             audit: None,
+            request_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+            ingest: crate::rate_limit::NamespaceIngestLimiter::new(),
         }
+    }
+
+    /// Share the server's per-namespace request and ingestion limiters, so a
+    /// tenant's quotas are the same on this surface as on HTTP.
+    #[must_use]
+    pub fn with_limiters(
+        mut self,
+        request: crate::rate_limit::NamespaceRateLimiter,
+        ingest: crate::rate_limit::NamespaceIngestLimiter,
+    ) -> Self {
+        self.request_limiter = request;
+        self.ingest = ingest;
+        self
     }
 
     /// Attach the Cedar policy engine.
@@ -196,6 +217,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Write,
             &request,
         )?;
@@ -212,6 +234,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
 
         crate::util::insert_batch_with_mode(
             &self.db,
+            &self.ingest,
             scope.as_deref(),
             points,
             self.write_timeout,
@@ -244,6 +267,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Write,
             &request,
         )?;
@@ -312,7 +336,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
 
                             // ── Flush if batch threshold reached ───────
                             if buffer.len() >= self.stream_batch_size {
-                                let count = flush_point_buffer(&self.db, scope.as_deref(), &mut buffer, self.write_timeout).await?;
+                                let count = flush_point_buffer(&self.db, &self.ingest, scope.as_deref(), &mut buffer, self.write_timeout).await?;
                                 total_written += count;
                                 last_batch_written = count;
                                 commit_dedup_keys(&self.dedup_cache, &mut pending_keys).await;
@@ -321,7 +345,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
                         None => {
                             // ── Graceful close: drain remaining buffer ─
                             if !buffer.is_empty() {
-                                let count = flush_point_buffer(&self.db, scope.as_deref(), &mut buffer, self.write_timeout).await?;
+                                let count = flush_point_buffer(&self.db, &self.ingest, scope.as_deref(), &mut buffer, self.write_timeout).await?;
                                 total_written += count;
                                 last_batch_written = count;
                                 commit_dedup_keys(&self.dedup_cache, &mut pending_keys).await;
@@ -334,7 +358,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
                 _ = interval.tick() => {
                     // ── Periodic flush ──────────────────────────────
                     if !buffer.is_empty() {
-                        let count = flush_point_buffer(&self.db, scope.as_deref(), &mut buffer, self.write_timeout).await?;
+                        let count = flush_point_buffer(&self.db, &self.ingest, scope.as_deref(), &mut buffer, self.write_timeout).await?;
                         total_written += count;
                         last_batch_written = count;
                         commit_dedup_keys(&self.dedup_cache, &mut pending_keys).await;
@@ -360,6 +384,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Read,
             &request,
         )?;
@@ -482,6 +507,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Read,
             &request,
         )?;
@@ -525,6 +551,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Read,
             &_request,
         )?;
@@ -569,6 +596,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Delete,
             &request,
         )?;
@@ -611,6 +639,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Delete,
             &request,
         )?;
@@ -673,6 +702,7 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Read,
             &request,
         )?;
@@ -756,13 +786,10 @@ impl proto::chronix_service_server::ChronixService for ChronixGrpcService {
 
 /// Convert an Arrow array cell to a protobuf `SqlValue`.
 ///
-/// Scalars keep a native proto field — in particular a `double` carries `NaN`
-/// and the infinities, which JSON cannot, so floats deliberately do **not**
-/// take the JSON route. Everything with no scalar home goes through
+/// Scalars keep a native proto field — a `double` carries `NaN` and the
+/// infinities, which JSON cannot. Everything with no scalar home goes through
 /// [`crate::wire::value::to_json`], the encoding every surface shares, and
-/// arrives in `SqlValue.json`. It used to arrive as the literal text
-/// `"<unsupported: List(Float64)>"` in the `string` field, which no client
-/// could tell from a string.
+/// arrives in `SqlValue.json`.
 fn arrow_to_sql_value(col: &arrow::array::ArrayRef, row: usize) -> proto::SqlValue {
     use arrow::array::*;
     use arrow::datatypes::{DataType as D, TimeUnit};
@@ -913,6 +940,7 @@ async fn commit_dedup_keys(
 /// completes successfully.
 async fn flush_point_buffer(
     db: &Arc<Chronix>,
+    ingest: &crate::rate_limit::NamespaceIngestLimiter,
     namespace: Option<&str>,
     buffer: &mut Vec<Point>,
     write_timeout: Duration,
@@ -920,7 +948,7 @@ async fn flush_point_buffer(
     let points = std::mem::take(buffer);
     let count = points.len() as u64;
 
-    crate::util::insert_with_timeout(db, namespace, points, write_timeout)
+    crate::util::insert_with_timeout(db, ingest, namespace, points, write_timeout)
         .await
         .map_err(|e| e.to_grpc_status())?;
 

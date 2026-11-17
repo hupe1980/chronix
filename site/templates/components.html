@@ -1,0 +1,26 @@
+{#- Tera 2 components: global once defined, and they see only their arguments. -#}
+{% component logo() %}<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><circle cx="16" cy="16" r="13" fill="none" stroke="var(--accent)" stroke-width="3"/><path d="M16 8.5v7.8l5.6 3" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>{% endcomponent logo %}
+
+{#- A captioned screenshot. Captured at 2×; width and height (half the file's) keep the page
+    from shifting while it loads, and the image links to itself at full size. In Markdown: {{ <screenshot src="img/x.webp" alt="…" caption="…" /> }} -#}
+{% component screenshot(src, alt, caption="") %}
+{%- set meta = get_image_metadata(path=src) -%}
+<figure class="shot">
+  <a href="{{ get_url(path=src) | safe }}"><img src="{{ get_url(path=src) | safe }}" alt="{{ alt }}" width="{{ meta.width // 2 }}" height="{{ meta.height // 2 }}" loading="lazy" decoding="async"></a>
+  {%- if caption %}<figcaption>{{ caption | markdown(inline=true) | safe }}</figcaption>{% endif %}
+</figure>
+{% endcomponent screenshot %}
+
+{#- A note or warning box. In Markdown: {% <callout kind="warning" title="…"> %} … {% </callout> %} -#}
+{% component callout(kind="note", title="") %}
+<aside class="callout callout-{{ kind }}" role="note">{% if title %}<strong class="callout-title">{{ title }}</strong>{% endif %}
+{{ body | markdown | safe }}
+</aside>
+{% endcomponent callout %}
+
+{#- Code tabs: wrap two or more fenced blocks; the tab label comes from each block's language and the reader's choice is remembered. In Markdown: {% <tabs> %} ```rust … ``` ```python … ``` {% </tabs> %} -#}
+{% component tabs() %}
+<div class="tabs" data-tabs>
+{{ body | markdown | safe }}
+</div>
+{% endcomponent tabs %}

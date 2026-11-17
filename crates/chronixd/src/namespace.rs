@@ -81,8 +81,8 @@ pub fn scoped_delete_request(
 /// the router and checks that each path this returns `true` for is in fact
 /// behind a capability layer, so the two cannot drift.
 ///
-/// Health, readiness, metrics and the OpenAPI document are neither: they
-/// carry no tenant data, and a liveness probe that fails because a policy
+/// Health, readiness, metrics, the OpenAPI document and the console's static
+/// shell are neither: they carry no tenant data, and a liveness probe that fails because a policy
 /// file changed is an outage a policy file should not be able to cause.
 #[must_use]
 pub fn is_control_plane(path: &str) -> bool {
@@ -90,6 +90,9 @@ pub fn is_control_plane(path: &str) -> bool {
         path,
         "/health" | "/healthz" | "/ready" | "/readyz" | "/metrics"
     ) || path == "/api/v1/openapi.json"
+        // The console's static shell: identical for every caller, no data.
+        || path == "/console"
+        || path.starts_with("/console/")
         || path.starts_with("/api/v1/admin")
         || path.starts_with("/api/v1/namespaces")
 }
@@ -97,27 +100,17 @@ pub fn is_control_plane(path: &str) -> bool {
 /// The action a data request asks for, from the **route** rather than the
 /// method.
 ///
-/// The method is a convention and this server breaks it in both directions,
-/// so a mapping from the method alone is wrong twice over — which a live
-/// drive found and no test had:
+/// The method is a convention this server breaks in both directions:
+/// `POST /api/v1/chronix/sql`, `POST /api/v1/chronix/query` and
+/// `POST /api/v1/query` are reads (Grafana POSTs PromQL by default), and the
+/// bulk delete routes are `POST` but are deletes. Classifying by method would
+/// force a read-only data source to hold `Write` and let any writer delete.
 ///
-/// * **A read-only policy could not read.** `POST /api/v1/chronix/sql`,
-///   `POST /api/v1/chronix/query` and `POST /api/v1/query` are reads, and a
-///   method mapping calls them `Write`. Grafana POSTs its PromQL by default,
-///   so granting a datasource the least privilege it needs meant granting
-///   `Write` — which also grants ingest. Least privilege was not available.
-/// * **A `forbid Delete` policy did not forbid a delete.** The two bulk
-///   delete routes are `POST`, so they asked for `Write`, and any principal
-///   that could write could delete.
-///
-/// So every data route is classified here, explicitly, and `_ => None` is
-/// deliberate: `every_data_route_is_classified` walks the router and fails
-/// on a route this does not name, so adding one is a decision somebody makes
-/// rather than a default somebody inherits.
-///
-/// The path is the **matched route pattern** (`/api/v1/measurements/{name}`),
-/// not the request's own path, so a measurement cannot be named to reach a
-/// different arm.
+/// Every data route is classified here explicitly, and `_ => None` is
+/// deliberate: `every_data_route_is_classified` walks the router and fails on
+/// a route this does not name. The path is the matched route pattern
+/// (`/api/v1/measurements/{name}`), not the request path, so a measurement
+/// name cannot reach a different arm.
 #[must_use]
 pub fn action_for_route(
     path: &str,
@@ -140,6 +133,9 @@ pub fn action_for_route(
         "/api/v1/chronix/query"
         | "/api/v1/chronix/query/explain"
         | "/api/v1/chronix/sql"
+        | "/api/v1/chronix/promql/explain"
+        // MCP: every tool reads, whatever the method carries the message.
+        | "/mcp"
         | "/api/v1/query"
         | "/api/v1/query_range"
         | "/api/v1/labels"
@@ -163,6 +159,7 @@ pub fn action_for_route(
         "/api/v1/metadata"
         | "/api/v1/prom/metadata"
         | "/api/v1/status/buildinfo"
+        | "/api/v1/status/tsdb"
         | "/api/v1/rules"
         | "/api/v1/alerts"
         | "/api/v1/query_exemplars"
@@ -193,6 +190,8 @@ pub fn action_for_route(
         "/api/v1/measurements/{name}"
         | "/api/v1/rollups"
         | "/api/v1/rollups/{name}"
+        | "/api/v1/detectors"
+        | "/api/v1/detectors/{name}"
         | "/api/v1/triggers"
         | "/api/v1/triggers/{name}" => by_method(),
 
@@ -200,7 +199,7 @@ pub fn action_for_route(
     })
 }
 
-/// The `X-Namespace` header name./// The audit category a refused data action is recorded under.
+/// The audit category a refused data action is recorded under.
 ///
 /// The two enums are separate on purpose — one is what a policy decides
 /// about, the other is what a trail is searched by — so the mapping is
@@ -235,7 +234,7 @@ pub struct NamespaceContext {
 
 /// Resolve the request's namespace, then decide whether it may act in it.
 ///
-/// **The data-plane gate.** Three things happen here, in this order:
+/// **The data-plane gate.** In this order:
 ///
 /// 1. the namespace is resolved from `X-Namespace`, defaulting to `default`,
 ///    and must exist in the registry;
@@ -243,18 +242,9 @@ pub struct NamespaceContext {
 /// 3. when a policy engine is configured, it must permit the action the HTTP
 ///    method asks for.
 ///
-/// All three sat below an early `return` taken whenever
-/// `state.namespace_registry` was `None`. In the product that branch was
-/// **unreachable** — `run()` is the only thing that builds a `SharedState`
-/// and it always opened a registry — so this was not a live hole. It was
-/// worse than a hole in one respect: every test and bench in the tree set
-/// that field to `None`, so the branch the suite exercised was the one that
-/// skips the gate, and no test could have caught a defect here. The registry
-/// is no longer an `Option`, which is what makes that unrepresentable rather
-/// than merely fixed.
-///
-/// A namespace always exists: `default` is the one every point is written
-/// under, and both `NamespaceRegistry::new` and `open` create it.
+/// The registry is not optional, so there is no path that skips the gate. A
+/// namespace always exists: `default` is the one every point is written under,
+/// and both `NamespaceRegistry::new` and `open` create it.
 pub async fn namespace_layer(
     State(state): State<AppState>,
     mut req: Request<Body>,
@@ -428,7 +418,13 @@ pub async fn namespace_layer(
 // ── Admin endpoints ───────────────────────────────────────────────────
 
 /// Request body for `POST /api/v1/namespaces`.
+///
+/// Every quota is optional, and `0` — the default — means unlimited, so a
+/// namespace created without a limit is unlimited rather than unwritable.
+/// An unknown field is refused: a misspelt quota would otherwise create an
+/// unlimited namespace without a word.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateNamespaceRequest {
     /// Namespace name (e.g. `"prod"`, `"staging"`).
     pub name: String,
@@ -438,25 +434,40 @@ pub struct CreateNamespaceRequest {
     /// Owner identifier.
     #[serde(default = "default_owner")]
     pub owner: String,
-    /// Maximum number of series.
+    /// Maximum number of distinct series (`0` = unlimited).
     #[serde(default)]
     pub max_series: u64,
-    /// Maximum storage in bytes.
+    /// Maximum points per second (`0` = unlimited).
     #[serde(default)]
-    pub max_storage_bytes: u64,
-    /// Maximum number of measurements.
+    pub max_ingestion_rate: u64,
+    /// Maximum number of measurements (`0` = unlimited).
     #[serde(default)]
     pub max_measurements: u32,
-    /// Maximum HTTP requests per second (0 = unlimited).
+    /// Maximum requests per second (`0` = unlimited).
     #[serde(default)]
     pub max_request_rps: u64,
-    /// Burst size for HTTP request rate limiting (0 = defaults to `max_request_rps`).
+    /// Burst size for request rate limiting (`0` = `max_request_rps`).
     #[serde(default)]
     pub max_request_burst: u32,
+    /// Removed — present only so a request carrying it is refused by name.
+    #[serde(default)]
+    max_storage_bytes: Option<serde_json::Value>,
 }
 
 fn default_owner() -> String {
     "admin".into()
+}
+
+/// Refuse a request that still sets the removed storage quota.
+fn refuse_storage_quota(field: Option<&serde_json::Value>) -> Result<(), ServerError> {
+    if field.is_some() {
+        return Err(ServerError::InvalidQuota(
+            "max_storage_bytes was removed: namespaces share segments, so per-namespace bytes \
+             cannot be measured; use retention to bound disk"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Response for namespace operations.
@@ -470,38 +481,112 @@ pub struct NamespaceResponse {
     pub owner: String,
     /// Quota limits.
     pub quota: QuotaResponse,
-    /// Usage counters.
+    /// Usage, exact, computed on request.
     pub usage: UsageResponse,
 }
 
-/// Quota information.
+/// Quota information. `0` means unlimited.
 #[derive(Debug, Serialize)]
 pub struct QuotaResponse {
     /// Maximum series count.
     pub max_series_count: u64,
-    /// Maximum ingestion rate.
+    /// Maximum points per second.
     pub max_ingestion_rate: u64,
-    /// Maximum storage bytes.
-    pub max_storage_bytes: u64,
     /// Maximum measurements.
     pub max_measurements: u32,
-    /// Maximum HTTP requests per second (0 = unlimited).
+    /// Maximum requests per second.
     pub max_request_rps: u64,
     /// Maximum request burst size.
     pub max_request_burst: u32,
 }
 
-/// Current usage information.
+impl From<&NamespaceQuota> for QuotaResponse {
+    fn from(q: &NamespaceQuota) -> Self {
+        Self {
+            max_series_count: q.max_series_count,
+            max_ingestion_rate: q.max_ingestion_rate,
+            max_measurements: q.max_measurements,
+            max_request_rps: q.max_request_rps,
+            max_request_burst: q.max_request_burst,
+        }
+    }
+}
+
+/// A namespace's usage.
+///
+/// `series` and `measurements` are the database's own counts — the set new
+/// series are admitted against, so they cannot drift from what is enforced;
+/// `ingestion_rate` is the points admitted over the last whole second.
 #[derive(Debug, Serialize)]
 pub struct UsageResponse {
-    /// Active series count.
-    pub series_count: u64,
-    /// Current ingestion rate.
-    pub ingestion_rate: f64,
-    /// Storage bytes consumed.
-    pub storage_bytes: u64,
-    /// Number of measurements.
+    /// Distinct series in the namespace.
+    pub series: u64,
+    /// Measurements the namespace has written to and not dropped.
     pub measurements: u32,
+    /// Points per second admitted over the last whole second.
+    pub ingestion_rate: u64,
+}
+
+/// `GET /api/v1/namespaces/{name}/usage`: usage beside the quota it is
+/// measured against.
+#[derive(Debug, Serialize)]
+pub struct UsageReport {
+    /// The usage.
+    #[serde(flatten)]
+    pub usage: UsageResponse,
+    /// The quota.
+    pub quota: QuotaResponse,
+}
+
+fn usage_of(state: &AppState, namespace: &str) -> UsageResponse {
+    let usage = state.db.namespace_usage(namespace);
+    UsageResponse {
+        series: usage.series,
+        measurements: usage.measurements,
+        ingestion_rate: state.namespace_ingest_limiter.observed_rate(namespace),
+    }
+}
+
+/// Put a namespace's quota in force everywhere it is enforced: the database
+/// (series and measurements), the request limiter, the ingestion limiter.
+///
+/// The one function create, update and startup all call, so a quota cannot
+/// be persisted on one path and applied on another.
+pub fn apply_quota(
+    db: &chronix::Chronix,
+    requests: &crate::rate_limit::NamespaceRateLimiter,
+    ingest: &crate::rate_limit::NamespaceIngestLimiter,
+    namespace: &str,
+    quota: &NamespaceQuota,
+) {
+    if quota.max_series_count == 0 && quota.max_measurements == 0 {
+        db.clear_namespace_limits(namespace);
+    } else {
+        let unlimited_if_zero = |v: u64| if v == 0 { u64::MAX } else { v };
+        db.set_namespace_limits(
+            namespace,
+            chronix::NamespaceLimits {
+                max_series: unlimited_if_zero(quota.max_series_count),
+                max_measurements: if quota.max_measurements == 0 {
+                    u32::MAX
+                } else {
+                    quota.max_measurements
+                },
+            },
+        );
+    }
+    requests.set_limit(namespace, quota.max_request_rps, quota.max_request_burst);
+    ingest.set_limit(namespace, quota.max_ingestion_rate);
+}
+
+fn apply(state: &AppState, namespace: &str, quota: &NamespaceQuota) {
+    apply_quota(
+        &state.db,
+        &state.namespace_rate_limiter,
+        &state.namespace_ingest_limiter,
+        namespace,
+        quota,
+    );
 }
 
 /// Response for listing namespaces.
@@ -514,10 +599,6 @@ pub struct NamespaceListResponse {
 }
 
 /// The namespace registry.
-///
-/// A plain accessor since the registry stopped being an `Option`: it used to
-/// return `Err(Internal("namespace registry not configured"))`, an error no
-/// production server could produce.
 fn registry(state: &AppState) -> &Arc<NamespaceRegistry> {
     &state.namespace_registry
 }
@@ -536,28 +617,44 @@ fn tenant_error(e: chronix_security::tenant::TenantError) -> ServerError {
     }
 }
 
+fn namespace_response(
+    state: &AppState,
+    info: chronix_security::tenant::NamespaceInfo,
+) -> NamespaceResponse {
+    let usage = usage_of(state, info.id.as_str());
+    NamespaceResponse {
+        name: info.id.as_str().to_string(),
+        description: info.description,
+        owner: info.owner,
+        quota: QuotaResponse::from(&info.quota),
+        usage,
+    }
+}
+
 /// `POST /api/v1/namespaces` — create a new namespace.
 pub async fn create_namespace_handler(
     State(state): State<AppState>,
     req_extensions: axum::http::Extensions,
     Json(body): Json<CreateNamespaceRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
+    refuse_storage_quota(body.max_storage_bytes.as_ref())?;
     let registry = registry(&state);
 
     let id = chronix_core::NamespaceId::new(&body.name)
         .map_err(|e| ServerError::BadRequest(format!("invalid namespace name: {e}")))?;
     let quota = NamespaceQuota {
         max_series_count: body.max_series,
-        max_ingestion_rate: 0,
-        max_storage_bytes: body.max_storage_bytes,
+        max_ingestion_rate: body.max_ingestion_rate,
         max_measurements: body.max_measurements,
         max_request_rps: body.max_request_rps,
         max_request_burst: body.max_request_burst,
     };
+    quota.validate().map_err(ServerError::InvalidQuota)?;
 
     let info = registry
         .create_namespace(id, body.description, body.owner, quota)
         .map_err(tenant_error)?;
+    apply(&state, info.id.as_str(), &info.quota);
 
     // Creating a tenant is a permission change in everything but name, and
     // it was recorded nowhere: `NamespaceCreate` existed as a category and
@@ -574,69 +671,18 @@ pub async fn create_namespace_handler(
         ],
     );
 
-    // Register per-namespace rate limiter if quota includes RPS limit.
-    if info.quota.max_request_rps > 0 {
-        state.namespace_rate_limiter.set_limit(
-            info.id.as_str(),
-            info.quota.max_request_rps,
-            info.quota.max_request_burst,
-        );
-    }
-
-    Ok((
-        StatusCode::CREATED,
-        Json(NamespaceResponse {
-            name: info.id.as_str().to_string(),
-            description: info.description,
-            owner: info.owner,
-            quota: QuotaResponse {
-                max_series_count: info.quota.max_series_count,
-                max_ingestion_rate: info.quota.max_ingestion_rate,
-                max_storage_bytes: info.quota.max_storage_bytes,
-                max_measurements: info.quota.max_measurements,
-                max_request_rps: info.quota.max_request_rps,
-                max_request_burst: info.quota.max_request_burst,
-            },
-            usage: UsageResponse {
-                series_count: 0,
-                ingestion_rate: 0.0,
-                storage_bytes: 0,
-                measurements: 0,
-            },
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(namespace_response(&state, info))))
 }
 
 /// `GET /api/v1/namespaces` — list all namespaces.
 pub async fn list_namespaces_handler(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let registry = registry(&state);
-    let all = registry.list_all();
-
-    let namespaces: Vec<NamespaceResponse> = all
+    let namespaces: Vec<NamespaceResponse> = registry(&state)
+        .list_all()
         .into_iter()
-        .map(|s| NamespaceResponse {
-            name: s.info.id.as_str().to_string(),
-            description: s.info.description,
-            owner: s.info.owner,
-            quota: QuotaResponse {
-                max_series_count: s.info.quota.max_series_count,
-                max_ingestion_rate: s.info.quota.max_ingestion_rate,
-                max_storage_bytes: s.info.quota.max_storage_bytes,
-                max_measurements: s.info.quota.max_measurements,
-                max_request_rps: s.info.quota.max_request_rps,
-                max_request_burst: s.info.quota.max_request_burst,
-            },
-            usage: UsageResponse {
-                series_count: s.usage.series_count,
-                ingestion_rate: s.usage.ingestion_rate,
-                storage_bytes: s.usage.storage_bytes,
-                measurements: s.usage.measurements,
-            },
-        })
+        .map(|s| namespace_response(&state, s.info))
         .collect();
-
     let count = namespaces.len();
     Ok(Json(NamespaceListResponse { namespaces, count }))
 }
@@ -646,30 +692,10 @@ pub async fn get_namespace_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let registry = registry(&state);
-    let ns = registry
+    let ns = registry(&state)
         .get(&name)
         .map_err(|e| ServerError::NotFound(format!("{e}")))?;
-
-    Ok(Json(NamespaceResponse {
-        name: ns.info.id.as_str().to_string(),
-        description: ns.info.description,
-        owner: ns.info.owner,
-        quota: QuotaResponse {
-            max_series_count: ns.info.quota.max_series_count,
-            max_ingestion_rate: ns.info.quota.max_ingestion_rate,
-            max_storage_bytes: ns.info.quota.max_storage_bytes,
-            max_measurements: ns.info.quota.max_measurements,
-            max_request_rps: ns.info.quota.max_request_rps,
-            max_request_burst: ns.info.quota.max_request_burst,
-        },
-        usage: UsageResponse {
-            series_count: ns.usage.series_count,
-            ingestion_rate: ns.usage.ingestion_rate,
-            storage_bytes: ns.usage.storage_bytes,
-            measurements: ns.usage.measurements,
-        },
-    }))
+    Ok(Json(namespace_response(&state, ns.info)))
 }
 
 /// `DELETE /api/v1/namespaces/{name}` — delete a namespace.
@@ -680,6 +706,9 @@ pub async fn delete_namespace_handler(
 ) -> Result<impl IntoResponse, ServerError> {
     let registry = registry(&state);
     registry.delete_namespace(&name).map_err(tenant_error)?;
+    state.db.clear_namespace_limits(&name);
+    state.namespace_rate_limiter.remove(&name);
+    state.namespace_ingest_limiter.remove(&name);
 
     // Deleting a tenant removes every credential's route to its data. If one
     // operation in this server belongs in a tamper-evident trail it is this
@@ -703,45 +732,47 @@ pub async fn delete_namespace_handler(
 ///
 /// Every field is required: a quota is a complete statement of what a tenant
 /// may consume, and a partial update whose omitted fields mean "leave alone"
-/// is indistinguishable from one whose omitted fields mean "unlimited".
+/// is indistinguishable from one whose omitted fields mean "unlimited". `0`
+/// is how a field says "unlimited".
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateQuotaRequest {
     /// Maximum series the namespace may hold.
     pub max_series: u64,
-    /// Maximum stored bytes.
-    pub max_storage_bytes: u64,
+    /// Maximum points per second.
+    pub max_ingestion_rate: u64,
     /// Maximum distinct measurements.
     pub max_measurements: u32,
-    /// Requests per second; `0` disables the limit.
+    /// Requests per second.
     pub max_request_rps: u64,
-    /// Burst allowance for the rate limit.
+    /// Burst allowance for the request rate.
     pub max_request_burst: u32,
+    /// Removed — present only so a request carrying it is refused by name.
+    #[serde(default)]
+    max_storage_bytes: Option<serde_json::Value>,
 }
 
 /// `PUT /api/v1/namespaces/{name}/quota` — change a tenant's quota.
 ///
-/// `NamespaceRegistry::update_quota` existed, validated its bounds and
-/// persisted — and no route reached it, so a tenant's quota was whatever it
-/// was created with and growing one meant deleting the namespace. The
-/// `QuotaChange` audit category had the same shape: declared, and produced by
-/// nothing.
+/// Persisted, then applied to the database and both limiters before the
+/// response: a quota the API reports as changed and nothing enforces is the
+/// shape of a setting nothing reads.
 ///
 /// # Errors
 ///
 /// `404` when the namespace does not exist, `400` when the quota is out of
-/// bounds.
+/// bounds or sets a field that was removed.
 pub async fn update_namespace_quota_handler(
     State(state): State<AppState>,
     req_extensions: axum::http::Extensions,
     Path(name): Path<String>,
     Json(body): Json<UpdateQuotaRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
+    refuse_storage_quota(body.max_storage_bytes.as_ref())?;
     let registry = registry(&state);
     let quota = NamespaceQuota {
         max_series_count: body.max_series,
-        max_ingestion_rate: 0,
-        max_storage_bytes: body.max_storage_bytes,
+        max_ingestion_rate: body.max_ingestion_rate,
         max_measurements: body.max_measurements,
         max_request_rps: body.max_request_rps,
         max_request_burst: body.max_request_burst,
@@ -749,13 +780,7 @@ pub async fn update_namespace_quota_handler(
     registry
         .update_quota(&name, quota.clone())
         .map_err(tenant_error)?;
-
-    // The live limiter, not only the record: a quota that is persisted and
-    // not applied is the shape of a setting nothing reads. `set_limit` takes
-    // `rps == 0` as "remove", which is exactly what clearing the quota means.
-    state
-        .namespace_rate_limiter
-        .set_limit(&name, quota.max_request_rps, quota.max_request_burst);
+    apply(&state, &name, &quota);
 
     crate::audit::record(
         &state,
@@ -765,47 +790,43 @@ pub async fn update_namespace_quota_handler(
         chronix_security::audit::AuditDecision::Allow,
         &[
             ("max_series", quota.max_series_count.to_string()),
-            ("max_storage_bytes", quota.max_storage_bytes.to_string()),
+            ("max_ingestion_rate", quota.max_ingestion_rate.to_string()),
+            ("max_measurements", quota.max_measurements.to_string()),
             ("max_request_rps", quota.max_request_rps.to_string()),
         ],
     );
 
-    Ok(Json(QuotaResponse {
-        max_series_count: quota.max_series_count,
-        max_ingestion_rate: quota.max_ingestion_rate,
-        max_storage_bytes: quota.max_storage_bytes,
-        max_measurements: quota.max_measurements,
-        max_request_rps: quota.max_request_rps,
-        max_request_burst: quota.max_request_burst,
-    }))
+    Ok(Json(QuotaResponse::from(&quota)))
 }
 
-/// `GET /api/v1/namespaces/{name}/usage` — get namespace usage.
+/// `GET /api/v1/namespaces/{name}/usage` — usage beside its quota.
 pub async fn get_namespace_usage_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let registry = registry(&state);
-    let usage = registry
-        .get_usage(&name)
-        .ok_or_else(|| ServerError::NotFound(format!("namespace not found: {name}")))?;
-
-    Ok(Json(UsageResponse {
-        series_count: usage.series_count,
-        ingestion_rate: usage.ingestion_rate,
-        storage_bytes: usage.storage_bytes,
-        measurements: usage.measurements,
+    let ns = registry(&state)
+        .get(&name)
+        .map_err(|_| ServerError::NotFound(format!("namespace not found: {name}")))?;
+    let usage = usage_of(&state, &name);
+    // Refreshed on read, so the gauge an alert watches is never older than
+    // the last time anybody looked — and is set at all.
+    chronix_security::tenant::record_usage_ratio(
+        &name,
+        "series_count",
+        usage.series,
+        ns.info.quota.max_series_count,
+    );
+    Ok(Json(UsageReport {
+        usage,
+        quota: QuotaResponse::from(&ns.info.quota),
     }))
 }
 
 // ── The namespace as a system invariant ────────────────────────────────
 
-/// The tag every ingested point carries and every read is scoped by.
-///
-/// Re-exported from `chronix_core` so the server, the query builder, the SQL
-/// provider and the PromQL evaluator all name the same constant. They used to
-/// spell the string out separately, and the copies drifted: two of five write
-/// paths stamped it and one of seven read paths filtered on it.
+/// The tag every ingested point carries and every read is scoped by,
+/// re-exported from `chronix_core` so every write and read path names the
+/// same constant.
 pub use chronix_core::NAMESPACE_TAG;
 
 /// The namespace a request is confined to, or `None` when tenancy is off.
@@ -852,12 +873,8 @@ pub fn scope_from_metadata(
 }
 
 /// Namespace scope for a gRPC or Flight request, checked against the
-/// credential the request authenticated with.
-///
-/// The metadata-only [`scope_from_metadata`] trusts the client's chosen
-/// namespace, which is the same defect the HTTP layer had: a valid
-/// credential could name any tenant. Prefer this everywhere a request is in
-/// hand.
+/// credential the request authenticated with. Prefer this to
+/// [`scope_from_metadata`], which trusts the namespace the client names.
 ///
 /// # Errors
 ///
@@ -910,6 +927,7 @@ pub fn authorize_request<T>(
     multi_tenancy: bool,
     authz: Option<&chronix_security::authz::AuthzEngine>,
     audit: Option<&chronix_security::audit::AuditLogger>,
+    limiter: &crate::rate_limit::NamespaceRateLimiter,
     action: chronix_security::authz::ChronixAction,
     request: &tonic::Request<T>,
 ) -> Result<Option<String>, tonic::Status> {
@@ -918,9 +936,37 @@ pub fn authorize_request<T>(
         "{action} applies to the system; these surfaces carry data actions"
     );
     let scope = scope_from_request(multi_tenancy, request)?;
+    authorize_policy(authz, audit, action, request, scope.as_deref())?;
 
+    // The request-rate quota, after the policy as on HTTP so a refused
+    // request spends no token. These surfaces never consulted it: a tenant
+    // limited to one request a second on HTTP was unlimited on gRPC and
+    // Flight SQL.
+    let namespace = scope.as_deref().unwrap_or(DEFAULT_NAMESPACE);
+    if let Err(wait) = limiter.check_wait(namespace) {
+        metrics::counter!("chronix_rate_limited_total", "namespace" => namespace.to_string())
+            .increment(1);
+        let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1);
+        let mut status = tonic::Status::resource_exhausted(format!(
+            "namespace {namespace:?} is over its request rate; retry after {} ms",
+            ms
+        ));
+        crate::error::pushback(&mut status, ms);
+        return Err(status);
+    }
+    Ok(scope)
+}
+
+/// The Cedar half of [`authorize_request`].
+fn authorize_policy<T>(
+    authz: Option<&chronix_security::authz::AuthzEngine>,
+    audit: Option<&chronix_security::audit::AuditLogger>,
+    action: chronix_security::authz::ChronixAction,
+    request: &tonic::Request<T>,
+    scope: Option<&str>,
+) -> Result<(), tonic::Status> {
     let Some(engine) = authz else {
-        return Ok(scope);
+        return Ok(());
     };
     let Some(ctx) = request
         .extensions()
@@ -929,15 +975,13 @@ pub fn authorize_request<T>(
         // No credential, and a policy engine cannot decide about nobody.
         // Authentication being off is the operator's decision; it is checked
         // where it is made, not re-litigated per RPC.
-        return Ok(scope);
+        return Ok(());
     };
 
     // A single-tenant deployment still has a namespace to name: `default` is
     // the one every point is written under. Scoping is off, authorization is
     // not — a policy naming `Chronix::Namespace::"default"` governs it.
-    let namespace = scope
-        .clone()
-        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+    let namespace = scope.unwrap_or(DEFAULT_NAMESPACE).to_string();
     let resource = chronix_security::authz::ChronixNamespace::new(&namespace);
     if engine
         .authorize_namespace(&ctx.principal(), action, &resource)
@@ -968,7 +1012,7 @@ pub fn authorize_request<T>(
             "access denied: {action} on namespace {namespace}"
         )));
     }
-    Ok(scope)
+    Ok(())
 }
 
 /// gRPC / Flight metadata key carrying the namespace.
@@ -1150,15 +1194,16 @@ mod tests {
             "description": "Staging env",
             "owner": "team-a",
             "max_series": 100000,
-            "max_storage_bytes": 1073741824,
+            "max_ingestion_rate": 5000,
             "max_measurements": 50
         }"#;
         let req: CreateNamespaceRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "staging");
         assert_eq!(req.description, "Staging env");
         assert_eq!(req.max_series, 100_000);
-        assert_eq!(req.max_storage_bytes, 1_073_741_824);
+        assert_eq!(req.max_ingestion_rate, 5000);
         assert_eq!(req.max_measurements, 50);
+        assert!(req.max_storage_bytes.is_none());
     }
 
     #[test]
@@ -1170,21 +1215,19 @@ mod tests {
             quota: QuotaResponse {
                 max_series_count: 1_000_000,
                 max_ingestion_rate: 0,
-                max_storage_bytes: 0,
                 max_measurements: 0,
                 max_request_rps: 0,
                 max_request_burst: 0,
             },
             usage: UsageResponse {
-                series_count: 42,
-                ingestion_rate: 0.0,
-                storage_bytes: 1024,
+                series: 42,
                 measurements: 3,
+                ingestion_rate: 0,
             },
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["name"], "prod");
-        assert_eq!(json["usage"]["series_count"], 42);
+        assert_eq!(json["usage"]["series"], 42);
         assert_eq!(json["quota"]["max_series_count"], 1_000_000);
     }
 

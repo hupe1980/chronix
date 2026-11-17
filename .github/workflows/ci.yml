@@ -144,13 +144,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-protoc
-      - run: cargo check -p chronix-meta -p chronix-cluster -p chronix-dsim
+      - run: cargo check -p chronix-meta -p chronix-cluster -p chronix-dsim -p chronixd-cluster
       # `cargo check` is a weaker floor than it reads as: the frozen tier once
       # stopped *clippy-compiling* while this job stayed green (R14). Lints are
       # not denied here — the frozen tier is compile-checked, not lint-clean —
       # but a deny-level lint must not go unnoticed.
-      - run: cargo clippy -p chronix-meta -p chronix-cluster -p chronix-dsim --all-targets
-      - run: cargo check -p chronixd --features cluster
+      - run: cargo clippy -p chronix-meta -p chronix-cluster -p chronix-dsim -p chronixd-cluster --all-targets
 
   features:
     # Optional features are not covered by the default build, so nothing
@@ -217,6 +216,9 @@ jobs:
       # is on by default everywhere else.
       - run: cargo clippy -p chronix --no-default-features --all-targets -- -D warnings
       - run: cargo test -p chronix --no-default-features
+      # The console needs nothing but its own feature: a server built without
+      # MCP still serves the page (the overlays say they are unavailable).
+      - run: cargo check -p chronixd --no-default-features --features console
 
   examples:
     # Nothing ran the examples, so `storage_lifecycle` silently rotted: it
@@ -254,22 +256,34 @@ jobs:
       - name: Install Zola
         run: |
           set -euo pipefail
-          VERSION=v0.23.4
+          VERSION=v0.23.6
           curl -sSL "https://github.com/getzola/zola/releases/download/${VERSION}/zola-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C /usr/local/bin zola
           zola --version
+      # `build.sh` is the deploy build: Zola, the llms files, the Pagefind
+      # index. Building it here means a pull request cannot break the deploy.
       - name: Build
         working-directory: site
-        run: zola build
+        run: ./build.sh
       - name: Check links and anchors
         working-directory: site
         run: zola check
+      # Every page has a unique title, a search-result-sized description, a
+      # canonical URL and JSON-LD that parses; the landing page makes its case
+      # before the first code block; the colour tokens meet WCAG AA.
+      - name: Check SEO and accessibility basics
+        working-directory: site
+        run: |
+          python3 check-seo.py --strict public
+          python3 check-seo.py --contrast
 
       # `zola check` proves the links resolve. This proves the prose is about
       # this tree: crate names, default ports, example paths and removed
       # subsystems, none of which a link checker can see.
       - name: Check documentation against the code
         run: ./scripts/check-docs.sh
+      - name: Console budget and lints
+        run: ./scripts/check-console.sh
 
       # `cargo machete` cannot read the `[features]` table and `cargo udeps`
       # needs nightly and a full build, so a `dep:` entry that no code names
@@ -323,6 +337,64 @@ jobs:
           done
           curl -sf http://127.0.0.1:4242/health
           cd sdks/python && CHRONIX_URL=http://127.0.0.1:4242 python tests/smoke_live.py
+
+  demo-smoke:
+    # The first command a new user runs is `chronixd --demo`. This runs it the
+    # way they do — a release build, the default port, no flags — and fails
+    # if the first answer takes longer than a minute or comes back empty.
+    name: Demo smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-disk-space
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/setup-protoc
+      - name: Build chronixd (release)
+        run: cargo build --release -p chronixd
+      - name: Generator and ingest stay under five seconds
+        run: cargo test --release -p chronixd --test suite demo_generates_and_ingests_quickly -- --nocapture
+      - name: First answer from `chronixd --demo`
+        run: |
+          set -euo pipefail
+          start=$(date +%s.%N)
+          ./target/release/chronixd --demo 2> demo.err &
+          server=$!
+          trap 'kill $server; cat demo.err' EXIT
+          for _ in $(seq 1 600); do
+            if curl -sf http://127.0.0.1:8086/health >/dev/null; then break; fi
+            sleep 0.1
+          done
+          bound=$(date +%s.%N)
+          promql=$(curl -sf 'http://127.0.0.1:8086/api/v1/query?query=pv_power_w')
+          echo "$promql" | grep -q '"pv_power_w"'
+          sql=$(curl -sf http://127.0.0.1:8086/api/v1/chronix/sql -H 'content-type: application/json' \
+            -d '{"query":"SELECT device, avg(power_w) FROM pv GROUP BY device"}')
+          echo "$sql" | grep -q '"row_count":1'
+          done_at=$(date +%s.%N)
+          to_bind=$(echo "$bound - $start" | bc)
+          to_answer=$(echo "$done_at - $start" | bc)
+          echo "startup to bind: ${to_bind}s · first answers: ${to_answer}s"
+          [ "$(echo "$to_answer < 60" | bc)" = 1 ]
+
+          # The console, in a real browser. The table view must render rows and
+          # the chart view a canvas, within two seconds of page start.
+          chrome="google-chrome --headless=new --no-sandbox --disable-gpu --virtual-time-budget=8000 --dump-dom"
+          base='http://127.0.0.1:8086/console'
+          table=$($chrome "$base#q=pv_power_w&r=7d&t=table")
+          echo "$table" | grep -q '<td class="num">'
+          chart=$($chrome "$base#q=pv_power_w&r=7d")
+          echo "$chart" | grep -q '<canvas'
+          ms=$(echo "$chart" | grep -oE 'data-first-chart-ms="[0-9]+"' | grep -oE '[0-9]+')
+          echo "first chart: ${ms} ms"
+          [ "$ms" -lt 2000 ]
+
+          # A hostile label value renders as text: escaped in the DOM, never an element.
+          curl -sf http://127.0.0.1:8086/write --data-binary \
+            'xss,name=\"><img\ src\=x\ onerror\=alert(1)> v=1'
+          hostile=$($chrome "$base#q=xss_v&r=1h&t=table")
+          echo "$hostile" | grep -q '&lt;img'
+          ! echo "$hostile" | grep -q '<img'
 
   deny:
     # The single advisory gate. `cargo audit` used to run beside this and was

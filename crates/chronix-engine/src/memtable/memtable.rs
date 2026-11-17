@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
@@ -68,6 +68,11 @@ pub struct Memtable {
     min_wal_seq: AtomicU64,
     /// Maximum WAL sequence number covered by this memtable.
     max_wal_seq: AtomicU64,
+    /// Oldest and newest timestamp ever inserted; `i64::MAX` / `i64::MIN`
+    /// while empty. Points are only ever added to a memtable, so the bounds
+    /// never need to shrink.
+    min_ts: AtomicI64,
+    max_ts: AtomicI64,
     /// Whether this memtable has been frozen (read-only).
     frozen: AtomicBool,
 }
@@ -101,6 +106,8 @@ impl Memtable {
             index_size: AtomicUsize::new(0),
             min_wal_seq: AtomicU64::new(u64::MAX),
             max_wal_seq: AtomicU64::new(0),
+            min_ts: AtomicI64::new(i64::MAX),
+            max_ts: AtomicI64::new(i64::MIN),
             frozen: AtomicBool::new(false),
         }
     }
@@ -150,14 +157,12 @@ impl Memtable {
             let old_size = existing.value().estimated_size()
                 + std::mem::size_of::<MemtableKey>()
                 + NODE_OVERHEAD;
-            let _ =
-                self.estimated_size
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        Some(current.saturating_sub(old_size))
-                    });
+            saturating_sub_relaxed(&self.estimated_size, old_size);
         }
 
         self.data.insert(key, entry);
+        self.min_ts.fetch_min(point.timestamp(), Ordering::Relaxed);
+        self.max_ts.fetch_max(point.timestamp(), Ordering::Relaxed);
         let new_size = self.estimated_size.fetch_add(entry_size, Ordering::Relaxed) + entry_size;
 
         // Emit memtable memory usage gauge so operators can monitor
@@ -221,6 +226,7 @@ impl Memtable {
         // for append-only time-series ingestion).
         let mut prev_hash: u64 = 0;
         let mut prev_ts: i64 = i64::MIN;
+        let (mut batch_min, mut batch_max) = (i64::MAX, i64::MIN);
 
         for point in points {
             let canonical: Arc<str> = self.interner.intern(point.series_key().canonical_form());
@@ -259,6 +265,8 @@ impl Memtable {
 
             prev_hash = cur_hash;
             prev_ts = cur_ts;
+            batch_min = batch_min.min(cur_ts);
+            batch_max = batch_max.max(cur_ts);
 
             self.data.insert(key, entry);
             // Saturating cast prevents theoretical i64 overflow.
@@ -267,16 +275,18 @@ impl Memtable {
             new_index_entries.push((measurement, cur_hash));
         }
 
+        self.min_ts.fetch_min(batch_min, Ordering::Relaxed);
+        self.max_ts.fetch_max(batch_max, Ordering::Relaxed);
+
         // Flush accumulated size delta in one atomic operation.
         if total_size_delta >= 0 {
             self.estimated_size
                 .fetch_add(total_size_delta as usize, Ordering::Relaxed);
         } else {
-            let _ =
-                self.estimated_size
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        Some(current.saturating_sub(total_size_delta.unsigned_abs() as usize))
-                    });
+            saturating_sub_relaxed(
+                &self.estimated_size,
+                total_size_delta.unsigned_abs() as usize,
+            );
         }
 
         // DashMap entry API — per-shard locking, no global contention.
@@ -308,6 +318,14 @@ impl Memtable {
         let count = self.insert_batch(points)?;
         self.update_wal_seq(wal_seq);
         Ok(count)
+    }
+
+    /// The oldest and newest timestamp held, or `None` while empty.
+    #[must_use]
+    pub fn time_bounds(&self) -> Option<(Timestamp, Timestamp)> {
+        let min = self.min_ts.load(Ordering::Relaxed);
+        let max = self.max_ts.load(Ordering::Relaxed);
+        (min <= max).then_some((min, max))
     }
 
     /// Update the WAL sequence range tracked by this memtable.
@@ -677,6 +695,20 @@ mod tests {
             .into_iter()
             .collect();
         Point::new(series_key, fields, ts).unwrap()
+    }
+
+    #[test]
+    fn time_bounds_cover_single_and_batch_inserts() {
+        let mt = Memtable::new();
+        assert_eq!(mt.time_bounds(), None);
+        mt.insert(&make_point("cpu", "a", 500, 1.0)).unwrap();
+        assert_eq!(mt.time_bounds(), Some((500, 500)));
+        mt.insert_batch(&[
+            make_point("cpu", "a", 900, 1.0),
+            make_point("cpu", "b", 100, 2.0),
+        ])
+        .unwrap();
+        assert_eq!(mt.time_bounds(), Some((100, 900)));
     }
 
     #[test]
@@ -1147,9 +1179,9 @@ mod calibration {
     #[global_allocator]
     static ALLOC: Counting = Counting;
 
-    /// The design partner's shape: 50 series, two fields, a few hundred
+    /// A gateway's shape: 50 series, two fields, a few hundred
     /// points each. The estimate must land within a quarter of what the
-    /// allocator says — it used to be eight times below it.
+    /// allocator says.
     #[test]
     fn memtable_estimate_tracks_real_allocation() {
         let keys: Vec<SeriesKey> = (0..50)
@@ -1449,5 +1481,25 @@ impl Memtable {
             .into_iter()
             .filter_map(|(m, b)| b.finish(&m))
             .collect()
+    }
+}
+
+/// Subtract from an atomic counter, clamping at zero.
+///
+/// An explicit compare-exchange loop rather than `fetch_update`, which is
+/// deprecated in favour of `try_update` — and `try_update` is newer than the
+/// workspace's minimum supported Rust version.
+fn saturating_sub_relaxed(counter: &std::sync::atomic::AtomicUsize, amount: usize) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_sub(amount),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
     }
 }

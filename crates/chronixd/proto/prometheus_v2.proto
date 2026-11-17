@@ -1,6 +1,7 @@
 // Prometheus Remote Write 2.0.
 //
 // Based on https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/write/v2/types.proto
+// at v2.0-rc.5.
 //
 // What changed from 1.0, and why it is worth a second message set:
 //
@@ -10,8 +11,9 @@
 //     times on the 1.0 wire and once here.
 //   * **Metadata travels with the series** — type, help and unit — instead of
 //     arriving through a separate channel that could be lost or reordered.
-//   * **Created timestamps**, so a counter that has just been created is
-//     distinguishable from one that has just reset.
+//   * **Start timestamps** on every sample (rc.5), so a counter that has
+//     just started is distinguishable from one that has just reset. They are
+//     stored in the `_start` column.
 //
 // Native histograms are carried by both versions; 2.0 is simply the version
 // Prometheus 3 is configured to speak.
@@ -41,8 +43,10 @@ message TimeSeries {
   repeated Histogram histograms = 3;
   repeated Exemplar exemplars = 4;
   Metadata metadata = 5;
-  // Milliseconds since epoch; 0 means "not provided".
-  int64 created_timestamp = 6;
+  // Was the per-series `created_timestamp` before rc.4. Upstream moved the
+  // start timestamp onto each sample and reserved this number; a sender that
+  // still sets it is ignored here, as it is upstream.
+  reserved 6;
 }
 
 message Exemplar {
@@ -54,6 +58,9 @@ message Exemplar {
 message Sample {
   double value = 1;
   int64 timestamp = 2;
+  // Milliseconds since epoch when the series started counting. 0 is unset;
+  // the epoch itself is sent as 1 or -1.
+  int64 start_timestamp = 3;
 }
 
 message Metadata {
@@ -105,6 +112,8 @@ message Histogram {
   ResetHint reset_hint = 14;
   int64 timestamp = 15;
   repeated double custom_values = 16;
+  // As `Sample.start_timestamp`.
+  int64 start_timestamp = 17;
 }
 
 message BucketSpan {

@@ -122,6 +122,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = evaluator.range_query(&expr, &params)?;
     print_promql_result(&result);
 
+    // ── 7. Duration expression: the window is two steps wide ───
+    println!("\n─── 7. Duration expression: rate(http_requests_total[step() * 2]) ───");
+    let expr = parse(r#"rate(http_requests_total{instance="inst-1"}[step() * 2])"#)?;
+    print_promql_result(&evaluator.range_query(&expr, &params)?);
+
+    // ── 8. Anchored range: increase without extrapolation ──────
+    println!("\n─── 8. increase(http_requests_total[5m] anchored) ───");
+    run_instant(
+        &evaluator,
+        r#"increase(http_requests_total{instance="inst-1"}[5m] anchored)"#,
+        eval_time,
+    )?;
+
     db.close()?;
     println!("\n✅ Done");
 

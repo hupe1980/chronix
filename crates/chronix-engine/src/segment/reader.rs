@@ -378,6 +378,79 @@ impl SegmentReader {
     /// Returns an error if the row group index is out of range or a column
     /// is not found.
     pub fn read_columns(&self, column_names: &[&str], row_group: usize) -> Result<Vec<ArrayRef>> {
+        self.read_columns_with_presence(column_names, row_group, &[])
+    }
+
+    /// Drop the rows where any `presence` column is null.
+    fn keep_present_rows(
+        names: &[&str],
+        arrays: Vec<ArrayRef>,
+        presence: &[&str],
+    ) -> Result<Vec<ArrayRef>> {
+        let mut mask: Option<arrow::array::BooleanArray> = None;
+        for (name, array) in names.iter().zip(&arrays) {
+            if !presence.contains(name) || array.null_count() == 0 {
+                continue;
+            }
+            let present = arrow::compute::is_not_null(array.as_ref()).map_err(|e| {
+                SegmentError::CorruptFile {
+                    detail: format!("presence of '{name}': {e}"),
+                }
+            })?;
+            mask = Some(match mask {
+                None => present,
+                Some(m) => {
+                    arrow::compute::and(&m, &present).map_err(|e| SegmentError::CorruptFile {
+                        detail: format!("presence of '{name}': {e}"),
+                    })?
+                }
+            });
+        }
+        let Some(mask) = mask else {
+            return Ok(arrays);
+        };
+        arrays
+            .iter()
+            .map(|a| {
+                arrow::compute::filter(a.as_ref(), &mask).map_err(|e| SegmentError::CorruptFile {
+                    detail: format!("filtering by presence: {e}"),
+                })
+            })
+            .collect()
+    }
+
+    /// A column carrying only presence: the field's Arrow type, zeroed
+    /// values, and the block's validity bitmap. The value bytes are not read.
+    fn read_presence_block(
+        &self,
+        block_meta: &ColumnBlockMeta,
+        col_idx: usize,
+    ) -> Result<ArrayRef> {
+        let data_type = self.metadata.columns[col_idx]
+            .arrow_field()
+            .data_type()
+            .clone();
+        let rows = block_meta.value_count as usize;
+        let nulls = self.read_validity(block_meta)?;
+        let data = arrow::array::ArrayData::new_null(&data_type, rows)
+            .into_builder()
+            .nulls(nulls)
+            .build()
+            .map_err(|e| SegmentError::CorruptFile {
+                detail: format!("presence column: {e}"),
+            })?;
+        Ok(arrow::array::make_array(data))
+    }
+
+    /// [`read_columns`](Self::read_columns), reading the columns named in
+    /// `presence` as presence only (see
+    /// [`read_projected_with_presence`](Self::read_projected_with_presence)).
+    fn read_columns_with_presence(
+        &self,
+        column_names: &[&str],
+        row_group: usize,
+        presence: &[&str],
+    ) -> Result<Vec<ArrayRef>> {
         if row_group >= self.metadata.row_group_blocks.len() {
             return Err(SegmentError::RowGroupOutOfRange {
                 index: row_group,
@@ -414,14 +487,18 @@ impl SegmentReader {
         for (i, &(col_idx, block_meta)) in resolved.iter().enumerate() {
             // Prefetch the next column block via madvise(WillNeed)
             // so the OS starts paging it in while we decode the current one.
-            if i + 1 < resolved.len() {
+            // A presence column's value bytes are never read, so they are
+            // not paged in either.
+            if i + 1 < resolved.len() && !presence.contains(&column_names[i + 1]) {
                 let (_, next_block) = resolved[i + 1];
                 self.prefetch_block(next_block);
             }
 
             // Also prefetch the same columns in the next row group if
             // we're doing a sequential multi-row-group scan.
-            if row_group + 1 < self.metadata.row_group_blocks.len() {
+            if row_group + 1 < self.metadata.row_group_blocks.len()
+                && !presence.contains(&column_names[i])
+            {
                 let next_rg_blocks = &self.metadata.row_group_blocks[row_group + 1];
                 if let Some(next_rg_block) = next_rg_blocks
                     .iter()
@@ -431,7 +508,11 @@ impl SegmentReader {
                 }
             }
 
-            let array = self.read_column_block(block_meta, col_idx)?;
+            let array = if presence.contains(&column_names[i]) {
+                self.read_presence_block(block_meta, col_idx)?
+            } else {
+                self.read_column_block(block_meta, col_idx)?
+            };
             result.push(array);
         }
 
@@ -602,6 +683,42 @@ impl SegmentReader {
         time_range: Option<(i64, i64)>,
         tag_predicates: &[(&str, &str)],
         field_predicates: &[FieldPredicate],
+    ) -> Result<RecordBatch> {
+        self.read_projected_with_presence(
+            column_names,
+            time_range,
+            tag_predicates,
+            field_predicates,
+            &[],
+        )
+    }
+
+    /// [`read_projected_with_zone_maps`](Self::read_projected_with_zone_maps),
+    /// keeping only the rows where every column in `presence` holds a value
+    /// — and reading those columns' **presence only**.
+    ///
+    /// A presence column is answered from what the segment stores beside the
+    /// values: a row group whose block has no value is skipped without I/O,
+    /// and the rest read the block's validity bitmap, which is stored
+    /// uncompressed and unencrypted. The value bytes are never read, never
+    /// decompressed and never decrypted, so presence works on an encrypted
+    /// column without its key.
+    ///
+    /// The returned column has the field's own Arrow type (so batches from
+    /// segments and the memtable still line up), but its values are zeroes:
+    /// **it carries presence, not values**, and every row in the result is
+    /// present by construction.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_projected_with_zone_maps`](Self::read_projected_with_zone_maps).
+    pub fn read_projected_with_presence(
+        &self,
+        column_names: &[&str],
+        time_range: Option<(i64, i64)>,
+        tag_predicates: &[(&str, &str)],
+        field_predicates: &[FieldPredicate],
+        presence: &[&str],
     ) -> Result<RecordBatch> {
         // If column_names is empty, read ALL columns (equivalent to read_all).
         let all_col_names: Vec<String> = if column_names.is_empty() {
@@ -784,6 +901,24 @@ impl SegmentReader {
                 }
             }
 
+            // Presence: a block holding no value cannot contribute a row.
+            // Suppressed statistics (an encrypted block) say nothing, so
+            // they never prune; the bitmap below still decides row by row.
+            if !presence.is_empty() {
+                let empty = presence.iter().any(|name| {
+                    self.metadata
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *name)
+                        .and_then(|idx| rg_blocks.iter().find(|b| b.column_index == idx as u16))
+                        .is_none_or(|b| b.stats.value_count == 0 && !b.stats.says_nothing())
+                });
+                if empty {
+                    metrics::counter!("chronix_segment_rg_pruned_by_presence_total").increment(1);
+                    continue;
+                }
+            }
+
             // Late materialisation — zone-map field predicate pushdown.
             //
             // For each numeric field predicate, retrieve the column's
@@ -837,7 +972,12 @@ impl SegmentReader {
                 }
             }
 
-            let arrays = self.read_columns(&names, rg_idx)?;
+            let arrays = self.read_columns_with_presence(&names, rg_idx, presence)?;
+            let arrays = if presence.is_empty() {
+                arrays
+            } else {
+                Self::keep_present_rows(&names, arrays, presence)?
+            };
             for (col_idx, array) in arrays.into_iter().enumerate() {
                 all_arrays[col_idx].push(array);
             }
@@ -1204,9 +1344,8 @@ mod zone_map_tests {
         }
     }
 
-    /// A fractional bound must not be truncated to an integer. `n < 1.5`
-    /// used to become `n < 1`, which prunes a block holding `{1, 2, 3}`
-    /// even though 1 matches — a pruning step that loses rows.
+    /// A fractional bound must not be truncated to an integer: `n < 1.5` on a
+    /// block holding `{1, 2, 3}` must not prune it, because 1 matches.
     #[test]
     fn a_fractional_bound_does_not_prune_an_integer_block() {
         assert!(pred(StatsOp::Lt, 1.5).may_match_i64(1, 3));
@@ -2072,6 +2211,68 @@ mod tests {
             present.iter().all(|v| *v % 2.0 == 0.0),
             "values corrupted: {present:?}"
         );
+    }
+
+    /// Presence is answered from the validity bitmap and the block
+    /// statistics alone: a row group with no value of the field is skipped,
+    /// rows without a value are dropped, and the value bytes are never
+    /// decoded — so it works on an encrypted column with no key at all.
+    #[test]
+    #[cfg(feature = "field-encryption")]
+    fn presence_reads_the_bitmap_and_never_the_values() {
+        use crate::segment::field_encryption::{FieldEncryptionConfig, FieldEncryptionKey};
+        use arrow::array::{Array, StringArray};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presence.csx");
+        let mut enc_config = FieldEncryptionConfig::default();
+        enc_config.encrypt_column("m", FieldEncryptionKey::new("k".to_string(), [7; 32]));
+
+        // Row group 0 (rows 0..16): `m` on even rows, under host a.
+        // Row group 1 (rows 16..32): no `m` at all, host b.
+        let point = |i: i64| {
+            let host = if i < 16 { "a" } else { "b" };
+            let key = SeriesKey::new(
+                "meas",
+                BTreeMap::from([("host".to_string(), host.to_string())]),
+            )
+            .unwrap();
+            let fields = if i < 16 && i % 2 == 0 {
+                BTreeMap::from([("m".to_string(), FieldValue::F64(i as f64))])
+            } else {
+                BTreeMap::from([("n".to_string(), FieldValue::F64(1.0))])
+            };
+            Point::new(key, fields, 1_000 + i).unwrap()
+        };
+        let points: Vec<Point> = (0..32).map(point).collect();
+        let config = SegmentWriterConfig {
+            row_group_size: 16,
+            compress: true,
+            field_encryption: enc_config,
+            ..Default::default()
+        };
+        let mut writer = SegmentWriter::new(&path, config).unwrap();
+        writer.write_rows(&points).unwrap();
+        writer.finalize().unwrap();
+
+        // No key provider: a value read of `m` would fail closed.
+        let reader = SegmentReader::open(&path).unwrap();
+        assert!(reader.read_projected(&["host", "m"]).is_err());
+        let batch = reader
+            .read_projected_with_presence(&["host", "m"], None, &[], &[], &["m"])
+            .unwrap();
+        assert_eq!(batch.num_rows(), 8, "the eight rows that hold a value of m");
+        let hosts = batch
+            .column_by_name("host")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(
+            (0..hosts.len()).all(|i| hosts.value(i) == "a"),
+            "never host b"
+        );
+        assert_eq!(batch.column_by_name("m").unwrap().null_count(), 0);
     }
 
     #[test]

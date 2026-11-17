@@ -106,6 +106,7 @@ pub async fn remote_write_handler(
     if count > 0 {
         crate::util::insert_batch_with_mode(
             &state.db,
+            &state.namespace_ingest_limiter,
             scope.as_deref(),
             points,
             state.write_timeout,
@@ -319,15 +320,20 @@ fn convert_write_request_v2(
                 .map_err(|e| ServerError::BadRequest(e.to_string()))?;
             let mut fields = BTreeMap::new();
             fields.insert(VALUE_FIELD.to_string(), FieldValue::F64(value));
-            points.push(
-                Point::new(key, fields, sample.timestamp * 1_000_000)
-                    .map_err(|e| ServerError::BadRequest(e.to_string()))?,
-            );
+            let point = Point::new(key, fields, sample.timestamp * 1_000_000)
+                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+            let Some(point) = with_wire_start(point, sample.start_timestamp) else {
+                continue;
+            };
+            points.push(point);
             written.samples += 1;
         }
 
         for h in &ts.histograms {
             if let Some(p) = histogram_point(&measurement, &tags, &borrow_v2(h))? {
+                let Some(p) = with_wire_start(p, h.start_timestamp) else {
+                    continue;
+                };
                 points.push(p);
                 written.histograms += 1;
             }
@@ -335,6 +341,39 @@ fn convert_write_request_v2(
     }
 
     Ok((points, written))
+}
+
+/// A remote write 2.0 start timestamp in nanoseconds, or `None` when unset.
+///
+/// The specification's encoding: `0` is "unset", and the epoch itself — which
+/// would otherwise be `0` — is sent as `1` or `-1`.
+pub(crate) fn wire_start_ns(ms: i64) -> Option<i64> {
+    match ms {
+        0 => None,
+        1 | -1 => Some(0),
+        ms => Some(ms.saturating_mul(1_000_000)),
+    }
+}
+
+/// Attach a remote write 2.0 start timestamp to `point`.
+///
+/// `None` drops the sample: a start after the sample it belongs to is a
+/// sender defect, and storing the sample without it would make the next
+/// `rate()` across a reset wrong in a way nobody could see. The drop is
+/// counted, and the 2.0 accounting headers report the sample as unwritten.
+fn with_wire_start(point: Point, start_ms: i64) -> Option<Point> {
+    let Some(start) = wire_start_ns(start_ms) else {
+        return Some(point);
+    };
+    match point.with_start_timestamp(start) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            metrics::counter!("chronix_prom_remote_write_rejected_samples_total", "reason" => "start_after_sample")
+                .increment(1);
+            tracing::debug!(error = %e, "remote write sample refused");
+            None
+        }
+    }
 }
 
 /// Borrow a 2.0 protobuf histogram into the version-neutral shape.
@@ -703,9 +742,7 @@ fn read_one_metric(
 ) -> Result<Vec<prom_proto::TimeSeries>, ServerError> {
     let measurement = metric.measurement.as_str();
     // Equality matchers are pushed into the scan; the rest are applied per
-    // series below. They used to be collected and dropped, behind a comment
-    // claiming a post-filter that did not exist — so `job!="a"` returned
-    // *every* job.
+    // series below.
     let mut tag_filters: Vec<(&str, &str)> = Vec::new();
     let mut post_filters: Vec<PostFilter> = Vec::new();
 
@@ -959,13 +996,11 @@ mod tests {
 
     /// A staleness marker must not fail the batch.
     ///
-    /// Prometheus marks the end of a series' life with a `NaN` carrying the
-    /// payload `0x7ff0000000000002`, and it sends one every time a scrape
-    /// target disappears. `Point::new` rejects non-finite floats, and that
-    /// rejection used to become a `400` for the whole request — which
-    /// Prometheus responds to by retrying the same batch indefinitely, so one
-    /// vanished target stalled the remote-write queue and stopped ingestion
-    /// altogether. The valid samples beside it must still land.
+    /// Prometheus ends a series with a `NaN` carrying the payload
+    /// `0x7ff0000000000002` whenever a scrape target disappears. Refusing the
+    /// request would make Prometheus retry the same batch indefinitely and stall
+    /// its remote-write queue, so the marker is skipped and the valid samples
+    /// beside it land.
     #[test]
     fn a_staleness_marker_is_skipped_not_fatal() {
         const STALE_NAN: u64 = 0x7ff0_0000_0000_0002;

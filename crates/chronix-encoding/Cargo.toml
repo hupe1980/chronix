@@ -9,7 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["compression", "encoding", "timeseries", "alp", "gorilla"]
 categories = ["compression", "encoding", "algorithms"]
-homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 

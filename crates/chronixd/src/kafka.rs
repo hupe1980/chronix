@@ -70,13 +70,13 @@ pub struct KafkaConsumer {
     /// Populated by [`new_arc`] — avoids `unsafe` Arc reconstruction.
     #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     self_ref: OnceLock<Weak<Self>>,
+    /// The server's per-namespace ingestion limiter; unlimited until the
+    /// server shares its own ([`Self::with_ingest_limiter`]).
+    ingest: OnceLock<crate::rate_limit::NamespaceIngestLimiter>,
     /// Whether the server enforces namespace isolation.
     ///
-    /// Decides whether points get a namespace tag: without it a
-    /// multi-tenant deployment could not read its own connector data.
-    // Read only by this connector's own loop, which is feature-gated. The
-    // guard used to name *both* connector features, so building with only the
-    // other one warned.
+    /// Decides whether points get a namespace tag: without it a multi-tenant
+    /// deployment could not read its own connector data.
     #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     multi_tenancy: bool,
     running: AtomicBool,
@@ -99,6 +99,23 @@ pub struct KafkaConsumer {
 }
 
 impl KafkaConsumer {
+    /// Charge this connector's writes against the server's per-namespace
+    /// ingestion limits, as every other write path is.
+    #[must_use]
+    pub fn with_ingest_limiter(
+        self: Arc<Self>,
+        limiter: crate::rate_limit::NamespaceIngestLimiter,
+    ) -> Arc<Self> {
+        let _ = self.ingest.set(limiter);
+        self
+    }
+
+    #[cfg_attr(not(any(feature = "kafka", feature = "mqtt")), allow(dead_code))]
+    fn ingest_limiter(&self) -> &crate::rate_limit::NamespaceIngestLimiter {
+        self.ingest
+            .get_or_init(crate::rate_limit::NamespaceIngestLimiter::new)
+    }
+
     /// Record what the consumer task is doing. `start()`/`stop()` own the
     /// `Stopped` transitions; everything else is an observation.
     #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
@@ -140,6 +157,7 @@ impl KafkaConsumer {
             db,
             multi_tenancy,
             self_ref: OnceLock::new(),
+            ingest: OnceLock::new(),
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             cancel: tokio::sync::Notify::new(),
@@ -165,6 +183,7 @@ impl KafkaConsumer {
             db,
             multi_tenancy,
             self_ref: OnceLock::new(),
+            ingest: OnceLock::new(),
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             cancel: tokio::sync::Notify::new(),
@@ -460,6 +479,7 @@ mod consumer_impl {
                     if !points.is_empty() {
                         match crate::util::insert_from_connector(
                             &this.db,
+                            this.ingest_limiter(),
                             this.namespace_scope(),
                             points,
                             INSERT_TIMEOUT,
@@ -484,11 +504,8 @@ mod consumer_impl {
                         warn!(name = %this.name, %e, "Kafka offset commit failed");
                     }
 
-                    // How far behind the broker we are, from the watermarks
-                    // the last fetch response already carried — no extra
-                    // round trip. This is the number that used to be a
-                    // hard-coded zero on `/api/v1/connectors`, so a connector
-                    // an hour behind read as caught up.
+                    // How far behind the broker we are, from the watermarks the last fetch
+                    // response already carried — no extra round trip.
                     let lag = consumer.lag().await;
                     let total: u64 = lag.lag.values().sum();
                     this.lag
@@ -756,9 +773,8 @@ mod tests {
         assert_eq!(consumer.status().await, ConnectorStatus::Stopped);
 
         consumer.start().await.unwrap();
-        // `Running` is the one thing this must not say, in either build: the
-        // status used to come from the flag `start()` had just set, so this
-        // assertion passed with no broker and no task at all.
+        // `Running` is the one thing this must not say without a broker: the status
+        // comes from the task, not from the flag `start()` sets.
         #[cfg(feature = "kafka")]
         assert_eq!(consumer.status().await, ConnectorStatus::Reconnecting);
         #[cfg(not(feature = "kafka"))]
@@ -787,11 +803,9 @@ mod tests {
         );
     }
 
-    /// A connector's namespace tag used to be skipped whenever the value
-    /// was `default`, which is the value most deployments leave in place —
-    /// so on a multi-tenant server the connector's points were stored
-    /// untagged, and every scoped read filters on the tag. The data was in
-    /// the database and unreachable through the database's own query API.
+    /// A connector's namespace tag is stamped even when the value is `default`:
+    /// every scoped read filters on the tag, so untagged points would be
+    /// unreachable through the query API.
     #[cfg(feature = "kafka")]
     #[test]
     fn a_multi_tenant_connector_tags_even_the_default_namespace() {

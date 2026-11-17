@@ -33,6 +33,19 @@ use crate::error::ServerError;
 pub struct PromParams(HashMap<String, Vec<String>>);
 
 impl PromParams {
+    /// Parameters from key/value pairs, for calling a handler in-process —
+    /// the MCP tools answer through the same handlers as the HTTP routes.
+    #[must_use]
+    pub fn from_pairs<K: Into<String>, V: Into<String>>(
+        pairs: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in pairs {
+            map.entry(k.into()).or_default().push(v.into());
+        }
+        Self(map)
+    }
+
     /// The first value of `key`, if present.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -92,6 +105,22 @@ impl PromParams {
         Ok((n > 0).then_some(n))
     }
 
+    /// A boolean flag: `true`/`1` or `false`/`0`; absent is `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::BadRequest`] for any other value, so a misspelt `ture`
+    /// is reported rather than read as "off".
+    pub fn flag(&self, key: &str) -> Result<bool, ServerError> {
+        match self.get(key) {
+            None | Some("false" | "0") => Ok(false),
+            Some("true" | "1") => Ok(true),
+            Some(other) => Err(ServerError::BadRequest(format!(
+                "cannot parse {key} as a boolean: \"{other}\"; use true or false"
+            ))),
+        }
+    }
+
     /// A duration, in nanoseconds, from a Prometheus duration or a number of
     /// seconds.
     ///
@@ -120,8 +149,7 @@ pub fn parse_time_ns(key: &str, value: &str) -> Result<i64, ServerError> {
         ServerError::BadRequest(format!("cannot parse {key} as a timestamp: {value}"))
     })?;
     if !secs.is_finite() {
-        // `time=NaN` used to reach the evaluator as epoch 0 and answer with
-        // whatever happened to be stored in 1970.
+        // `time=NaN` is refused, never read as epoch 0.
         return Err(ServerError::BadRequest(format!(
             "{key} must be a finite timestamp, got {value}"
         )));
@@ -275,7 +303,7 @@ mod tests {
             1_725_364_800_123_000_000
         );
 
-        // Not a timestamp at all, and the values that used to become 1970.
+        // Not a timestamp at all, and values that must not become 1970.
         assert!(parse_time_ns("time", "yesterday").is_err());
         assert!(parse_time_ns("time", "NaN").is_err());
         assert!(parse_time_ns("time", "inf").is_err());

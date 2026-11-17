@@ -1,147 +1,115 @@
 {% extends "base.html" %}
 
 {% block structured_data %}
-{{ super() }}
-{#- `WebSite` with a `SearchAction` is what lets a search engine offer a
-    sitelinks search box against this site's own search rather than sending
-    the reader back to its results. Declared only on the home page, which is
-    where the specification says it belongs. -#}
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
-  "@type": "WebSite",
-  "name": {{ config.title | json_encode() | safe }},
-  "alternateName": {{ config.extra.tagline | json_encode() | safe }},
-  "url": {{ config.base_url | json_encode() | safe }},
-  "description": {{ config.description | json_encode() | safe }},
-  "inLanguage": "en"
-}
-</script>
-{#- A landing page benefits from a second, product-shaped entity: it is what
-    populates a rich result rather than a plain blue link. -#}
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  "name": "Chronix",
-  "applicationCategory": "DeveloperApplication",
-  "operatingSystem": "Linux, macOS, Windows",
-  "description": {{ config.description | json_encode() | safe }},
-  "url": {{ config.base_url | json_encode() | safe }},
-  "softwareVersion": {{ config.extra.version | json_encode() | safe }},
-  "license": "https://spdx.org/licenses/MIT.html",
-  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": {{ (config.base_url ~ "/#website") | json_encode | safe }},
+      "name": {{ config.title | json_encode | safe }},
+      "url": {{ config.base_url | json_encode | safe }},
+      "description": {{ config.description | json_encode | safe }},
+      "inLanguage": "en"
+    },
+    {
+      "@type": "SoftwareSourceCode",
+      "name": "Chronix",
+      "description": {{ config.description | json_encode | safe }},
+      "url": {{ config.base_url | json_encode | safe }},
+      "codeRepository": {{ config.extra.repo_url | json_encode | safe }},
+      "programmingLanguage": "Rust",
+      "runtimePlatform": "Linux, macOS, Windows",
+      "version": {{ config.extra.version | json_encode | safe }},
+      "license": [{% for l in config.extra.licenses %}{{ l | json_encode | safe }}{% if not loop.last %}, {% endif %}{% endfor %}],
+      "author": {"@type": "Person", "name": {{ config.author | default(value="hupe1980") | json_encode | safe }}, "url": {{ config.extra.repo_url | json_encode | safe }}}
+    },
+    {
+      "@type": "SoftwareApplication",
+      "name": "Chronix",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux, macOS, Windows",
+      "softwareVersion": {{ config.extra.version | json_encode | safe }},
+      "description": {{ config.description | json_encode | safe }},
+      "url": {{ config.base_url | json_encode | safe }},
+      "license": [{% for l in config.extra.licenses %}{{ l | json_encode | safe }}{% if not loop.last %}, {% endif %}{% endfor %}],
+      "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+    }
+  ]
 }
 </script>
 {% endblock %}
 
 {% block content %}
+<div data-pagefind-body>
 <section class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <p class="eyebrow">{{ section.extra.eyebrow }}</p>
+      <h1>{{ section.extra.tagline }}</h1>
+      <div class="lede">{{ section.extra.lede | markdown(inline=true) | safe }}</div>
+      <div class="cta">
+        <a class="btn btn-primary" href="{{ get_url(path='@/learn/quickstart.md') }}">Get started <span aria-hidden="true">→</span></a>
+        <a class="btn" href="{{ get_url(path='@/learn/_index.md') }}">Read the docs</a>
+      </div>
+      <ul class="pills" aria-label="Install">
+        <li class="pill"><code>cargo add chronix</code><button type="button" data-copy="cargo add chronix" aria-label="Copy: cargo add chronix">Copy</button></li>
+        <li class="pill"><code>{{ config.extra.server_cmd }}</code><button type="button" data-copy="{{ config.extra.server_cmd }}" aria-label="Copy: {{ config.extra.server_cmd }}">Copy</button></li>
+      </ul>
+    </div>
+    <div class="hero-code">{{ section.extra.hero_code | markdown | safe }}</div>
+  </div>
+</section>
+
+<section class="band band-alt" aria-labelledby="why">
   <div class="wrap">
-    <p class="eyebrow">Time-series database · Rust · MIT OR Apache-2.0</p>
-    <h1>{{ section.extra.tagline }}</h1>
-    <div class="lede">{{ section.extra.subtitle | markdown | safe }}</div>
-
-    <div class="cta">
-      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
-      <a class="btn" href="{{ config.extra.repo_url }}" rel="noopener">View on GitHub</a>
+    <div class="band-head">
+      <h2 id="why">One engine, from the gateway to Grafana</h2>
+      <p>Embedded databases do not speak observability protocols, and time-series servers do not fit in a binary. Chronix is both — and the analytics come with it.</p>
     </div>
-
-    <div class="install">
-      <code>cargo add chronix</code>
-    </div>
-  </div>
-</section>
-
-<section class="wrap band">
-  <h2>Two ways to run it, one engine</h2>
-  <div class="two-col">
-    <div class="panel">
-      <h3>Embedded</h3>
-      <p>A library, not a deployment. File-locked data directory, crash-safe WAL,
-      graceful <code>close()</code>, no background daemons required. Runs where a
-      database <em>server</em> cannot — a 512&nbsp;MB gateway, a desktop app, a test.</p>
-      {{ section.extra.embedded_code | markdown | safe }}
-    </div>
-    <div class="panel">
-      <h3>Server</h3>
-      <p><code>chronixd</code> speaks the protocols your tools already emit:
-      InfluxDB line protocol, Prometheus remote write/read, full PromQL, OTLP
-      metrics and Arrow Flight SQL. Point Grafana at it and it behaves like a
-      Prometheus data source.</p>
-      {{ section.extra.server_code | markdown | safe }}
+    <div class="cards">
+    {% for c in section.extra.cards %}
+      <article class="card">
+        <h3>{{ c.title }}</h3>
+        <p class="stat">{{ c.stat }}<small>{{ c.stat_note }}</small></p>
+        <p>{{ c.body }}</p>
+        <a class="more" href="{{ get_url(path=c.href) }}">{{ c.more }} <span aria-hidden="true">→</span></a>
+      </article>
+    {% endfor %}
     </div>
   </div>
 </section>
 
-
-<section class="wrap band">
-  <h2>Why Chronix</h2>
-  <div class="cards">
-    <article class="card">
-      <h3>Analytics in the engine</h3>
-      <p>Forecasting (SES, Holt, Holt-Winters, ARIMA/SARIMA) and anomaly
-      detection (Z-score, MAD, IQR, CUSUM, forecast-residual) run against
-      zero-copy Arrow buffers, callable as <code>FORECAST()</code> and
-      <code>ANOMALY()</code> from SQL. No Python sidecar, no data leaving the
-      process.</p>
-      <a href="{{ get_url(path='@/docs/analytics.md') }}">Analytics guide →</a>
-    </article>
-    <article class="card">
-      <h3>Compression that fits the data</h3>
-      <p>Most metric values started life as decimals — a meter reporting
-      <code>231.45</code>&nbsp;W. Pcodec recovers the integer instead of XOR-ing
-      bit patterns, then entropy-codes the deltas: <strong>5–29×</strong> on
-      realistic meter and inverter data, where ALP manages 3–8× and the XOR
-      codecs 1.0–2.5×. The winner is chosen per block by trial encoding.
-      A column declared <code>Decimal</code> skips the recovery step — the
-      mantissa is already the integer — and reaches <strong>475×</strong> on
-      noisy connection-point power.</p>
-      <a href="{{ get_url(path='@/internals/encoding.md') }}">How encoding works →</a>
-    </article>
-    <article class="card">
-      <h3>Built for small machines</h3>
-      <p><code>Chronix::open_small()</code> is a ~48&nbsp;MB preset with a
-      flash-friendly WAL fsync policy, for eMMC and SD-backed gateways. The
-      primary target is a 64-bit ARM box with 512&nbsp;MB of RAM and days of
-      offline operation.</p>
-      <a href="{{ get_url(path='@/docs/performance.md') }}">Tuning guide →</a>
-    </article>
-    <article class="card">
-      <h3>Wire-compatible</h3>
-      <p>InfluxDB line protocol, Prometheus remote write/read and PromQL, OTLP
-      metrics, Arrow Flight SQL. Drop it in behind Telegraf, Prometheus, Grafana
-      or the OpenTelemetry Collector without changing what they send.</p>
-      <a href="{{ get_url(path='@/docs/api-reference.md') }}">API reference →</a>
-    </article>
-    <article class="card">
-      <h3>Security that stays out of the way</h3>
-      <p>Cedar policy authorization, AES-256-GCM at rest, mTLS, Argon2 API keys,
-      JWT/OIDC and a tamper-evident HMAC-chained audit log — all feature-gated,
-      and an embedded build compiles none of it.</p>
-      <a href="{{ get_url(path='@/docs/security.md') }}">Security guide →</a>
-    </article>
-    <article class="card">
-      <h3>Open about what it isn't</h3>
-      <p>Pre-1.0, single-node, and no production deployments yet. The
-      distributed tier is frozen on purpose. Everything measured names the test
-      that pins it, and the gaps are written down rather than implied away.</p>
-      <a href="{{ get_url(path='@/reference/_index.md') }}">Read the internals →</a>
-    </article>
+<section class="band" aria-labelledby="server">
+  <div class="wrap hero-grid">
+    <div>
+      <div class="band-head">
+        <h2 id="server">Or run it as a server</h2>
+        <p><code>chronixd</code> is the same engine and the same file format behind an HTTP, gRPC and Flight SQL front. The tools you already run — Prometheus, Telegraf, the OpenTelemetry Collector, Grafana — talk to it without a plugin.</p>
+      </div>
+      <a class="btn" href="{{ get_url(path='@/guides/grafana.md') }}">Connect Grafana <span aria-hidden="true">→</span></a>
+    </div>
+    <div>{{ section.extra.server_code | markdown | safe }}</div>
   </div>
 </section>
 
-<section class="wrap band">
-  <h2>Start here</h2>
-  <div class="cards compact">
-    <a class="card link" href="{{ get_url(path='@/docs/getting-started.md') }}">
-      <h3>Getting started</h3><p>Install, write a point, query it — embedded and server.</p></a>
-    <a class="card link" href="{{ get_url(path='@/docs/api-reference.md') }}">
-      <h3>API reference</h3><p>Every REST, gRPC, Flight SQL and Rust entry point.</p></a>
-    <a class="card link" href="{{ get_url(path='@/docs/operations.md') }}">
-      <h3>Operations</h3><p>Configuration, metrics, retention, backup and restore.</p></a>
-    <a class="card link" href="{{ get_url(path='@/internals/storage-engine.md') }}">
-      <h3>How it works</h3><p>The storage engine, from WAL to compaction.</p></a>
+<section class="band band-alt" aria-labelledby="start">
+  <div class="wrap">
+    <div class="band-head"><h2 id="start">Start here</h2></div>
+    <div class="cards">
+      <a class="card" href="{{ get_url(path='@/learn/_index.md') }}"><h3>Learn</h3><p>Embedded in five minutes, a server with demo data in one, and a gateway monitor.</p></a>
+      <a class="card" href="{{ get_url(path='@/guides/_index.md') }}"><h3>Guides</h3><p>Ingest, Grafana, forecasting, backups, security, tuning and operations.</p></a>
+      <a class="card" href="{{ get_url(path='@/reference/_index.md') }}"><h3>Reference</h3><p>Every endpoint, setting, flag and metric, and the Rust API on docs.rs.</p></a>
+      <a class="card" href="{{ get_url(path='@/explanation/_index.md') }}"><h3>How it works</h3><p>The storage engine, the codecs and the statistics, and why each was chosen.</p></a>
+    </div>
   </div>
 </section>
+
+<section class="band" aria-label="Project status">
+  <div class="wrap">
+    <p class="limits"><strong>Honest about what it is.</strong> Pre-1.0 and single-node; the clustered tier is frozen on purpose. Every performance and compression number in these docs names the test or benchmark that measures it.</p>
+  </div>
+</section>
+</div>
 {% endblock %}

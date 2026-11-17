@@ -119,24 +119,33 @@ enum ManifestEntry {
         /// The output segment id.
         output: u64,
     },
-    /// A rollup definition was created or replaced. The payload is the
-    /// facade's `RollupConfig`, opaque here — the catalog persists it, the
-    /// facade interprets it.
-    SetRollup {
-        /// The rollup's name, its identity.
+    /// A declared object — a rollup, a detector — was created or replaced.
+    /// The payload is the facade's definition, opaque here: the catalog
+    /// persists it, the facade interprets it.
+    SetDeclared {
+        /// What kind of declaration this is.
+        kind: DeclaredKind,
+        /// Its name, unique within the kind.
         name: String,
         /// Postcard-encoded definition.
         definition: Vec<u8>,
     },
-    /// A rollup definition was deleted.
-    RemoveRollup(String),
-    /// A rollup's materialisation state changed: its watermark advanced, or
-    /// a write below the watermark invalidated some of its buckets.
-    SetRollupState {
-        /// The rollup's name.
+    /// A declared object's state changed: a rollup's watermark advanced, a
+    /// detector's baseline moved.
+    SetDeclaredState {
+        /// What kind of declaration this is.
+        kind: DeclaredKind,
+        /// Its name.
         name: String,
         /// Postcard-encoded state.
         state: Vec<u8>,
+    },
+    /// A declared object was deleted, with its state.
+    RemoveDeclared {
+        /// What kind of declaration this is.
+        kind: DeclaredKind,
+        /// Its name.
+        name: String,
     },
     /// A measurement was soft-deleted: it is pending a hard delete at
     /// `deadline_ms` unless cancelled first.
@@ -156,9 +165,34 @@ enum ManifestEntry {
     CancelPendingMeasurementDrop(String),
 }
 
-/// A rollup's persisted definition and state, as opaque payloads.
+/// What a declared object is.
+///
+/// Declarations share one record and one lifecycle — an opaque definition, an
+/// opaque state persisted after the derived data it describes is durable — so
+/// the kind is data rather than layout: a later kind needs no format change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DeclaredKind {
+    /// A cascading rollup tier.
+    Rollup,
+    /// A declared anomaly detector.
+    Detector,
+}
+
+impl std::fmt::Display for DeclaredKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Rollup => "rollup",
+            Self::Detector => "detector",
+        })
+    }
+}
+
+/// The largest state one declaration may persist.
+pub const MAX_DECLARED_STATE_BYTES: usize = 1024 * 1024;
+
+/// A declared object's persisted definition and state, as opaque payloads.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RollupRecord {
+pub struct DeclaredRecord {
     /// Postcard-encoded definition, absent while only state is known.
     #[serde(default)]
     pub definition: Vec<u8>,
@@ -199,30 +233,20 @@ pub struct SegmentCatalog {
     schemas: HashMap<String, MeasurementSchema>,
     /// Tombstones recorded by deletes.
     ///
-    /// These live in the catalog rather than in the data WAL, and that is the
-    /// fix for a delete that did not survive a restart. The data WAL is
-    /// truncated once the memtable it covers has been flushed, so a delete
-    /// logged before a flush was discarded by it — the tombstone existed only
-    /// in memory from then on, and the deleted rows came back at the next
-    /// open. The manifest is only ever rewritten by a snapshot that carries
-    /// its full contents forward.
+    /// These live in the catalog, not the data WAL: the data WAL is truncated
+    /// after a flush, and the manifest is only rewritten by a snapshot that
+    /// carries its full contents forward.
     tombstones: TombstoneSet,
     /// The WAL floor: every data-WAL record with `sequence_no <= wal_floor`
     /// has been flushed into a segment that this catalog registers.
     ///
     /// Recorded here rather than inferred from the WAL files, because the
-    /// active WAL file is never deleted by truncation. Without a floor every
-    /// restart replayed that file — up to 32 MB of already-flushed points —
-    /// into the memtable, and the next flush wrote them to disk a second
-    /// time. Dedup hid the duplicates from queries; the flash wear was real.
+    /// active WAL file is never deleted by truncation; without it a restart
+    /// would replay already-flushed points and write them a second time.
     wal_floor: u64,
-    /// Rollup definitions and state, persisted with everything else that
-    /// a restart must not lose. They used to live in a hand-written JSON
-    /// file beside the data directory with no fsync and no CRC, and a
-    /// failure to parse it was logged and swallowed — leaving a database
-    /// that believed it had no rollups, and a retention pass that then
-    /// dropped the raw data those rollups existed to preserve.
-    rollups: BTreeMap<String, RollupRecord>,
+    /// Declared objects (rollups, detectors) and their state, persisted with
+    /// everything else a restart must not lose.
+    declared: BTreeMap<(DeclaredKind, String), DeclaredRecord>,
     /// Measurements pending a hard delete, by the unix-ms deadline a GC pass
     /// acts on. See [`ManifestEntry::SetPendingMeasurementDrop`].
     pending_measurement_drops: BTreeMap<String, u64>,
@@ -243,9 +267,8 @@ pub struct SegmentCatalog {
     /// Bytes of `manifest.wal` known to hold whole records.
     ///
     /// The rewind point. An append that fails part-way truncates back to it,
-    /// so the file never holds a fragment with a valid record after it —
-    /// which replay reads as corruption, and used to answer by silently
-    /// discarding every transition that followed.
+    /// so the file never holds a fragment with a valid record after it, which
+    /// replay would read as corruption.
     manifest_good_len: u64,
     /// Number of appends written but not yet `sync_data()`d.
     ///
@@ -335,7 +358,7 @@ impl SegmentCatalog {
             schemas: HashMap::new(),
             tombstones: TombstoneSet::new(),
             wal_floor: 0,
-            rollups: BTreeMap::new(),
+            declared: BTreeMap::new(),
             pending_measurement_drops: BTreeMap::new(),
             manifest_seq: 0,
             manifest_dir,
@@ -357,16 +380,41 @@ impl SegmentCatalog {
     pub fn open(manifest_dir: impl Into<PathBuf>) -> Result<Self> {
         let manifest_dir = manifest_dir.into();
         std::fs::create_dir_all(&manifest_dir)?;
+        Self::load(manifest_dir)
+    }
 
+    /// Open an existing catalog without writing anything.
+    ///
+    /// Loads the snapshot and replays the manifest log in memory only: no
+    /// directory is created, no file is opened for writing, and a torn tail
+    /// is skipped exactly as [`open`](Self::open) skips it. The returned
+    /// catalog is for reading; a mutation would append to the manifest.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Io`] (`NotFound`) if `manifest_dir` does not exist,
+    /// [`IndexError::UnsupportedVersion`] for a snapshot of another format
+    /// generation, and the same parse errors as [`open`](Self::open).
+    pub fn open_read_only(manifest_dir: impl Into<PathBuf>) -> Result<Self> {
+        let manifest_dir = manifest_dir.into();
+        if !manifest_dir.is_dir() {
+            return Err(IndexError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no catalog directory at {}", manifest_dir.display()),
+            )));
+        }
+        Self::load(manifest_dir)
+    }
+
+    /// Snapshot + manifest replay, shared by both opens; writes nothing.
+    fn load(manifest_dir: PathBuf) -> Result<Self> {
         let bin_snapshot_path = manifest_dir.join("manifest.snapshot.bin");
+        let wal_path = manifest_dir.join("manifest.wal");
         let mut catalog = if bin_snapshot_path.exists() {
             let data = std::fs::read(&bin_snapshot_path)?;
             let snapshot: CatalogSnapshot = postcard::from_bytes(&data)
                 .map_err(|e| IndexError::BinarySerialization(e.to_string()))?;
-            // Equality, both directions. This used to be `>`, so an *older*
-            // snapshot was accepted by a reader with no code to interpret
-            // one — an asymmetry against the three sibling formats that
-            // nobody had decided (see `crate::format`).
+            // Equality, both directions (see `crate::format`).
             if let Some(detail) = crate::format::check(
                 "this catalog snapshot",
                 u64::from(snapshot.format_version),
@@ -385,10 +433,10 @@ impl SegmentCatalog {
                 schemas: snapshot.schemas,
                 tombstones: snapshot.tombstones,
                 wal_floor: snapshot.wal_floor,
-                rollups: snapshot.rollups,
+                declared: snapshot.declared,
                 pending_measurement_drops: snapshot.pending_measurement_drops,
                 manifest_seq: snapshot.manifest_seq,
-                manifest_dir: manifest_dir.clone(),
+                manifest_dir,
                 changes_since_snapshot: 0,
                 next_segment_id: snapshot.next_segment_id,
                 manifest_wal_file: None,
@@ -403,10 +451,10 @@ impl SegmentCatalog {
                 schemas: HashMap::new(),
                 tombstones: TombstoneSet::new(),
                 wal_floor: 0,
-                rollups: BTreeMap::new(),
+                declared: BTreeMap::new(),
                 pending_measurement_drops: BTreeMap::new(),
                 manifest_seq: 0,
-                manifest_dir: manifest_dir.clone(),
+                manifest_dir,
                 changes_since_snapshot: 0,
                 next_segment_id: 1,
                 manifest_wal_file: None,
@@ -418,7 +466,6 @@ impl SegmentCatalog {
         };
 
         // Replay manifest WAL
-        let wal_path = manifest_dir.join("manifest.wal");
         if wal_path.exists() {
             catalog.replay_manifest(&wal_path)?;
         }
@@ -655,60 +702,105 @@ impl SegmentCatalog {
         self.manifest_seq
     }
 
-    /// Every persisted rollup, by name.
-    #[must_use]
-    pub fn rollups(&self) -> &BTreeMap<String, RollupRecord> {
-        &self.rollups
+    /// Every persisted declaration of `kind`, by name.
+    pub fn declared(&self, kind: DeclaredKind) -> impl Iterator<Item = (&str, &DeclaredRecord)> {
+        self.declared
+            .range((kind, String::new())..)
+            .take_while(move |((k, _), _)| *k == kind)
+            .map(|((_, name), record)| (name.as_str(), record))
     }
 
-    /// Persist a rollup definition, durably.
+    /// Every persisted rollup, by name.
+    pub fn rollups(&self) -> impl Iterator<Item = (&str, &DeclaredRecord)> {
+        self.declared(DeclaredKind::Rollup)
+    }
+
+    /// Every persisted detector, by name.
+    pub fn detectors(&self) -> impl Iterator<Item = (&str, &DeclaredRecord)> {
+        self.declared(DeclaredKind::Detector)
+    }
+
+    /// Persist a declaration's definition, durably.
     ///
     /// # Errors
     ///
     /// Returns an error if the manifest cannot be written or synced.
-    pub fn set_rollup(&mut self, name: &str, definition: Vec<u8>) -> Result<()> {
-        self.append_manifest(&ManifestEntry::SetRollup {
+    pub fn set_declared(
+        &mut self,
+        kind: DeclaredKind,
+        name: &str,
+        definition: Vec<u8>,
+    ) -> Result<()> {
+        self.append_manifest(&ManifestEntry::SetDeclared {
+            kind,
             name: name.to_string(),
             definition: definition.clone(),
         })?;
-        self.rollups.entry(name.to_string()).or_default().definition = definition;
+        self.declared
+            .entry((kind, name.to_string()))
+            .or_default()
+            .definition = definition;
         self.sync_manifest()?;
         self.maybe_snapshot();
         Ok(())
     }
 
-    /// Persist a rollup's materialisation state, durably.
+    /// Persist a declaration's state, durably.
     ///
-    /// Called after the rollup's points are durable, never before: a
-    /// watermark that outlives the rows it claims is a permanent hole in
-    /// the tier, because nothing recomputes a bucket the watermark has
-    /// already passed.
+    /// Called after the derived data the state describes is durable, never
+    /// before: a rollup watermark that outlives the rows it claims is a
+    /// permanent hole in the tier, because nothing recomputes a bucket the
+    /// watermark has already passed — and a detector baseline is the same
+    /// shape.
     ///
     /// # Errors
     ///
-    /// Returns an error if the manifest cannot be written or synced.
-    pub fn set_rollup_state(&mut self, name: &str, state: Vec<u8>) -> Result<()> {
-        self.append_manifest(&ManifestEntry::SetRollupState {
+    /// [`IndexError::DeclaredStateTooLarge`] over
+    /// [`MAX_DECLARED_STATE_BYTES`]; otherwise an error if the manifest
+    /// cannot be written or synced.
+    pub fn set_declared_state(
+        &mut self,
+        kind: DeclaredKind,
+        name: &str,
+        state: Vec<u8>,
+    ) -> Result<()> {
+        if state.len() > MAX_DECLARED_STATE_BYTES {
+            return Err(IndexError::DeclaredStateTooLarge {
+                kind: kind.to_string(),
+                name: name.to_string(),
+                size: state.len(),
+                max: MAX_DECLARED_STATE_BYTES,
+            });
+        }
+        self.append_manifest(&ManifestEntry::SetDeclaredState {
+            kind,
             name: name.to_string(),
             state: state.clone(),
         })?;
-        self.rollups.entry(name.to_string()).or_default().state = state;
+        self.declared
+            .entry((kind, name.to_string()))
+            .or_default()
+            .state = state;
         self.sync_manifest()?;
         self.maybe_snapshot();
         Ok(())
     }
 
-    /// Delete a rollup definition and its state.
+    /// Delete a declaration and its state.
     ///
     /// # Errors
     ///
     /// Returns an error if the manifest cannot be written.
-    pub fn remove_rollup(&mut self, name: &str) -> Result<bool> {
-        if !self.rollups.contains_key(name) {
+    pub fn remove_declared(&mut self, kind: DeclaredKind, name: &str) -> Result<bool> {
+        let key = (kind, name.to_string());
+        if !self.declared.contains_key(&key) {
             return Ok(false);
         }
-        self.append_manifest(&ManifestEntry::RemoveRollup(name.to_string()))?;
-        self.rollups.remove(name);
+        self.append_manifest(&ManifestEntry::RemoveDeclared {
+            kind,
+            name: name.to_string(),
+        })?;
+        self.declared.remove(&key);
         self.sync_manifest()?;
         self.maybe_snapshot();
         Ok(true)
@@ -979,20 +1071,11 @@ impl SegmentCatalog {
     ///
     /// # A failed append leaves nothing behind
     ///
-    /// Three `write_all` calls, and a short write inside any of them — an
-    /// `ENOSPC` at the boundary — leaves a fragment. That used to stay: the
-    /// next append, once a retention pass had freed space, wrote a valid
-    /// record *after* it, and replay then read the fragment as the end of the
-    /// log and **silently discarded every transition that followed**. The
-    /// caller had been told those transitions were durable, and `open()`'s
-    /// orphan sweep deletes the segment files the restored catalog no longer
-    /// names.
-    ///
-    /// So a failed append truncates back to the last whole record, the same
-    /// way `WalWriter::rewind_to_durable` does — the error the caller sees
-    /// and the bytes on the disk say the same thing. The catalog is the
-    /// durable record of what may be deleted; it is the last place a write
-    /// may half-succeed in silence.
+    /// A short write (e.g. `ENOSPC`) leaves a fragment; if a later append
+    /// wrote a valid record after it, replay would treat the fragment as
+    /// corruption. So a failed append truncates back to the last whole record,
+    /// as `WalWriter::rewind_to_durable` does, and the error the caller sees
+    /// matches the bytes on disk.
     fn append_manifest(&mut self, entry: &ManifestEntry) -> Result<()> {
         self.manifest_seq += 1;
 
@@ -1028,8 +1111,7 @@ impl SegmentCatalog {
         if let Err(e) = written {
             // The record is not whole. Truncate back to the last one that
             // was, so the file never holds a fragment with a valid record
-            // after it — see this function's own documentation for what that
-            // used to cost. `manifest_seq` is put back too: a sequence
+            // after it. `manifest_seq` is put back too: a sequence
             // consumed by a record that does not exist makes the catalog's
             // version disagree with its log.
             self.manifest_seq -= 1;
@@ -1147,24 +1229,11 @@ impl SegmentCatalog {
     ///
     /// # A bad record is the tail, or it is corruption
     ///
-    /// The difference decides everything and it was decided by a *byte
-    /// count*: "more than eight bytes remain, so this is mid-stream". A
-    /// process that dies between two `write_all` calls leaves a fragment at
-    /// the end of the log, which is ordinary and must be skipped; a fragment
-    /// with **valid records after it** is corruption, and treating it as the
-    /// tail silently discards every transition that follows. Those
-    /// transitions were acknowledged, and the segment files a restored
-    /// catalog no longer names are deleted by `open()`'s orphan sweep — so
-    /// the quiet answer ends in deleted data, which is the one outcome a
-    /// durable record of *what may be deleted* must not produce.
-    ///
-    /// So the question is asked directly: **is there a whole, CRC-valid
-    /// record later in this file?** If there is, this is corruption and the
-    /// catalog refuses to open, naming both offsets. If there is not, it is
-    /// the tail, and it is skipped. Refusing is the right failure: pass 53
-    /// made `open()` refuse a catalog naming a segment file that is not
-    /// there, for the same reason — a catalog that is *partly* true reads as
-    /// a catalog.
+    /// A crash between two writes leaves a fragment at the end of the log,
+    /// which is skipped. A fragment with a whole, CRC-valid record **after**
+    /// it is corruption: skipping it would discard acknowledged transitions,
+    /// and the orphan sweep would then delete segment files they name. So the
+    /// catalog refuses to open, naming both offsets.
     fn replay_manifest(&mut self, wal_path: &Path) -> Result<()> {
         let buf = std::fs::read(wal_path)?;
 
@@ -1303,14 +1372,18 @@ impl SegmentCatalog {
             ManifestEntry::SetWalFloor(seq) => {
                 self.wal_floor = self.wal_floor.max(seq);
             }
-            ManifestEntry::SetRollup { name, definition } => {
-                self.rollups.entry(name).or_default().definition = definition;
+            ManifestEntry::SetDeclared {
+                kind,
+                name,
+                definition,
+            } => {
+                self.declared.entry((kind, name)).or_default().definition = definition;
             }
-            ManifestEntry::RemoveRollup(name) => {
-                self.rollups.remove(&name);
+            ManifestEntry::RemoveDeclared { kind, name } => {
+                self.declared.remove(&(kind, name));
             }
-            ManifestEntry::SetRollupState { name, state } => {
-                self.rollups.entry(name).or_default().state = state;
+            ManifestEntry::SetDeclaredState { kind, name, state } => {
+                self.declared.entry((kind, name)).or_default().state = state;
             }
             ManifestEntry::Compacted { inputs, output } => {
                 self.tombstones.extend_to_compaction_output(&inputs, output);
@@ -1336,7 +1409,7 @@ impl SegmentCatalog {
             schemas: self.schemas.clone(),
             tombstones: self.tombstones.clone(),
             wal_floor: self.wal_floor,
-            rollups: self.rollups.clone(),
+            declared: self.declared.clone(),
             pending_measurement_drops: self.pending_measurement_drops.clone(),
             manifest_seq: self.manifest_seq,
             next_segment_id: self.next_segment_id,
@@ -1459,9 +1532,8 @@ impl SegmentCatalog {
     /// error from `add_segment` told the flush that registering the segment
     /// had failed — and the flush answers that by **deleting the segment
     /// files it just wrote**, while the catalog entry naming them is already
-    /// durable. The next `open()` then refuses the database outright,
-    /// because a catalog that names a file which is not there is one pass 53
-    /// taught it not to trust.
+    /// durable, and the next `open()` would refuse a catalog naming a missing
+    /// file.
     ///
     /// So it is logged and retried: `changes_since_snapshot` is left where it
     /// is, so the next mutation attempts it again, and a longer log costs
@@ -1506,11 +1578,11 @@ struct CatalogSnapshot {
     /// See [`SegmentCatalog::wal_floor`].
     #[serde(default)]
     wal_floor: u64,
-    /// Rollup definitions and their materialisation state, by name. Opaque
+    /// Declarations (rollups, detectors) and their state, by kind and name. Opaque
     /// bytes: the catalog is where they are durable, the facade is where
     /// they mean something.
     #[serde(default)]
-    rollups: BTreeMap<String, RollupRecord>,
+    declared: BTreeMap<(DeclaredKind, String), DeclaredRecord>,
     /// See [`SegmentCatalog::pending_measurement_drops`].
     #[serde(default)]
     pending_measurement_drops: BTreeMap<String, u64>,
@@ -1540,6 +1612,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn open_read_only_reads_the_log_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat_dir = dir.path().join("catalog");
+        {
+            let mut cat = SegmentCatalog::new(&cat_dir).unwrap();
+            cat.add_segment(test_entry(1, 0, 0, 10)).unwrap();
+            cat.add_segment(test_entry(2, 0, 10, 20)).unwrap();
+            cat.set_wal_floor(42).unwrap();
+            cat.sync_manifest().unwrap();
+        }
+        let listing = |d: &Path| {
+            let mut v: Vec<(String, u64)> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().unwrap().len(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = listing(&cat_dir);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cat_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let cat = SegmentCatalog::open_read_only(&cat_dir).unwrap();
+        assert_eq!(cat.segment_count(), 2);
+        assert_eq!(cat.wal_floor(), 42);
+        drop(cat);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cat_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(
+            listing(&cat_dir),
+            before,
+            "a read-only open changed the directory"
+        );
+
+        let missing = dir.path().join("nope");
+        let err = SegmentCatalog::open_read_only(&missing).unwrap_err();
+        assert!(matches!(err, IndexError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound));
+        assert!(!missing.exists(), "a read-only open created a directory");
+    }
+
     /// Set the manifest log's remaining byte budget for this thread.
     fn set_disk_budget(bytes: i64) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
         MANIFEST_DISK_BUDGET.with(|b| {
@@ -1551,14 +1676,9 @@ mod tests {
     /// **A failed manifest append must lose the transition it failed on, and
     /// nothing else.**
     ///
-    /// The shape this reproduces is the one an embedded gateway on flash
-    /// actually meets: the disk fills, an append fails part-way, a retention
-    /// pass frees space, and the next append succeeds. The fragment the
-    /// failure left is then *mid-stream*, and replay used to read it as the
-    /// end of the log — returning `Ok` while **silently discarding every
-    /// transition after it**. Those transitions had been acknowledged, and
-    /// `open()`'s orphan sweep deletes the segment files a restored catalog
-    /// no longer names, so the silence ended in deleted data.
+    /// The disk fills, an append fails part-way, space is freed, and the next
+    /// append succeeds: every transition after the failure must survive
+    /// replay.
     ///
     /// Driven through the real write path rather than by writing a fragment
     /// by hand: the question is what the *writer* leaves behind, and a
@@ -1677,10 +1797,8 @@ mod tests {
 
     /// A compaction is **one** fsync, whatever it retires.
     ///
-    /// It used to be one per append: the output, one per input segment, and
-    /// the `Compacted` record — six for a four-segment merge, and compaction
-    /// runs every maintenance interval. On the flash the design partner
-    /// writes to, the fsync rate is the wear rate.
+    /// On flash the fsync rate is the wear rate, and compaction runs every
+    /// maintenance interval.
     #[test]
     fn a_compaction_costs_one_manifest_fsync() {
         let dir = tempfile::tempdir().unwrap();
@@ -1742,6 +1860,79 @@ mod tests {
             25,
             "every tombstone survived the reopen"
         );
+    }
+
+    /// Declarations of both kinds round-trip through manifest replay and
+    /// through a snapshot, and the per-kind views see only their own kind.
+    #[test]
+    fn declarations_of_every_kind_survive_replay_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = SegmentCatalog::new(dir.path()).unwrap();
+        catalog
+            .set_declared(DeclaredKind::Rollup, "power_1h", vec![1])
+            .unwrap();
+        catalog
+            .set_declared_state(DeclaredKind::Rollup, "power_1h", vec![2])
+            .unwrap();
+        // The same name in another kind is another declaration.
+        catalog
+            .set_declared(DeclaredKind::Detector, "power_1h", vec![3])
+            .unwrap();
+        catalog
+            .set_declared_state(DeclaredKind::Detector, "power_1h", vec![4])
+            .unwrap();
+        catalog
+            .set_declared(DeclaredKind::Detector, "gone", vec![5])
+            .unwrap();
+        assert!(
+            catalog
+                .remove_declared(DeclaredKind::Detector, "gone")
+                .unwrap()
+        );
+        assert!(
+            !catalog
+                .remove_declared(DeclaredKind::Detector, "gone")
+                .unwrap()
+        );
+
+        let check = |c: &SegmentCatalog| {
+            let rollups: Vec<_> = c.rollups().collect();
+            assert_eq!(rollups.len(), 1);
+            assert_eq!(rollups[0].0, "power_1h");
+            assert_eq!(rollups[0].1.definition, [1]);
+            assert_eq!(rollups[0].1.state, [2]);
+            let detectors: Vec<_> = c.detectors().collect();
+            assert_eq!(detectors.len(), 1, "the removed detector stays removed");
+            assert_eq!(detectors[0].1.definition, [3]);
+            assert_eq!(detectors[0].1.state, [4]);
+        };
+        check(&catalog);
+        drop(catalog);
+        let mut replayed = SegmentCatalog::open(dir.path()).unwrap();
+        check(&replayed);
+        replayed.force_snapshot().unwrap();
+        drop(replayed);
+        check(&SegmentCatalog::open(dir.path()).unwrap());
+    }
+
+    /// One declaration's state is capped: every open reads all of them.
+    #[test]
+    fn an_oversized_declared_state_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = SegmentCatalog::new(dir.path()).unwrap();
+        let err = catalog
+            .set_declared_state(
+                DeclaredKind::Detector,
+                "big",
+                vec![0; MAX_DECLARED_STATE_BYTES + 1],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, IndexError::DeclaredStateTooLarge { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("detector 'big'"), "{err}");
+        assert_eq!(catalog.detectors().count(), 0, "nothing was persisted");
     }
 
     /// A single mutation still syncs on its own — the batching is opt-in, and

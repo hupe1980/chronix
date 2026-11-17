@@ -59,6 +59,12 @@ pub enum QueryPlan {
         /// segment belongs to this namespace — providing defense-in-depth
         /// even if the tag filter injection is bypassed.
         namespace_id: Option<String>,
+        /// Fields whose **presence** is projected rather than their values:
+        /// only rows where each holds a value are returned, and the column
+        /// carries presence, not values — its values are zeroes. Answered
+        /// from each block's validity bitmap and statistics, so it never
+        /// decodes or decrypts the field. See [`QueryBuilder::present`].
+        presence: Vec<String>,
     },
     /// Aggregate results from a scan.
     Aggregate {
@@ -144,6 +150,8 @@ pub struct QueryBuilder {
     namespace_id: Option<String>,
     /// Estimated group-key cardinality from segment stats.
     estimated_cardinality: Option<usize>,
+    /// See [`QueryBuilder::present`].
+    presence: Vec<String>,
 }
 
 impl QueryBuilder {
@@ -165,6 +173,7 @@ impl QueryBuilder {
             window_value_column: None,
             namespace_id: None,
             estimated_cardinality: None,
+            presence: Vec::new(),
         }
     }
 
@@ -201,6 +210,32 @@ impl QueryBuilder {
     #[must_use]
     pub fn field(mut self, name: impl Into<String>) -> Self {
         self.fields.push(name.into());
+        self
+    }
+
+    /// Keep only the rows where `field` holds a value, without reading its
+    /// values.
+    ///
+    /// The question a label dropdown asks — "which series of this metric have
+    /// data in this window?" — answered from what each segment stores beside
+    /// the values: a row group with no value of the field is skipped without
+    /// I/O, and the rest read the block's validity bitmap. Nothing is
+    /// decompressed or decrypted, so it is cheap on every keystroke and works
+    /// on an encrypted field without its key.
+    ///
+    /// The `field` column is in the result with its own type, but **its
+    /// values are not the field's**: every row is present by construction,
+    /// and the values are zeroes. Project the field with
+    /// [`field`](Self::field) in a separate query when the values matter.
+    #[must_use]
+    pub fn present(mut self, field: impl Into<String>) -> Self {
+        let field = field.into();
+        if !self.fields.contains(&field) {
+            self.fields.push(field.clone());
+        }
+        if !self.presence.contains(&field) {
+            self.presence.push(field);
+        }
         self
     }
 
@@ -390,6 +425,7 @@ impl QueryBuilder {
             time_range,
             field_predicates: Vec::new(),
             namespace_id: self.namespace_id,
+            presence: self.presence,
         };
 
         // Reject ambiguous combination of downsample + aggregate.
@@ -487,6 +523,18 @@ pub fn extract_namespace(plan: &QueryPlan) -> Option<&str> {
         | QueryPlan::Downsample { source, .. }
         | QueryPlan::Limit { source, .. }
         | QueryPlan::Window { source, .. } => extract_namespace(source),
+    }
+}
+
+/// The presence-only fields of the underlying `Scan` plan.
+#[must_use]
+pub fn extract_presence(plan: &QueryPlan) -> &[String] {
+    match plan {
+        QueryPlan::Scan { presence, .. } => presence,
+        QueryPlan::Aggregate { source, .. }
+        | QueryPlan::Downsample { source, .. }
+        | QueryPlan::Limit { source, .. }
+        | QueryPlan::Window { source, .. } => extract_presence(source),
     }
 }
 

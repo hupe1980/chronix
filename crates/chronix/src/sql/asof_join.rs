@@ -155,15 +155,9 @@ impl AsofJoinExec {
         let left_schema = left.schema();
         let right_schema = right.schema();
 
-        // Every join key must exist on **both** sides, and be a string.
-        //
-        // This used to be resolved with `schema.index_of(tag).ok()`, so a key
-        // that was absent — a typo, or a column one side does not have —
-        // became `None` on both sides, and `None == None` compared equal.
-        // The key silently matched *everything*: `asof_join(cpu, mem,
-        // ["hostname"])` where the column is `host` returned a full
-        // nearest-timestamp join across unrelated series, with no error and
-        // no empty result to notice.
+        // Every join key must exist on both sides and be a string. An absent key
+        // must not resolve to `None` on both sides, where `None == None` would
+        // match every row of unrelated series.
         for side in [("left", &left_schema), ("right", &right_schema)] {
             let (which, schema) = side;
             if schema.index_of(time_col).is_err() {
@@ -288,13 +282,9 @@ impl ExecutionPlan for AsofJoinExec {
 
     /// Both inputs must arrive as one partition.
     ///
-    /// The right side is materialised whole and searched for *every* left row,
-    /// so a partitioned right side is not a partitioned join — it is a join
-    /// against a fraction of the data. `execute` used to take its own
-    /// partition number and pass it to both children, which silently dropped
-    /// every partition but that one on each side. Declaring the requirement
-    /// makes DataFusion insert the coalesce, instead of leaving the operator
-    /// to be wrong when the plan happens to be parallel.
+    /// The right side is materialised whole and searched for every left row, so
+    /// a partitioned right side would be a join against a fraction of the data.
+    /// Declaring the requirement makes DataFusion insert the coalesce.
     fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
         vec![
             datafusion::physical_plan::Distribution::SinglePartition,
@@ -380,14 +370,8 @@ impl AsofJoinStream {
         }
     }
 
-    /// Drive the stream to completion and collect it.
-    ///
-    /// This is a *collect over the stream*, not a second implementation of
-    /// the join. It used to be the latter: the same "buffer the right, then
-    /// walk the left" state machine written twice, once here as an `async fn`
-    /// and once in `poll_next`, so a fix to one silently did not apply to the
-    /// other. Two implementations of one semantic is the bug class this tree
-    /// has paid for most often.
+    /// Drive the stream to completion and collect it — a collect over the
+    /// stream, not a second implementation of the join.
     async fn execute_batch(self) -> DFResult<Vec<RecordBatch>> {
         use futures::TryStreamExt;
         let batches: Vec<RecordBatch> = Box::pin(self).try_collect().await?;
@@ -1307,12 +1291,9 @@ mod defect_tests {
         MemorySourceConfig::try_new_exec(batches, schema, None).unwrap()
     }
 
-    /// A join key that is not on both sides must be refused.
-    ///
-    /// It used to be resolved with `index_of(..).ok()`, so a key absent from
-    /// both sides was `None` on both sides and `None == None` compared equal —
-    /// the key matched **every** row, silently, and a mistyped column name
-    /// turned an ASOF join into a nearest-timestamp cross join.
+    /// A join key that is not on both sides must be refused: `None == None`
+    /// would otherwise match every row, turning a mistyped column into a
+    /// nearest-timestamp cross join.
     #[test]
     fn a_join_key_missing_from_a_side_is_refused() {
         let left = plan_of(&[vec![batch(&[1], &["a"], &[1.0])]]);
@@ -1346,11 +1327,8 @@ mod defect_tests {
         assert!(AsofJoinExec::try_new(left, right, "ts", vec![], 1_000).is_err());
     }
 
-    /// A partitioned right input must be joined against in full.
-    ///
-    /// `execute` used to pass its own partition number to both children, so a
-    /// right side split across N partitions contributed one of them and the
-    /// rest of the matches simply did not happen — a silently incomplete join.
+    /// A partitioned right input must be joined against in full; joining one
+    /// partition would silently drop the other partitions' matches.
     #[tokio::test]
     async fn a_partitioned_input_is_joined_in_full() {
         // Left: three rows in one partition. Right: the matching rows split

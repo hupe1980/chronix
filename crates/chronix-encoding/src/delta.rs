@@ -21,26 +21,16 @@
 //! fallback bucket, resulting in *worse* compression than raw storage
 //! (68 bits vs. 64 bits per value, plus header overhead).
 //!
-//! **Prefer instead:**
-//! - [`Gorilla`](crate::gorilla) / [`Chimp`](crate::chimp) XOR encoding
-//!   for floating-point value columns — they exploit the bitwise
-//!   similarity of consecutive IEEE 754 values.
-//! - [`RLE`](crate::rle) for columns with many consecutive repeated
-//!   values (e.g., status codes, boolean flags).
-//! - [`IntegerEncoder`](crate::integer) (delta + ZigZag) for general
-//!   integer columns that may not be monotonic.
-//!
-//! The [`AdaptiveSelector`](crate::adaptive::AdaptiveSelector) in the
-//! unified encoder automatically samples data and picks the best
-//! encoding, so callers using [`ColumnEncoder`](crate::unified::ColumnEncoder)
-//! do not need to make this choice manually.
+//! Timestamps default to pco, which beats this codec on jittered samplers;
+//! [`ColumnEncoder`](crate::unified::ColumnEncoder) picks per block, so callers
+//! do not choose manually.
 //!
 //! ## Encoding scheme
 //!
 //! | Delta-of-delta value     | Prefix bits | Value bits | Total bits |
 //! |--------------------------|-------------|------------|------------|
 //! | 0                        | `0`         | 0          | 1          |
-//! | −064..=63                 | `10`        | 7          | 9          |
+//! | −64..=63                 | `10`        | 7          | 9          |
 //! | −256..=255               | `110`       | 9          | 12         |
 //! | −2048..=2047             | `1110`      | 12         | 16         |
 //! | anything else            | `1111`      | 64         | 68         |
@@ -488,13 +478,10 @@ mod tests {
         );
     }
 
-    /// Regression test for the `DoD` boundary bug: values at the exact
-    /// `ZigZag` bit-width boundaries must roundtrip correctly.
-    /// Previously, ranges were `-63..=64`, `-255..=256`, `-2047..=2048`
-    /// which silently truncated the positive boundary values.
+    /// Values at the exact `ZigZag` bit-width boundaries must round-trip.
     #[test]
     fn roundtrip_dod_boundary_values() {
-        // DoD of exactly 64 (was corrupted to 0)
+        // DoD of exactly 64
         let ts_64 = vec![0_i64, 0, 64];
         let encoded = DeltaOfDeltaEncoder::encode(&ts_64).unwrap();
         let decoded = DeltaOfDeltaDecoder::decode(&encoded).unwrap();
@@ -512,7 +499,7 @@ mod tests {
         let decoded = DeltaOfDeltaDecoder::decode(&encoded).unwrap();
         assert_eq!(ts_63, decoded, "DoD=63 boundary failed");
 
-        // DoD of exactly 256 (was corrupted to 0)
+        // DoD of exactly 256
         let ts_256 = vec![0_i64, 0, 256];
         let encoded = DeltaOfDeltaEncoder::encode(&ts_256).unwrap();
         let decoded = DeltaOfDeltaDecoder::decode(&encoded).unwrap();
@@ -530,7 +517,7 @@ mod tests {
         let decoded = DeltaOfDeltaDecoder::decode(&encoded).unwrap();
         assert_eq!(ts_255, decoded, "DoD=255 boundary failed");
 
-        // DoD of exactly 2048 (was corrupted to 0)
+        // DoD of exactly 2048
         let ts_2048 = vec![0_i64, 0, 2048];
         let encoded = DeltaOfDeltaEncoder::encode(&ts_2048).unwrap();
         let decoded = DeltaOfDeltaDecoder::decode(&encoded).unwrap();

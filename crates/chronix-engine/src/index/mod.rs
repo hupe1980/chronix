@@ -25,7 +25,9 @@ pub mod series_index;
 pub mod zone_map;
 
 pub use bloom::SeriesBloomFilter;
-pub use catalog::{CatalogColumnStats, SegmentCatalog, SegmentCatalogEntry};
+pub use catalog::{
+    CatalogColumnStats, DeclaredKind, DeclaredRecord, SegmentCatalog, SegmentCatalogEntry,
+};
 pub use error::IndexError;
 pub use inverted::TagInvertedIndex;
 pub use zone_map::{

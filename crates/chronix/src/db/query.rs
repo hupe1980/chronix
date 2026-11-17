@@ -25,6 +25,8 @@ pub(super) struct SegmentFilterCtx<'a> {
     pub(super) time_range: &'a chronix_query::plan::TimeRange,
     pub(super) tag_filter_refs: &'a [(&'a str, &'a str)],
     pub(super) field_predicates: &'a [chronix_engine::segment::FieldPredicate],
+    /// Fields read as presence only; see `QueryBuilder::present`.
+    pub(super) presence: &'a [String],
     pub(super) measurement: &'a str,
     pub(super) projection: &'a [String],
     pub(super) plan: &'a QueryPlan,
@@ -46,14 +48,10 @@ pub(super) struct SegmentFilterCtx<'a> {
 
 /// The Arrow field-metadata key that carries a column's role.
 ///
-/// Read by `chronixd`'s HTTP, gRPC and Flight SQL result encoders, and by the
+/// Read by `chronixd`'s HTTP, gRPC and Flight SQL encoders and by the
 /// series-key extractor. Public so an embedded caller reading batches from
-/// `execute_iter` can tell a tag from a string field without guessing.
-///
-/// **Re-exported, not re-declared.** The writer that stamps this metadata
-/// lives in `chronix-engine`; this used to be a second `const` with the same
-/// spelling, beside three string literals that also spelled it out. One key
-/// written in five places is one key that can drift in four of them.
+/// `execute_iter` can tell a tag from a string field. Re-exported from
+/// `chronix-engine`, which writes it, so there is one spelling.
 pub use chronix_engine::segment::metadata::roles::ARROW_ROLE_KEY as ROLE_KEY;
 
 /// `role` metadata for one column.
@@ -389,12 +387,18 @@ impl super::Chronix {
             if available.is_empty() {
                 return Ok(None);
             }
-            // Zone-map field predicate pushdown.
-            reader.read_projected_with_zone_maps(
+            // A segment that predates a presence field holds no value of it.
+            let presence: Vec<&str> = ctx.presence.iter().map(String::as_str).collect();
+            if presence.iter().any(|p| !available.contains(p)) {
+                return Ok(None);
+            }
+            // Zone-map field predicate pushdown, and presence-only reads.
+            reader.read_projected_with_presence(
                 &available,
                 time_range_ns,
                 ctx.tag_filter_refs,
                 ctx.field_predicates,
+                &presence,
             )?
         } else {
             reader.read_projected_with_zone_maps(
@@ -443,6 +447,7 @@ impl super::Chronix {
     pub(super) fn load_catalog_state(
         catalog: &SegmentCatalog,
         segments_dir: &std::path::Path,
+        rewrite_sidecars: bool,
     ) -> (
         BTreeMap<u64, SeriesBloomFilter>,
         TagInvertedIndex,
@@ -458,7 +463,11 @@ impl super::Chronix {
             if entry.state != SegmentState::Active {
                 continue;
             }
-            let keys = Self::series_keys_of(&entry.file.resolve(segments_dir), &entry.measurement);
+            let keys = Self::series_keys_with(
+                &entry.file.resolve(segments_dir),
+                &entry.measurement,
+                rewrite_sidecars,
+            );
             Self::index_series_keys(&mut blooms, &tag_index, entry.segment_id, &keys);
             for key in &keys {
                 known.insert(key.canonical_form().to_string());
@@ -476,6 +485,16 @@ impl super::Chronix {
     /// rebuilt from the segment's tag columns once and rewritten; a segment
     /// that cannot be opened at all yields nothing.
     pub(super) fn series_keys_of(path: &std::path::Path, measurement: &str) -> Vec<SeriesKey> {
+        Self::series_keys_with(path, measurement, true)
+    }
+
+    /// [`series_keys_of`](Self::series_keys_of), with the sidecar rewrite
+    /// optional: a read-only open recovers the keys and writes nothing.
+    pub(super) fn series_keys_with(
+        path: &std::path::Path,
+        measurement: &str,
+        rewrite: bool,
+    ) -> Vec<SeriesKey> {
         use chronix_engine::index::series_index;
         match series_index::SegmentStamp::read(path)
             .and_then(|stamp| series_index::read(path, stamp))
@@ -487,7 +506,7 @@ impl super::Chronix {
                     error = %e,
                     "series index unreadable — rebuilding it from the segment"
                 );
-                Self::rebuild_series_index(path, measurement).unwrap_or_default()
+                Self::rebuild_series_index(path, measurement, rewrite).unwrap_or_default()
             }
         }
     }
@@ -511,7 +530,11 @@ impl super::Chronix {
 
     /// Recover a segment's series list from its tag columns and rewrite the
     /// sidecar. Returns `None` if the segment itself cannot be read.
-    fn rebuild_series_index(path: &std::path::Path, measurement: &str) -> Option<Vec<SeriesKey>> {
+    fn rebuild_series_index(
+        path: &std::path::Path,
+        measurement: &str,
+        rewrite: bool,
+    ) -> Option<Vec<SeriesKey>> {
         use chronix_engine::index::series_index;
         use chronix_engine::segment::metadata::roles;
 
@@ -537,7 +560,7 @@ impl super::Chronix {
         };
         let keys = Self::extract_series_keys_from_batch(&batch, measurement);
         let stamp = series_index::SegmentStamp::of(reader.header());
-        if let Err(e) = series_index::write(path, &keys, stamp) {
+        if rewrite && let Err(e) = series_index::write(path, &keys, stamp) {
             warn!(segment = %path.display(), error = %e, "Could not rewrite the series index");
         }
         Some(keys)
@@ -616,9 +639,8 @@ impl super::Chronix {
             .map_err(|e| DbError::InvalidRequest(format!("invalid series key: {e}")))?;
 
         // Tombstones are checked per timestamp, below, against every candidate
-        // this function considers. A series-level check used to stand here
-        // instead and return `None` outright, which made a delete of any single
-        // hour of a series hide the series' newest point forever.
+        // this function considers: deleting one hour of a series must not hide its
+        // newest point.
         let canonical = key.canonical_form().to_string();
         // Segment rows only: the memtable's points postdate every tombstone.
         let masked = |ts: i64, segment: u64| {
@@ -881,26 +903,14 @@ impl super::Chronix {
             .map_err(|e| DbError::Internal(format!("Failed to create point: {e}")))
     }
 
-    /// Convert a `MeasurementSchema` to an Arrow `Schema`.
-    ///
-    /// If `projection` is non-empty, only the timestamp and projected fields
-    /// (plus tags) are included.
     /// Rewrite a scan batch's schema so every column says what it *is*.
     ///
-    /// The producers — the memtable's builder, the segment reader, the
-    /// compaction writer — build an Arrow schema from a column's *type*, and
-    /// a role is not a type: a tag and a string field are both `Utf8`. The
-    /// role was known at write time, dropped here, and then guessed again by
-    /// four consumers with three different guesses. The HTTP and gRPC query
-    /// APIs guessed "not tag", so every tag came back as a field and `tags`
-    /// was always empty; Flight SQL guessed "not field", so a string *field*
-    /// came back as a tag; and the series-key extractor guessed the same way,
-    /// which puts a string field into a `SeriesKey`.
-    ///
-    /// So the role is stamped once, here, from the registry that owns it, and
-    /// the consumers read it. It costs a `Schema` per batch — the column
-    /// arrays are shared, not copied — and it makes the batch self-describing
-    /// for an external Flight SQL client too.
+    /// Producers build the Arrow schema from a column's type, and a tag and a
+    /// string field are both `Utf8`. The role is stamped once, here, from the
+    /// registry that owns it, so every consumer — the HTTP, gRPC and Flight
+    /// SQL encoders and the series-key extractor — reads it rather than
+    /// guessing. It costs one `Schema` per batch (the arrays are shared) and
+    /// makes the batch self-describing for an external Flight SQL client.
     pub(super) fn stamp_roles(&self, measurement: &str, batch: RecordBatch) -> RecordBatch {
         let Some(ms) = self.schema(measurement) else {
             return batch;
@@ -938,6 +948,10 @@ impl super::Chronix {
         RecordBatch::try_new(stamped, batch.columns().to_vec()).unwrap_or(batch)
     }
 
+    /// Convert a `MeasurementSchema` to an Arrow `Schema`.
+    ///
+    /// If `projection` is non-empty, only the timestamp and projected fields
+    /// (plus tags) are included.
     pub(super) fn measurement_to_arrow_schema(
         ms: &MeasurementSchema,
         projection: &[String],

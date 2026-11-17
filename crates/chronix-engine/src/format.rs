@@ -1,77 +1,68 @@
 //! The on-disk format versions, and the one rule for checking them.
 //!
-//! Chronix writes four durable formats and every one of them used to carry
-//! its own version constant, its own comparison and its own error text:
-//!
-//! - the `.csx` segment header refused anything but an exact match, and said
-//!   so through a dedicated `UnsupportedVersion` variant;
-//! - the WAL file header refused anything but an exact match, as an
-//!   `InvalidHeader`;
-//! - the `.series` sidecar refused anything but an exact match and reported
-//!   it as **`Corrupt`** — which points an operator at a failing disk when
-//!   what actually happened is that they upgraded chronix;
-//! - and the catalog snapshot refused only a **newer** version, silently
-//!   accepting an older one it has no code to interpret.
-//!
-//! That last one is an asymmetry nobody decided. The three others agree that
-//! a version is an identity, not an ordering: there is no partial reader for
-//! a superseded layout, because the layouts were superseded before anyone
-//! could have data under them.
+//! Chronix writes four durable formats — `.csx` segments, the WAL, the catalog
+//! snapshot and the `.series` sidecar — and checks all four the same way.
 //!
 //! # The rule
 //!
 //! **A format version is checked for equality, in both directions, and a
-//! mismatch is its own error — never corruption.** The two are different
-//! facts with different remedies: corruption means the bytes are damaged and
-//! the answer is a restore; a version mismatch means the software and the
-//! directory disagree about the layout and the answer is to match them up.
+//! mismatch is its own error — never corruption.** Corruption means the bytes
+//! are damaged and the answer is a restore; a version mismatch means the
+//! software and the directory disagree about the layout, and the answer is to
+//! match them up. There is no reader for another generation and no migration:
+//! a directory from another generation is refused by name, with the remedy in
+//! the message.
 //!
-//! # Changing a format
+//! # Generations
 //!
-//! Bump the constant here **and** state the break in `CHANGELOG.md`. There is
-//! deliberately no migration: chronix reads exactly the generation it writes,
-//! and a directory from another generation is refused by name with the
-//! remedy in the message. That is a decision with an expiry date — it holds
-//! only while the project is willing to tell a consumer to recreate their
-//! data directory, which is a promise 1.0 will have to replace.
+//! The four versions move together, so a directory belongs to one
+//! *generation*:
 //!
-//! **Bump it when the bytes change, not before.** The version exists to make
-//! a foreign directory *legible*: without a bump, an old directory has
-//! matching magic and a matching version, so the reader proceeds into a
-//! layout it does not understand and the failure arrives as a CRC error, a
-//! bounds check or a decode error — which is exactly the "report a version
-//! mismatch as corruption" confusion this module exists to remove. A bump
-//! with no layout change is the mirror mistake: it invalidates every
-//! directory in exchange for nothing. All four are still at **1** because
-//! nothing has changed the bytes yet; the format-changing work is batched so
-//! they move together, once.
+//! | Generation | Written by |
+//! |---|---|
+//! | 1 | chronix 0.7 and earlier |
+//! | 2 | chronix 0.8 and later — **frozen** |
+//!
+//! Generation 2 is frozen: a minor release does nothing to a data directory.
+//! A version moves only when the bytes change, all four together, and the
+//! change is stated in `CHANGELOG.md`.
 
 /// `.csx` segment files.
-pub const SEGMENT_FORMAT_VERSION: u16 = 1;
+pub const SEGMENT_FORMAT_VERSION: u16 = 2;
 
 /// Write-ahead log files.
-pub const WAL_FORMAT_VERSION: u16 = 1;
+pub const WAL_FORMAT_VERSION: u16 = 2;
 
 /// The catalog manifest snapshot.
-pub const CATALOG_FORMAT_VERSION: u32 = 1;
+pub const CATALOG_FORMAT_VERSION: u32 = 2;
 
 /// The per-segment `.series` sidecar.
-pub const SERIES_INDEX_FORMAT_VERSION: u8 = 1;
+pub const SERIES_INDEX_FORMAT_VERSION: u8 = 2;
 
 /// What to tell somebody whose directory this build cannot read.
 ///
-/// The message an operator meets before they have any other information, so
-/// it names the thing, both versions, and what to do — rather than a bare
-/// number, which is what three of the four used to print.
+/// It names the thing, both generations and what to do, because it is the
+/// first message an operator sees after an upgrade.
 #[must_use]
 pub fn version_mismatch(what: &str, found: u64, expected: u64) -> String {
     format!(
-        "{what} is format version {found}, and this build of chronix reads \
-         version {expected}. Chronix has no on-disk migration: a data \
-         directory belongs to one format generation. Either run the version \
-         of chronix that wrote it, or start a new data directory and re-ingest \
-         — see the release notes for the version that changed it."
+        "{what} is format generation {found} ({}), and this build of chronix \
+         reads generation {expected} ({}). Chronix has no on-disk migration: a \
+         data directory belongs to one generation. Either run the chronix that \
+         wrote it, or start a new data directory and re-ingest into it.",
+        written_by(found),
+        written_by(expected),
     )
+}
+
+/// Which releases write a generation, in words an operator can act on.
+#[must_use]
+pub fn written_by(generation: u64) -> &'static str {
+    match generation {
+        1 => "chronix 0.7 and earlier",
+        2 => "chronix 0.8 and later",
+        _ => "a chronix newer than this one",
+    }
 }
 
 /// Check a format version, returning the message to report on a mismatch.
@@ -94,8 +85,7 @@ mod tests {
 
     #[test]
     fn an_older_version_is_refused_as_firmly_as_a_newer_one() {
-        // The catalog used to accept an older snapshot, having no code to
-        // interpret one. Both directions are a mismatch.
+        // Both directions are a mismatch: there is no reader for an older one.
         assert!(check("a catalog", 1, 2).is_some());
         assert!(check("a catalog", 3, 2).is_some());
     }
@@ -103,8 +93,13 @@ mod tests {
     #[test]
     fn the_message_names_the_remedy_not_just_the_number() {
         let m = check("the WAL", 1, 2).expect("mismatch");
-        assert!(m.contains("version 1"), "{m}");
-        assert!(m.contains("version 2"), "{m}");
+        assert!(m.contains("generation 1"), "{m}");
+        assert!(m.contains("generation 2"), "{m}");
+        assert!(
+            m.contains("chronix 0.7 and earlier"),
+            "names who wrote it: {m}"
+        );
+        assert!(m.contains("chronix 0.8 and later"), "{m}");
         assert!(
             m.contains("re-ingest") || m.contains("new data directory"),
             "a version mismatch is the first error an operator meets; it has \

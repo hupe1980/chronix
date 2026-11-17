@@ -3,12 +3,22 @@
 debug
 target
 
-# Internal-only documents (not published) — the architecture notes and the backlog
+# Internal architecture notes (see concepts/README.md), anchored to the repository
+# root. ROADMAP.md is the spec of specs: every open item names its feature specification.
+#
+# The third-party corpus — papers, protocol specifications and .proto definitions —
+# lives at `concepts/reference/` and is covered by this line: copyrighted, and indexed
+# with what each is used for in `concepts/REFERENCES.md` so the folder can be rebuilt.
 /concepts/
 
-# Third-party specifications, protocol definitions and papers (copyrighted;
-# indexed with retrieval URLs in concepts/REFERENCES.md so the folder can be rebuilt).
+# This project's own feature specifications, and the Spec Kit machinery that produces
+# them: one `specs/NNN-slug/` per ROADMAP item, `.specify/memory/constitution.md`, and
+# the `/speckit-*` skills. Same rule as `concepts/` — internal, and the published tree
+# may not cite a path its reader does not have; scripts/concepts-check.sh fails on one
+# that does. Matching eebus, agentplane and nuvec.
 /specs/
+/.specify/
+/.claude/
 
 # Feedback for sibling crates (bug reports / feature requests; always internal — sent to their teams)
 *_FEEDBACK.md

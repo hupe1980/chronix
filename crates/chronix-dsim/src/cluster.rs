@@ -162,7 +162,12 @@ impl SimCluster {
                 }
             }
             if tokio::time::Instant::now() > deadline {
-                panic!("no leader elected within 5s");
+                // A simulation harness: an election that never completes is the
+                // failure the run exists to report, so it ends the run.
+                #[allow(clippy::panic)]
+                {
+                    panic!("no leader elected within 5s");
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

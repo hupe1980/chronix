@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 keywords = ["timeseries", "query", "database", "arrow", "sql"]
 categories = ["database-implementations"]
-homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 license.workspace = true

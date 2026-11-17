@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use rayon::prelude::*;
+use crate::par;
 
 use crate::compute::CpuEngine;
 
@@ -49,11 +49,7 @@ pub fn batch_fit<D: AnomalyDetector + Send>(
         )))];
     }
     let _start = std::time::Instant::now();
-    let results: Vec<_> = detectors
-        .par_iter_mut()
-        .zip(data.par_iter())
-        .map(|(det, (ts, vals))| det.fit(ts, vals))
-        .collect();
+    let results = par::map_zip_mut(detectors, data, |det, (ts, vals)| det.fit(ts, vals));
     metrics::histogram!("chronix_anomaly_batch_fit_duration_seconds")
         .record(_start.elapsed().as_secs_f64());
     results
@@ -79,11 +75,7 @@ pub fn batch_detect<D: AnomalyDetector + Send>(
         )))];
     }
     let _start = std::time::Instant::now();
-    let results: Vec<_> = detectors
-        .par_iter_mut()
-        .zip(data.par_iter())
-        .map(|(det, (ts, vals))| det.detect(ts, vals))
-        .collect();
+    let results = par::map_zip_mut(detectors, data, |det, (ts, vals)| det.detect(ts, vals));
     metrics::histogram!("chronix_anomaly_batch_detect_duration_seconds")
         .record(_start.elapsed().as_secs_f64());
     results
@@ -102,14 +94,11 @@ where
     F: Fn() -> D + Sync,
 {
     let _start = std::time::Instant::now();
-    let results: Vec<_> = data
-        .par_iter()
-        .map(|(ts, vals)| {
-            let mut det = factory();
-            det.fit(ts, vals)?;
-            det.detect(ts, vals)
-        })
-        .collect();
+    let results = par::map(data, |(ts, vals)| {
+        let mut det = factory();
+        det.fit(ts, vals)?;
+        det.detect(ts, vals)
+    });
     metrics::histogram!("chronix_anomaly_batch_fit_detect_duration_seconds")
         .record(_start.elapsed().as_secs_f64());
     results
@@ -157,10 +146,9 @@ pub fn batch_detect_zscore(
     let threshold = threshold.unwrap_or(3.0);
     let _start = std::time::Instant::now();
 
-    let results: Vec<_> = data
-        .par_iter()
-        .map(|(ts, vals)| detect_zscore_engine(engine, ts, vals, threshold))
-        .collect();
+    let results = par::map(data, |(ts, vals)| {
+        detect_zscore_engine(engine, ts, vals, threshold)
+    });
 
     metrics::histogram!("chronix_anomaly_batch_detect_zscore_duration_seconds")
         .record(_start.elapsed().as_secs_f64());
@@ -186,10 +174,7 @@ pub fn batch_detect_iqr(
     let k = k.unwrap_or(1.5);
     let _start = std::time::Instant::now();
 
-    let results: Vec<_> = data
-        .par_iter()
-        .map(|(ts, vals)| detect_iqr_batch(ts, vals, k))
-        .collect();
+    let results = par::map(data, |(ts, vals)| detect_iqr_batch(ts, vals, k));
 
     metrics::histogram!("chronix_anomaly_batch_detect_iqr_duration_seconds")
         .record(_start.elapsed().as_secs_f64());

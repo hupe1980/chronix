@@ -9,7 +9,6 @@ repository.workspace = true
 rust-version.workspace = true
 keywords = ["timeseries", "database", "tsdb", "metrics"]
 categories = ["database-implementations", "data-structures"]
-homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
@@ -24,12 +23,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 doctest = false
 
 [features]
-## `TryFrom` conversions between [`Decimal`] and `rust_decimal::Decimal`.
-##
-## Off by default — nothing in Chronix needs it, and this is the crate every
-## other crate depends on. The ranges differ: `rust_decimal` is a 96-bit
-## mantissa with scale 0..=28, Chronix 128-bit with scale 0..=38, so the
-## conversion into Chronix always succeeds and the one out can fail.
+## `TryFrom` conversions between [`Decimal`] and `rust_decimal::Decimal`. Off by
+## default. Conversion into Chronix (128-bit, scale ≤ 38) always succeeds; out of it
+## (96-bit, scale ≤ 28) can fail.
 rust_decimal = ["dep:rust_decimal"]
 
 [dependencies]

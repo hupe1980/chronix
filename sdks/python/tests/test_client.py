@@ -606,6 +606,56 @@ async def test_backpressure_is_retryable_and_says_how_long(mock_api):
 
 
 @pytest.mark.asyncio
+async def test_a_query_error_carries_the_hint_and_span(mock_api):
+    query = "SELECT * FROM cpu_usge"
+    mock_api.post("/api/v1/chronix/sql").respond(
+        status_code=400,
+        json={
+            "error": 'unknown table "cpu_usge" — did you mean "cpu_usage"?',
+            "code": "BAD_REQUEST",
+            "hint": 'did you mean "cpu_usage"?',
+            "span": {"start": 14, "end": 22},
+        },
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(QueryError) as exc:
+            await c.sql(query)
+    assert exc.value.hint == 'did you mean "cpu_usage"?'
+    assert exc.value.span == (14, 22)
+    start, end = exc.value.span
+    assert query[start:end] == "cpu_usge"
+    # The message is unchanged by the new fields.
+    assert 'did you mean "cpu_usage"?' in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_an_error_without_a_hint_has_none(mock_api):
+    mock_api.post("/api/v1/chronix/sql").respond(
+        status_code=400, json={"error": "bad", "code": "BAD_REQUEST"}
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(QueryError) as exc:
+            await c.sql("SELECT 1")
+    assert exc.value.hint is None
+    assert exc.value.span is None
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_is_backpressure_not_a_query_error(mock_api):
+    mock_api.post("/api/v1/write").respond(
+        status_code=429,
+        json={"error": "ingest rate for namespace 'a' is spent", "code": "NAMESPACE_RATE_LIMITED"},
+        headers={"Retry-After": "2"},
+    )
+    async with ChronixClient(BASE) as c:
+        with pytest.raises(BackpressureError) as exc:
+            await c.write([Point("cpu", {"host": "a"}, {"value": 1.0}, 1)])
+    assert exc.value.status_code == 429
+    assert exc.value.retry_after == 2.0
+    assert exc.value.retryable
+
+
+@pytest.mark.asyncio
 async def test_a_full_disk_is_retryable(mock_api):
     mock_api.post("/api/v1/write").respond(
         status_code=507,

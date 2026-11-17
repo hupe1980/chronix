@@ -103,7 +103,7 @@ impl PlacementPolicy {
 
         // Sort groups by size ascending (prefer smaller groups to even out).
         let mut groups: Vec<Vec<&DataNodeInfo>> = by_group.into_values().collect();
-        groups.sort_by_key(|g| g.len());
+        groups.sort_by_key(std::vec::Vec::len);
 
         // Within each group, sort by region count (fewest first) for
         // load-aware placement.
@@ -152,13 +152,13 @@ impl PlacementPolicy {
         for label_key in &self.spread_labels {
             let mut seen: HashMap<&str, NodeId> = HashMap::new();
             for &nid in replica_ids {
-                if let Some(node) = nodes.get(&nid) {
-                    if let Some(val) = node.labels.get(label_key) {
-                        if seen.contains_key(val.as_str()) {
-                            return Some((label_key.clone(), val.clone()));
-                        }
-                        seen.insert(val.as_str(), nid);
+                if let Some(node) = nodes.get(&nid)
+                    && let Some(val) = node.labels.get(label_key)
+                {
+                    if seen.contains_key(val.as_str()) {
+                        return Some((label_key.clone(), val.clone()));
                     }
+                    seen.insert(val.as_str(), nid);
                 }
             }
         }

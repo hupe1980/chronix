@@ -7,10 +7,8 @@
 # including the working-directory cleanliness check — without compiling or
 # uploading anything, so the whole sweep costs seconds on every commit.
 #
-# There is **one** changelog, at the repository root, read in git. It is
-# deliberately not bundled into the crates: nothing may write into a package
-# directory to get it there, because a dirty package directory is precisely
-# what cargo refuses, and refusing it is a protection rather than an obstacle.
+# There is **one** changelog, at the repository root. Crates do not carry a
+# copy; the README and the facade's rustdoc link it by absolute URL.
 #
 # What this does **not** cover: `cargo publish --dry-run`, which resolves
 # dependencies against crates.io and so cannot work for a crate whose siblings

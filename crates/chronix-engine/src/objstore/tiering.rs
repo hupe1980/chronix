@@ -40,13 +40,9 @@ pub struct TieringConfig {
 ///
 /// # Why `measurement=` and not `namespace=`
 ///
-/// The old layout partitioned by namespace. It could not be populated: a
-/// namespace is a *tag on a series*, so one segment holds rows of many
-/// namespaces and there is no namespace to name the directory after — the
-/// caller passed `NamespaceId::default_namespace()` unconditionally, and every
-/// tenant's archive landed in one `namespace=default` directory that said
-/// nothing true. The namespace tag travels in the data instead, where it is
-/// queryable and correct.
+/// A namespace is a tag on a series, so one segment holds rows of many
+/// namespaces and there is no single namespace to name a directory after. The
+/// namespace tag travels in the data, where it is queryable.
 ///
 /// Measurement *is* a segment-level property, and it is the partition an
 /// archive actually needs: one Parquet listing table requires one schema, and
@@ -175,9 +171,7 @@ impl TieringEngine {
     ///
     /// Returns the object key. The caller's next step is to drop the source
     /// segments, so an upload that cannot be *verified* is an error rather
-    /// than a warning: the old engine logged and returned success, and a
-    /// caller that removed the catalog entry on a successful return then
-    /// dropped data that was never archived.
+    /// than a warning.
     ///
     /// # Errors
     ///

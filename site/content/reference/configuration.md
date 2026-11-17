@@ -1,0 +1,556 @@
++++
+title = "Configuration"
+description = "Every Chronix setting: the embedded ChronixConfig and the chronixd TOML file, section by section, with defaults and environment variables."
+weight = 50
+aliases = ["/docs/configuration/"]
++++
+
+This page documents all configuration options for Chronix — both the
+embedded library (`ChronixConfig`) and the standalone server (`chronixd`).
+
+---
+
+## Embedded Library — `ChronixConfig`
+
+Build with `ChronixConfig::builder()`:
+
+```rust
+use chronix::ChronixConfig;
+use std::time::Duration;
+
+let config = ChronixConfig::builder()
+    .data_dir("/var/lib/chronix")
+    .retention(Some(Duration::from_secs(30 * 86400)))
+    .compression(CompressionCodec::Lz4)
+    .build()?;
+```
+
+### Core Settings
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `data_dir` | `PathBuf` | *required* | Root directory for all data files |
+| `shard_duration` | `Duration` | 1 hour | Time range per memtable shard |
+| `ooo_shard_tolerance` | `u32` | 2 | Number of past shards that accept out-of-order writes. Writes outside the window use `backfill()` instead |
+| `future_write_tolerance` | `Duration` | 1 h | How far ahead of the wall clock a timestamp may be, on every path including `backfill()`. The out-of-order window is anchored on the newest *admitted* write, so without this bound one point from a device with a broken clock moved the anchor into the future and every real write after it was rejected until the next restart |
+| `retention` | `Option<Duration>` | `None` (keep forever) | Global data retention period. The maintenance pass enforces **every** configured rule — this one, `measurement_retention`, and each rollup's own `retention_ns` — so per-measurement rules take effect whether or not a global one is set |
+| `measurement_retention` | `HashMap<String, Duration>` | empty | Per-measurement retention overrides |
+| `max_series_cardinality` | `usize` | 1,000,000 | Maximum number of unique series |
+| `query_timeout` | `Duration` | 60 s | Deadline for one read. Checked before each time bucket's segment I/O, so a scan that runs out of time stops rather than finishing and then reporting. `Duration::ZERO` disables |
+| `per_query_memory_limit` | `usize` | 256 MiB | Memory budget for one query's intermediate state |
+| `max_query_result_bytes` | `usize` | 256 MiB | Ceiling on the bytes one collected result may hold |
+| `parallelism` | `Parallelism` | `Auto` (`Serial` in the small preset) | Threads one call may use for the segment scan, SQL partitions and analytics: `Serial` (the caller's thread only), `Threads(n)`, or `Auto` (one per core). A scan fans out only above one thread and from four segments up. To share a pool you already own, open with `Chronix::open_with_pool` instead. TOML: `"serial"`, `"auto"` or a number |
+| `read_only` | `bool` | `false` | Open for queries only: nothing is created, locked or written, the WAL is replayed into memory and left on disk, and every write returns `ReadOnly`. A directory a running process holds is refused with `DirectoryLive`. For a directory copied off a device |
+
+### WAL Settings
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `wal.fsync_policy` | `FsyncPolicy` | `PerBatch` | `FsyncPolicy::PerWrite`, `PerBatch`, or `Periodic(Duration)` |
+| `wal.fsync_interval` | `Option<Duration>` | `None` | Periodic background fsync interval (e.g. `100ms`). Enables `start_periodic_sync()` |
+| `wal.max_file_size` | `usize` | 32 MB | Maximum WAL file size before rotation |
+| `wal.max_unflushed_wals` | `usize` | 4 | Backpressure: max WAL files before blocking writes |
+
+### Memory & Storage
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `memtable_flush_threshold` | `usize` | 64 MB | Flush memtable when it exceeds this size |
+| `max_memtable_memory` | `usize` | 256 MB | Total memory budget for all memtables |
+| `segment_cache_size` | `usize` | 512 MB | LRU cache for decoded segment data |
+| `cdc_capacity` | `usize` | 65 536 | CDC events buffered for a slow subscriber. The ring (~112 bytes/event) is allocated on the first subscription, so a deployment that never reads the CDC stream pays nothing. `open_small` sets 4 096 |
+| `enable_last_value_cache` | `bool` | `false` | Enable O(1) last-value lookups |
+| `lvc_measurements` | `Option<HashSet<String>>` | `None` | Measurements to include in LVC (None = all) |
+| `field_encryption` | `FieldEncryption` | empty | Per-column AES-256-GCM in the segment format — see [Security](@/reference/security.md#field-level-encryption) |
+
+### Encoding & Compression
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `compression` | `CompressionCodec` | `Lz4` | Block compression: `None`, `Lz4`, `Zstd` |
+| `float_encoding` | `FloatEncoding` | `Chimp` | Float encoding: `Gorilla`, `Chimp` |
+
+### Compaction
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `compaction_concurrency` | `usize` | 2 | Max concurrent compaction workers |
+| `maintenance_interval` | `Duration` | 30 s (60 s in the small preset) | How often the built-in maintenance thread compacts, materialises rollups, collects garbage and enforces retention; `0` disables the periodic passes (flush-on-demand stays) |
+
+### Analytics
+
+Two bounds, both enforced by the SQL forecast aggregates — and that is the
+whole section. The model, the detector, the confidence level and the anomaly
+threshold are arguments to the analytics API rather than settings, so a
+per-call choice stays a per-call choice; the section has no key for them and
+refuses a file that sets one.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `analytics.max_forecast_horizon` | `usize` | 8760 | Most points one `forecast()` may predict. A call over it is a planning error naming this setting — refused rather than clamped, because a silently shortened forecast is a wrong answer |
+| `analytics.max_training_points` | `usize` | 1,000,000 | Most input points one series feeds a model; the **newest** are kept. `0` means no bound |
+
+---
+
+## Server — `chronixd` Configuration
+
+The server is configured via a TOML file (default: `chronixd.toml`). It is a
+set of named sections: `[server]` holds the process-level scalars,
+`[database]` is the embedded database, and every other table switches a
+subsystem on by being present.
+
+**A key or a section the server does not know is a startup error naming it** —
+not a warning, and not silence.
+
+```toml
+[server]
+http_addr = "0.0.0.0:8086"
+grpc_addr = "0.0.0.0:8087"
+flight_addr = "0.0.0.0:8817"
+log_format = "json"
+log_level = "info"
+max_body_size = 10485760
+max_concurrent_queries = 3
+
+[database]
+data_dir = "/var/lib/chronix"
+parallelism = 4
+compression = "lz4"
+float_encoding = "chimp"
+retention_secs = 2592000
+segment_cache_size = 536870912
+maintenance_interval_secs = 30
+ooo_shard_tolerance = 2
+future_write_tolerance_secs = 3600
+soft_delete_ttl_secs = 86400
+```
+
+### Database Settings
+
+`[database]` maps to the embedded `ChronixConfig`, so everything in the
+**Embedded Library** tables above applies to a server deployment too. Each key
+below is **optional; omitting it keeps the engine's default**, which is why no
+second default is written here.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `maintenance_interval_secs` | `u64` | engine default (30 s) | How often the maintenance thread compacts, materialises rollups, collects garbage and enforces retention. `0` disables the periodic passes; flush-on-demand stays. On flash-backed storage a longer interval is fewer writes |
+| `ooo_shard_tolerance` | `u32` | engine default (2) | Past shards that still accept live out-of-order writes. Anything older needs `?backfill=true` |
+| `future_write_tolerance_secs` | `u64` | engine default (1 h) | How far ahead of the wall clock a timestamp may be, on every write path including backfill |
+| `cdc_capacity` | `usize` | engine default (65 536) | Change events buffered for a slow subscriber. The ring is allocated on the first subscription, so a deployment that never reads the change stream pays nothing |
+| `wal_max_unflushed` | `usize` | engine default | Unflushed WAL files tolerated before writes are held back |
+| `soft_delete_ttl_secs` | `u64` | unset — drops are immediate | Grace period before a dropped measurement is hard-deleted. With it set, `DELETE /api/v1/measurements/{name}` is recoverable until the deadline passes; without it the drop is irreversible. Measured from the wall clock capped by the newest timestamp held, as retention is, so a clock jump cannot close the window early |
+| `lvc_measurements` | `[String]` | empty — all measurements | Measurements the last-value cache covers, when `enable_last_value_cache` is on |
+| `field_encryption.columns` | `{String: String}` | empty | Column name → key id. Only a **field** may be encrypted; a tag or the time column is a write error. See [Security](@/reference/security.md#field-level-encryption) |
+| `field_encryption.keys` | `{String: String}` | empty | Key id → the name of an **environment variable** holding base64 of 32 bytes. Never the key itself. Every declared key must resolve at startup |
+| `checkpoints.interval_secs` | `u64` | unset — off | Take a checkpoint this often, from the maintenance thread. Requires `checkpoints.directory` |
+| `checkpoints.directory` | `PathBuf` | unset | Where scheduled checkpoints go. Must be outside the data directory's `segments/` tree |
+| `checkpoints.keep` | `usize` | `3` | How many complete checkpoints to keep; older ones are removed after a successful run |
+| `wal_fsync_policy` | string | `per_batch` | `per_write`, `per_batch`, or `periodic_<ms>` |
+| `wal_max_file_size` | size | `64MB` | WAL rotation threshold |
+| `shard_duration_secs` | `u64` | `86400` | Time-shard width |
+| `retention_secs` | `u64` | `0` | Global retention; `0` keeps everything |
+| `zstd_level` | `i32` | `3` | Zstd level 1–22; used only with `compression = "zstd"` |
+| `query_timeout_secs` | `u64` | `60` | Deadline for one native read — `/api/v1/chronix/query`, exports, every engine scan |
+
+### Server Settings
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `http_addr` | `SocketAddr` | `0.0.0.0:8086` | HTTP API listen address |
+| `grpc_addr` | `SocketAddr` | unset — port `8087` on `http_addr`'s host | gRPC API listen address. Leave it unset and gRPC listens wherever HTTP does, so `--bind 127.0.0.1:8086` keeps every listener on loopback; set it to put gRPC somewhere else |
+| `flight_addr` | `SocketAddr` | unset — port `8817` on `http_addr`'s host | Arrow Flight SQL listen address, with the same rule as `grpc_addr` |
+| `authz_policy_dir` | `Option<PathBuf>` | `None` | Directory of Cedar `.cedar` policies; absent = open mode |
+| `backup_root` | `Option<PathBuf>` | `<data_dir>/backups` | Root every admin backup/restore path is resolved inside |
+| `multi_tenancy` | `bool` | `false` | Namespace isolation on every read and write |
+| `metrics_path` | `String` | `"/metrics"` | Prometheus metrics endpoint |
+| `max_body_size` | `usize` | 10 MB | Maximum HTTP request body |
+| `log_format` | enum | `"text"` | Log format: `text`, `json`, `compact`. A value that is none of these is a startup error, not plain text |
+| `log_level` | `String` | `"info"` | Log filter: `trace`, `debug`, `info`, `warn`, `error` |
+| `sql_query_timeout_secs` | `u64` | 30 | SQL query timeout |
+| `prom_query_timeout_secs` | `u64` | 30 | PromQL query timeout (0 = disabled) |
+| `max_concurrent_queries` | `usize` | 0 (derive) | SQL, PromQL and Flight SQL queries executing at once. `0` derives one less than `[database] parallelism`, at least one. A query waits for a slot within its timeout, then gets `503` with `Retry-After: 1`. Writes and health checks never wait |
+| `sql_max_rows` | `usize` | 100,000 | Maximum rows per SQL result |
+| `max_write_batch_size` | `usize` | 50,000 | Maximum points per write request |
+| `cors_allowed_origins` | `Vec<String>` | empty | CORS allowed origins |
+| `metrics_require_auth` | `bool` | `true` | `false` allows unauthenticated scraping of `metrics_path` |
+| `shutdown_timeout_secs` | `u64` | `30` | Graceful drain deadline on shutdown |
+| `public_url` | `Option<String>` | unset | Absolute base URL for the OpenAPI `servers` entry; leave unset behind a reverse proxy |
+| `max_range_query_points` | `u64` | `11000` | Point budget for one PromQL range query |
+| `prom_series_limit` | `usize` | `10000` | Maximum label sets from `/api/v1/series` |
+| `prom_max_result_bytes` | `usize` | `268435456` | Byte budget for an accumulated range-query result; `0` disables |
+| `write_timeout_secs` | `u64` | `30` | Deadline for any write; `0` disables |
+| `max_dedup_entries` | `usize` | `1000000` | Write-dedup cache ceiling (about 24 bytes per entry) |
+| `rate_limit_rps`, `rate_limit_burst` | `u64`, `u32` | `0` — unlimited | Global requests per second, and the burst (defaults to the rate) |
+| `per_user_rate_limit_rps`, `per_user_rate_limit_burst` | `u64`, `u32` | `0` — unlimited | Requests per second and burst per authenticated principal |
+
+### gRPC Settings
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `grpc_keepalive_secs` | `u64` | 60 | gRPC keepalive interval |
+| `grpc_keepalive_timeout_secs` | `u64` | 20 | gRPC keepalive timeout |
+| `stream_batch_size` | `usize` | 10,000 | Streaming batch size |
+| `stream_batch_interval_ms` | `u64` | 100 | Streaming batch interval |
+| `dedup_window_secs` | `u64` | 300 | Deduplication window |
+
+### TLS
+
+```toml
+[tls]
+cert = "/etc/chronix/server.crt"
+key = "/etc/chronix/server.key"
+# Optional: CA certificate for mutual TLS (client cert verification)
+client_ca = "/etc/chronix/ca.crt"
+# Optional: hot-reload interval in seconds (0 = disabled)
+# When enabled, the server watches cert/key files and atomically
+# reloads TLS configuration on change — zero-downtime cert rotation.
+reload_interval_secs = 3600
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `cert` | `PathBuf` | — | Path to PEM-encoded server certificate |
+| `key` | `PathBuf` | — | Path to PEM-encoded private key |
+| `client_ca` | `PathBuf?` | None | CA cert for mutual TLS client verification |
+| `reload_interval_secs` | `u64` | 60 | Seconds between checks for a rotated cert/key; `0` disables. **On by default** — a certificate that expires without a reload is an outage with no warning |
+
+**CLI equivalents:**
+
+```bash
+chronixd --tls-cert /path/to/cert.pem \
+         --tls-key /path/to/key.pem \
+         --tls-client-ca /path/to/ca.pem \
+         --tls-reload-interval-secs 3600
+```
+
+### Authentication
+
+```toml
+[auth]
+exempt_paths = ["/health", "/ready", "/metrics"]
+
+[[auth.api_keys]]
+name = "ingest"
+key = "$CHRONIX_INGEST_KEY"      # env-var reference, Argon2 PHC string, or plain text
+namespaces = ["tenant-a"]        # namespaces this key may act in; empty = all
+admin = false                    # the administrative capability
+roles = ["ingest-service"]       # Chronix::Role memberships, for Cedar policies
+
+[auth.jwt]
+secret = "your-jwt-secret"       # HS256/HS384/HS512 only
+algorithm = "HS256"
+issuer = "https://auth.example.com"     # optional
+audience = "chronix"                    # optional
+role_claim = "realm_access.roles"       # optional; defaults to "roles"
+
+# For the asymmetric families, set a key file instead of a secret:
+# algorithm = "RS256"                   # or PS*, ES256, ES384, EdDSA
+# public_key_pem_file = "/etc/chronix/jwt-public.pem"
+# jwks_url = "https://auth.example.com/.well-known/jwks.json"
+```
+
+An API key carries a principal name, the namespaces it may act in, whether
+it is an administrator, and its Cedar roles. A JWT carries the same four:
+`namespaces` (an array, or a single string), `admin`, and roles from the
+claim named by `role_claim`.
+
+**Roles are resolved once, at authentication**, whichever credential was
+used, so the same role means the same thing at the data gate and the
+administrative gate — and `principal in Chronix::Role::"…"` matches on both.
+API keys carry roles as well as tokens.
+
+**`namespaces` is not optional under multi-tenancy.** A key naming none is
+unrestricted and reads every tenant, so `chronixd` refuses to start with
+`multi_tenancy = true` while one exists, naming it in the error.
+
+**`admin` gates the administrative endpoints** — restore, namespace
+management, key management, the log level — and it is required whether or
+not a policy directory is configured. With one, a policy permitting the
+route group's specific capability is required *as well*, so adding policies
+can only narrow what a credential reaches.
+
+The verification key follows the algorithm's family. `HS*` reads `secret`;
+`RS*`, `PS*`, `ES*` and `EdDSA` read `public_key_pem_file`; `jwks_url`
+replaces the file for providers that publish and rotate their own keys, and
+is fetched once at startup. Pairing an algorithm with the other family's key
+material is a startup error.
+
+### Audit log
+
+```toml
+[audit]
+path = "/var/log/chronix/audit.jsonl"
+hmac_key_env = "CHRONIX_AUDIT_KEY"   # names the env var holding the key
+sync_each = true                     # fsync after every event
+```
+
+Without this section the audit trail lives only in the process log, which
+does not survive a restart and cannot be shown to be unedited.
+
+The hash chain **continues across restarts**, anchoring on the last sealed
+event in the file. Without the key it is a bare SHA-256, which detects
+corruption but not tampering. The key comes from the environment rather than
+the config, so reading the config does not confer the ability to forge
+history.
+
+### Backup root
+
+```toml
+[server]
+backup_root = "/var/lib/chronix/backups"   # defaults to <data_dir>/backups
+```
+
+Every path the admin backup and restore endpoints accept is resolved inside
+this root, following symlinks. An absolute path outside it is refused.
+
+### Scheduled checkpoints
+
+```toml
+[database.checkpoints]
+interval_secs = 21600                    # every six hours
+directory     = "/mnt/backup/chronix"
+keep          = 4
+```
+
+Off by default; taken by the maintenance thread. An interval without a
+directory is a startup error rather than a schedule that never runs. See
+[Operations](@/guides/backup-and-restore.md#backup-restore).
+
+### Field encryption
+
+```toml
+[database.field_encryption]
+columns = { patient_id = "phi-2026", diagnosis = "phi-2026" }
+keys    = { phi-2026 = "CHRONIX_FIELD_KEY_PHI" }
+```
+
+`keys` values are **environment variable names**, not keys — the file holds
+no key material. Each variable holds the base64 of 32 bytes, and every
+declared key must resolve at startup; a missing one stops the server with the
+variable named and the value never printed.
+
+Only a **field** can be encrypted: declaring a tag or the time column is a
+write error. An encrypted column is refused by the Parquet export, the
+cold-tier archive and any rollup over its measurement. Full detail in
+[Security](@/reference/security.md#field-level-encryption).
+
+### Cluster
+
+`chronixd` refuses a `[cluster]` section. The section belongs to the separate,
+frozen `chronixd-cluster` binary; see [Cluster (frozen)](@/reference/cluster.md).
+
+### Connectors
+
+```toml
+[kafka]
+brokers = "kafka1:9092,kafka2:9092"
+group_id = "chronix-ingest"
+topics = ["metrics"]
+format = "line_protocol"
+
+[mqtt]
+broker = "mqtt.example.com"
+port = 1883
+client_id = "chronix-1"
+topics = ["sensors/#"]
+qos = 1
+format = "json"
+username = "chronix"                       # or credential_file, which rotates
+password = "$CHRONIX_MQTT_PASSWORD"
+```
+
+A connector carries no request, so its `namespace` comes from its own
+configuration. Under `multi_tenancy = true` its points are tagged with that
+namespace, `default` included.
+
+`credential_file` holds `{"username": "...", "password": "..."}` and takes
+precedence over the inline pair, so credentials rotate without a config
+change.
+
+**MQTT TLS is not available in this build** — `rumqttc`'s rustls feature
+pulls in an advisory-capped `rustls-webpki` and an unmaintained
+`rustls-pemfile`. Setting `ca_cert`, `client_cert` or `client_key` is
+refused at startup rather than ignored, so a connector never sends its
+password over a link the operator believes is encrypted. Terminate TLS in
+front of the broker.
+
+### Cold archiving
+
+Absent by default, and requires a binary built with `--features object-store`;
+a `[cold_archive]` section without it is a startup error.
+
+```toml
+[cold_archive]
+remote_url = "s3://bucket/chronix"   # or gs://, az://, file://
+cold_after_secs = 2592000            # 30 days
+interval_secs = 3600                 # one pass per hour
+max_objects_per_run = 8
+```
+
+`ArchiveOutcome.more_pending` is `true` when the bound stopped a pass with work
+still eligible. The server's periodic task picks it up on the next tick; a
+caller driving `archive_cold_segments` itself should call again.
+
+Each pass archives up to `max_objects_per_run` complete `(measurement, shard)`
+groups and stops; the next pass continues. A failed pass is logged and counted
+in `chronix_cold_archive_pass_failures_total` — not fatal, and the data stays
+hot and queryable. See [Object Storage](@/explanation/object-storage.md) for what a
+group is and when it is eligible.
+
+### Signal triggers
+
+Absent by default; the trigger endpoints answer `404` until it is present.
+
+```toml
+[triggers]
+catalog_path = "triggers.json"          # relative to data_dir; survives restart
+webhook_signing_secrets = ["$CHRONIX_WEBHOOK_SIGNING_SECRET"]
+webhook_timeout_secs = 10
+webhook_allow_private_targets = false   # see below
+signal_store_capacity = 10000
+```
+
+`webhook_signing_secrets` is configuration rather than part of the `DELIVER`
+clause: a secret written in SQL lands in the trigger catalog on disk and in
+every `SHOW TRIGGERS`. With none set, `DELIVER webhook(…)` is refused at
+creation. Each entry may be a `$VAR` reference, resolved at startup.
+
+It is a list because a delivery is signed with every entry, so a receiver
+holding any one of them verifies — see
+[Rotating a signing secret](@/reference/security.md#rotating-a-signing-secret).
+`CHRONIX_WEBHOOK_SIGNING_SECRET` sets the whole list, comma-separated.
+
+`webhook_allow_private_targets` waives the *resolved-address* rule for an
+alerting endpoint on your own network — `https://alertmanager.corp.example/`
+resolving to 10.x. It does not waive the https, userinfo or literal-address
+checks.
+
+### MCP
+
+On by default: `/mcp` serves AI agents — see [Use Chronix from an AI agent](@/guides/ai-agents.md).
+
+```toml
+[mcp]
+enabled = true
+tools = ["list_metrics", "label_values", "query_promql", "query_sql",
+         "explain", "cardinality", "forecast", "detect_anomalies"]
+max_result_bytes = 262144
+# allowed_hosts = ["chronix.example.com"]
+```
+
+Every tool only reads, and `/mcp` is authenticated, namespaced and authorised
+(`Read`) like `/api/v1/query`. `tools` limits what is offered; an unknown name
+is a startup error. `allowed_hosts` is the `Host` headers `/mcp` accepts:
+unset, that is `localhost`, `127.0.0.1` and `::1` when authentication is off,
+and any host when it is on.
+
+### Console
+
+On by default: `/console` serves the [console](@/guides/console.md), a page that queries,
+charts and explains through the same routes every other client uses.
+
+```toml
+[console]
+enabled = true
+```
+
+The page is the same for every caller and holds no data, so it loads without a key;
+every request it makes is authenticated and authorised as usual. Turning it off removes
+the page, not an access path.
+
+### Observability
+
+Log format and level are `[server]` settings; `[tracing]` only says where
+traces go.
+
+```toml
+[server]
+log_format = "json"   # text | json | compact
+log_level  = "info"
+
+[tracing]
+service_name = "chronix"
+
+[tracing.otlp]
+endpoint = "https://jaeger:4317"
+sampling = { ratio = 0.01 }        # or "always_on" / "always_off"
+always_sample_errors = true
+```
+
+OTLP export needs `--features otlp`. A `[tracing.otlp]` section in a build
+without it is a startup error, as is a `[tracing]` section naming no target.
+
+---
+
+## Checking a file before a deploy
+
+```bash
+chronixd --config /etc/chronix/chronixd.toml --check-config
+```
+
+Loads the file, applies the environment and the flags, runs every startup
+validation, prints what it resolved to, and exits without opening the database
+or binding a port. An unknown key, a `[tracing]` section this build cannot
+honour, an `[auth]` section that authenticates nobody and two listeners on one
+address are all refused here.
+
+## Inspecting a data directory
+
+```bash
+chronixd inspect /var/lib/chronix          # report
+chronixd inspect /var/lib/chronix --json   # one JSON document
+```
+
+Reads the directory without opening it — see
+[Operations](@/guides/operate.md#inspecting-a-data-directory) for the report
+and what each state means.
+
+```text
+configuration is valid
+  http_addr        127.0.0.1:8086
+  grpc_addr        127.0.0.1:8087
+  flight_addr      127.0.0.1:8817
+  data_dir         /var/lib/chronix
+  log_format       Json
+  log_level        info
+  sql_max_rows     100000
+  max_body_size    10485760
+  multi_tenancy    false
+  sections         tls, auth, audit
+```
+
+---
+
+## Environment Variables
+
+Precedence is **file, then environment, then CLI flags**.
+
+| Variable | Override |
+|----------|---------|
+| `CHRONIX_DATA_DIR` | `database.data_dir` |
+| `CHRONIX_LOG_LEVEL` | `server.log_level` |
+| `CHRONIX_HTTP_ADDR` | `server.http_addr` |
+| `CHRONIX_JWT_SECRET` | `auth.jwt.secret` — overrides an existing `[auth.jwt]` section; with no such section the server refuses to start rather than silently ignoring it |
+| `CHRONIX_WEBHOOK_SIGNING_SECRET` | `triggers.webhook_signing_secrets` (comma-separated, newest first) |
+
+A value that cannot be parsed is a startup error, not a fall back to the
+default.
+
+### `$VAR` in secret-bearing settings
+
+Separately from the table above, any field that holds a credential accepts a
+`$VAR` or `${VAR}` reference resolved at startup — API keys
+(`auth.api_keys[].key`), and connector credentials (`username`, `password`,
+`sasl_username`, `sasl_password`). The variable name is yours to choose:
+
+```toml
+[mqtt]
+broker = "mqtt://broker.example:1883"
+topics = ["sensors/#"]
+username = "chronix"
+password = "$CHRONIX_MQTT_PASSWORD"
+```
+
+A referenced variable that is not set is a startup error for a connector, and
+a skipped key with a warning for an API key.

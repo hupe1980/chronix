@@ -183,8 +183,7 @@ fn collect_annotations(
         if !name.starts_with("_signals") && !name.starts_with("_alerts") {
             continue;
         }
-        // Scoped like every other read: a dashboard used to show every
-        // tenant's signal firings as annotations on its own panels.
+        // Scoped like every other read: a dashboard sees its own tenant's signals.
         let plan = match db.query().measurement(name).namespace_scope(scope).build() {
             Ok(p) => p,
             Err(_) => continue,
@@ -210,28 +209,16 @@ fn collect_annotations(
     anns
 }
 
-/// `GET /api/v1/annotations/stream` — SSE stream of signal events for Grafana live annotations.
+/// `GET /api/v1/annotations/stream` — SSE stream of signal events for
+/// Grafana live annotations.
 ///
-/// # How it wakes up
+/// The loop is pushed, not polled: it subscribes to the CDC event bus and
+/// re-scans when a write arrives. A 30-second timer is the fallback for
+/// anything that reaches the database without publishing an event. If the bus
+/// is at its subscriber limit the stream reports an error rather than
+/// degrading to polling.
 ///
-/// The loop is **pushed, not polled**: it subscribes to the CDC event bus and
-/// re-scans when a write arrives, so an annotation reaches Grafana as fast as
-/// the write does. The 30-second timer beside it is a *fallback*, there to
-/// catch anything that reaches the database without publishing an event —
-/// not an interval anybody waits for. It used to be a bare 2-second poll, and
-/// this comment went on describing that for some time after it stopped being
-/// true, which is why the number is now stated next to the code that produces
-/// it. A subscription is required: if the bus is at its subscriber limit the
-/// stream reports an error rather than silently degrading to polling.
-///
-/// # Dedup key strategy
-///
-/// Deduplication uses the **full JSON serialisation** of each annotation
-/// as the `HashSet` key. This is simple and semantically correct but
-/// allocates ~200–500 bytes per entry. A hash-based approach (e.g.
-/// `u64` via `DefaultHasher` on the JSON bytes) would reduce the
-/// per-entry overhead from `O(n)` string to a fixed 8 bytes, at the
-/// cost of accepting theoretical (2⁻⁶⁴ probability) hash collisions.
+/// Deduplication keys on the full JSON serialisation of each annotation.
 pub async fn annotations_stream_handler(
     State(state): State<AppState>,
     ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,

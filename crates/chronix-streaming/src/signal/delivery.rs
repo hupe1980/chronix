@@ -14,40 +14,27 @@
 //!                      └── Retry + Dead Letter Queue
 //! ```
 //!
-//! ## The wire format is two open standards, not one of our own
+//! ## The wire format is two open standards
 //!
-//! A webhook receiver is somebody else's code, so the bar is the same one
-//! the wire protocols are held to: conformance with what a receiver already
-//! knows how to verify, not a bespoke scheme with one implementation. The
-//! body is a [CloudEvents](https://cloudevents.io) 1.0 structured-mode JSON
-//! envelope —
-//! `specversion`, `id`, `source`, `type`, `time`, `data` — so any
-//! CloudEvents-aware router (Knative, EventBridge, an OTel Collector
-//! receiver) can consume a fired signal without knowing chronix's own shape;
-//! `data` carries the [`SignalEvent`] verbatim, so nothing already reading it
-//! for `trigger_id`, `measurement` or `value` has to change. The signature is
+//! The body is a [CloudEvents](https://cloudevents.io) 1.0 structured-mode JSON
+//! envelope (`specversion`, `id`, `source`, `type`, `time`, `data`), so any
+//! CloudEvents-aware router can consume a signal; `data` carries the
+//! [`SignalEvent`] verbatim. The signature is
 //! [Standard Webhooks](https://www.standardwebhooks.com) `v1`: `webhook-id`,
 //! `webhook-timestamp` and `webhook-signature` headers over
-//! `{id}.{timestamp}.{body}`, which is what turns a payload signature into a
-//! request signature — the old `X-Chronix-Signature: sha256=<hex>` covered
-//! the body alone, so a captured request could be replayed indefinitely with
-//! nothing to bound its age. A receiver that already speaks Standard
-//! Webhooks — Svix, Stripe-alikes, the reference libraries the spec ships —
-//! verifies a chronix signal with no code specific to chronix at all.
+//! `{id}.{timestamp}.{body}`, which signs the request rather than the payload
+//! and bounds a replay's age. A receiver that speaks Standard Webhooks
+//! verifies a chronix signal with no chronix-specific code.
 //!
 //! ## Delivery does not block evaluation
 //!
 //! Each channel owns a **bounded queue and a worker thread**, and
-//! [`DeliveryRouter::deliver`] only enqueues. It used to run the retry
-//! schedule inline, on the same task that processes the CDC event — so one
-//! unreachable webhook backing off for seven seconds delayed every trigger
-//! evaluation behind it, and a sustained write rate overran the event bus.
-//! Evaluation stays ordered because the CDC listener is; delivery is
-//! per-channel, so a broken webhook cannot slow a healthy one.
+//! [`DeliveryRouter::deliver`] only enqueues, so a webhook backing off cannot
+//! delay trigger evaluation or another channel. Evaluation stays ordered
+//! because the CDC listener is.
 //!
-//! A full queue **drops the oldest event** and counts it. That is the honest
-//! failure: the alternative is blocking ingestion on a channel nobody can
-//! reach.
+//! A full queue **drops the oldest event** and counts it, rather than blocking
+//! ingestion on a channel nobody can reach.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -377,29 +364,20 @@ struct DeliveryRequest {
 }
 
 impl WebhookChannel {
-    /// Create a new webhook channel.
+    /// Create a new webhook channel, with its own single-threaded runtime and
+    /// background thread; deliveries are submitted through a bounded channel.
     ///
-    /// A single-threaded tokio runtime and a dedicated background thread
-    /// are created here and kept alive for the lifetime of this channel.
-    /// Deliveries are submitted via a bounded channel, avoiding per-call
-    /// OS thread creation.
-    ///
-    /// # The target is resolved once, here, and the client is pinned to it
-    ///
-    /// [`ssrf::resolve_allowed_addrs`](crate::signal::ssrf::resolve_allowed_addrs)
-    /// resolves the host and refuses every address that is not routable on the
-    /// public internet; the client is then told to use exactly those addresses
-    /// for that host. Checking the URL and then letting the client resolve it
-    /// again is a DNS-rebinding hole — the name can answer with a public
-    /// address for the check and a link-local one for the request — and it is
-    /// the reason the check lives at the connection rather than only at
-    /// `CREATE TRIGGER`.
+    /// The target is resolved once, here, by
+    /// [`ssrf::resolve_allowed_addrs`](crate::signal::ssrf::resolve_allowed_addrs),
+    /// which refuses every address not routable on the public internet, and the
+    /// client is pinned to those addresses. Letting the client resolve the name
+    /// again would be a DNS-rebinding hole: a public address for the check, a
+    /// link-local one for the request.
     ///
     /// # Errors
     ///
-    /// Returns an error if the URL is not an allowed webhook target, if its
-    /// host does not resolve, or if the tokio runtime or HTTP client cannot be
-    /// built.
+    /// Returns an error if the URL is not an allowed webhook target, if its host
+    /// does not resolve, or if the runtime or HTTP client cannot be built.
     pub fn new(config: WebhookConfig) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let addrs =
             crate::signal::ssrf::resolve_allowed_addrs(&config.url, config.allow_private_targets)?;
@@ -1110,17 +1088,11 @@ impl Default for DeliveryRouter {
 // ── SignalStore ──────────────────────────────────────────────────────
 
 /// Persists fired signals for later querying, **one bounded ring per
-/// namespace**.
+/// namespace**, so a busy tenant cannot evict a quiet tenant's signals. Total
+/// memory is `max_size × namespaces`.
 ///
-/// The capacity is per namespace, not shared. It used to be one process-wide
-/// deque filtered on the way out, so a tenant firing signals quickly evicted
-/// a quiet tenant's — and the quiet tenant saw fewer of its own signals with
-/// nothing to say why. Total memory is `max_size × namespaces`, which is what
-/// isolation costs and what the namespace registry bounds.
-///
-/// A signal's namespace is the `__namespace__` tag on the series it is about —
-/// the same thing the trigger's own scoping matched on. A deployment that is
-/// not multi-tenant has one unnamed bucket and behaves exactly as before.
+/// A signal's namespace is the `__namespace__` tag on the series it is about.
+/// A deployment that is not multi-tenant has one unnamed bucket.
 pub struct SignalStore {
     /// `None` is the unnamed bucket a single-tenant deployment uses.
     signals: RwLock<std::collections::BTreeMap<Option<String>, VecDeque<SignalEvent>>>,
@@ -1623,11 +1595,9 @@ mod tests {
         let event = test_signal("t1", "cpu", Severity::Critical);
         let started = std::time::Instant::now();
         assert_eq!(router.deliver(&event), 1);
-        // The backoff schedule is 400 ms + 800 ms and `deliver` must not have
-        // paid for any of it — this is the defect the worker exists for. The
-        // budget is an order of magnitude under the first sleep rather than
-        // just under it, because a wall-clock assertion with a thin margin is
-        // a test that fails on a busy machine and teaches people to re-run.
+        // The backoff schedule is 400 ms + 800 ms and `deliver` must not pay for
+        // any of it. The budget is an order of magnitude under the first sleep, so
+        // the assertion holds on a busy machine.
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "deliver blocked for {:?}",

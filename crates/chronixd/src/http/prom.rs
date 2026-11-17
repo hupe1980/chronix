@@ -21,13 +21,13 @@ fn prom_error(error_type: &str, message: impl Into<String>) -> axum::response::R
     let code = match error_type {
         "bad_data" => axum::http::StatusCode::BAD_REQUEST,
         "timeout" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "canceled" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "canceled" | "unavailable" => axum::http::StatusCode::SERVICE_UNAVAILABLE,
         // "execution" and anything else: Prometheus answers 422 for a query
         // that parsed but could not be evaluated.
         "internal" => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         _ => axum::http::StatusCode::UNPROCESSABLE_ENTITY,
     };
-    (
+    let mut response = (
         code,
         Json(PromResponse {
             status: "error".into(),
@@ -37,7 +37,15 @@ fn prom_error(error_type: &str, message: impl Into<String>) -> axum::response::R
             warnings: Vec::new(),
         }),
     )
-        .into_response()
+        .into_response();
+    // Every query slot was busy: worth retrying shortly.
+    if error_type == "unavailable" {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    response
 }
 
 /// A [`ServerError`] on a Prometheus-API route.
@@ -187,7 +195,7 @@ pub async fn prom_instant_query_handler(
 
     let expr = match chronix::promql::parse(&query_str) {
         Ok(e) => e,
-        Err(e) => return prom_error("bad_data", e.to_string()),
+        Err(e) => return prom_error("bad_data", positioned(&query_str, &e)),
     };
 
     let limit = match params.limit() {
@@ -195,7 +203,14 @@ pub async fn prom_instant_query_handler(
         Err(e) => return prom_error("bad_data", e.to_string()),
     };
 
+    let explain = match params.flag("explain_empty") {
+        Ok(f) => f,
+        Err(e) => return prom_error("bad_data", e.to_string()),
+    };
+
     let query_kind = "instant";
+    let diagnose_scope = scope.clone();
+    let diagnose_expr = expr.clone();
     let evaluator = chronix::promql::PromQLEvaluator::new(state.db.clone()).with_namespace(scope);
     // The same bounds the range query sets. One selector must not have a
     // series cap and a memory budget on `/query_range` and neither here.
@@ -217,7 +232,18 @@ pub async fn prom_instant_query_handler(
     // task — so the stats have to come back out with the result. Without this
     // the counters existed, were asserted by a test, and were visible to
     // nobody running the server.
+    let slot = match state
+        .query_slots
+        .acquire(std::time::Duration::from_secs(timeout_secs))
+        .await
+    {
+        Ok(slot) => slot,
+        Err(e) => return prom_error("unavailable", e.to_string()),
+    };
+    // The slot moves into the blocking task: it is freed when the evaluation
+    // ends, which may be after the client was answered `timeout`.
     let task = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let value = evaluator.instant_query(&expr, &params);
         (value, evaluator.scan_stats())
     });
@@ -238,9 +264,65 @@ pub async fn prom_instant_query_handler(
     });
 
     match result {
-        Ok(Ok(value)) => Json(prom_value_to_response(value, limit)).into_response(),
+        Ok(Ok(value)) => {
+            let warnings = if super::explain::is_empty(&value) {
+                empty_warnings(
+                    &state,
+                    diagnose_scope,
+                    diagnose_expr,
+                    eval_time_ns,
+                    eval_time_ns,
+                    explain,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            let mut response = prom_value_to_response(value, limit);
+            response.warnings.extend(warnings);
+            Json(response).into_response()
+        }
         Ok(Err(e)) => prom_error("execution", e.to_string()),
         Err(e) => prom_error("internal", format!("query task failed: {e}")),
+    }
+}
+
+/// The warnings for an empty result, computed off the async runtime: they
+/// read label sets, which is a scan.
+async fn empty_warnings(
+    state: &AppState,
+    scope: Option<String>,
+    expr: chronix::promql::Expr,
+    start_ns: i64,
+    end_ns: i64,
+    explain: bool,
+) -> Vec<String> {
+    let db = state.db.clone();
+    let limit = state.config.server.prom_series_limit;
+    tokio::task::spawn_blocking(move || {
+        super::explain::empty_result_warnings(
+            &db,
+            scope.as_deref(),
+            &expr,
+            start_ns,
+            end_ns,
+            limit,
+            explain,
+        )
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// A parse error as Prometheus words it, with its position first:
+/// `1:15: parse error: expected ")", found "]"`.
+pub(super) fn positioned(query: &str, e: &chronix::promql::ParseError) -> String {
+    match e.span {
+        Some(span) => {
+            let (line, column) = span.line_column(query);
+            format!("{line}:{column}: {e}")
+        }
+        None => e.to_string(),
     }
 }
 
@@ -290,10 +372,17 @@ pub async fn prom_range_query_handler(
 
     let expr = match chronix::promql::parse(&query_str) {
         Ok(e) => e,
+        Err(e) => return prom_error("bad_data", positioned(&query_str, &e)),
+    };
+
+    let explain = match params.flag("explain_empty") {
+        Ok(f) => f,
         Err(e) => return prom_error("bad_data", e.to_string()),
     };
 
     let query_kind = "range";
+    let diagnose_scope = scope.clone();
+    let diagnose_expr = expr.clone();
     let evaluator = chronix::promql::PromQLEvaluator::new(state.db.clone()).with_namespace(scope);
     let qparams = chronix::promql::eval::QueryParams {
         time: end_ns,
@@ -313,7 +402,16 @@ pub async fn prom_range_query_handler(
     };
 
     let timeout_secs = state.config.server.prom_query_timeout_secs;
+    let slot = match state
+        .query_slots
+        .acquire(std::time::Duration::from_secs(timeout_secs))
+        .await
+    {
+        Ok(slot) => slot,
+        Err(e) => return prom_error("unavailable", e.to_string()),
+    };
     let task = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let value = evaluator.range_query(&expr, &qparams);
         (value, evaluator.scan_stats())
     });
@@ -334,7 +432,24 @@ pub async fn prom_range_query_handler(
     });
 
     match result {
-        Ok(Ok(value)) => Json(prom_value_to_response(value, limit)).into_response(),
+        Ok(Ok(value)) => {
+            let warnings = if super::explain::is_empty(&value) {
+                empty_warnings(
+                    &state,
+                    diagnose_scope,
+                    diagnose_expr,
+                    start_ns,
+                    end_ns,
+                    explain,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            let mut response = prom_value_to_response(value, limit);
+            response.warnings.extend(warnings);
+            Json(response).into_response()
+        }
         Ok(Err(e)) => prom_error("execution", e.to_string()),
         Err(e) => prom_error("internal", format!("query task failed: {e}")),
     }
@@ -369,6 +484,75 @@ pub async fn prom_buildinfo_handler() -> Json<serde_json::Value> {
             "application": "chronixd",
         }
     }))
+}
+
+/// `GET /api/v1/status/tsdb` — where the series budget goes.
+///
+/// Prometheus's TSDB statistics, field for field, so tools built for
+/// Prometheus read it unchanged; `chronix` adds the
+/// budget, its use and the headroom left. A namespace-scoped caller sees its
+/// own series and its own limit only.
+pub async fn prom_status_tsdb_handler(
+    State(state): State<AppState>,
+    ns_ctx: Option<axum::extract::Extension<crate::namespace::NamespaceContext>>,
+    prom_params: super::PromParams,
+) -> Result<Json<serde_json::Value>, PromApiError> {
+    let limit = match prom_params.get("limit") {
+        None => 10,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=chronix::MAX_CARDINALITY_LIMIT).contains(&n) => n,
+            _ => {
+                return Err(ServerError::BadRequest(format!(
+                    "limit must be a whole number between 1 and {}, got {raw}",
+                    chronix::MAX_CARDINALITY_LIMIT
+                ))
+                .into());
+            }
+        },
+    };
+    let db = state.db.clone();
+    let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
+    let stats = tokio::task::spawn_blocking(move || db.cardinality(limit, scope.as_deref()))
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+        .map_err(ServerError::from)?;
+    Ok(Json(status_tsdb_body(&stats)))
+}
+
+/// The `/api/v1/status/tsdb` body for a set of statistics.
+#[must_use]
+pub fn status_tsdb_body(s: &chronix::CardinalityStats) -> serde_json::Value {
+    let list = |l: &[chronix::NameCount]| -> serde_json::Value {
+        l.iter()
+            .map(|n| serde_json::json!({"name": n.name, "value": n.value}))
+            .collect()
+    };
+    let scope = match &s.scope {
+        chronix::CardinalityScope::Database => "database".to_string(),
+        chronix::CardinalityScope::Namespace(ns) => format!("namespace:{ns}"),
+    };
+    serde_json::json!({
+        "status": "success",
+        "data": {
+            "headStats": {
+                "numSeries": s.num_series,
+                "chunkCount": s.segment_count,
+                "minTime": s.min_time_ms,
+                "maxTime": s.max_time_ms,
+            },
+            "seriesCountByMetricName": list(&s.series_by_measurement),
+            "labelValueCountByLabelName": list(&s.label_value_counts),
+            "memoryInBytesByLabelName": list(&s.label_memory_bytes),
+            "seriesCountByLabelValuePair": list(&s.series_by_label_pair),
+            "chronix": {
+                "budget": s.budget,
+                "used": s.used,
+                "headroom": s.headroom,
+                "scope": scope,
+                "enforced": s.enforced,
+            },
+        }
+    })
 }
 
 /// `GET /api/v1/rules` — chronix has no recording or alerting rules.
@@ -507,7 +691,7 @@ pub async fn prom_label_values_handler(
 }
 
 /// The label sets an enumeration found, and whether it stopped at the limit.
-type ObservedLabelSets = (Vec<Vec<(String, String)>>, bool);
+pub(super) type ObservedLabelSets = (Vec<Vec<(String, String)>>, bool);
 
 /// One parsed `match[]` selector: the metrics it names and the rest of its
 /// matchers, compiled.
@@ -518,13 +702,13 @@ type ObservedLabelSets = (Vec<Vec<(String, String)>>, bool);
 /// resolves a selector through the same function — the two having their own
 /// answers is what let `/series?match[]={__name__=~".+"}` return nothing while
 /// `/query` with that selector returned every series.
-struct Selector {
+pub(super) struct Selector {
     /// The metrics the selector names.
-    targets: Vec<chronix::promql::MetricRef>,
+    pub(super) targets: Vec<chronix::promql::MetricRef>,
     /// Equality matchers, pushed into the scan.
-    pushdown: Vec<(String, String)>,
+    pub(super) pushdown: Vec<(String, String)>,
     /// Every matcher except `__name__`, applied to the label sets produced.
-    compiled: Vec<chronix::promql::CompiledMatcher>,
+    pub(super) compiled: Vec<chronix::promql::CompiledMatcher>,
 }
 
 /// Parse `match[]` selectors into metrics plus compiled matchers.
@@ -622,10 +806,8 @@ impl PromSeriesQuery {
     /// Read the parameters from a request, whether they arrived in the query
     /// string or in a POST form body.
     ///
-    /// `start` and `end` accept RFC 3339 as well as a Unix timestamp, and an
-    /// unparseable one is an **error** rather than a silent fall back to the
-    /// default window: `start=yesterday` used to widen the scan to the last
-    /// hour and answer as though it had understood.
+    /// `start` and `end` accept RFC 3339 or a Unix timestamp; an unparseable one
+    /// is an error, never a silent fall-back to the default window.
     fn from_params(params: &super::PromParams) -> Result<Self, ServerError> {
         let mut matchers: Vec<String> = params
             .get_all("match[]")
@@ -658,29 +840,23 @@ impl PromSeriesQuery {
 }
 
 /// Every distinct label set present in a window, for the metrics the
-/// selectors name — or for every metric, when there are none.
+/// selectors name — or for every metric, when there are none. One scan behind
+/// `/series`, `/labels` and `/label/{name}/values`, so they agree on what a
+/// metric is.
 ///
-/// One scan behind `/series`, `/labels` and `/label/{name}/values`, because
-/// three near-identical enumerations is the shape that drifts: they answered
-/// the same selector syntax and disagreed about what a metric is.
-///
-/// `project_value` decides how precise the answer is, and it is a real
-/// trade-off rather than an oversight:
+/// `project_value` sets the precision:
 ///
 /// - `true` (`/series`) projects each metric's own field and skips a row where
-///   it is null, so a series is listed only if it has a sample. A measurement
-///   gains fields over its life, and the rows written before `free` existed
-///   are not `mem_free` series. One scan per metric.
-/// - `false` (the label endpoints, which Grafana calls to fill a dropdown on
-///   every keystroke) projects tag columns only and scans once per
-///   *measurement*, attributing every row to each of that measurement's
-///   metrics. Decoding one dictionary block per tag instead of every sample in
-///   the window is the difference between a responsive editor and a scan, and
-///   the label names and values it reports are the same set.
+///   it is null, so a series is listed only if it has a sample. One scan per
+///   metric.
+/// - `false` (the label endpoints, which Grafana calls on every keystroke)
+///   projects tag columns only, scans once per measurement, and attributes
+///   every row to each of that measurement's metrics — one dictionary block
+///   per tag instead of every sample in the window.
 ///
-/// The `truncated` half of the return is how the caller knows to put
-/// `results truncated due to limit` in the response.
-fn observed_label_sets(
+/// The `truncated` half of the return tells the caller to add `results
+/// truncated due to limit` to the response.
+pub(super) fn observed_label_sets(
     db: &std::sync::Arc<chronix::Chronix>,
     namespace: Option<&str>,
     start_ns: i64,
@@ -711,18 +887,24 @@ fn observed_label_sets(
             .collect()
     };
 
-    // One scan per group. Reading the value column forces a group per metric;
-    // without it the metrics of one measurement share a scan and differ only
-    // in the `__name__` they contribute.
+    // One scan per metric and selector. A label set is offered only if the
+    // metric has a sample in the window, so every scan asks about the
+    // metric's own column — `/series` for its values, `/labels` and
+    // `/label/{name}/values` for its presence only, which reads each
+    // block's validity bitmap and never decodes or decrypts a value.
     let mut groups: Vec<Scan<'_>> = Vec::new();
     for (target, selector) in targets {
-        // A bucket view needs the value column whatever the caller asked
-        // for: the `le` labels it contributes are read out of the histogram,
-        // so without the column `/labels` would offer `lat_bucket` with no
-        // `le` at all — a label set `/query` never produces.
+        // A bucket view needs the values whatever the caller asked for: the
+        // `le` labels it contributes are read out of the histogram, so
+        // without them `/labels` would offer `lat_bucket` with no `le` at
+        // all — a label set `/query` never produces.
         let needs_value = project_value || target.view == chronix::promql::ClassicView::Bucket;
-        let field = needs_value.then_some(target.field.as_str());
-        let key = (target.measurement.as_str(), field, selector);
+        let key = (
+            target.measurement.as_str(),
+            target.field.as_str(),
+            selector,
+            needs_value,
+        );
         if let Some(existing) = groups.iter_mut().find(|g| g.key == key) {
             existing.names.push((target.name.as_str(), target.view));
         } else {
@@ -734,7 +916,8 @@ fn observed_label_sets(
     }
 
     for group in &groups {
-        let (measurement, field, selector_idx) = group.key;
+        let (measurement, field_name, selector_idx, read_values) = group.key;
+        let field = Some(field_name);
         let selector = selector_idx.and_then(|i| selectors.get(i));
         let Some(schema) = db.schema(measurement) else {
             continue;
@@ -754,9 +937,11 @@ fn observed_label_sets(
         for tag in &tag_names {
             builder = builder.field(tag);
         }
-        if let Some(field) = field {
-            builder = builder.field(field);
-        }
+        builder = if read_values {
+            builder.field(field_name)
+        } else {
+            builder.present(field_name)
+        };
         if let Some(sel) = selector {
             for (key, value) in &sel.pushdown {
                 builder = builder.tag(key, value);
@@ -893,9 +1078,10 @@ fn effective_limit(server_cap: usize, requested: Option<usize>) -> usize {
 /// One scan of `observed_label_sets`: a measurement, optionally a value
 /// column, and the metric names its rows are attributed to.
 struct Scan<'a> {
-    /// Measurement, the value column when one is projected, and the index of
-    /// the selector this scan answers.
-    key: (&'a str, Option<&'a str>, Option<usize>),
+    /// Measurement, the metric's value column, the index of the selector
+    /// this scan answers, and whether the values are read (`true`) or only
+    /// their presence (`false`).
+    key: (&'a str, &'a str, Option<usize>, bool),
     /// The metric names every row of the scan is attributed to, each with the
     /// view its name asked for — `lat` and `lat_bucket` read the same column
     /// and contribute different label sets.

@@ -1,0 +1,12 @@
+# Chronix — full documentation
+
+> {{ config.description }}
+{% for item in config.extra.nav %}{% set s = get_section(path=item.path) %}{% for p in s.pages %}
+---
+
+# {{ p.title }}
+
+Source: {{ p.permalink }}
+
+{% set parts = load_data(path="content/" ~ p.relative_path, format="plain") | split(pat="+++") %}{{ parts[2:] | join(sep="+++") | trim | safe }}
+{% endfor %}{% endfor %}

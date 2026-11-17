@@ -17,8 +17,8 @@ const SERVER_SRC: &str = include_str!("../../src/server.rs");
 pub fn mounted_paths() -> BTreeSet<String> {
     let body = {
         let start = SERVER_SRC
-            .find("pub fn build_router(")
-            .expect("build_router");
+            .find("pub fn build_router_with(")
+            .expect("build_router_with");
         &SERVER_SRC[start..]
     };
 
@@ -40,7 +40,11 @@ pub fn mounted_paths() -> BTreeSet<String> {
             }
             '.' => {
                 let rest = &body[idx..];
-                if let Some(path) = literal_after(rest, ".route(") {
+                // `.route_service(` mounts a tower service at a path — `/mcp`
+                // is one — and is a route like any other.
+                if let Some(path) = literal_after(rest, ".route(")
+                    .or_else(|| literal_after(rest, ".route_service("))
+                {
                     let prefix: String = nests.iter().map(|(p, _)| p.as_str()).collect();
                     let full = if path == "/" && !prefix.is_empty() {
                         prefix

@@ -1,0 +1,21 @@
+apiVersion: 1
+datasources:
+  # Your data: chronix answers the Prometheus HTTP API itself.
+  - name: Chronix
+    uid: chronix
+    type: prometheus
+    access: proxy
+    url: http://__CHRONIX__
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 10s
+  # Chronix's own metrics, scraped by Prometheus — what the bundled dashboards read.
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://__PROMETHEUS__
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s

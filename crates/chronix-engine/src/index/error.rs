@@ -24,9 +24,7 @@ pub enum IndexError {
     ///
     /// Deliberately distinct from [`Corrupt`](Self::Corrupt): the bytes are
     /// intact and the reader is from another generation, so the remedy is to
-    /// match the versions up rather than to restore from a backup. The two
-    /// used to be one variant, which sent an operator who had upgraded
-    /// looking for a failing disk.
+    /// match the versions up rather than to restore from a backup.
     #[error("{detail}")]
     UnsupportedVersion {
         /// What was read, what this build expects, and what to do.
@@ -42,6 +40,25 @@ pub enum IndexError {
     Manifest {
         /// Description of the manifest error.
         detail: String,
+    },
+
+    /// A declared object's persisted state is over the per-declaration cap.
+    ///
+    /// The catalog snapshot holds every declaration's state, and replay reads
+    /// it at every open, so an unbounded state is an unbounded open.
+    #[error(
+        "the state of {kind} '{name}' is {size} bytes, over the {max}-byte cap for one \
+         declaration"
+    )]
+    DeclaredStateTooLarge {
+        /// The declaration's kind.
+        kind: String,
+        /// The declaration's name.
+        name: String,
+        /// The size that was refused.
+        size: usize,
+        /// The cap.
+        max: usize,
     },
 }
 

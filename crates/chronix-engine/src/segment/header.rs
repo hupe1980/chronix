@@ -218,9 +218,107 @@ impl SegmentFooter {
     }
 }
 
+/// What a segment file's header and footer say, read without mapping it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentFileMeta {
+    /// The header at the start of the file.
+    pub header: SegmentHeader,
+    /// The footer at the end of the file.
+    pub footer: SegmentFooter,
+    /// The file's size on disk.
+    pub byte_size: u64,
+}
+
+/// Read a segment's header and footer with two positioned reads.
+///
+/// Neither the file nor its metadata section is mapped or decoded, so this
+/// costs the same for a 1 KiB segment as for a 1 GiB one, and it is what an
+/// offline inspection of a data directory reads per segment.
+///
+/// # Errors
+///
+/// [`SegmentError::UnsupportedVersion`] (carrying the version found) for a
+/// file of another format generation, [`SegmentError::InvalidMagic`] or
+/// [`SegmentError::CorruptFile`] for a file that is not a whole segment, and
+/// [`SegmentError::Io`] if it cannot be read.
+pub fn read_meta(path: &std::path::Path) -> Result<SegmentFileMeta> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let byte_size = file.metadata()?.len();
+    if byte_size < (HEADER_SIZE + FOOTER_SIZE) as u64 {
+        return Err(SegmentError::CorruptFile {
+            detail: format!(
+                "{byte_size} bytes is shorter than a header and a footer ({} bytes)",
+                HEADER_SIZE + FOOTER_SIZE
+            ),
+        });
+    }
+    let mut head = [0u8; HEADER_SIZE];
+    file.read_exact(&mut head)?;
+    let header = SegmentHeader::from_bytes(&head)?;
+    let mut tail = [0u8; FOOTER_SIZE];
+    file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+    file.read_exact(&mut tail)?;
+    let footer = SegmentFooter::from_bytes(&tail)?;
+    Ok(SegmentFileMeta {
+        header,
+        footer,
+        byte_size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_meta_reads_header_and_footer_only() {
+        let header = SegmentHeader {
+            version: VERSION,
+            flags: 0,
+            created_at: 7,
+            min_timestamp: 100,
+            max_timestamp: 200,
+            row_count: 3,
+            column_count: 2,
+            series_count: 1,
+            compression: 0,
+            sort_order: 1,
+        };
+        let footer = SegmentFooter {
+            metadata_offset: HEADER_SIZE as u64 + 16,
+            row_group_count: 4,
+            checksum: 0,
+            metadata_checksum: 0,
+        };
+        let mut bytes = header.to_bytes();
+        bytes.extend_from_slice(&[0xAB; 16]); // a body nothing decodes
+        bytes.extend_from_slice(&footer.to_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.csx");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let meta = read_meta(&path).unwrap();
+        assert_eq!(meta.header, header);
+        assert_eq!(meta.footer, footer);
+        assert_eq!(meta.byte_size, bytes.len() as u64);
+
+        // Another generation is reported with the version it carries.
+        bytes[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        match read_meta(&path) {
+            Err(SegmentError::UnsupportedVersion { version, .. }) => {
+                assert_eq!(version, VERSION + 1);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+
+        std::fs::write(&path, b"CXSG").unwrap();
+        assert!(matches!(
+            read_meta(&path),
+            Err(SegmentError::CorruptFile { .. })
+        ));
+    }
 
     #[test]
     fn header_roundtrip() {

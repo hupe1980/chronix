@@ -148,6 +148,9 @@ pub struct ConnectorManager {
     max_start_retries: u32,
     /// Initial backoff duration in milliseconds (doubles each retry).
     start_retry_backoff_ms: u64,
+    /// The server's per-namespace ingestion limiter, handed to every
+    /// connector this manager builds.
+    ingest: crate::rate_limit::NamespaceIngestLimiter,
 }
 
 impl ConnectorManager {
@@ -158,7 +161,19 @@ impl ConnectorManager {
             db,
             max_start_retries: 0,
             start_retry_backoff_ms: 1000,
+            ingest: crate::rate_limit::NamespaceIngestLimiter::new(),
         }
+    }
+
+    /// Share the server's per-namespace ingestion limiter with every
+    /// connector this manager builds.
+    #[must_use]
+    pub fn with_ingest_limiter(
+        mut self,
+        ingest: crate::rate_limit::NamespaceIngestLimiter,
+    ) -> Self {
+        self.ingest = ingest;
+        self
     }
 
     /// Set the maximum number of start retries per connector.
@@ -339,7 +354,8 @@ impl ConnectorManager {
                 kafka_cfg.clone(),
                 self.db.clone(),
                 config.server.multi_tenancy,
-            );
+            )
+            .with_ingest_limiter(self.ingest.clone());
             info!(name = "kafka-default", "registering new Kafka connector");
             connectors.push(consumer.clone());
             self.start_with_retry(consumer.as_ref()).await?;
@@ -353,7 +369,8 @@ impl ConnectorManager {
                 mqtt_cfg.clone(),
                 self.db.clone(),
                 config.server.multi_tenancy,
-            );
+            )
+            .with_ingest_limiter(self.ingest.clone());
             info!(name = "mqtt-default", "registering new MQTT connector");
             connectors.push(subscriber.clone());
             self.start_with_retry(subscriber.as_ref()).await?;

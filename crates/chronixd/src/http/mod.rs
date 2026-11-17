@@ -14,6 +14,8 @@
 //!
 //! The shared database handle is passed via Axum state.
 
+mod detectors;
+mod explain;
 mod management;
 mod prom;
 mod prom_params;
@@ -29,6 +31,10 @@ pub use types::{
 };
 
 // Re-export all handler functions so server.rs can reference them as `http::handler_name`.
+pub use detectors::{declare_detector_handler, drop_detector_handler, list_detectors_handler};
+#[cfg(feature = "mcp")]
+pub(crate) use explain::promql_explain;
+pub use explain::{PromqlExplainRequest, promql_explain_handler};
 pub use management::{
     create_rollup_handler, declare_field_handler, delete_batch_handler, delete_handler,
     delete_rollup_handler, drop_measurement_handler, export_dashboards_handler,
@@ -40,9 +46,10 @@ pub use prom::{
     prom_buildinfo_handler, prom_empty_alerts_handler, prom_empty_exemplars_handler,
     prom_empty_rules_handler, prom_instant_query_handler, prom_label_values_handler,
     prom_labels_handler, prom_metadata_handler, prom_range_query_handler, prom_series_handler,
+    prom_status_tsdb_handler, status_tsdb_body,
 };
 pub use prom_params::{PromParams, parse_duration_ns, parse_time_ns};
-pub use query::{query_explain_handler, query_handler, sql_handler};
+pub use query::{SqlRequest, query_explain_handler, query_handler, sql_handler};
 pub use streaming::{annotations_handler, annotations_stream_handler, cdc_stream_handler};
 pub use triggers::{
     SignalView, TriggerResponse, TriggerSqlRequest, TriggerView, drop_trigger_handler,

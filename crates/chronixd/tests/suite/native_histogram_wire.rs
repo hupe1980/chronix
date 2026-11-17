@@ -40,8 +40,6 @@ async fn server() -> (String, TempDir) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: std::sync::Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -50,11 +48,13 @@ async fn server() -> (String, TempDir) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_handle = chronixd::server::prometheus_builder()
@@ -272,10 +272,10 @@ async fn remote_write_v2_histogram_is_stored_and_counted_in_the_response() {
                     reset_hint: 0,
                     timestamp: ts,
                     custom_values: vec![],
+                    start_timestamp: 0,
                 }],
                 exemplars: vec![],
                 metadata: None,
-                created_timestamp: 0,
             },
             // A plain counter, sharing the `job="api"` symbols above.
             prom_proto_v2::TimeSeries {
@@ -283,11 +283,11 @@ async fn remote_write_v2_histogram_is_stored_and_counted_in_the_response() {
                 samples: vec![prom_proto_v2::Sample {
                     value: 42.0,
                     timestamp: ts,
+                    start_timestamp: 0,
                 }],
                 histograms: vec![],
                 exemplars: vec![],
                 metadata: None,
-                created_timestamp: 0,
             },
         ],
     };
@@ -732,11 +732,11 @@ async fn a_dangling_symbol_reference_is_refused() {
             samples: vec![prom_proto_v2::Sample {
                 value: 1.0,
                 timestamp: now_ms(),
+                start_timestamp: 0,
             }],
             histograms: vec![],
             exemplars: vec![],
             metadata: None,
-            created_timestamp: 0,
         }],
     };
     let resp = post_proto(
@@ -865,4 +865,252 @@ async fn discovery_and_the_evaluator_agree_about_classic_bucket_series() {
         1,
         "an `le` equality must narrow /series too, not empty it: {body}"
     );
+}
+
+// ── Start timestamps ───────────────────────────────────────────────────
+
+/// Run one SQL query, returning the rows.
+async fn sql_rows(base: &str, sql: &str) -> Vec<Value> {
+    chronixd::tls::ensure_crypto_provider();
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/chronix/sql"))
+        .json(&serde_json::json!({ "query": sql }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    assert!(status.is_success(), "`{sql}` failed: {body}");
+    body["rows"].as_array().cloned().unwrap_or_default()
+}
+
+/// The `_start` of every row of `measurement`, in nanoseconds, ordered by time.
+async fn starts(base: &str, measurement: &str) -> Vec<Option<i64>> {
+    sql_rows(
+        base,
+        &format!("SELECT CAST(_start AS BIGINT) FROM {measurement} ORDER BY _time"),
+    )
+    .await
+    .into_iter()
+    .map(|row| row[0].as_i64())
+    .collect()
+}
+
+fn v2_counter(ts: i64, samples: Vec<prom_proto_v2::Sample>) -> prom_proto_v2::Request {
+    let _ = ts;
+    prom_proto_v2::Request {
+        symbols: vec![
+            String::new(),
+            "__name__".to_string(),
+            "boots_total".to_string(),
+        ],
+        timeseries: vec![prom_proto_v2::TimeSeries {
+            label_refs: vec![1, 2],
+            samples,
+            histograms: vec![],
+            exemplars: vec![],
+            metadata: None,
+        }],
+    }
+}
+
+/// A remote write 2.0 sample's start timestamp (rc.5, `Sample` field 3) is
+/// stored in `_start`, with the specification's encoding: `0` is unset, and
+/// `1` / `-1` are the epoch.
+#[tokio::test]
+async fn remote_write_v2_start_timestamps_are_stored() {
+    let (base, _tmp) = server().await;
+    let ts = now_ms();
+    let sample = |offset: i64, start: i64| prom_proto_v2::Sample {
+        value: 1.0,
+        timestamp: ts + offset,
+        start_timestamp: start,
+    };
+    let req = v2_counter(
+        ts,
+        vec![
+            sample(0, ts - 5_000),
+            sample(1, 0),
+            sample(2, 1),
+            sample(3, -1),
+        ],
+    );
+    let resp = post_proto(
+        &base,
+        "/api/v1/prom/write",
+        Some("application/x-protobuf;proto=io.prometheus.write.v2.Request"),
+        req.encode_to_vec(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        starts(&base, "boots_total").await,
+        vec![Some((ts - 5_000) * 1_000_000), None, Some(0), Some(0)]
+    );
+}
+
+/// A start after the sample is a sender defect: the sample is refused and the
+/// 2.0 accounting header says it was not written, while its neighbours land.
+#[tokio::test]
+async fn a_start_after_the_sample_is_refused_and_counted() {
+    let (base, _tmp) = server().await;
+    let ts = now_ms();
+    let req = v2_counter(
+        ts,
+        vec![
+            prom_proto_v2::Sample {
+                value: 1.0,
+                timestamp: ts,
+                start_timestamp: ts + 1,
+            },
+            prom_proto_v2::Sample {
+                value: 2.0,
+                timestamp: ts + 1,
+                start_timestamp: ts,
+            },
+        ],
+    );
+    let resp = post_proto(
+        &base,
+        "/api/v1/prom/write",
+        Some("application/x-protobuf;proto=io.prometheus.write.v2.Request"),
+        req.encode_to_vec(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        resp.headers()["x-prometheus-remote-write-samples-written"],
+        "1"
+    );
+    assert_eq!(
+        starts(&base, "boots_total").await,
+        vec![Some(ts * 1_000_000)]
+    );
+}
+
+/// OTLP `start_time_unix_nano` on a cumulative sum is stored in `_start`,
+/// over protobuf and over JSON; `0` is unset.
+#[tokio::test]
+async fn otlp_start_times_are_stored_over_protobuf_and_json() {
+    let (base, _tmp) = server().await;
+    let ts = now_ms() as u64 * 1_000_000;
+    let sum = |name: &str, start: u64| otlp::ExportMetricsServiceRequest {
+        resource_metrics: vec![otlp::ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![otlp::ScopeMetrics {
+                scope: None,
+                metrics: vec![otlp::Metric {
+                    name: name.into(),
+                    description: String::new(),
+                    unit: String::new(),
+                    data: Some(otlp::metric::Data::Sum(otlp::Sum {
+                        data_points: vec![otlp::NumberDataPoint {
+                            attributes: vec![],
+                            start_time_unix_nano: start,
+                            time_unix_nano: ts,
+                            value: Some(otlp::number_data_point::Value::AsDouble(3.0)),
+                        }],
+                        aggregation_temporality: 2,
+                        is_monotonic: true,
+                    })),
+                }],
+            }],
+        }],
+    };
+    chronixd::tls::ensure_crypto_provider();
+    for (name, start) in [("otel_set", ts - 7_000), ("otel_unset", 0)] {
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/metrics"))
+            .header("content-type", "application/x-protobuf")
+            .body(sum(name, start).encode_to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    }
+    assert_eq!(
+        starts(&base, "otel_set").await,
+        vec![Some((ts - 7_000) as i64)]
+    );
+    // A measurement that never received a start timestamp has no `_start`
+    // column at all — it pays nothing for the feature.
+    assert_eq!(
+        sql_rows(&base, "SELECT value FROM otel_unset").await.len(),
+        1
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/chronix/sql"))
+        .json(&serde_json::json!({ "query": "SELECT _start FROM otel_unset" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let json = serde_json::json!({
+        "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{
+            "name": "otel_json",
+            "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [{
+                    "startTimeUnixNano": (ts - 9_000).to_string(),
+                    "timeUnixNano": ts.to_string(),
+                    "asDouble": 1.0
+                }]
+            }
+        }]}]}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/metrics"))
+        .json(&json)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    assert_eq!(
+        starts(&base, "otel_json").await,
+        vec![Some((ts - 9_000) as i64)]
+    );
+}
+
+/// `_start` is not a metric: PromQL enumerates no `boots_total__start`, and
+/// label discovery does not offer it.
+#[tokio::test]
+async fn the_start_column_is_not_a_metric() {
+    let (base, _tmp) = server().await;
+    let ts = now_ms();
+    let req = v2_counter(
+        ts,
+        vec![prom_proto_v2::Sample {
+            value: 1.0,
+            timestamp: ts,
+            start_timestamp: ts - 1_000,
+        }],
+    );
+    let resp = post_proto(
+        &base,
+        "/api/v1/prom/write",
+        Some("application/x-protobuf;proto=io.prometheus.write.v2.Request"),
+        req.encode_to_vec(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    chronixd::tls::ensure_crypto_provider();
+    let names: Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/label/__name__/values"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = names["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(names.contains(&"boots_total"), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("_start")), "{names:?}");
+    assert_eq!(one_value(&promql(&base, "boots_total").await), 1.0);
 }

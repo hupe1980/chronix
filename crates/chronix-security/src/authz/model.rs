@@ -246,9 +246,7 @@ impl ChronixSystem {
 ///
 /// Built in one place — `chronixd`'s authentication middleware, from the
 /// credential — so the roles a policy matches on are the same set whichever
-/// gate asks. They used to be resolved inside the admin gate alone, so the
-/// *same* role granted an administrative operation and nothing in a
-/// namespace policy, and an API key had no roles at all.
+/// gate asks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChronixPrincipal {
     /// The principal identifier (an API key name, a JWT subject, a cert CN).

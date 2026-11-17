@@ -1,0 +1,14 @@
+{
+  "rust": {
+    "promql": "use chronix::Chronix;\n\nfn main() -> Result<(), Box<dyn std::error::Error>> {\n    let db = Chronix::open_small(\"./data\")?;\n\n    // {{range}}\n    let result = db.promql_range(\n        {{query_rust}},\n        {{start_ns}},\n        {{end_ns}},\n        {{step_ns}},\n    )?;\n    println!(\"{result:?}\");\n    Ok(())\n}\n",
+    "sql": "use chronix::Chronix;\nuse chronix::arrow::util::pretty::print_batches;\n\nfn main() -> Result<(), Box<dyn std::error::Error>> {\n    let db = Chronix::open_small(\"./data\")?;\n\n    let batches = db.sql({{query_rust}})?;\n    print_batches(&batches)?;\n    Ok(())\n}\n"
+  },
+  "python": {
+    "promql": "import asyncio{{py_os}}\n\nfrom chronix_client import ChronixClient\n\n\nasync def main() -> None:\n    async with ChronixClient({{base_url_py}}{{auth_py}}) as client:\n        # {{range}}\n        result = await client.prom_query_range(\n            {{query_py}},\n            start=\"{{start}}\",\n            end=\"{{end}}\",\n            step=\"{{step}}\",\n        )\n        for series in result[\"data\"][\"result\"]:\n            print(series[\"metric\"], len(series[\"values\"]), \"points\")\n\n\nasyncio.run(main())\n",
+    "sql": "import asyncio{{py_os}}\n\nfrom chronix_client import ChronixClient\n\n\nasync def main() -> None:\n    async with ChronixClient({{base_url_py}}{{auth_py}}) as client:\n        result = await client.sql({{query_py}})\n        for row in result:\n            print(row)\n\n\nasyncio.run(main())\n"
+  },
+  "curl": {
+    "promql": "curl -sG {{base_url}}/api/v1/query_range{{auth_curl}} \\\n  --data-urlencode {{query_param_shell}} \\\n  --data-urlencode 'start={{start}}' \\\n  --data-urlencode 'end={{end}}' \\\n  --data-urlencode 'step={{step}}'\n",
+    "sql": "curl -s {{base_url}}/api/v1/chronix/sql{{auth_curl}} \\\n  -H 'content-type: application/json' \\\n  -d {{sql_body_shell}}\n"
+  }
+}

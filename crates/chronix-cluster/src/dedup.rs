@@ -107,7 +107,7 @@ impl DeduplicationCache {
         // Inline eviction: every 1000 operations, sweep expired entries
         // and trim to max capacity.
         let ops = self.ops_since_sweep.fetch_add(1, Ordering::Relaxed);
-        if ops % 1000 == 0 {
+        if ops.is_multiple_of(1000) {
             self.sweep(now);
         }
     }

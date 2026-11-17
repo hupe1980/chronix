@@ -29,6 +29,10 @@ impl Chronix {
         let cfg = config.unwrap_or_default();
         let (timestamps, values) =
             self.fetch_series_data(measurement, field, tags, start_ns, end_ns)?;
+        let (timestamps, values) = match cfg.step_ns {
+            Some(step) => bucket_mean(&timestamps, &values, start_ns, end_ns, step)?,
+            None => (timestamps, values),
+        };
 
         if values.len() < 2 {
             return Err(DbError::Internal(
@@ -54,10 +58,8 @@ impl Chronix {
                 Box::new(SarimaModel::new(p, d, q, sp, sd, sq, m))
             }
             Some("linear_regression") => Box::new(LinearRegressionModel::new()),
-            // A name that is neither built in nor registered is an error, not
-            // a reason to quietly fit something else: a typo in `"holtwinters"`
-            // used to return a simple exponential smoothing forecast under the
-            // caller's belief that it was seasonal.
+            // A name that is neither built in nor registered is an error, never a
+            // reason to quietly fit a different model.
             Some(name) => match chronix_analytics::registry::global_registry()
                 .try_create_model_default(name)
             {
@@ -73,19 +75,23 @@ impl Chronix {
             },
         };
 
-        model
-            .fit(&timestamps, &values)
+        let result = self
+            .executor
+            .run(|| {
+                model.fit(&timestamps, &values)?;
+                model.predict(horizon)
+            })
             .map_err(|e| DbError::Internal(e.to_string()))?;
 
-        let result = model
-            .predict(horizon)
-            .map_err(|e| DbError::Internal(e.to_string()))?;
-
-        // Every model builds a 95 % interval; `confidence` used to be read by
-        // nothing at all, so a caller asking for 99 % got 95 % and no warning.
-        result
+        // Every model builds a 95 % interval; rescale it to the requested
+        // `confidence`.
+        let mut result = result
             .with_confidence(cfg.confidence)
-            .map_err(|e| DbError::Internal(e.to_string()))
+            .map_err(|e| DbError::Internal(e.to_string()))?;
+        if let Some(min) = cfg.lower_bound {
+            result.clamp_below(min);
+        }
+        Ok(result)
     }
 
     /// Forecast a series with the model chosen automatically.
@@ -119,13 +125,54 @@ impl Chronix {
     ) -> Result<chronix_analytics::forecast::AutoForecast> {
         let (timestamps, values) =
             self.fetch_series_data(measurement, field, tags, start_ns, end_ns)?;
-        chronix_analytics::forecast::auto_forecast(
-            &timestamps,
-            &values,
-            horizon,
-            &options.unwrap_or_default(),
-        )
-        .map_err(|e| DbError::Internal(e.to_string()))
+        let options = options.unwrap_or_default();
+        self.executor
+            .run(|| {
+                chronix_analytics::forecast::auto_forecast(&timestamps, &values, horizon, &options)
+            })
+            .map_err(|e| DbError::Internal(e.to_string()))
+    }
+
+    /// [`auto_forecast`](Self::auto_forecast) on the series averaged into
+    /// `step_ns`-wide buckets.
+    ///
+    /// Fitting at a chart's resolution rather than on raw samples is both
+    /// faster and better: a week of 10 s samples is 60 480 points and too
+    /// long to cross-validate interactively, while the same week at 15 min
+    /// is 672 points in which the daily season is visible to period
+    /// detection. `horizon` and the result are in steps.
+    ///
+    /// Buckets are aligned to `start_ns` and hold the mean of their samples,
+    /// stamped at the bucket's start. An empty bucket between two non-empty
+    /// ones is filled by linear interpolation, so the spacing stays regular,
+    /// which every seasonal model assumes; empty buckets at either end are
+    /// dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`auto_forecast`](Self::auto_forecast), and
+    /// [`DbError::InvalidRequest`] if `step_ns` is not positive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn auto_forecast_at_step(
+        &self,
+        measurement: &str,
+        field: &str,
+        tags: &[(&str, &str)],
+        start_ns: i64,
+        end_ns: i64,
+        step_ns: i64,
+        horizon: usize,
+        options: Option<chronix_analytics::forecast::AutoForecastOptions>,
+    ) -> Result<chronix_analytics::forecast::AutoForecast> {
+        let (timestamps, values) =
+            self.fetch_series_data(measurement, field, tags, start_ns, end_ns)?;
+        let (timestamps, values) = bucket_mean(&timestamps, &values, start_ns, end_ns, step_ns)?;
+        let options = options.unwrap_or_default();
+        self.executor
+            .run(|| {
+                chronix_analytics::forecast::auto_forecast(&timestamps, &values, horizon, &options)
+            })
+            .map_err(|e| DbError::Internal(e.to_string()))
     }
 
     /// Detect anomalies in a series.
@@ -155,18 +202,9 @@ impl Chronix {
             ));
         }
 
-        // The name is refused if it is not one this database has, exactly as
-        // `forecast` refuses an unknown model one function above. It used to
-        // fall through to a z-score and say nothing, so `"modified-zscore"` —
-        // a plausible typo for the *median/MAD* detector, which is chosen
-        // precisely because it is robust to the outliers a mean and standard
-        // deviation are not — returned mean-based scores under
-        // `method: ZScore`.
-        //
-        // `"zscore"` needs a branch of its own now. It never had one: it is
-        // the first name in `AnomalyConfig::method`'s documented list and it
-        // reached its detector only by falling through the same arm that
-        // swallowed the typos, which is why nobody noticed the arm.
+        // An unknown method name is refused, as `forecast` refuses an unknown
+        // model: a typo must not silently run a different detector. `"zscore"` has
+        // its own branch for the same reason.
         let mut detector: Box<dyn AnomalyDetector> = match cfg.method.as_deref() {
             Some("zscore") | None => Box::new(ZScoreDetector::new(Some(cfg.threshold))),
             Some("iqr") => Box::new(IqrDetector::new(Some(cfg.threshold))),
@@ -198,12 +236,11 @@ impl Chronix {
             },
         };
 
-        detector
-            .fit(&timestamps, &values)
-            .map_err(|e| DbError::Internal(e.to_string()))?;
-
-        detector
-            .detect(&timestamps, &values)
+        self.executor
+            .run(|| {
+                detector.fit(&timestamps, &values)?;
+                detector.detect(&timestamps, &values)
+            })
             .map_err(|e| DbError::Internal(e.to_string()))
     }
 
@@ -221,7 +258,14 @@ impl Chronix {
         let (timestamps, values) =
             self.fetch_series_data(measurement, field, tags, start_ns, end_ns)?;
 
-        chronix_analytics::preprocess::PreprocessPipeline::run(&config, &timestamps, &values)
+        self.executor
+            .run(|| {
+                chronix_analytics::preprocess::PreprocessPipeline::run(
+                    &config,
+                    &timestamps,
+                    &values,
+                )
+            })
             .map_err(|e| DbError::Internal(e.to_string()))
     }
 
@@ -291,5 +335,88 @@ impl Chronix {
         }
 
         Ok((timestamps, values))
+    }
+}
+
+/// Average `(timestamps, values)` into `step`-wide buckets aligned to
+/// `start`; interior empty buckets are interpolated, edge ones dropped.
+fn bucket_mean(
+    timestamps: &[i64],
+    values: &[f64],
+    start: i64,
+    end: i64,
+    step: i64,
+) -> Result<(Vec<i64>, Vec<f64>)> {
+    if step <= 0 {
+        return Err(DbError::InvalidRequest(format!(
+            "step must be a positive number of nanoseconds, got {step}"
+        )));
+    }
+    // One accumulator per bucket; a window of more than a million steps is
+    // a step chosen too small, not a series worth fitting.
+    const MAX_BUCKETS: i64 = 1_000_000;
+    let buckets = end.saturating_sub(start).max(0) / step + 1;
+    if buckets > MAX_BUCKETS {
+        return Err(DbError::InvalidRequest(format!(
+            "step {step} ns splits the window into {buckets} buckets; at most {MAX_BUCKETS}"
+        )));
+    }
+    let n = usize::try_from(buckets).unwrap_or(0);
+    let mut sum = vec![0.0_f64; n];
+    let mut count = vec![0_u32; n];
+    for (&t, &v) in timestamps.iter().zip(values) {
+        if t < start || !v.is_finite() {
+            continue;
+        }
+        let Ok(i) = usize::try_from((t - start) / step) else {
+            continue;
+        };
+        if let (Some(s), Some(c)) = (sum.get_mut(i), count.get_mut(i)) {
+            *s += v;
+            *c += 1;
+        }
+    }
+    let filled: Vec<usize> = (0..n)
+        .filter(|&i| count.get(i).is_some_and(|&c| c > 0))
+        .collect();
+    let (Some(&first), Some(&last)) = (filled.first(), filled.last()) else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut out_t = Vec::with_capacity(last - first + 1);
+    let mut out_v = Vec::with_capacity(last - first + 1);
+    let mean = |i: usize| {
+        sum.get(i).copied().unwrap_or(0.0) / f64::from(count.get(i).copied().unwrap_or(1))
+    };
+    for pair in filled.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let (va, vb) = (mean(a), mean(b));
+        for i in a..b {
+            let frac = (i - a) as f64 / (b - a) as f64;
+            out_t.push(start + i as i64 * step);
+            out_v.push(va + (vb - va) * frac);
+        }
+    }
+    out_t.push(start + last as i64 * step);
+    out_v.push(mean(last));
+    Ok((out_t, out_v))
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::bucket_mean;
+
+    #[test]
+    fn averages_and_interpolates_interior_gaps() {
+        // Buckets of 10: [0,10) holds 1 and 3, [10,20) is empty, [20,30) holds 6.
+        let (t, v) = bucket_mean(&[0, 5, 25], &[1.0, 3.0, 6.0], 0, 29, 10).unwrap();
+        assert_eq!(t, vec![0, 10, 20]);
+        assert_eq!(v, vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn drops_empty_edges_and_refuses_a_bad_step() {
+        let (t, v) = bucket_mean(&[15], &[7.0], 0, 40, 10).unwrap();
+        assert_eq!((t, v), (vec![10], vec![7.0]));
+        assert!(bucket_mean(&[1], &[1.0], 0, 10, 0).is_err());
     }
 }

@@ -33,9 +33,10 @@ mod reader;
 mod sink;
 mod writer;
 
-pub use reader::{WalReader, WalRecord, replay_all, replay_range};
+pub use reader::{WalReader, WalRecord, WalScan, replay_all, replay_range, scan_headers};
 pub use sink::WalSink;
 pub use writer::WalWriter;
+pub use writer::list_wal_files;
 
 /// WAL file magic bytes.
 pub const WAL_MAGIC: &[u8; 4] = b"CXWL";

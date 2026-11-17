@@ -69,6 +69,7 @@ impl Chronix {
     /// I/O fails.
     #[must_use = "backup errors indicate incomplete backup"]
     pub fn backup(&self, target_dir: &Path) -> Result<BackupManifest> {
+        self.ensure_writable("a backup")?;
         self.check_open()?;
 
         // A checkpoint into the database's own directory would place a file

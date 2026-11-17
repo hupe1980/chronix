@@ -27,26 +27,17 @@ pub async fn list_measurements_handler(
 ) -> Result<Json<PaginatedResponse<MeasurementInfo>>, ServerError> {
     let db = state.db.clone();
     let scope = crate::namespace::scope(&state, ns_ctx.as_ref().map(|e| &e.0)).map(str::to_string);
-    // No cardinality cap on the *listing*. This used to pass
-    // `prom_series_limit` into `measurements_in`, so a tenant with more
-    // measurements than the cap got a truncated list whose `total` reported
-    // the truncated length — a paginated endpoint that says "total: 10000"
-    // and can never reach the rest. Pagination is the bound here, and it is
-    // exact.
-    //
-    // The cost is one `LIMIT 1` probe per measurement under tenancy, which is
-    // bounded by the number of *measurements* (tens to hundreds) rather than
-    // by series cardinality — and it was already paying up to
-    // `prom_series_limit` of them. A per-namespace measurement index would
-    // make it a lookup; that is a backlog item, not a hazard.
+    // No cardinality cap on the listing: pagination is the bound, and it is
+    // exact, so `total` is the real total. Under tenancy this costs one
+    // `LIMIT 1` probe per measurement, bounded by the number of measurements
+    // rather than by series cardinality.
     let all_infos = tokio::task::spawn_blocking(move || {
         let names = if scope.is_some() {
             crate::namespace::measurements_in(&db, scope.as_deref(), i64::MIN, i64::MAX, usize::MAX)
         } else {
-            // Through `measurement_names_in`, not the raw schema registry:
-            // the registry still lists a measurement pending a soft-delete,
-            // and listing it back is the same defect as scanning it back —
-            // a "drop" a caller can still see is not a drop.
+            // Through `measurement_names_in`, not the raw schema registry: the
+            // registry still lists a measurement pending a soft-delete, and a dropped
+            // measurement must not be listed.
             db.measurement_names_in(None)
         };
 
@@ -228,21 +219,10 @@ pub async fn drop_measurement_handler(
 /// `POST /api/v1/measurements/{name}/restore` — undo a pending drop.
 ///
 /// Only meaningful when `[database] soft_delete_ttl_secs` is set: a drop then
-/// marks the measurement pending and a background pass hard-deletes it once
-/// the deadline passes, so until then it can be brought back. Without the
-/// setting a drop is immediate and there is nothing to restore, which is what
-/// `404` means here.
-///
-/// This exists because the setting did not: `soft_delete_ttl` and
-/// `restore_measurement` were both in the engine, tested, and reachable only
-/// from the embedded API — so the server's most destructive call, dropping a
-/// measurement, had no undo even though the engine implemented one. A grace
-/// window nothing can act on is worse than none, because it reads as a safety
-/// net.
-///
-/// Under multi-tenancy the drop handler deletes *this namespace's series*
-/// rather than the measurement, so there is no pending drop to undo and the
-/// answer is the same `404`.
+/// marks the measurement pending, and a background pass hard-deletes it once
+/// the deadline passes. Without the setting a drop is immediate and there is
+/// nothing to restore. Under multi-tenancy a drop deletes this namespace's
+/// series rather than the measurement, so there is no pending drop either.
 ///
 /// # Errors
 ///
@@ -436,22 +416,14 @@ pub struct RollupInfo {
     pub source_measurement: String,
     /// Target measurement storing the roll-up data.
     pub target_measurement: String,
-    /// The bucket width, spelled the way it is written: `"15m"`, `"1d"`,
-    /// `"1mo"`.
-    ///
-    /// It used to be `window_seconds`, which cannot say "a month" and reads
-    /// "86400" for a tier whose buckets are 23 or 25 hours long. The string
-    /// is the one `every` accepts, so what this endpoint reports can be typed
-    /// straight back into a create request.
+    /// The bucket width as written — `"15m"`, `"1d"`, `"1mo"` — the same string
+    /// `every` accepts, so the response can be typed straight back into a create
+    /// request.
     pub every: String,
     /// The IANA zone the buckets are read against, or `null` for UTC.
     pub timezone: Option<String>,
-    /// The instant the boundaries are aligned to, RFC 3339, or `null` for
-    /// the default anchor (midnight on the 1st).
-    ///
-    /// Reported so the round trip this struct promises actually holds: a
-    /// rollup created with an `origin` used to read back without one, and
-    /// typing the response back in would have silently moved every boundary.
+    /// The instant the boundaries are aligned to, RFC 3339, or `null` for the
+    /// default anchor (midnight on the 1st), so a read-back round-trips.
     pub origin: Option<String>,
     /// Aggregation functions applied.
     pub aggregations: Vec<String>,
@@ -797,8 +769,7 @@ pub async fn export_parquet_handler(
             ));
         }
 
-        // Scoped like every other read: an export used to write **every**
-        // tenant's rows into a file the caller then downloads.
+        // Scoped like every other read: an export holds the caller's rows only.
         let mut builder = db
             .query()
             .measurement(&body.measurement)

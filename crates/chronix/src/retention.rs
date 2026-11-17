@@ -70,24 +70,16 @@ pub fn shards_to_drop(
 /// The instant retention measures age from: the wall clock, **capped by the
 /// newest timestamp the database holds**.
 ///
-/// Retention is the only irreversible thing a background thread does, and a
-/// cutoff derived from `SystemTime::now()` alone makes one reading of the
-/// clock enough to delete everything — a gateway with no battery-backed RTC,
-/// an NTP server handing out a date in the next century, a restored VM
-/// snapshot. It also empties a database that has simply *stopped writing*:
-/// three days of readings that ended a month ago are three days old to each
-/// other, and a seven-day rule has nothing to say about them.
+/// Retention is the only irreversible thing a background thread does, so one
+/// bad clock reading — a gateway with no RTC, a wrong NTP answer, a restored
+/// VM snapshot — must not delete everything, and a database that has simply
+/// stopped writing must not be emptied. Finality is anchored on the newest
+/// write, as for rollups.
 ///
-/// Capping answers both, and is the rule the rollup materialiser already
-/// used: finality is anchored on the newest write, not on the clock.
-///
-/// The cap **delays** retention rather than disabling it — one fresh write
-/// moves the reference to the present. Two consequences, stated rather than
-/// implied: the newest data can never be expired, and a database that stops
-/// receiving data stops freeing disk. `delete` is the way to reclaim it.
-///
-/// `newest_data_ns` is `None` for an empty database, where nothing can expire
-/// anyway.
+/// The cap delays retention rather than disabling it: one fresh write moves
+/// the reference to the present. The newest data can never expire, and a
+/// database that stops receiving data stops freeing disk; `delete` reclaims
+/// it. `newest_data_ns` is `None` for an empty database.
 #[must_use]
 pub fn retention_reference(now_ns: i64, newest_data_ns: Option<i64>) -> i64 {
     match newest_data_ns {

@@ -1,8 +1,8 @@
 //! Namespace registry — CRUD for tenant namespaces.
 //!
 //! Manages the lifecycle of namespaces: creation, deletion, listing,
-//! and configuration updates. Each namespace encapsulates its own
-//! quota limits and usage counters.
+//! and configuration updates. Each namespace carries its quota limits;
+//! usage is the database's to report, not this registry's.
 //!
 //! Optionally persists namespace state to disk via JSON snapshots.
 
@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use chronix_core::{NamespaceId, NamespaceQuota, NamespaceUsage};
+use chronix_core::{NamespaceId, NamespaceQuota};
 
 use crate::tenant::error::{Result, TenantError};
 
@@ -33,19 +33,24 @@ pub struct NamespaceInfo {
     pub created_at_ms: u64,
 }
 
-/// Current state of a namespace including live usage.
+/// A registered namespace.
+///
+/// It carries configuration only. Usage is not kept here: a counter beside
+/// the data is one nothing decrements on retention or delete, which is how
+/// this registry once reported a namespace's series count without any write
+/// ever moving it. Usage is read from the database, which admits every
+/// series against the same exact set it counts
+/// (`Chronix::namespace_usage`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceState {
     /// Namespace metadata.
     pub info: NamespaceInfo,
-    /// Real-time resource usage.
-    pub usage: NamespaceUsage,
 }
 
 /// Thread-safe namespace registry.
 ///
-/// Provides fast, concurrent access to namespace metadata and usage
-/// counters using [`DashMap`] for lock-free reads.
+/// Provides fast, concurrent access to namespace metadata using
+/// [`DashMap`] for lock-free reads.
 ///
 /// # Default Namespace
 ///
@@ -131,8 +136,12 @@ impl NamespaceRegistry {
             let data = std::fs::read_to_string(&snapshot_path).map_err(|e| {
                 TenantError::InvalidConfig(format!("cannot read namespace snapshot: {e}"))
             })?;
+            refuse_removed_fields(&snapshot_path, &data)?;
             let states: Vec<NamespaceState> = serde_json::from_str(&data).map_err(|e| {
-                TenantError::InvalidConfig(format!("corrupt namespace snapshot: {e}"))
+                TenantError::InvalidConfig(format!(
+                    "corrupt namespace snapshot {}: {e}",
+                    snapshot_path.display()
+                ))
             })?;
             let namespaces = DashMap::new();
             for state in states {
@@ -172,10 +181,7 @@ impl NamespaceRegistry {
             };
             self.namespaces.insert(
                 NamespaceId::DEFAULT.to_string(),
-                NamespaceState {
-                    info: default_info,
-                    usage: NamespaceUsage::default(),
-                },
+                NamespaceState { info: default_info },
             );
         }
     }
@@ -223,10 +229,7 @@ impl NamespaceRegistry {
                     created_at_ms: now_ms(),
                 };
 
-                let state = NamespaceState {
-                    info: info.clone(),
-                    usage: NamespaceUsage::default(),
-                };
+                let state = NamespaceState { info: info.clone() };
 
                 vacant.insert(state);
 
@@ -338,290 +341,33 @@ impl NamespaceRegistry {
         self.save_snapshot_inner()?;
         Ok(())
     }
-
-    /// Get a reference to the usage counters for a namespace.
-    ///
-    /// Returns `None` if the namespace does not exist.
-    #[must_use]
-    pub fn get_usage(&self, name: &str) -> Option<NamespaceUsage> {
-        self.namespaces.get(name).map(|r| r.value().usage.clone())
-    }
-
-    /// Update usage counters for a namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns `NamespaceNotFound` if the namespace does not exist.
-    pub fn update_usage(&self, name: &str, usage: NamespaceUsage) -> Result<()> {
-        let mut entry = self
-            .namespaces
-            .get_mut(name)
-            .ok_or_else(|| TenantError::NamespaceNotFound(name.to_string()))?;
-
-        entry.value_mut().usage = usage;
-        Ok(())
-    }
-
-    /// Increment the series count for a namespace.
-    ///
-    /// Uses saturating addition to prevent `u64` overflow.
-    ///
-    /// # Errors
-    ///
-    /// Returns `NamespaceNotFound` if the namespace does not exist.
-    pub fn increment_series(&self, name: &str, count: u64) -> Result<()> {
-        let mut entry = self
-            .namespaces
-            .get_mut(name)
-            .ok_or_else(|| TenantError::NamespaceNotFound(name.to_string()))?;
-
-        entry.value_mut().usage.series_count =
-            entry.value().usage.series_count.saturating_add(count);
-        Ok(())
-    }
-
-    /// Increment the storage bytes for a namespace.
-    ///
-    /// Uses saturating addition to prevent `u64` overflow.
-    ///
-    /// # Errors
-    ///
-    /// Returns `NamespaceNotFound` if the namespace does not exist.
-    pub fn increment_storage(&self, name: &str, bytes: u64) -> Result<()> {
-        let mut entry = self
-            .namespaces
-            .get_mut(name)
-            .ok_or_else(|| TenantError::NamespaceNotFound(name.to_string()))?;
-
-        entry.value_mut().usage.storage_bytes =
-            entry.value().usage.storage_bytes.saturating_add(bytes);
-        Ok(())
-    }
-
-    /// Increment the measurement count for a namespace.
-    ///
-    /// Uses saturating addition to prevent `u32` overflow.
-    ///
-    /// # Errors
-    ///
-    /// Returns `NamespaceNotFound` if the namespace does not exist.
-    pub fn increment_measurements(&self, name: &str, count: u32) -> Result<()> {
-        let mut entry = self
-            .namespaces
-            .get_mut(name)
-            .ok_or_else(|| TenantError::NamespaceNotFound(name.to_string()))?;
-
-        entry.value_mut().usage.measurements =
-            entry.value().usage.measurements.saturating_add(count);
-        Ok(())
-    }
-
-    /// Atomically check write quota and increment usage counters.
-    ///
-    /// Holds the DashMap shard lock for the namespace across both the
-    /// quota check and the usage update, eliminating the TOCTOU race
-    /// between a separate `check_write()` and `increment_series()`.
-    ///
-    /// The ingestion rate is tracked as a **windowed counter** that resets
-    /// once per second. This prevents the rate from accumulating
-    /// indefinitely and permanently blocking writes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `NamespaceNotFound` if the namespace does not exist.
-    /// Returns `QuotaExceeded` if any resource limit would be breached.
-    pub fn check_and_increment_write(
-        &self,
-        name: &str,
-        new_series: u64,
-        new_points: u64,
-    ) -> Result<()> {
-        let mut entry = self
-            .namespaces
-            .get_mut(name)
-            .ok_or_else(|| TenantError::NamespaceNotFound(name.to_string()))?;
-
-        // Read quota limits and current usage into local copies to avoid
-        // overlapping borrows between value() and value_mut().
-        let max_series = entry.value().info.quota.max_series_count;
-        let max_rate = entry.value().info.quota.max_ingestion_rate;
-        let max_storage = entry.value().info.quota.max_storage_bytes;
-        let current_series = entry.value().usage.series_count;
-        let current_storage = entry.value().usage.storage_bytes;
-
-        // 1. Series count
-        let projected_series = current_series.saturating_add(new_series);
-        if projected_series > max_series {
-            return Err(TenantError::QuotaExceeded {
-                namespace: name.to_string(),
-                resource: "series_count".to_string(),
-                current: current_series,
-                limit: max_series,
-            });
-        }
-
-        // 2. Ingestion rate — windowed per second.
-        //    Reset the counter if we've moved into a new 1-second window.
-        let now_s = now_ms() / 1000;
-        let last_window = entry.value().usage.ingestion_rate_window_s;
-        let current_rate = if last_window == now_s {
-            entry.value().usage.ingestion_rate
-        } else {
-            // New window — reset rate.
-            0.0
-        };
-
-        #[allow(clippy::cast_precision_loss)]
-        let projected_rate = current_rate + new_points as f64;
-        #[allow(clippy::cast_precision_loss)]
-        let rate_limit = max_rate as f64;
-        if projected_rate > rate_limit {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let current = current_rate as u64;
-            return Err(TenantError::QuotaExceeded {
-                namespace: name.to_string(),
-                resource: "ingestion_rate".to_string(),
-                current,
-                limit: max_rate,
-            });
-        }
-
-        // 3. Storage (soft check — bytes tracked asynchronously)
-        if current_storage > max_storage {
-            return Err(TenantError::QuotaExceeded {
-                namespace: name.to_string(),
-                resource: "storage_bytes".to_string(),
-                current: current_storage,
-                limit: max_storage,
-            });
-        }
-
-        // All checks passed — atomically update usage while still holding
-        // the shard lock.
-        let state_mut = entry.value_mut();
-        state_mut.usage.series_count = projected_series;
-        state_mut.usage.ingestion_rate = projected_rate;
-        state_mut.usage.ingestion_rate_window_s = now_s;
-
-        Ok(())
-    }
-
-    /// Atomically check measurement quota and increment count.
-    ///
-    /// Like [`check_and_increment_write`](Self::check_and_increment_write),
-    /// this holds the shard lock across check and update.
-    ///
-    /// # Errors
-    ///
-    /// Returns `NamespaceNotFound` if the namespace does not exist.
-    /// Returns `QuotaExceeded` if the measurement limit would be breached.
-    pub fn check_and_increment_measurement(&self, name: &str) -> Result<()> {
-        let mut entry = self
-            .namespaces
-            .get_mut(name)
-            .ok_or_else(|| TenantError::NamespaceNotFound(name.to_string()))?;
-
-        let state = entry.value();
-        let projected = u64::from(state.usage.measurements) + 1;
-        let limit = u64::from(state.info.quota.max_measurements);
-
-        if projected > limit {
-            return Err(TenantError::QuotaExceeded {
-                namespace: name.to_string(),
-                resource: "measurements".to_string(),
-                current: u64::from(state.usage.measurements),
-                limit,
-            });
-        }
-
-        entry.value_mut().usage.measurements = state.usage.measurements.saturating_add(1);
-        Ok(())
-    }
-
-    /// Compute usage ratios for all namespaces.
-    ///
-    /// Returns a list of `(namespace, resource, ratio)` tuples suitable for
-    /// metric emission or admin API responses. The ratio is `current / limit`
-    /// (0.0 when the limit is 0).
-    #[must_use]
-    pub fn usage_ratios(&self) -> Vec<UsageRatio> {
-        let mut ratios = Vec::new();
-
-        for entry in &self.namespaces {
-            let ns = entry.key();
-            let state = entry.value();
-            let q = &state.info.quota;
-            let u = &state.usage;
-
-            ratios.push(UsageRatio {
-                namespace: ns.clone(),
-                resource: "series_count".to_string(),
-                current: u.series_count,
-                limit: q.max_series_count,
-                ratio: ratio(u.series_count, q.max_series_count),
-            });
-            ratios.push(UsageRatio {
-                namespace: ns.clone(),
-                resource: "storage_bytes".to_string(),
-                current: u.storage_bytes,
-                limit: q.max_storage_bytes,
-                ratio: ratio(u.storage_bytes, q.max_storage_bytes),
-            });
-            ratios.push(UsageRatio {
-                namespace: ns.clone(),
-                resource: "measurements".to_string(),
-                current: u64::from(u.measurements),
-                limit: u64::from(q.max_measurements),
-                ratio: ratio(u64::from(u.measurements), u64::from(q.max_measurements)),
-            });
-        }
-
-        ratios
-    }
-
-    /// Emit `chronix_namespace_usage_ratio` gauges for all namespaces.
-    ///
-    /// Intended to be called periodically (e.g. every 10 s) from a
-    /// background task so dashboards always have fresh data, not just
-    /// on write paths.
-    pub fn emit_usage_metrics(&self) {
-        for r in self.usage_ratios() {
-            metrics::gauge!(
-                "chronix_namespace_usage_ratio",
-                "namespace" => r.namespace,
-                "resource" => r.resource,
-            )
-            .set(r.ratio);
-        }
-    }
 }
 
-/// Per-resource usage ratio for a namespace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageRatio {
-    /// Namespace identifier.
-    pub namespace: String,
-    /// Resource type (e.g. `"series_count"`, `"storage_bytes"`).
-    pub resource: String,
-    /// Current usage value.
-    pub current: u64,
-    /// Configured limit.
-    pub limit: u64,
-    /// Usage ratio (0.0–1.0+). Values > 1.0 indicate over-quota.
-    pub ratio: f64,
-}
-
-/// Compute a safe ratio avoiding division by zero.
+/// Refuse a snapshot that still carries a quota field this release removed,
+/// naming the file, the field and the remedy.
 ///
-/// When the limit is zero and usage is non-zero, returns [`f64::MAX`]
-/// to indicate over-quota. This avoids returning `f64::INFINITY` which
-/// is not valid JSON (RFC 7159) and breaks `serde_json` serialization.
-#[allow(clippy::cast_precision_loss)]
-fn ratio(current: u64, limit: u64) -> f64 {
-    if limit == 0 {
-        return if current > 0 { f64::MAX } else { 0.0 };
+/// `NamespaceQuota` denies unknown fields, so the snapshot would be refused
+/// anyway — but as "unknown field", which reads like a corrupt file. The
+/// operator who upgraded needs to hear that the field was removed on
+/// purpose and that deleting it is the whole fix.
+fn refuse_removed_fields(path: &Path, data: &str) -> Result<()> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Ok(()); // the typed parse reports a malformed file
+    };
+    let carries = value.as_array().is_some_and(|states| {
+        states
+            .iter()
+            .any(|s| s.pointer("/info/quota/max_storage_bytes").is_some())
+    });
+    if carries {
+        return Err(TenantError::InvalidConfig(format!(
+            "{} sets max_storage_bytes, which was removed: namespaces share segments, so \
+             per-namespace bytes cannot be measured. Delete the field from every namespace's \
+             quota and restart; use retention to bound disk",
+            path.display()
+        )));
     }
-    current as f64 / limit as f64
+    Ok(())
 }
 
 impl Default for NamespaceRegistry {
@@ -800,7 +546,6 @@ mod tests {
         let new_quota = NamespaceQuota {
             max_series_count: 500,
             max_ingestion_rate: 1000,
-            max_storage_bytes: 1024,
             max_measurements: 10,
             max_request_rps: 0,
             max_request_burst: 0,
@@ -811,24 +556,6 @@ mod tests {
             .unwrap();
         let state = registry.get("quota-ns").unwrap();
         assert_eq!(state.info.quota, new_quota);
-    }
-
-    #[test]
-    fn usage_tracking() {
-        let registry = NamespaceRegistry::new();
-        let id = NamespaceId::new("usage-ns").unwrap();
-        registry
-            .create_namespace(id, "usage test", "admin", NamespaceQuota::default())
-            .unwrap();
-
-        registry.increment_series("usage-ns", 100).unwrap();
-        registry.increment_storage("usage-ns", 4096).unwrap();
-        registry.increment_measurements("usage-ns", 5).unwrap();
-
-        let usage = registry.get_usage("usage-ns").unwrap();
-        assert_eq!(usage.series_count, 100);
-        assert_eq!(usage.storage_bytes, 4096);
-        assert_eq!(usage.measurements, 5);
     }
 
     #[test]
@@ -852,98 +579,6 @@ mod tests {
         assert!(NamespaceId::new("trailing-").is_err()); // trailing hyphen
         assert!(NamespaceId::new("a".repeat(64)).is_err()); // too long
         assert!(NamespaceId::new("a".repeat(63)).is_ok()); // max length ok
-    }
-
-    // ── Usage ratios ──────────────────────────────────────────
-
-    #[test]
-    fn usage_ratios_empty_registry() {
-        let registry = NamespaceRegistry::new();
-        let ratios = registry.usage_ratios();
-        // Only "default" namespace → 3 resources
-        assert_eq!(ratios.len(), 3);
-        for r in &ratios {
-            assert_eq!(r.namespace, "default");
-            assert!((r.ratio - 0.0).abs() < f64::EPSILON);
-        }
-    }
-
-    #[test]
-    fn usage_ratios_with_usage() {
-        let registry = NamespaceRegistry::new();
-        let id = NamespaceId::new("metrics-ns").unwrap();
-        let quota = NamespaceQuota {
-            max_series_count: 100,
-            max_ingestion_rate: 1000,
-            max_storage_bytes: 10_000,
-            max_measurements: 20,
-            max_request_rps: 0,
-            max_request_burst: 0,
-        };
-        registry
-            .create_namespace(id, "test", "admin", quota)
-            .unwrap();
-
-        registry.increment_series("metrics-ns", 50).unwrap();
-        registry.increment_storage("metrics-ns", 7500).unwrap();
-        registry.increment_measurements("metrics-ns", 10).unwrap();
-
-        let ratios = registry.usage_ratios();
-        let ns_ratios: Vec<_> = ratios
-            .iter()
-            .filter(|r| r.namespace == "metrics-ns")
-            .collect();
-        assert_eq!(ns_ratios.len(), 3);
-
-        let series = ns_ratios
-            .iter()
-            .find(|r| r.resource == "series_count")
-            .unwrap();
-        assert!((series.ratio - 0.5).abs() < f64::EPSILON);
-        assert_eq!(series.current, 50);
-        assert_eq!(series.limit, 100);
-
-        let storage = ns_ratios
-            .iter()
-            .find(|r| r.resource == "storage_bytes")
-            .unwrap();
-        assert!((storage.ratio - 0.75).abs() < f64::EPSILON);
-
-        let measurements = ns_ratios
-            .iter()
-            .find(|r| r.resource == "measurements")
-            .unwrap();
-        assert!((measurements.ratio - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn emit_usage_metrics_does_not_panic() {
-        let registry = NamespaceRegistry::new();
-        let id = NamespaceId::new("emit-ns").unwrap();
-        registry
-            .create_namespace(id, "test", "admin", NamespaceQuota::default())
-            .unwrap();
-        registry.increment_series("emit-ns", 42).unwrap();
-
-        // Should not panic (metrics crate handles missing recorder gracefully).
-        registry.emit_usage_metrics();
-    }
-
-    #[test]
-    fn usage_ratio_zero_limit() {
-        // current > 0, limit == 0 → over-quota → f64::MAX (JSON-safe)
-        let r = ratio(100, 0);
-        assert_eq!(r, f64::MAX);
-
-        // current == 0, limit == 0 → 0.0
-        let r = ratio(0, 0);
-        assert!((r - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn usage_ratio_over_quota() {
-        let r = ratio(200, 100);
-        assert!((r - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1014,5 +649,64 @@ mod tests {
             let state = reg.get("quotans").unwrap();
             assert_eq!(state.info.quota.max_series_count, 42);
         }
+    }
+
+    /// **A snapshot written before the storage quota was removed is refused
+    /// by name, not parsed as corrupt and not silently accepted.** Silently
+    /// accepting it would keep a limit the operator believes is enforced;
+    /// "corrupt" would send them looking for a failing disk.
+    #[test]
+    fn a_snapshot_with_the_removed_storage_quota_is_refused_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("namespaces");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = serde_json::json!([{
+            "info": {
+                "id": "team-a",
+                "description": "",
+                "owner": "admin",
+                "created_at_ms": 0,
+                "quota": {
+                    "max_series_count": 10,
+                    "max_ingestion_rate": 10,
+                    "max_storage_bytes": 1024,
+                    "max_measurements": 1
+                }
+            },
+            "usage": {"series_count": 0}
+        }]);
+        std::fs::write(dir.join(SNAPSHOT_FILE), stale.to_string()).unwrap();
+
+        let err = NamespaceRegistry::open(&dir).unwrap_err().to_string();
+        assert!(err.contains("max_storage_bytes"), "{err}");
+        assert!(err.contains("removed"), "{err}");
+        assert!(err.contains("namespaces.json"), "{err}");
+        assert!(!err.contains("corrupt"), "{err}");
+    }
+
+    /// The `usage` block an older snapshot carries is ignored: usage is the
+    /// database's to report, and a stale counter is not a fact.
+    #[test]
+    fn a_snapshot_with_an_old_usage_block_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("namespaces");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = serde_json::json!([{
+            "info": {
+                "id": "team-a",
+                "description": "",
+                "owner": "admin",
+                "created_at_ms": 0,
+                "quota": {
+                    "max_series_count": 10,
+                    "max_ingestion_rate": 10,
+                    "max_measurements": 1
+                }
+            },
+            "usage": {"series_count": 99, "storage_bytes": 7}
+        }]);
+        std::fs::write(dir.join(SNAPSHOT_FILE), old.to_string()).unwrap();
+        let reg = NamespaceRegistry::open(&dir).unwrap();
+        assert_eq!(reg.get("team-a").unwrap().info.quota.max_series_count, 10);
     }
 }

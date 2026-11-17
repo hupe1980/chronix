@@ -62,11 +62,9 @@ pub struct ApiKeyEntry {
     /// handing every tenant's data to every key.
     #[serde(default)]
     pub namespaces: Vec<String>,
-    /// Whether this key may perform administrative operations.
-    ///
-    /// Restore, namespace management and key management are all reachable
-    /// with an ordinary key otherwise, because the Cedar authorization
-    /// engine is optional and its absence used to mean "permit".
+    /// Whether this key may perform administrative operations: restore,
+    /// namespace management and key management. Checked even when no Cedar
+    /// policy engine is configured.
     #[serde(default)]
     pub admin: bool,
     /// Cedar roles this key carries, as `Chronix::Role` memberships.
@@ -166,9 +164,7 @@ impl ApiKeyStore {
         use base64::Engine;
         let raw_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes);
         let argon2 = Argon2::default();
-        // `hash_password` draws its own salt from the OS. It is the salt this
-        // tree used to build by hand, from the same source, at the same
-        // length — the crate simply owns it now.
+        // `hash_password` draws its own salt from the OS.
         let hash = argon2
             .hash_password(raw_key.as_bytes())
             .map_err(|e| AuthError::Config(format!("hash error: {e}")))?
@@ -669,7 +665,7 @@ mod tests {
             let _ = store.validate(bad_key);
         }
 
-        // The bad key prefix is now rate-limited
+        // The bad key prefix is rate-limited
         let result = store.validate(bad_key);
         assert!(result.is_err());
 

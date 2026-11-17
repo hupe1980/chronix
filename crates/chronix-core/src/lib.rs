@@ -35,7 +35,7 @@ pub mod wal_codec;
 
 pub use config::{
     AnalyticsConfig, Checkpoints, ChronixConfig, ChronixConfigBuilder, CompressionCodec,
-    FieldEncryption, FloatEncoding, FsyncPolicy, WalConfig,
+    FieldEncryption, FloatEncoding, FsyncPolicy, Parallelism, WalConfig,
 };
 pub use decimal::{
     DECIMAL_PRECISION, Decimal, DecimalError, MAX_DECIMAL_MANTISSA, MAX_DECIMAL_SCALE, pow10,
@@ -47,9 +47,9 @@ pub use schema::{
 pub use timebucket::{BucketParseError, BucketWidth, TimeBucket};
 pub use types::{
     FieldValue, Fields, KV_SEPARATOR, MAX_STRING_FIELD_LENGTH, NAMESPACE_TAG, NamespaceId,
-    NamespaceQuota, NamespaceUsage, Point, RESERVED_COLUMN_NAMES, SegmentFile, SegmentId,
-    SegmentState, SeriesKey, ShardId, TAG_SEPARATOR, TIME_COLUMN, Tags, Timestamp, Tombstone,
-    TombstoneSet, WalEntry, canonical_from_pairs, push_canonical,
+    NamespaceQuota, Point, RESERVED_COLUMN_NAMES, START_COLUMN, SealedSection, SegmentFile,
+    SegmentId, SegmentState, SeriesKey, ShardId, TAG_SEPARATOR, TIME_COLUMN, Tags, Timestamp,
+    Tombstone, TombstoneSet, WalEntry, canonical_from_pairs, push_canonical,
 };
 pub use wal_codec::{
     CodecError as WalCodecError, decode as wal_decode, encode as wal_encode,

@@ -1,0 +1,12 @@
+# name	target	path (Grafana URL path, or console fragment)	theme	size
+grafana-explore	grafana	EXPLORE:avg_over_time(pv_power_w[15m])	light	1100x680
+grafana-demo	grafana	/d/chronix-demo/gateway-demo?from=now-2d&to=now	light	1100x775
+grafana-ingestion	grafana	/d/chronix-ingestion/?from=now-5m&to=now&var-datasource=prometheus	light	1100x1180
+grafana-query-performance	grafana	/d/chronix-query-performance/?from=now-5m&to=now&var-datasource=prometheus	light	1100x1000
+console-anomalies	console	q=heat_pump_power_w&l=promql&r=7d&a=1	light	1100x680
+console-hint	console	q=rat(pv_power_w%5B5m%5D)&l=promql&r=1h	light	1100x680
+console-empty	console	q=pv_power_w%7Bdevice%3D%22inverter-9%22%7D&l=promql&r=1h	light	1100x680
+console-cardinality	console	l=promql&r=1h&t=cardinality	light	1100x680
+console-explain	console	q=sum%20by%20(device)%20(rate(grid_import_w%5B5m%5D))&l=promql&r=1h&t=explain	light	1100x680
+console-forecast	console	q=pv_power_w&l=promql&r=7d&f=1	light	1100x680
+console-forecast-dark	console	q=pv_power_w&l=promql&r=7d&f=1	dark	1100x680

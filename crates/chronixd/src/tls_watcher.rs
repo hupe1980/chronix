@@ -43,44 +43,19 @@ impl FileState {
     }
 }
 
-/// Spawns a background task that watches cert/key files and reloads TLS
-/// configuration when changes are detected.
+/// Watch the certificate and key files and reload the live TLS configuration
+/// when they change, with zero downtime.
 ///
-/// The `rustls_config` handle from `axum_server::tls_rustls::RustlsConfig`
-/// supports atomic reload via `reload_from_config()`. This function creates
-/// a polling loop that:
+/// Every `interval_secs` the task compares modification times; on a change it
+/// re-parses the PEM files and swaps the configuration atomically. A reload
+/// that fails keeps the running configuration and counts
+/// `chronix_tls_reloads_total{status="error"}`. A supervisor awaits the
+/// watcher: if it panics, the supervisor counts
+/// `chronix_tls_watcher_panics_total` and logs it, so a dead watcher is always
+/// visible.
 ///
-/// 1. Checks cert and key file modification times every `interval_secs` seconds
-/// 2. On change, re-parses the PEM files via `load_rustls_config()`
-/// 3. Atomically swaps the live TLS configuration (zero downtime)
-///
-/// # Error tracking
-///
-/// Reload errors are tracked via the `chronix_tls_reloads_total{status="error"}`
-/// counter. If the watcher **task itself** panics (e.g. due to a bug in
-/// filesystem I/O), the tokio `JoinHandle` is currently dropped without
-/// notification. An `is_finished()` health check or `panic = "abort"`
-/// policy can guard against silent watcher death.
-///
-/// # Arguments
-///
-/// * `tls_cfg` - The TLS configuration with cert/key paths
-/// * `rustls_config` - The live `RustlsConfig` handle to reload
-/// * `interval_secs` - Polling interval in seconds
-///
-/// Spawns the TLS watcher and returns a `JoinHandle` so the caller can
-/// optionally monitor it (e.g. via `is_finished()` in a health check).
-///
-/// # Supervision
-///
-/// A supervisor task awaits the inner watcher `JoinHandle`.  If the
-/// watcher panics, the supervisor:
-///
-/// 1. Increments `chronix_tls_watcher_panics_total`
-/// 2. Logs the panic via `tracing::error!`
-///
-/// This ensures silent watcher death is always observable through
-/// metrics and logs.
+/// `grpc_cert_resolver`, when given, is reloaded too. An `interval_secs` of
+/// `0` disables watching.
 pub fn spawn_tls_watcher(
     tls_cfg: crate::config::TlsConfig,
     rustls_config: axum_server::tls_rustls::RustlsConfig,

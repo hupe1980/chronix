@@ -311,17 +311,16 @@ impl proto::data_service_server::DataService for DataGrpcServer {
         // client requests linearizable reads. This prevents stale data
         // from a deposed leader whose routing cache entry has not
         // expired yet.
-        if req.require_linearizable {
-            if let Some(ref rm) = self.raft_manager {
-                if let Some(raft) = rm.get_raft(req.region_id) {
-                    raft.ensure_linearizable().await.map_err(|e| {
-                        Status::failed_precondition(format!(
-                            "linearizable read failed for region {}: {e}",
-                            req.region_id,
-                        ))
-                    })?;
-                }
-            }
+        if req.require_linearizable
+            && let Some(ref rm) = self.raft_manager
+            && let Some(raft) = rm.get_raft(req.region_id)
+        {
+            raft.ensure_linearizable().await.map_err(|e| {
+                Status::failed_precondition(format!(
+                    "linearizable read failed for region {}: {e}",
+                    req.region_id,
+                ))
+            })?;
         }
 
         let query = RegionQuery {

@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
@@ -23,6 +24,8 @@ use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
@@ -31,7 +34,7 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::physical_plan::{
     ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream, Statistics,
+    RecordBatchStream, SendableRecordBatchStream, SortOrderPushdownResult, Statistics,
 };
 use futures::Stream;
 
@@ -59,6 +62,10 @@ pub struct ChronixExec {
     tag_filters: Vec<(String, String)>,
     field_predicates: Vec<chronix_engine::segment::FieldPredicate>,
     limit: Option<usize>,
+    /// Emit newest first. Set only by [`ExecutionPlan::try_pushdown_sort`]
+    /// for `ORDER BY _time DESC`, so the declared ordering always matches
+    /// what the stream does.
+    descending: bool,
     properties: Arc<PlanProperties>,
     /// Execution metrics, so `EXPLAIN ANALYZE` says what the scan did.
     ///
@@ -92,12 +99,7 @@ impl ChronixExec {
             None => schema.clone(),
         };
 
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(projected_schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
+        let properties = plan_properties(&projected_schema, false);
 
         Ok(Self {
             db,
@@ -109,10 +111,59 @@ impl ChronixExec {
             tag_filters,
             field_predicates,
             limit,
+            descending: false,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
+
+    /// The same scan with a different direction or limit.
+    fn variant(&self, descending: bool, limit: Option<usize>) -> Self {
+        Self {
+            db: self.db.clone(),
+            measurement: self.measurement.clone(),
+            _schema: self._schema.clone(),
+            projected_schema: self.projected_schema.clone(),
+            time_start: self.time_start,
+            time_end: self.time_end,
+            tag_filters: self.tag_filters.clone(),
+            field_predicates: self.field_predicates.clone(),
+            limit,
+            descending,
+            properties: plan_properties(&self.projected_schema, descending),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+/// The scan's plan properties, declaring the order it really emits.
+///
+/// `execute_iter` merges time-disjoint buckets in ascending time order, and
+/// sorts each bucket by `_time`, so the output is globally `_time`-ordered
+/// — ascending by default, descending when the stream runs newest-first.
+/// Declaring it lets DataFusion drop a redundant `ORDER BY _time` and push a
+/// `LIMIT` into the scan, which then stops after the buckets it needs.
+fn plan_properties(schema: &SchemaRef, descending: bool) -> Arc<PlanProperties> {
+    let eq = match schema.index_of(chronix_core::TIME_COLUMN) {
+        Ok(idx) => EquivalenceProperties::new_with_orderings(
+            schema.clone(),
+            [[PhysicalSortExpr::new(
+                Arc::new(Column::new(chronix_core::TIME_COLUMN, idx)),
+                SortOptions {
+                    descending,
+                    // SQL's defaults; `_time` is never null, so either holds.
+                    nulls_first: descending,
+                },
+            )]],
+        ),
+        Err(_) => EquivalenceProperties::new(schema.clone()),
+    };
+    Arc::new(PlanProperties::new(
+        eq,
+        Partitioning::UnknownPartitioning(1),
+        EmissionType::Incremental,
+        Boundedness::Bounded,
+    ))
 }
 
 /// A chronix error crossing into DataFusion.
@@ -124,12 +175,17 @@ impl DisplayAs for ChronixExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "ChronixExec: measurement={}, time=[{}..{}], filters={}, limit={:?}",
+            "ChronixExec: measurement={}, time=[{}..{}], filters={}, limit={:?}, order={}",
             self.measurement,
             self.time_start,
             self.time_end,
             self.tag_filters.len(),
             self.limit,
+            if self.descending {
+                "_time desc"
+            } else {
+                "_time asc"
+            },
         )
     }
 }
@@ -168,6 +224,49 @@ impl ExecutionPlan for ChronixExec {
         Ok(self)
     }
 
+    /// A `LIMIT` above the scan goes into the chronix plan, where it stops
+    /// `execute_iter` reading buckets.
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let limit = match (self.limit, limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Some(Arc::new(self.variant(self.descending, limit)))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// `ORDER BY _time` in either direction is answered by the scan itself.
+    ///
+    /// Ascending is what the stream already emits; descending runs it
+    /// newest-first. Any other ordering — another column, or `_time` with a
+    /// tie-break — is not what the stream emits, so it is left to a sort.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        let [only] = order else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        let is_time = only
+            .expr
+            .downcast_ref::<Column>()
+            .is_some_and(|c| c.name() == chronix_core::TIME_COLUMN);
+        if !is_time
+            || self
+                .projected_schema
+                .index_of(chronix_core::TIME_COLUMN)
+                .is_err()
+        {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(self.variant(only.options.descending, self.limit)),
+        })
+    }
+
     /// Stream the scan.
     ///
     /// The scan runs on the blocking pool and pushes batches through a bounded
@@ -190,6 +289,7 @@ impl ExecutionPlan for ChronixExec {
         let tag_filters = self.tag_filters.clone();
         let field_predicates = self.field_predicates.clone();
         let limit = self.limit;
+        let descending = self.descending;
         let schema = self.projected_schema.clone();
         let stream_schema = self.projected_schema.clone();
 
@@ -235,7 +335,11 @@ impl ExecutionPlan for ChronixExec {
                 };
             }
 
-            for batch in db.execute_iter(&plan)? {
+            let mut stream = db.execute_iter(&plan)?;
+            if descending {
+                stream = stream.descending();
+            }
+            for batch in stream {
                 if let Ok(b) = &batch {
                     scan_rows.add(b.num_rows());
                 }

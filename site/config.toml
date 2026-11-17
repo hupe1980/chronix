@@ -8,11 +8,15 @@
 
 base_url = "https://hupe1980.github.io/chronix"
 title = "Chronix"
-description = "Chronix is an embedded-first time-series database in pure Rust, with forecasting and anomaly detection inside the engine. Run it as a Cargo dependency or as a server behind Grafana."
+description = "Chronix is an embedded-first time-series database in Rust, with forecasting and anomaly detection in the engine — a Cargo dependency or a server."
 default_language = "en"
 compile_sass = true
-minify_html = true
-build_search_index = true
+# Off: the minifier also runs over `llms.txt`, which is text, and collapses it.
+# GitHub Pages serves gzip, which is where the bytes are saved anyway.
+minify_html = false
+# Search is Pagefind, run by `build.sh` after `zola build`: a chunked index
+# fetched a few KB per query, where Zola's own was one 3.5 MB download.
+build_search_index = false
 generate_feeds = true
 feed_filenames = ["atom.xml"]
 author = "hupe1980"
@@ -37,14 +41,6 @@ style = "class"
 light_theme = "ayu-light"
 dark_theme = "ayu-dark"
 
-[search]
-# The javascript format defines `window.searchIndex`, so it loads with a
-# plain <script src> and needs no fetch, no CORS story and no async gap.
-index_format = "elasticlunr_javascript"
-include_title = true
-include_description = true
-include_path = true
-
 [link_checker]
 # Anchors inside generated pages are checked at build time.
 internal_level = "error"
@@ -57,8 +53,20 @@ repo_url = "https://github.com/hupe1980/chronix"
 crates_url = "https://crates.io/crates/chronix"
 docsrs_url = "https://docs.rs/chronix"
 # Shown in the footer and used for the JSON-LD `softwareVersion`.
-version = "0.6.0"
+version = "0.8.0"
 license = "MIT OR Apache-2.0"
+licenses = ["https://spdx.org/licenses/MIT.html", "https://spdx.org/licenses/Apache-2.0.html"]
+# The server command the landing page shows; it must work against the release
+# this site documents.
+server_cmd = "chronixd --demo"
+# Top navigation: label and section. One list, so reorganising the docs is a
+# change here rather than in every template.
+nav = [
+  { label = "Learn", path = "learn/_index.md" },
+  { label = "Guides", path = "guides/_index.md" },
+  { label = "Reference", path = "reference/_index.md" },
+  { label = "How it works", path = "explanation/_index.md" },
+]
 # Default social preview.
 #
 # **PNG, not the SVG it is drawn from.** Facebook, LinkedIn, Slack, Discord and

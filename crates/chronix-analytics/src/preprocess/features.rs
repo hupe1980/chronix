@@ -157,10 +157,8 @@ pub fn rolling_mean(values: &[f64], window: usize) -> Vec<f64> {
 /// window, by Welford's algorithm.
 ///
 /// Outputs NAN for the first `window - 1` rows and wherever the window holds
-/// fewer than two values — including `window == 1`, where a sample standard
-/// deviation divides by zero. Returning `0.0` there, which this used to do,
-/// asserts that a single reading has no spread; it has no *measurable*
-/// spread, which is what NULL says.
+/// fewer than two values (including `window == 1`): one reading has no
+/// measurable spread, which is what NULL says.
 #[must_use]
 pub fn rolling_std(values: &[f64], window: usize) -> Vec<f64> {
     let n = values.len();
@@ -285,12 +283,9 @@ pub fn rolling_corr(a: &[f64], b: &[f64], window: usize) -> Vec<f64> {
 /// standard deviation.
 ///
 /// The statistics are taken over the non-NULL values; a NULL row stays NULL
-/// and does not make the rest of the partition NULL, which is what summing a
-/// slice containing one NaN used to do. Returns all-NAN when fewer than two
-/// values are present or the spread is zero.
-///
-/// Uses the sample standard deviation (Bessel's correction, `n-1`) for
-/// consistency with `crate::compute::simd_std_dev`.
+/// without making the rest of the partition NULL. Returns all-NAN when fewer
+/// than two values are present or the spread is zero. Uses the sample
+/// standard deviation (`n-1`), consistent with `crate::compute::simd_std_dev`.
 #[must_use]
 pub fn zscore(values: &[f64]) -> Vec<f64> {
     let n = values.len();
@@ -314,14 +309,8 @@ pub fn zscore(values: &[f64]) -> Vec<f64> {
 /// Exponentially weighted mean with smoothing factor `alpha ∈ (0, 1]`.
 ///
 /// `ewm[i] = alpha * values[i] + (1 - alpha) * ewm[i-1]`, seeded with the
-/// first non-NULL value — pandas' `ewm(alpha=…, adjust=False).mean()`.
-///
-/// A NULL contributes no observation: the state carries across it unchanged
-/// and is what the row reports, exactly as `rolling_mean` still reports its
-/// window's mean at a NULL row. The statistic is a property of the samples
-/// seen so far, and a row with no sample does not undefine it. Folding the
-/// NaN into the recurrence, which is what this used to do, made every row
-/// after the first NULL NULL as well.
+/// first non-NULL value. A NULL contributes no observation: the state carries
+/// across it unchanged and is what the row reports, as `rolling_mean` does.
 ///
 /// Matches pandas' `ewm(alpha=…, adjust=False, ignore_na=True).mean()`.
 #[must_use]
@@ -435,12 +424,9 @@ mod tests {
 
     #[test]
     fn test_rolling_std_window_one() {
-        // A *sample* standard deviation of one observation divides by
-        // `n - 1 = 0`: it is undefined, not zero. This used to return 0.0
-        // under the comment "window of 1 has zero variance", which asserts
-        // that a single reading has been observed not to vary. pandas'
-        // `.rolling(1).std()` and `numpy.std(ddof=1)` both answer NaN, and
-        // every other member of this family uses the sample form.
+        // A sample standard deviation of one observation divides by `n - 1 = 0`:
+        // undefined, not zero — as pandas' `.rolling(1).std()` and
+        // `numpy.std(ddof=1)` answer.
         let v = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let r = rolling_std(&v, 1);
         assert_eq!(r.len(), v.len());

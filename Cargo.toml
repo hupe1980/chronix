@@ -11,16 +11,14 @@ members = [
     "crates/chronix-query",
     "crates/chronix",
     "crates/chronixd",
-    # ── Frozen: distributed cluster (build with `-p` or `--workspace`;
-    #    thaw is a post-v1.0 decision) ───────────────────────────────────
+    # ── Frozen: the distributed cluster tier (build with `-p` or `--workspace`)
     "crates/chronix-meta",
     "crates/chronix-cluster",
     "crates/chronix-dsim",
+    "crates/chronixd-cluster",
 ]
 
-# The frozen cluster tier is excluded from the default
-# build/test set. `cargo build` / `cargo test` covers the product;
-# `cargo test --workspace` additionally covers the frozen crates.
+# `cargo build` / `cargo test` cover the product; `--workspace` adds the frozen tier.
 default-members = [
     "crates/chronix-core",
     "crates/chronix-encoding",
@@ -34,33 +32,29 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/chronix"
-homepage = "https://github.com/hupe1980/chronix"
 documentation = "https://docs.rs/chronix"
 readme = "README.md"
 rust-version = "1.94"
 
 [workspace.dependencies]
-# Internal crates.
-#
-# The `version` is not decoration: `cargo publish` refuses a manifest whose
-# dependency carries only a `path`, so without it none of the seven crates that
-# depend on a sibling can be released at all. Declared once here, inherited by
-# every member through `chronix-core.workspace = true`.
-chronix = { path = "crates/chronix", version = "0.7.0" }
-chronix-core = { path = "crates/chronix-core", version = "0.7.0" }
-chronix-engine = { path = "crates/chronix-engine", version = "0.7.0" }
-chronix-security = { path = "crates/chronix-security", version = "0.7.0" }
-chronix-streaming = { path = "crates/chronix-streaming", version = "0.7.0" }
-chronix-encoding = { path = "crates/chronix-encoding", version = "0.7.0" }
-chronix-query = { path = "crates/chronix-query", version = "0.7.0" }
-chronix-analytics = { path = "crates/chronix-analytics", version = "0.7.0" }
-# Frozen and dev-only: never published, so a path-only dependency is correct.
+# Internal crates. `cargo publish` needs the `version`; members inherit these with
+# `chronix-core.workspace = true`.
+chronix = { path = "crates/chronix", version = "0.8.0" }
+chronix-core = { path = "crates/chronix-core", version = "0.8.0" }
+chronix-engine = { path = "crates/chronix-engine", version = "0.8.0" }
+chronix-security = { path = "crates/chronix-security", version = "0.8.0" }
+chronix-streaming = { path = "crates/chronix-streaming", version = "0.8.0" }
+chronix-encoding = { path = "crates/chronix-encoding", version = "0.8.0" }
+chronix-query = { path = "crates/chronix-query", version = "0.8.0" }
+chronix-analytics = { path = "crates/chronix-analytics", version = "0.8.0" }
+# Frozen and not published, so a path-only dependency is enough.
 chronix-meta = { path = "crates/chronix-meta" }
+chronixd = { path = "crates/chronixd", version = "0.8.0" }
 chronix-cluster = { path = "crates/chronix-cluster" }
 
 # Optional, off by default: the `rust_decimal` interop feature on
@@ -71,22 +65,9 @@ rust_decimal = { version = "1.43", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
-# Binary serialization for the WAL, segment metadata, the catalog manifest and
-# model snapshots.
-#
-# postcard rather than bincode: bincode's development ceased permanently after
-# a doxxing and harassment incident, and 3.0.0 was published as a tombstone —
-# a README and a `lib.rs` that is a deliberate compile error, because
-# crates.io cannot mark a crate archived (RUSTSEC-2025-0141). bincode 2 is the
-# same dead line. Of the successors the advisory names, postcard is the only
-# one that keeps serde, which every persisted type here derives; it is also
-# varint-encoded, so the WAL and segment metadata get smaller on the flash
-# storage the embedded target writes to (D50).
-#
-# `default-features = false`: postcard's default `heapless-cas` pulls in
-# heapless 0.7, which on some targets depends on the unmaintained
-# `atomic-polyfill` (RUSTSEC-2023-0089). Nothing here serialises into a
-# fixed-capacity buffer, so the feature is cost without benefit.
+# WAL, segment metadata, catalog and model snapshots. postcard: serde-based,
+# varint-encoded and maintained (bincode is archived, RUSTSEC-2025-0141). No default
+# features: `heapless-cas` pulls the unmaintained `atomic-polyfill`.
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 # Parallelism
@@ -114,19 +95,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
 metrics = "0.24"
-# `default-features = false`: chronixd installs a recorder and renders
-# `/metrics` through its own axum route, so the crate's HTTP listener and
-# push-gateway clients are unused — and they are what drag `hyper-rustls`,
-# and with it a second rustls crypto provider and a C build of aws-lc-sys.
+# No default features: chronixd serves `/metrics` itself, and the defaults pull
+# `hyper-rustls`, a second crypto provider and a C build of aws-lc-sys.
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # HTTP
 axum = { version = "0.8", features = ["json"] }
 tower = { version = "0.5" }
-# `decompression-gzip`: the OpenTelemetry Collector and Telegraf both gzip
-# their request bodies by default, and without this layer every one of their
-# batches was a protobuf/line-protocol parse error — a permanent failure the
-# client does not retry, so the data was simply dropped.
+# `decompression-gzip`: the OpenTelemetry Collector and Telegraf gzip request
+# bodies by default.
 tower-http = { version = "0.7", features = [
     "cors",
     "trace",
@@ -145,37 +122,10 @@ prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
 
-# TLS
-#
-# `rustls-platform-verifier` is declared so the *library* crates can build a
-# client TLS config explicitly rather than relying on a process-global
-# provider — see `chronix_security::auth::oidc`. It is already in the graph
-# through reqwest; naming it here is what lets a library use it directly.
+# TLS. Library crates build client TLS configs explicitly with the platform verifier.
 rustls-platform-verifier = "0.7"
-#
-# **Exactly one crypto provider is compiled in, and it is `aws-lc-rs`.** With
-# two compiled in and none installed, `ServerConfig::builder()` cannot choose
-# and *panics*, so every rustls-adjacent dependency below carries
-# `default-features = false` and names the provider explicitly rather than
-# taking a default nobody wrote down (D41).
-#
-# `aws-lc-rs` rather than `ring`: it is rustls's own default, is actively
-# released where `ring` has had none since March 2025, is the only
-# FIPS-certifiable option, and is the only one with post-quantum key exchange.
-# Neither is toolchain-free — `ring` compiles 17 C files and 90 assembly files
-# and fails an aarch64 cross-compile without a cross C compiler exactly as
-# `aws-lc-sys` does — and `aws-lc-sys` no longer needs CMake for this target:
-# it ships a `cc_builder` with pregenerated configuration for `linux_aarch64`.
-#
-# Verify after any dependency change, because it is a property of the whole
-# graph rather than of this line:
-#
-#     cargo tree -p chronixd -e normal -f "{p} {f}" | grep rustls
-#
-# The shipped build must read `aws-lc-rs,aws_lc_rs,…` with no `ring`. Under
-# `--all-features` it does carry `ring`, because `object_store` enables it;
-# that is why `chronixd::tls::ensure_crypto_provider` installs `aws-lc-rs` at
-# process start rather than relying on there being only one to find.
+# Exactly one crypto provider, aws-lc-rs: two providers with none installed make
+# rustls panic. Check with `cargo tree -p chronixd -e normal -f "{p} {f}" | grep rustls`.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 # Same provider as rustls above; naming it is what keeps the count at one.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
@@ -196,16 +146,10 @@ zstd = "0.13"
 # Memory-mapped I/O
 memmap2 = "0.9"
 
-# Object storage — pinned to the version DataFusion 55 uses, so the cold tier
-# can be registered with the SQL engine rather than exposing a second,
-# incompatible `ObjectStore` trait (D6).
+# Pinned to DataFusion's version, so the cold tier registers with the SQL engine.
 object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 
-# Arrow
-# `prettyprint` is used by the examples' table output. Declared here rather
-# than inherited: DataFusion enables it transitively, so without this a build
-# with `--no-default-features` (no SQL, no DataFusion) stopped compiling them —
-# a dependency's default features are this workspace's configuration (D41).
+# Arrow. `prettyprint` for the examples, which also build without DataFusion.
 arrow = { version = "59", features = ["prettyprint"] }
 parquet = { version = "59", features = ["arrow"] }
 
@@ -221,19 +165,13 @@ futures = "0.3"
 
 # File locking
 fs2 = "0.4"
+# Who holds a data directory: a safe pid probe and the host name
+rustix = { version = "1.1", default-features = false, features = ["std", "process", "system"] }
 
-# Auth & crypto
-#
-# The PHC string an API key is stored as is produced and verified by this
-# crate alone, so a major bump is a hard cut rather than a migration: nothing
-# is released, and there are no stored hashes in the wild to keep readable.
+# Auth & crypto. A major argon2 bump changes the stored API-key hash format.
 argon2 = "0.6"
-# `aws_lc_rs`, never `rust_crypto`: 11.0 requires choosing a backend, and
-# `rust_crypto` pulls the `rsa` crate — **RUSTSEC-2023-0071**, the Marvin
-# timing sidechannel, key recovery over the network, with no fixed version —
-# into JWT signature verification, which is precisely a setting where an
-# attacker observes timing. `aws_lc_rs` is the crate the workspace already
-# compiles as its rustls provider (D59), so it costs nothing here.
+# `aws_lc_rs`, never `rust_crypto`: the latter pulls `rsa` (RUSTSEC-2023-0071,
+# a timing side channel) into JWT verification.
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 aes-gcm = "0.11"
 hmac = "0.13"
@@ -247,29 +185,13 @@ chrono = "0.4"
 
 # URL encoding
 percent-encoding = "2"
-# Query-string parsing where a repeated key is meaningful — Prometheus's
-# `?match[]=a&match[]=b`, which `serde_urlencoded` (and therefore axum's
-# `Query`) cannot represent at all.
+# Repeated query keys (`?match[]=a&match[]=b`), which axum's `Query` cannot represent.
 form_urlencoded = "1"
 
-# HTTP client
-#
-# `rustls-no-provider` rather than `rustls`: the latter would pick a provider
-# of its own, and this workspace names one place — the `rustls` line above.
-# A `Client` resolves the process-level provider when it is constructed, so
-# `ensure_crypto_provider` runs at process start rather than only on the TLS
-# path.
-#
-# 0.13 removed the root-certificate features and verifies with
-# `rustls-platform-verifier`, so the host's CA store decides which endpoints
-# are reachable. Both users are server-side (OIDC discovery, webhook
-# delivery), where the platform store is the better default; the embedded
-# library never reaches either.
+# HTTP client (OIDC discovery, webhooks): no provider of its own, and the platform
+# CA store for verification.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
-# `default-features = false`: ureq's default `rustls` feature is
-# `rustls-no-provider + _ring + rustls-webpki-roots`, so taking it forces
-# `rustls/ring` on and makes the provider choice twice. Naming the parts
-# leaves the choice in one place (D41).
+# No default features: ureq's default `rustls` forces `ring` as a second provider.
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
 
 # Authorization
@@ -281,20 +203,11 @@ snap = "1"
 # Embedded key-value storage (Raft log persistence)
 redb = "4"
 
-# Ingestion connectors (optional).
-#
-# krafka rather than rdkafka: rdkafka builds librdkafka from C via cmake, which
-# is exactly the toolchain the embedded aarch64 cross-compile job does not have
-# (R11). krafka is pure async Rust with `unsafe_code = "deny"`, so the `kafka`
-# feature no longer costs a C toolchain or an unaudited FFI surface (D38).
+# Ingestion connectors (optional). krafka is pure Rust, so the `kafka` feature
+# needs no C toolchain for the aarch64 cross-compile.
 krafka = { version = "0.21", default-features = false, features = ["gzip", "snappy", "lz4", "rustls-aws-lc-rs"] }
-# `default-features = false` drops `use-rustls`, which is not a TLS *option*
-# here but a liability: the connector never constructs a `Transport`, so the
-# feature only ever added `rustls-webpki` 0.102 (two advisories, capped below
-# the fixed 0.103.10 by rumqttc's own `^0.102.8`), the unmaintained
-# `rustls-pemfile`, and `ring` via `tokio-rustls/default`. MQTT is plaintext
-# here; restoring TLS means waiting for rumqttc to move to rustls 0.23's
-# provider-agnostic stack, not re-enabling this.
+# No default features: `use-rustls` is unused here and pulls a vulnerable
+# `rustls-webpki` and `ring`. MQTT is plaintext.
 rumqttc = { version = "0.25", default-features = false }
 
 # Testing
@@ -321,15 +234,12 @@ unsafe_code = "warn"
 panic = "warn"
 unwrap_used = "warn"
 expect_used = "allow"       # expect with a message is fine
-# Re-enabling module-by-module is in the backlog — the numeric
-# kernels (forecast, multivariate, SIMD, codecs) index pervasively with
-# structural bounds; empirically panicking sites were fixed in passes 1–25.
+# The numeric kernels index with structurally checked bounds.
 indexing_slicing = "allow"
 
 # Style & clarity
 needless_pass_by_value = "warn"
 redundant_closure_for_method_calls = "warn"
-# 25 pre-existing sites; re-enable after a dedicated style pass.
 manual_let_else = "allow"
 cloned_instead_of_copied = "warn"
 flat_map_option = "warn"

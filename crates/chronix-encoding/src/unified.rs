@@ -173,11 +173,8 @@ encoding_types! {
     /// Opaque byte strings — a count, then a length and payload per value.
     ///
     /// For columns whose values are **composite objects** rather than
-    /// numbers: today, native histograms. There is deliberately no clever
-    /// codec here. A histogram's own encoding already packs it, and a
-    /// second-guessing layer over an opaque blob would compress nothing while
-    /// adding a decoder to audit — so this is a framing, and the general-purpose
-    /// block compression underneath the segment does the rest.
+    /// numbers: native histograms. A framing only — the value's own encoding
+    /// already packs it, and the segment's block compression does the rest.
     Bytes = 25, "bytes";
 }
 
@@ -237,12 +234,9 @@ const MIN_COMPRESSION_RATIO: f64 = 1.5;
 
 /// Which codec [`ColumnEncoder::encode_timestamps_with`] should use.
 ///
-/// The float equivalent lives in `chronix_core::config::FloatEncoding`
-/// because it is a user-facing knob; this one is not (yet) reachable from
-/// configuration, and exists so the codec that lost the default can still be
-/// produced on demand — by the tests that measure it, by a tool that has to
-/// write a segment in the old shape, and by anyone re-running the comparison
-/// when pco next changes.
+/// Not a configuration setting (the float equivalent is
+/// `chronix_core::config::FloatEncoding`); it lets tests and tools produce a
+/// specific timestamp codec on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TimestampEncoding {
     /// Trial-encode pco and delta-of-delta, keep the smaller, ties to pco.
@@ -1334,8 +1328,7 @@ mod tests {
     fn encode_timestamps_monotonic() {
         let ts: Vec<i64> = (0..1000).map(|i| 1_000_000 + i * 10_000).collect();
         let block = ColumnEncoder::encode_timestamps(&ts).unwrap();
-        // pco is the default even on a perfect metronome, where DoD used to
-        // be chosen: pco beats it there too (see
+        // pco wins even on a perfect metronome (see
         // `tests/timestamp_codec_check.rs`).
         assert_eq!(block.encoding, EncodingType::PcoI64);
         let decoded = ColumnDecoder::decode(&block).unwrap();

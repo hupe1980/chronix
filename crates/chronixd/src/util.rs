@@ -109,26 +109,19 @@ pub fn register_write_metrics() {
 ///
 /// **The server's only write path.** Every ingestion surface — REST JSON,
 /// Line Protocol, OTLP, Prometheus remote write, gRPC, Flight SQL `DoPut`,
-/// and the Kafka and MQTT connectors — goes through here, which is what makes
-/// the namespace stamp an invariant rather than something each handler has to
-/// remember. The namespace is applied, not merged.
+/// and the Kafka and MQTT connectors — goes through here, so the namespace
+/// stamp is an invariant. The namespace is applied, not merged.
 ///
 /// # The deadline bounds the wait, not the write
 ///
-/// `timeout` stops this task waiting; it does **not** stop the write. The
-/// insert runs on a blocking thread, a blocking task cannot be cancelled, and
-/// a durable write must not be abandoned half-way in any case — so when the
-/// deadline fires the write is still running and will very likely land. The
-/// only honest answer is that the outcome is *unknown*, which is what
-/// [`ServerError::WriteTimeout`] says; a retry is safe because a point is
-/// identified by its series and its timestamp.
-///
-/// What actually bounds concurrent writes is admission control in the engine:
-/// a memtable at capacity refuses the batch with `DbError::TransientOverload`,
-/// which reaches the client as `503 BACKPRESSURE` with a `Retry-After`. This
-/// deadline used to claim it "prevents a stuck downstream write from
-/// exhausting the tokio thread pool", which it never did — the thread is held
-/// either way.
+/// `timeout` stops this task waiting; it does not stop the write. The insert
+/// runs on a blocking thread that cannot be cancelled, and a durable write
+/// must not be abandoned half-way, so when the deadline fires the outcome is
+/// unknown — which is what [`ServerError::WriteTimeout`] says. A retry is
+/// safe: a point is identified by its series and its timestamp. Concurrent
+/// writes are bounded by the engine's admission control: a full memtable
+/// refuses the batch with `DbError::TransientOverload`, which reaches the
+/// client as `503 BACKPRESSURE` with `Retry-After`.
 ///
 /// A zero timeout disables the deadline and waits indefinitely.
 ///
@@ -139,11 +132,41 @@ pub fn register_write_metrics() {
 /// - `ServerError::Db` (or cardinality-specific variants) on database errors.
 pub async fn insert_with_timeout(
     db: &Arc<Chronix>,
+    ingest: &crate::rate_limit::NamespaceIngestLimiter,
     namespace: Option<&str>,
     points: Vec<Point>,
     timeout: Duration,
 ) -> Result<(), ServerError> {
-    insert_batch_with_mode(db, namespace, points, timeout, WriteMode::Live).await
+    insert_batch_with_mode(db, ingest, namespace, points, timeout, WriteMode::Live).await
+}
+
+/// Charge a batch against its namespace's ingestion rate.
+fn admit_ingest(
+    ingest: &crate::rate_limit::NamespaceIngestLimiter,
+    namespace: &str,
+    points: u64,
+) -> Result<(), ServerError> {
+    use crate::rate_limit::IngestRefusal;
+    match ingest.admit(namespace, points) {
+        Ok(()) => Ok(()),
+        Err(refusal) => {
+            let rate = ingest.limit(namespace).unwrap_or(0);
+            metrics::counter!("chronix_namespace_quota_refusals_total", "resource" => "ingestion_rate")
+                .increment(1);
+            Err(match refusal {
+                IngestRefusal::RetryAfterMs(retry_after_ms) => ServerError::NamespaceRateLimited {
+                    namespace: namespace.to_string(),
+                    rate,
+                    retry_after_ms,
+                },
+                IngestRefusal::BatchTooLarge => ServerError::BatchExceedsNamespaceRate {
+                    namespace: namespace.to_string(),
+                    points,
+                    rate,
+                },
+            })
+        }
+    }
 }
 
 /// [`insert_with_timeout`], with the write mode chosen by the caller.
@@ -153,14 +176,21 @@ pub async fn insert_with_timeout(
 /// As [`insert_with_timeout`].
 pub async fn insert_batch_with_mode(
     db: &Arc<Chronix>,
+    ingest: &crate::rate_limit::NamespaceIngestLimiter,
     namespace: Option<&str>,
     mut points: Vec<Point>,
     timeout: Duration,
     mode: WriteMode,
 ) -> Result<(), ServerError> {
     crate::namespace::scope_points(namespace, &mut points)?;
-    let db = db.clone();
     let batch_size = points.len();
+    // The namespace's ingestion rate, before the write runs: a refused batch
+    // writes nothing. This is the one function every write path reaches, so
+    // it is the one place the check cannot be skipped.
+    if let Some(ns) = namespace {
+        admit_ingest(ingest, ns, batch_size as u64)?;
+    }
+    let db = db.clone();
     // Every protocol funnels through here, so this is the one place a
     // total write rate can be counted. The per-protocol counters answer
     // "which client", not "how much is this server taking".
@@ -247,13 +277,14 @@ pub async fn insert_batch_with_mode(
 /// Returns the underlying error when nothing was written.
 pub async fn insert_from_connector(
     db: &Arc<Chronix>,
+    ingest: &crate::rate_limit::NamespaceIngestLimiter,
     namespace: Option<&str>,
     points: Vec<Point>,
     timeout: std::time::Duration,
     connector: &str,
 ) -> Result<u64, ServerError> {
     let total = points.len() as u64;
-    match insert_with_timeout(db, namespace, points, timeout).await {
+    match insert_with_timeout(db, ingest, namespace, points, timeout).await {
         Ok(()) => Ok(total),
         Err(ServerError::PartialWrite {
             accepted,
@@ -620,24 +651,18 @@ pub const SKIPPED_SAMPLES_METRIC: &str = "chronix_wire_non_finite_samples_skippe
 /// Returns `Some(value)` for a value the engine can store, and `None` for one
 /// it cannot — `NaN`, `±Inf` — after counting it.
 ///
-/// **Why this is a skip and not a rejection.** `Point::new` refuses non-finite
-/// `f64` on purpose: a `NaN` in storage poisons every aggregate that reads it.
-/// But both of the protocols chronix advertises as drop-in replacements emit
-/// non-finite values as a matter of routine:
+/// The sample is skipped, not the request rejected: `Point::new` refuses
+/// non-finite values because a `NaN` in storage poisons every aggregate, but
+/// both drop-in protocols send them routinely:
 ///
-/// Prometheus remote write signals the end of a series' life with a
-///   **staleness marker**, which on the wire is a specific `NaN` payload. It
-///   is sent every time a scrape target disappears.
-/// OTLP summary quantiles are `NaN` when nothing has been observed yet, and
-///   a gauge is free to report `NaN` or `±Inf`.
+/// - Prometheus remote write ends a series with a **staleness marker**, a
+///   specific `NaN` payload, whenever a scrape target disappears.
+/// - OTLP summary quantiles are `NaN` before anything is observed, and a gauge
+///   may report `NaN` or `±Inf`.
 ///
-/// Propagating the engine's rejection to the request turned each of those into
-/// a `400` for the **whole batch**. Prometheus does not drop a batch it cannot
-/// deliver — it retries it, forever — so the first target to go away stalled
-/// the remote-write queue and stopped ingestion entirely, from a valid
-/// message. A protocol surface has to be judged by what real senders actually
-/// send, and dropping the sample it cannot represent while accepting the
-/// rest is what every other receiver does.
+/// Prometheus retries a rejected batch forever, so failing the whole request
+/// would stall its remote-write queue. Dropping the one sample and accepting
+/// the rest is what every other receiver does.
 #[must_use]
 pub fn storable_sample(value: f64) -> Option<f64> {
     if value.is_finite() {

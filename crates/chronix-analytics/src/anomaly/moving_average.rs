@@ -234,13 +234,10 @@ impl AnomalyDetector for MovingAverageResidualDetector {
             return Err(AnomalyError::NotFitted);
         }
         let count = self.ring_count.min(self.window_size);
-        // A point whose window is not yet full cannot be judged: its
-        // residual is computed against fewer neighbours than every residual
-        // the detector was calibrated on, so it is systematically smaller
-        // and comparing the two is a units error. The detector says
-        // "warming up" instead of inventing a verdict — which is what it
-        // used to do, flagging the first `window` points of every stream
-        // whose level was not flat.
+        // A point whose window is not yet full cannot be judged: its residual uses
+        // fewer neighbours than the residuals the detector was calibrated on, so it
+        // is systematically smaller. The detector reports "warming up" instead of a
+        // verdict.
         if count < self.window_size {
             self.push(value);
             return Ok(AnomalyScore {

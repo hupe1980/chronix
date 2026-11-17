@@ -110,20 +110,9 @@ impl fmt::Display for SegmentId {
 /// Where a segment's `.csx` file lives, **relative to the `segments/`
 /// directory** — `shard_7/seg_1757…_000003.csx`.
 ///
-/// Relative *by construction*, and that is the whole point of the type. The
-/// catalog is the durable record of a database that can be copied — backed
-/// up, restored onto another machine, moved to a bigger disk — and an
-/// absolute path in it names the directory the database was **created** in,
-/// which is the one directory a restored copy is not sitting in.
-///
-/// It used to be a bare `PathBuf` holding the absolute path the flush had
-/// written, and every symptom of that was silent. A restore onto a fresh
-/// directory produced an **empty** database: the open-time sweep that removes
-/// `.csx` files the catalog does not know compared the restored files against
-/// paths naming the original directory, matched none of them, and deleted the
-/// lot. Restoring *beside* a live database was worse — it appeared to work,
-/// because the copy's catalog read the original's files, and then the copy's
-/// first compaction unlinked them.
+/// Relative by construction: a database can be backed up, restored or moved,
+/// and an absolute path would name the directory it was created in rather
+/// than the one it is in now.
 ///
 /// `resolve()` is the only way back to something openable, so a reader has to
 /// say which database it is reading.
@@ -333,16 +322,24 @@ impl fmt::Display for NamespaceId {
 
 /// Resource quota limits for a namespace.
 ///
-/// Enforced at write-time to prevent any single tenant from
-/// monopolising cluster resources.
+/// Every field is enforced on every write surface: the series and
+/// measurement limits by the engine, at the point a series becomes known and
+/// against the same exact set as the database-wide cardinality budget; the
+/// ingestion and request rates by the server.
+///
+/// There is no storage quota. Namespaces share segments, so the bytes one
+/// namespace occupies cannot be measured exactly, and a limit nobody can
+/// measure is one nobody can enforce. Retention bounds disk. A field this
+/// struct does not know — `max_storage_bytes` included — is refused rather
+/// than ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamespaceQuota {
     /// Maximum number of distinct time series.
     pub max_series_count: u64,
-    /// Maximum ingestion rate in points per second.
+    /// Maximum ingestion rate in points per second. One second's worth is
+    /// also the largest batch that can ever be admitted.
     pub max_ingestion_rate: u64,
-    /// Maximum total storage in bytes across all tiers.
-    pub max_storage_bytes: u64,
     /// Maximum number of measurements (tables).
     pub max_measurements: u32,
     /// Maximum HTTP request rate per second (0 = unlimited).
@@ -357,7 +354,6 @@ impl NamespaceQuota {
     /// Upper bounds for resource limits to catch misconfiguration.
     const MAX_SERIES_COUNT: u64 = 1_000_000_000; // 1B series
     const MAX_INGESTION_RATE: u64 = 100_000_000; // 100M pts/s
-    const MAX_STORAGE_BYTES: u64 = 100 * 1024 * 1024 * 1024 * 1024; // 100 TB
     const MAX_MEASUREMENTS: u32 = 1_000_000; // 1M measurements
 
     /// Validate quota values are within sane upper bounds.
@@ -380,13 +376,6 @@ impl NamespaceQuota {
                 Self::MAX_INGESTION_RATE
             ));
         }
-        if self.max_storage_bytes > Self::MAX_STORAGE_BYTES {
-            return Err(format!(
-                "max_storage_bytes {} exceeds upper bound {}",
-                self.max_storage_bytes,
-                Self::MAX_STORAGE_BYTES
-            ));
-        }
         if self.max_measurements > Self::MAX_MEASUREMENTS {
             return Err(format!(
                 "max_measurements {} exceeds upper bound {}",
@@ -403,30 +392,11 @@ impl Default for NamespaceQuota {
         Self {
             max_series_count: 1_000_000,
             max_ingestion_rate: 100_000,
-            max_storage_bytes: 100 * 1024 * 1024 * 1024, // 100 GB
             max_measurements: 1000,
             max_request_rps: 0,   // unlimited by default
             max_request_burst: 0, // defaults to max_request_rps
         }
     }
-}
-
-/// Real-time resource usage for a namespace.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct NamespaceUsage {
-    /// Current number of active time series.
-    pub series_count: u64,
-    /// Recent ingestion rate in points per second (windowed counter,
-    /// resets each second to prevent infinite accumulation).
-    pub ingestion_rate: f64,
-    /// Epoch-second of the current rate window. When the wall-clock
-    /// second changes, `ingestion_rate` is reset to zero.
-    #[serde(default)]
-    pub ingestion_rate_window_s: u64,
-    /// Total storage used in bytes.
-    pub storage_bytes: u64,
-    /// Current number of measurements.
-    pub measurements: u32,
 }
 
 impl ShardId {
@@ -712,13 +682,31 @@ pub const MAX_STRING_FIELD_LENGTH: usize = u16::MAX as usize; // 65_535
 /// `Timestamp(Nanosecond)` in SQL.
 pub const TIME_COLUMN: &str = "_time";
 
+/// Name of the start-timestamp column: when the series that produced a
+/// sample started counting, in nanoseconds since the epoch.
+///
+/// A counter that restarts — a process restart, a gateway reboot — begins
+/// again from zero, and the start timestamp is what tells a reader that it
+/// *started* rather than wrapped. Prometheus remote write 2.0 and OTLP both
+/// carry one per sample. The column exists on a measurement only once a
+/// point has carried one, so a measurement that never receives one pays
+/// nothing for it. It is nullable, never a tag, and never a PromQL metric.
+///
+/// Set it with [`Point::with_start_timestamp`]; read it with
+/// [`Point::start_timestamp`].
+pub const START_COLUMN: &str = "_start";
+
 /// Column names the engine owns: a field or tag may not use them.
 ///
 /// `time` and `timestamp` are reserved beside [`TIME_COLUMN`] because they are
 /// what a writer reaches for when it means the time column — accepting one as
 /// an ordinary field would make `SELECT time FROM cpu` return something that
 /// is not the time.
-pub const RESERVED_COLUMN_NAMES: &[&str] = &["time", "timestamp", "_time", "series_key_hash"];
+///
+/// [`START_COLUMN`] is reserved too: it is the engine's, and a point carries
+/// it only as the start timestamp — an `Int64` no later than the sample.
+pub const RESERVED_COLUMN_NAMES: &[&str] =
+    &["time", "timestamp", "_time", "_start", "series_key_hash"];
 
 /// A unique series identifier: measurement name + sorted tag set.
 ///
@@ -827,10 +815,10 @@ pub const TAG_SEPARATOR: char = '\0';
 /// Also reserved. Using a control character rather than `=` is what allows a
 /// tag *value* to contain `=`, which InfluxDB Line Protocol permits (escaped)
 /// and real-world tags — URLs with query strings, base64 padding, Kubernetes
-/// label selectors — routinely contain. The canonical form only has to be
-/// **injective** (nothing parses it back apart from the measurement prefix),
-/// so reserving two control characters that cannot appear in user data is
-/// strictly less restrictive than banning `=`.
+/// label selectors — routinely contain. The canonical form is
+/// **injective** — and, because neither separator can appear in user data,
+/// exactly invertible ([`SeriesKey::canonical_parts`]) — so reserving two
+/// control characters is strictly less restrictive than banning `=`.
 pub const KV_SEPARATOR: char = '\x01';
 
 /// Append a canonical series form to `out`.
@@ -840,9 +828,8 @@ pub const KV_SEPARATOR: char = '\x01';
 ///
 /// Query and dedup paths reconstruct the canonical form from Arrow columns
 /// rather than from a [`SeriesKey`]. Everything that needs a canonical form
-/// goes through this function so the format has exactly one definition — an
-/// inlined copy goes on emitting the old layout when the separators change,
-/// and tombstone matching breaks silently.
+/// goes through this function so the format has exactly one definition;
+/// tombstone matching depends on every producer agreeing byte for byte.
 pub fn push_canonical<'a, I>(out: &mut String, measurement: &str, tags: I)
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -1054,6 +1041,30 @@ impl SeriesKey {
         &self.canonical
     }
 
+    /// Split a canonical form back into its measurement and tag pairs.
+    ///
+    /// The exact inverse of [`canonical_form`](Self::canonical_form): both
+    /// separators are reserved, so splitting on them cannot cut a name.
+    /// Borrows from `canonical`; allocates nothing.
+    ///
+    /// ```
+    /// use chronix_core::SeriesKey;
+    /// let tags = [("meter".to_string(), "main".to_string())].into();
+    /// let key = SeriesKey::new("power", tags)?;
+    /// let (measurement, mut tags) = SeriesKey::canonical_parts(key.canonical_form());
+    /// assert_eq!(measurement, "power");
+    /// assert_eq!(tags.next(), Some(("meter", "main")));
+    /// # Ok::<(), chronix_core::SchemaError>(())
+    /// ```
+    pub fn canonical_parts(canonical: &str) -> (&str, impl Iterator<Item = (&str, &str)>) {
+        let mut parts = canonical.split(TAG_SEPARATOR);
+        let measurement = parts.next().unwrap_or_default();
+        (
+            measurement,
+            parts.filter_map(|pair| pair.split_once(KV_SEPARATOR)),
+        )
+    }
+
     /// Validate a name (measurement or tag key/value) against naming rules.
     ///
     /// Rejects empty names, names exceeding [`MAX_NAME_LENGTH`], and names
@@ -1147,11 +1158,9 @@ pub struct Tombstone {
     /// This is the tombstone's *scope*, on the read path as much as for
     /// reclaiming it. A row is masked only if it comes from one of these
     /// segments, so a point written after the delete — into the memtable,
-    /// hence into a newer segment — is visible at once. It used to mask by
-    /// `(series, time)` alone, so re-provisioning a device under the same
-    /// identifier, or backfilling into a deleted interval, wrote points
-    /// that were accepted, acknowledged, and invisible until a compaction
-    /// happened to reclaim the tombstone.
+    /// hence into a newer segment — is visible at once, including a device
+    /// re-provisioned under the same identifier or a backfill into the
+    /// deleted interval.
     pub segments: std::collections::BTreeSet<u64>,
 }
 
@@ -1244,12 +1253,8 @@ impl TombstoneSet {
     /// This is the **only** admissible tombstone test on a read path, and
     /// it is asked of segment rows only: memtable rows were written after
     /// every tombstone that exists (a delete flushes before it scans), so
-    /// they are never masked. A series-only variant used to sit beside it,
-    /// and the two disagreed: the segment scan and compaction asked this
-    /// question, while the memtable scan, `last_value` and the streaming
-    /// scan asked "does this series have any tombstone at all", so a delete
-    /// of one hour of one series removed that series entirely from three of
-    /// the five read paths.
+    /// they are never masked. Every read path asks this same question, so a
+    /// delete of one hour of one series removes exactly that hour everywhere.
     #[must_use]
     pub fn is_tombstoned_in(&self, canonical: &str, timestamp: i64, segment: u64) -> bool {
         self.inner.get(canonical).is_some_and(|tombstones| {
@@ -1367,17 +1372,9 @@ impl TombstoneSet {
 /// The WAL stores opaque byte payloads; this enum is the discriminator replay
 /// reads them back through.
 ///
-/// **There is one variant, and that is the point.** A `Delete` variant used to
-/// sit beside it, carrying the tombstones a delete resolved to — and nothing
-/// depended on it, because the tombstones are written to the **catalog
-/// manifest** first and fsynced there before `execute_delete` returns
-/// (`record_tombstones`), and the manifest is the store a flush never
-/// truncates. Replay folded the WAL copy into a set it had already loaded
-/// from the catalog. Its one documented purpose was to let a point-in-time
-/// restore replay the delete, and point-in-time restore never worked and is
-/// gone; what remained was a second `fsync` on every delete — on flash, the
-/// fsync rate is the wear rate — for a record whose removal no test could
-/// observe.
+/// Deletes have no WAL entry: their tombstones are fsynced to the catalog
+/// manifest before the delete returns, and the manifest is never truncated by
+/// a flush, so a second record would only add an fsync per delete.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WalEntry {
@@ -1386,6 +1383,23 @@ pub enum WalEntry {
         /// The point to insert.
         point: Point,
     },
+    /// The encrypted column values of the record's `Write` entries, sealed
+    /// per key. Always the record's last entry; the `Write` entries before
+    /// it carry those points without their encrypted values.
+    Sealed {
+        /// One section per key.
+        sections: Vec<SealedSection>,
+    },
+}
+
+/// One key's share of a sealed WAL record: AES-256-GCM over the values of
+/// every column that key protects, opaque here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedSection {
+    /// The key the section is sealed under.
+    pub key_id: String,
+    /// `[nonce 12][ciphertext][tag 16]`.
+    pub sealed: Vec<u8>,
 }
 
 /// Lifecycle state for a segment file.
@@ -1462,6 +1476,15 @@ impl Point {
             });
         }
         for (key, value) in &fields {
+            // The start timestamp travels as the engine-owned `_start`
+            // entry, so that every path that rebuilds a point from stored
+            // rows (flush, compaction, rollup output) carries it without a
+            // second constructor. It is accepted here only in the shape the
+            // engine writes: an `Int64` no later than the sample.
+            if key == START_COLUMN {
+                Self::validate_start(value, timestamp)?;
+                continue;
+            }
             SeriesKey::validate_name(key, "field name")?;
 
             // The columns the storage and query layers own. A field named
@@ -1522,6 +1545,11 @@ impl Point {
                     ),
                 });
             }
+        }
+        // A start timestamp is not a value: a point must carry at least one
+        // field besides it.
+        if fields.len() == 1 && fields.contains_key(START_COLUMN) {
+            return Err(SchemaError::EmptyFields);
         }
         // BTreeMap iterates in sorted order, so the resulting Vec is sorted.
         let sorted_fields: Fields = fields
@@ -1584,6 +1612,92 @@ impl Point {
     #[must_use]
     pub fn timestamp(&self) -> Timestamp {
         self.timestamp
+    }
+
+    /// Attach the time the producing series started counting
+    /// ([`START_COLUMN`]), in nanoseconds since the epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaError::StartAfterSample`] if `start` is later than the
+    /// sample's own timestamp — a series cannot have started after it was
+    /// observed.
+    pub fn with_start_timestamp(mut self, start: Timestamp) -> Result<Self, SchemaError> {
+        let value = FieldValue::I64(start);
+        Self::validate_start(&value, self.timestamp)?;
+        match self
+            .fields
+            .binary_search_by(|(k, _)| k.as_ref().cmp(START_COLUMN))
+        {
+            Ok(idx) => self.fields[idx].1 = value,
+            Err(idx) => self.fields.insert(idx, (Arc::from(START_COLUMN), value)),
+        }
+        Ok(self)
+    }
+
+    /// The time the producing series started counting, if one is known.
+    #[inline]
+    #[must_use]
+    pub fn start_timestamp(&self) -> Option<Timestamp> {
+        match self.field(START_COLUMN) {
+            Some(FieldValue::I64(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Remove and return the fields `take` selects.
+    ///
+    /// For the WAL's sealing path only: the remainder may have no field left
+    /// (every value encrypted), which is not a valid point on its own and
+    /// becomes one again when [`put_field`](Self::put_field) restores them
+    /// on replay.
+    #[doc(hidden)]
+    pub fn take_fields(&mut self, take: impl Fn(&str) -> bool) -> Vec<(String, FieldValue)> {
+        let mut taken = Vec::new();
+        self.fields.retain(|(k, v)| {
+            if take(k) {
+                taken.push((k.to_string(), v.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
+
+    /// Restore a field [`take_fields`](Self::take_fields) removed.
+    #[doc(hidden)]
+    pub fn put_field(&mut self, key: &str, value: FieldValue) {
+        match self.fields.binary_search_by(|(k, _)| k.as_ref().cmp(key)) {
+            Ok(idx) => self.fields[idx].1 = value,
+            Err(idx) => self.fields.insert(idx, (Arc::from(key), value)),
+        }
+    }
+
+    /// The point's value fields — every field except the engine-owned
+    /// [`START_COLUMN`].
+    pub fn value_fields(&self) -> impl Iterator<Item = (&str, &FieldValue)> {
+        self.fields
+            .iter()
+            .filter(|(k, _)| k.as_ref() != START_COLUMN)
+            .map(|(k, v)| (k.as_ref(), v))
+    }
+
+    fn validate_start(value: &FieldValue, timestamp: Timestamp) -> Result<(), SchemaError> {
+        match value {
+            FieldValue::I64(start) if *start <= timestamp => Ok(()),
+            FieldValue::I64(start) => Err(SchemaError::StartAfterSample {
+                start: *start,
+                timestamp,
+            }),
+            other => Err(SchemaError::InvalidFieldValue {
+                field: START_COLUMN.to_string(),
+                reason: format!(
+                    "the start timestamp is an Int64 of nanoseconds, not {}",
+                    crate::schema::ColumnType::from_field_value(other)
+                ),
+            }),
+        }
     }
     // ── Delegation from SeriesKey ─────────────────────────────────────
     // These convenience methods delegate to the inner `SeriesKey` so
@@ -1834,10 +1948,8 @@ mod tests {
     }
 
     /// Both separators are reserved and must be rejected in user data.
-    /// The engine's own column names are unusable as fields or tags. A
-    /// field named `timestamp` used to produce two `timestamp` columns in
-    /// one batch, and the SQL layer then answered `SELECT _time` with the
-    /// field's values.
+    /// The engine's own column names are unusable as fields or tags: a field
+    /// named `timestamp` would produce two `timestamp` columns in one batch.
     #[test]
     fn reserved_column_names_are_rejected() {
         for name in RESERVED_COLUMN_NAMES {
@@ -2311,5 +2423,107 @@ mod segment_file_tests {
             postcard::from_bytes::<SegmentFile>(&bytes).unwrap(),
             relative
         );
+    }
+
+    fn start_point(ts: i64) -> Point {
+        let key = SeriesKey::new("http", BTreeMap::new()).unwrap();
+        Point::new(
+            key,
+            BTreeMap::from([("requests".to_string(), FieldValue::F64(1.0))]),
+            ts,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_start_timestamp_at_or_before_the_sample_is_carried() {
+        let p = start_point(10).with_start_timestamp(4).unwrap();
+        assert_eq!(p.start_timestamp(), Some(4));
+        let p = start_point(10).with_start_timestamp(10).unwrap();
+        assert_eq!(p.start_timestamp(), Some(10));
+        // It is not a value: `value_fields` does not list it.
+        assert_eq!(
+            p.value_fields().map(|(k, _)| k).collect::<Vec<_>>(),
+            ["requests"]
+        );
+        assert_eq!(start_point(10).start_timestamp(), None);
+    }
+
+    #[test]
+    fn a_start_timestamp_after_the_sample_is_refused() {
+        let err = start_point(10).with_start_timestamp(11).unwrap_err();
+        assert!(matches!(
+            err,
+            SchemaError::StartAfterSample {
+                start: 11,
+                timestamp: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn start_is_reserved_against_any_other_shape() {
+        assert!(RESERVED_COLUMN_NAMES.contains(&START_COLUMN));
+        let key = SeriesKey::new("http", BTreeMap::new()).unwrap();
+        // A string, a float: not a start timestamp.
+        for bad in [FieldValue::String("x".into()), FieldValue::F64(1.0)] {
+            let fields = BTreeMap::from([
+                ("requests".to_string(), FieldValue::F64(1.0)),
+                (START_COLUMN.to_string(), bad),
+            ]);
+            assert!(Point::new(key.clone(), fields, 10).is_err());
+        }
+        // A start timestamp alone is not a point.
+        let only = BTreeMap::from([(START_COLUMN.to_string(), FieldValue::I64(1))]);
+        assert!(matches!(
+            Point::new(key.clone(), only, 10),
+            Err(SchemaError::EmptyFields)
+        ));
+        // A tag cannot take the name either.
+        assert!(SeriesKey::new("http", BTreeMap::from([("_start".into(), "a".into())])).is_err());
+        // A rebuilt point — what flush and compaction do — keeps it.
+        let rebuilt = BTreeMap::from([
+            ("requests".to_string(), FieldValue::F64(1.0)),
+            (START_COLUMN.to_string(), FieldValue::I64(3)),
+        ]);
+        assert_eq!(
+            Point::new(key, rebuilt, 10).unwrap().start_timestamp(),
+            Some(3)
+        );
+    }
+}
+
+/// Property tests reach the filesystem (proptest's failure persistence) and run
+/// thousands of cases, so they stay out of Miri, like `proptests` above.
+#[cfg(all(test, not(miri)))]
+mod canonical_parts_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn name() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_=.:/ -]{1,12}"
+    }
+
+    proptest! {
+        #[test]
+        fn canonical_parts_inverts_the_canonical_form(
+            measurement in name(),
+            tags in proptest::collection::btree_map(name(), name(), 0..6),
+        ) {
+            let key = SeriesKey::new(measurement, tags).unwrap();
+            let (m, parts) = SeriesKey::canonical_parts(key.canonical_form());
+            prop_assert_eq!(m, key.measurement());
+            let parts: Vec<(&str, &str)> = parts.collect();
+            let expected: Vec<(&str, &str)> =
+                key.tags().iter().map(|(k, v)| (k.as_ref(), v.as_ref())).collect();
+            prop_assert_eq!(parts, expected);
+        }
+    }
+
+    #[test]
+    fn an_untagged_series_has_no_parts() {
+        let (m, mut parts) = SeriesKey::canonical_parts("cpu");
+        assert_eq!(m, "cpu");
+        assert!(parts.next().is_none());
     }
 }

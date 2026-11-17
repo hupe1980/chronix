@@ -240,17 +240,10 @@ kernel! {
             ));
         }
 
-        // One decomposition, three projections — computing it three times is
-        // what the separate component functions cost, and this is the reason
-        // to prefer this one. Each projection goes back on its rows through
-        // the same `on_positional` the component kernels use; this used to
-        // carry its own copy of that logic, which was the `on_dense` one.
-        // One decomposition, three projections — computing it three times is
-        // what the separate component functions cost, and this is the reason
-        // to prefer this one. The projections go back on their rows through
-        // the same `on_positional` the component kernels use; this used to
-        // carry its own copy of that logic, which was the `on_dense` one and
-        // therefore shifted the phase at every gap.
+        // One decomposition, three projections — the reason to prefer this over
+        // the three component functions. The projections go back on their rows
+        // through the same `on_positional` the component kernels use, so the phase
+        // stays aligned across gaps.
         let cfg = stl_config(period, args, 2)?;
         let mut parts = on_positional_multi(&values, |dense| {
             if dense.len() < period * 2 {

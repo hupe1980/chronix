@@ -12,6 +12,7 @@
 
 pub mod ast;
 pub mod eval;
+pub mod explain;
 mod lexer;
 pub mod metric;
 mod parser;
@@ -20,9 +21,14 @@ mod parser;
 // `ast` part of this crate's public API by default, which is the opposite of
 // how a surface should grow.
 pub use ast::{
-    AggregationModifier, AggregationOp, AtModifier, BinaryOp, Duration, Expr, LabelMatcher,
-    MatchOp, PromQLValue, Sample, Series, UnaryOp, VectorMatching, VectorMatchingCardinality,
+    AggregationModifier, AggregationOp, AtModifier, BinaryOp, DurationExpr, DurationOp, Expr,
+    LabelMatcher, MatchOp, PromQLValue, RangeModifier, Sample, Series, UnaryOp, VectorMatching,
+    VectorMatchingCardinality,
 };
 pub use eval::{CompiledMatcher, PromQLEvaluator, compile_label_matchers, label_set_matches};
+pub use explain::{
+    EmptyExplanation, ExplainNode, PromqlExplain, SelectorRef, explain_empty, explain_tree,
+    selectors,
+};
 pub use metric::{ClassicView, MetricRef, VALUE_FIELD, all_metrics, metric_name, metrics_of};
 pub use parser::{ParseError, parse};

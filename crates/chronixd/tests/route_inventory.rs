@@ -43,14 +43,9 @@ fn undocumented_by_design(path: &str) -> Option<&'static str> {
         // alias as well as the canonical path doubles the surface a generated
         // client offers with no new capability.
         "/healthz" | "/readyz" => "alias of /health and /ready",
-        // Feature-gated on `cluster`, which the published binary
-        // does not build. A document that describes routes the server does
-        // not serve is worse than one that omits them.
-        "/api/v1/admin/nodes"
-        | "/api/v1/admin/nodes/{id}/decommission"
-        | "/api/v1/admin/heartbeat"
-        | "/api/v1/admin/regions"
-        | "/api/v1/admin/regions/{id}/state" => "requires --features cluster",
+        // A page for a browser, not an operation for a client: it calls the
+        // documented routes and documents nothing of its own.
+        "/console" | "/console/" | "/console/{file}" => "the console page, not an API",
         _ => return None,
     })
 }

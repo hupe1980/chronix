@@ -1,16 +1,10 @@
 +++
 title = "Reference"
-description = "Subsystem-by-subsystem implementation reference for Chronix: crate layout, storage engine, encoding, indexing and query, embedded API, server, analytics, security and cold tiering."
+description = "The complete Chronix reference: HTTP, PromQL, SQL, gRPC and Flight SQL APIs, configuration, CLI, metrics, data model and security."
 sort_by = "weight"
 weight = 30
 template = "docs-section.html"
 page_template = "docs-page.html"
 +++
 
-The implementation, subsystem by subsystem: types, formats, invariants and the
-call paths between them. This is the level of detail you need to modify the
-engine or to reason about a failure, and it assumes the concepts from
-[Internals](/internals/).
-
-One page per subsystem, because a single page that answers forty questions
-answers none of them well.
+Every endpoint, setting, flag and metric, generated from or checked against the code.

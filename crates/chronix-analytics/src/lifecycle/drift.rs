@@ -223,11 +223,7 @@ fn ks_detect(training: &[f64], current: &[f64], p_threshold: f64) -> ModelDriftR
     let ks_stat = ks_statistic(training, current);
 
     // The decision is the p-value against the configured threshold, which is
-    // what a field named `p_threshold` means. It used to be a three-entry
-    // lookup — 1.63 / 1.36 / 1.22 for α ≤ 0.01 / 0.05 / anything else — so
-    // every α above 0.05 got the same 0.10 critical value and the reported
-    // score was a statistic the threshold was not comparable to. The closed
-    // form reproduces all three constants exactly and works for any α.
+    // what `p_threshold` means. The closed form works for any α.
     let drift_detected = ks_p_value(ks_stat, training.len(), current.len()) < p_threshold;
     let action = if drift_detected {
         DriftAction::RetriggerFit
@@ -684,8 +680,7 @@ mod tests {
         }
     }
 
-    /// The KS decision is a p-value, so any `p_threshold` is meaningful — not
-    /// just the three the old lookup table had entries for.
+    /// The KS decision is a p-value, so any `p_threshold` is meaningful.
     #[test]
     fn ks_p_value_matches_the_textbook_critical_values() {
         // c(α)·sqrt((n1+n2)/(n1·n2)) is the classical critical value; at

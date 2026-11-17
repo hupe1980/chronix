@@ -53,6 +53,7 @@ mod continuous_forecast;
 pub mod forecast;
 pub mod lifecycle;
 pub mod multivariate;
+pub mod par;
 pub mod preprocess;
 
 pub mod error;

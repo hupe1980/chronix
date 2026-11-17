@@ -8,6 +8,7 @@
 
 mod aggregation;
 mod binary;
+mod extended;
 pub(crate) mod function;
 mod selector;
 
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::promql::ast::{
-    Duration, Expr, LabelMatcher, MatchOp, PromQLValue, Sample, Series, UnaryOp,
+    DurationExpr, Expr, LabelMatcher, MatchOp, PromQLValue, Sample, Series, UnaryOp,
 };
 use arrow::record_batch::RecordBatch;
 
@@ -378,7 +379,9 @@ impl PromQLEvaluator {
         expr: &Expr,
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
-        self.eval(expr, params)
+        // `step()` and `range()` are 0 s for an instant query.
+        let expr = resolve_durations(expr, 0.0, 0.0)?;
+        self.eval(&expr, params)
     }
 
     /// Evaluate a range query over a time window.
@@ -404,6 +407,8 @@ impl PromQLEvaluator {
         if start > end {
             return Err(EvalError("start must not be after end".into()));
         }
+        // Duration expressions resolve once, against this query's step and range.
+        let expr = &resolve_durations(expr, step as f64 / 1e9, (end - start) as f64 / 1e9)?;
 
         // Cost the query before running it. A range query evaluates the whole
         // expression once per step, so the step count *is* the cost, and it is
@@ -556,11 +561,14 @@ impl PromQLEvaluator {
                 matchers,
                 offset,
                 at,
-            } => self.eval_vector_selector(name, matchers, offset, *at, params),
+                smoothed,
+            } => self.eval_vector_selector(name, matchers, offset.as_ref(), *at, *smoothed, params),
 
-            Expr::MatrixSelector { vector, range } => {
-                self.eval_matrix_selector(vector, range, params)
-            }
+            Expr::MatrixSelector {
+                vector,
+                range,
+                modifier,
+            } => self.eval_matrix_selector(vector, range, *modifier, params),
 
             Expr::Call { func, args } => self.eval_function(func, args, params),
 
@@ -585,7 +593,7 @@ impl PromQLEvaluator {
                 step,
                 offset,
                 at,
-            } => self.eval_subquery(inner, *range, *step, *offset, *at, params),
+            } => self.eval_subquery(inner, range, step.as_ref(), offset.as_ref(), *at, params),
         }
     }
 
@@ -597,9 +605,9 @@ impl PromQLEvaluator {
     fn eval_subquery(
         &self,
         inner: &Expr,
-        range: Duration,
-        step: Option<Duration>,
-        offset: Option<Duration>,
+        range: &DurationExpr,
+        step: Option<&DurationExpr>,
+        offset: Option<&DurationExpr>,
         at: Option<crate::promql::ast::AtModifier>,
         params: &QueryParams,
     ) -> Result<PromQLValue, EvalError> {
@@ -610,7 +618,7 @@ impl PromQLEvaluator {
                 params.end.unwrap_or(params.time),
             ),
         };
-        let offset_ns = offset.map_or(0, |o| o.as_nanos());
+        let offset_ns = offset.map_or(0, DurationExpr::as_nanos);
         let range_ns = range.as_nanos();
         let step_ns = if let Some(s) = step {
             let s_ns = s.as_nanos();
@@ -759,6 +767,115 @@ impl PromQLEvaluator {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+// ── Duration expressions ───────────────────────────────────────────────
+
+/// A copy of `expr` with every duration expression resolved to a literal.
+///
+/// `step_secs` and `range_secs` are the query's step and `end − start`, both
+/// 0 for an instant query. A range must come out positive; any duration must
+/// come out finite.
+pub(crate) fn resolve_durations(
+    expr: &Expr,
+    step_secs: f64,
+    range_secs: f64,
+) -> Result<Expr, EvalError> {
+    let lit = |d: &DurationExpr| -> Result<DurationExpr, EvalError> {
+        d.resolve(step_secs, range_secs)
+            .map(DurationExpr::Literal)
+            .map_err(EvalError)
+    };
+    let positive = |d: &DurationExpr, what: &str| -> Result<DurationExpr, EvalError> {
+        let v = lit(d)?;
+        if v.as_secs() <= 0.0 {
+            return Err(EvalError(format!(
+                "{what} must be positive, but `{d}` is {}s",
+                v.as_secs()
+            )));
+        }
+        Ok(v)
+    };
+    let opt = |d: &Option<DurationExpr>| d.as_ref().map(lit).transpose();
+    let sub = |e: &Expr| resolve_durations(e, step_secs, range_secs).map(Box::new);
+
+    Ok(match expr {
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => expr.clone(),
+        Expr::VectorSelector {
+            name,
+            matchers,
+            offset,
+            at,
+            smoothed,
+        } => Expr::VectorSelector {
+            name: name.clone(),
+            matchers: matchers.clone(),
+            offset: opt(offset)?,
+            at: *at,
+            smoothed: *smoothed,
+        },
+        Expr::MatrixSelector {
+            vector,
+            range,
+            modifier,
+        } => Expr::MatrixSelector {
+            vector: sub(vector)?,
+            range: positive(range, "a range selector's range")?,
+            modifier: *modifier,
+        },
+        Expr::Call { func, args } => Expr::Call {
+            func: func.clone(),
+            args: args
+                .iter()
+                .map(|a| resolve_durations(a, step_secs, range_secs))
+                .collect::<Result<_, _>>()?,
+        },
+        Expr::Aggregation {
+            op,
+            expr: inner,
+            param,
+            modifier,
+        } => Expr::Aggregation {
+            op: *op,
+            expr: sub(inner)?,
+            param: param.as_deref().map(sub).transpose()?,
+            modifier: modifier.clone(),
+        },
+        Expr::BinaryExpr {
+            op,
+            lhs,
+            rhs,
+            bool_mod,
+            matching,
+        } => Expr::BinaryExpr {
+            op: *op,
+            lhs: sub(lhs)?,
+            rhs: sub(rhs)?,
+            bool_mod: *bool_mod,
+            matching: matching.clone(),
+        },
+        Expr::UnaryExpr { op, expr: inner } => Expr::UnaryExpr {
+            op: *op,
+            expr: sub(inner)?,
+        },
+        Expr::Paren(inner) => Expr::Paren(sub(inner)?),
+        Expr::Subquery {
+            expr: inner,
+            range,
+            step,
+            offset,
+            at,
+        } => Expr::Subquery {
+            expr: sub(inner)?,
+            range: positive(range, "a subquery's range")?,
+            step: step
+                .as_ref()
+                .map(|s| positive(s, "a subquery's step"))
+                .transpose()?,
+            offset: opt(offset)?,
+            at: *at,
+        },
+    })
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::{Deadline, PromQLEvaluator, QueryParams};
@@ -783,11 +900,9 @@ mod deadline_tests {
 
     /// An evaluation that starts past its deadline stops before it scans.
     ///
-    /// `prom_query_timeout_secs` used to be a `tokio::time::timeout` around
-    /// the `spawn_blocking` handle running this evaluator, and dropping a
-    /// `JoinHandle` cancels nothing: the client got its timeout while the
-    /// scan ran on, holding a blocking thread and its accumulator. So the
-    /// deadline had to become something the evaluation itself carries.
+    /// The deadline is carried by the evaluation itself: dropping the
+    /// `JoinHandle` of a `spawn_blocking` task cancels nothing, so a timeout
+    /// around it would answer the client and leave the scan running.
     #[test]
     fn an_expired_deadline_stops_a_range_query_before_its_first_step() {
         let tmp = tempfile::tempdir().expect("tempdir");

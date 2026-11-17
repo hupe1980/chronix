@@ -38,9 +38,8 @@ use chronix_core::timebucket::TimeBucket;
 /// FROM meter GROUP BY month ORDER BY month
 /// ```
 ///
-/// This function used to truncate the *local clock* for every width, which is
-/// right for a day and wrong for an hour: on an autumn fall-back the repeated
-/// local hour made two distinct UTC hours share one "one hour" bucket.
+/// A sub-day width is a fixed span in UTC, so on an autumn fall-back the
+/// repeated local hour is two buckets, not one.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(super) struct TimeBucketUdf {
     signature: Signature,
@@ -204,8 +203,8 @@ mod tests {
                 .timestamp_nanos_opt()
                 .unwrap()
         };
-        // Two instants an hour apart across Berlin's autumn transition, and
-        // one ordinary instant. The first two used to share a bucket.
+        // Two instants an hour apart across Berlin's autumn transition, and one
+        // ordinary instant: all three land in different buckets.
         let input: TimestampNanosecondArray = vec![
             Some(ts("2026-10-25T00:30:00Z")),
             Some(ts("2026-10-25T01:30:00Z")),

@@ -109,11 +109,9 @@ const _: () = assert!(
 /// header field that turns a corrupt byte into an out-of-memory abort. The
 /// per-codec truncation checks do **not** cover it: a block whose bit width is
 /// zero — a legitimate encoding for a constant run — has no payload at all, so
-/// there is nothing for the payload length to bound `count` against. A 19-byte
-/// ALP block declaring `u32::MAX` values decoded to a 34 GiB `Vec<f64>` before
-/// this guard existed, which on the flash-constrained gateway that is the
-/// design partner is a killed process rather than a decode error, and reaching
-/// it needs a single flipped bit rather than an attacker.
+/// there is nothing for the payload length to bound `count` against. Without
+/// this guard a 19-byte block declaring `u32::MAX` values would allocate
+/// 34 GiB — on a gateway, a killed process from a single flipped bit.
 #[inline]
 pub(crate) fn checked_decode_count(count: usize, codec: &'static str) -> Result<usize> {
     if count > MAX_BLOCK_VALUES {

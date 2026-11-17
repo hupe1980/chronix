@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // examples favour brevity
 //! # Compute Engine
 //!
-//! Demonstrates SIMD-accelerated computation, hardware tier detection,
-//! batch operations, and buffer pool management.
+//! SIMD statistics, batch operations on a host-owned thread pool, and the
+//! buffer pool.
 //!
 //! ```bash
 //! cargo run --example compute_engine
@@ -53,7 +53,19 @@ fn main() {
 
     // ── 4. CpuEngine Batch Operations ─────────────────────────────
     println!("\n--- CpuEngine Batch Operations ---");
-    let engine = CpuEngine::default();
+    // Share the host's pool rather than starting threads of the engine's own;
+    // `CpuEngine::serial()` starts none at all.
+    let host = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("host pool"),
+    );
+    let engine = CpuEngine::with_pool(std::sync::Arc::clone(&host));
+    println!(
+        "  engine threads: {} (the host's pool)",
+        engine.num_threads()
+    );
 
     // Batch dot product
     let batch_dot = engine

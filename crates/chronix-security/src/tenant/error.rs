@@ -14,32 +14,6 @@ pub enum TenantError {
     #[error("namespace already exists: {0}")]
     NamespaceAlreadyExists(String),
 
-    /// A namespace quota has been exceeded.
-    ///
-    /// # Information Disclosure
-    ///
-    /// The error message deliberately includes `current` and `limit`
-    /// values. This is acceptable because:
-    ///
-    /// The error is only returned to **authenticated, namespace-scoped**
-    ///   callers who already have write access and can trivially infer
-    ///   their own usage.
-    /// Operators need these values for capacity-planning and debugging.
-    /// The HTTP layer maps this to a 429 response with a generic
-    ///   message; the detailed fields are only visible in server logs
-    ///   and metrics (not forwarded to the end-user response body).
-    #[error("quota exceeded for namespace '{namespace}': {resource} ({current}/{limit})")]
-    QuotaExceeded {
-        /// The namespace that exceeded the quota.
-        namespace: String,
-        /// Which resource hit the limit (e.g. `series_count`).
-        resource: String,
-        /// Current usage value.
-        current: u64,
-        /// Configured limit.
-        limit: u64,
-    },
-
     /// Invalid namespace configuration.
     #[error("invalid namespace config: {0}")]
     InvalidConfig(String),

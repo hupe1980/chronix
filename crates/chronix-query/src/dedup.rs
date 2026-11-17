@@ -1,44 +1,25 @@
 //! K-way merge deduplication for overlapping segments.
 //!
-//! When multiple segments for the same shard may overlap in time, their
-//! `RecordBatch` results must be merged and deduplicated. The dedup strategy
-//! is **last-write-wins**: on duplicate `(series_key, timestamp)`, the
-//! value from the segment with the highest WAL sequence number is kept.
-//!
-//! # Streaming Merge Architecture
-//!
-//! The k-way merge uses a `BinaryHeap` of per-batch cursors and
-//! materialises the final result via `arrow::compute::interleave`
-//! instead of `concat_batches` + `take`. This avoids creating a full
-//! concatenated backing batch, cutting peak memory roughly in half.
+//! When segments of one shard overlap in time, their batches are merged and
+//! deduplicated **last-write-wins**: on a duplicate `(series, timestamp)`, the
+//! row from the latest input wins.
 //!
 //! ## Algorithm
 //!
-//! Instead of concatenating all batches and performing a full O(N log N)
-//! lexsort, this module uses a streaming **k-way merge** with a min-heap
-//! of segment cursors:
+//! 1. Each input `RecordBatch` is sorted by `(timestamp, series_hash,
+//!    series_group_id)`.
+//! 2. A min-heap holds one cursor per batch, keyed on its current row.
+//! 3. Each step pops the minimum; entries sharing the dedup key `(timestamp,
+//!    group_id)` are popped too, and the one from the latest batch wins.
+//! 4. The surviving `(cursor, row)` pairs are materialised with
+//!    `arrow::compute::interleave`, so no concatenated backing batch is built.
 //!
-//! 1. Each input `RecordBatch` is internally sorted by
-//!    `(timestamp, series_hash, series_group_id)`.
-//! 2. A `BinaryHeap` (used as a min-heap) maintains one cursor per batch,
-//!    keyed on the current row's sort key.
-//! 3. On each step, the minimum entry is popped. If subsequent entries share
-//!    the same dedup key `(timestamp, group_id)`, they are also popped and
-//!    the entry from the **latest** batch (highest `batch_idx`) wins
-//!    (last-write-wins semantics).
-//! 4. The merged result is collected as `(cursor_idx, row_idx)` pairs and
-//!    materialised into a final `RecordBatch` via Arrow `take` on a
-//!    concatenated backing batch.
+//! O(N log K) for K overlapping batches; when inputs are already time-sorted —
+//! the common case — the per-batch sort is nearly free.
 //!
-//! Complexity: O(N log K) where K = number of overlapping batches, vs the
-//! previous O(N log N) full-sort approach. When segments are already sorted
-//! by timestamp (the common case), intra-batch sorting is nearly free.
-//!
-//! Series identity is determined by the canonical form
-//! (`measurement\0tag1=v1\0tag2=v2`) — the FNV-1a hash is used as a fast
-//! grouping key for sort order, and unique canonical forms are mapped to
-//! integer group IDs to avoid O(N) heap-allocated strings while
-//! still preventing false-positive dedup from hash collisions.
+//! Series identity is the canonical form (`measurement\0tag1=v1\0…`). The
+//! FNV-1a hash orders rows quickly, and canonical forms map to integer group
+//! ids, so a hash collision can never merge two series.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -128,7 +109,7 @@ fn align_batch(batch: &RecordBatch, target: &Arc<Schema>) -> Result<RecordBatch>
 ///
 /// Each input batch is internally sorted by `(timestamp, series_hash,
 /// group_id)`, then a min-heap merges all batches in O(N log K) time
-/// (K = batch count), compared to a O(N log N) full sort.
+/// (K = batch count).
 ///
 /// # Errors
 ///

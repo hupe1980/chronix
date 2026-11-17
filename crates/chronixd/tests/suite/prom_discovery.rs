@@ -57,7 +57,11 @@ async fn server_with_data() -> (String, TempDir) {
     }
     db.insert_batch(&points).unwrap().into_complete().unwrap();
     db.flush().unwrap();
+    (serve(db).await, tmp)
+}
 
+/// Serve `db` over HTTP, returning the base URL.
+async fn serve(db: Arc<Chronix>) -> String {
     let sql_contexts = chronixd::namespace::SqlContexts::new(db.clone());
     let state: AppState = Arc::new(SharedState {
         db,
@@ -65,8 +69,6 @@ async fn server_with_data() -> (String, TempDir) {
         connector_manager: None,
         sql_contexts,
         auth_state: None,
-        #[cfg(feature = "cluster")]
-        meta_client: None,
         namespace_registry: std::sync::Arc::new(chronix_security::tenant::NamespaceRegistry::new()),
         model_catalog: Arc::new(parking_lot::RwLock::new(
             chronix::chronix_analytics::forecast::ModelCatalog::new(),
@@ -75,11 +77,13 @@ async fn server_with_data() -> (String, TempDir) {
         audit_logger: None,
         config: chronixd::config::ServerConfig::default(),
         namespace_rate_limiter: chronixd::rate_limit::NamespaceRateLimiter::new(),
+        namespace_ingest_limiter: chronixd::rate_limit::NamespaceIngestLimiter::new(),
         sql_plan_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
         write_dedup_cache: None,
         write_timeout: std::time::Duration::ZERO,
         pipeline: None,
         openapi_json: std::sync::OnceLock::new(),
+        query_slots: Default::default(),
     });
 
     let metrics_handle = chronixd::server::prometheus_builder()
@@ -94,7 +98,7 @@ async fn server_with_data() -> (String, TempDir) {
         axum::serve(listener, app).await.expect("serve");
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    (base, tmp)
+    base
 }
 
 /// GET a discovery endpoint over a **real query string** and return `data`.
@@ -548,4 +552,151 @@ async fn discovery_endpoints_accept_a_posted_form() {
         .unwrap();
     assert_eq!(body["status"], "success");
     assert_eq!(body["data"].as_array().unwrap().len(), 2);
+}
+
+/// The label endpoints are exact: a label is offered for a metric only if the
+/// metric has a sample under it in the window — from the memtable, from a
+/// segment, and for an encrypted metric whose values the server cannot read.
+///
+/// `meas` holds two fields. `m` is only ever written under `host=a`, `n` only
+/// under `host=b`, so `host=b` has no sample of `meas_m` at all. Projecting
+/// tag columns alone — what these endpoints used to do — offered it anyway.
+#[tokio::test]
+async fn label_endpoints_offer_only_labels_with_a_sample_of_the_metric() {
+    let tmp = TempDir::new().expect("tempdir");
+    let config = ChronixConfigBuilder::default()
+        .data_dir(tmp.path().to_path_buf())
+        .build()
+        .expect("chronix config");
+    let db = Arc::new(Chronix::open(config).expect("open db"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let point = |host: &str, field: &str, i: i64| {
+        Point::new(
+            SeriesKey::new("meas", chronix::tags! { "host" => host }).unwrap(),
+            [(field.to_string(), FieldValue::F64(i as f64))].into(),
+            now - (60 - i) * 1_000_000_000,
+        )
+        .unwrap()
+    };
+    let write = |offset: i64| {
+        let points: Vec<Point> = (0..10)
+            .flat_map(|i| [point("a", "m", offset + i), point("b", "n", offset + i)])
+            .collect();
+        db.insert_batch(&points).unwrap().into_complete().unwrap();
+    };
+    write(0);
+    let base = serve(Arc::clone(&db)).await;
+
+    let check = |label: &'static str| {
+        let base = base.clone();
+        async move {
+            let hosts = strings(&data(&base, "/api/v1/label/host/values?match[]=meas_m").await);
+            assert_eq!(hosts, ["a"], "{label}: host values of meas_m");
+            let hosts = strings(&data(&base, "/api/v1/label/host/values?match[]=meas_n").await);
+            assert_eq!(hosts, ["b"], "{label}: host values of meas_n");
+            let names = strings(&data(&base, "/api/v1/labels?match[]=meas_m{host=\"b\"}").await);
+            assert!(
+                names.is_empty(),
+                "{label}: meas_m has no series under host=b: {names:?}"
+            );
+        }
+    };
+    check("memtable").await;
+    db.flush().unwrap();
+    check("segment").await;
+    // A segment and the memtable together.
+    write(20);
+    check("segment and memtable").await;
+}
+
+/// `/api/v1/status/tsdb` has exactly upstream's keys and JSON types — what
+/// Grafana's and the Prometheus UI's cardinality views parse — plus `chronix`.
+#[tokio::test]
+async fn status_tsdb_has_the_prometheus_shape_and_the_budget() {
+    let (base, _tmp) = server_with_data().await;
+    let c = reqwest::Client::new();
+    let body: Value = c
+        .get(format!("{base}/api/v1/status/tsdb"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], "success");
+    let data = body["data"].as_object().unwrap();
+    let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "chronix",
+            "headStats",
+            "labelValueCountByLabelName",
+            "memoryInBytesByLabelName",
+            "seriesCountByLabelValuePair",
+            "seriesCountByMetricName",
+        ]
+    );
+    let head = &data["headStats"];
+    for k in ["numSeries", "chunkCount", "minTime", "maxTime"] {
+        assert!(
+            head[k].is_i64() || head[k].is_u64(),
+            "headStats.{k} is a number"
+        );
+    }
+    for list in [
+        "seriesCountByMetricName",
+        "labelValueCountByLabelName",
+        "memoryInBytesByLabelName",
+        "seriesCountByLabelValuePair",
+    ] {
+        for entry in data[list].as_array().unwrap() {
+            assert!(entry["name"].is_string(), "{list}");
+            assert!(entry["value"].is_u64(), "{list}");
+            assert_eq!(entry.as_object().unwrap().len(), 2, "{list}");
+        }
+    }
+    // cpu{host,dc} × 2 and mem{host} × 1.
+    assert_eq!(head["numSeries"], 3);
+    assert_eq!(head["numSeries"], data["chronix"]["used"]);
+    assert_eq!(data["seriesCountByMetricName"][0]["name"], "cpu");
+    assert_eq!(data["seriesCountByMetricName"][0]["value"], 2);
+    assert!(head["minTime"].as_i64().unwrap() > 0);
+    assert_eq!(data["chronix"]["scope"], "database");
+    assert_eq!(data["chronix"]["enforced"], true);
+
+    // `limit` is upstream's: 1–10000, anything else is bad_data.
+    for bad in ["0", "10001", "x"] {
+        let resp = c
+            .get(format!("{base}/api/v1/status/tsdb?limit={bad}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "limit={bad}"
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["errorType"], "bad_data");
+    }
+    let one: Value = c
+        .get(format!("{base}/api/v1/status/tsdb?limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        one["data"]["seriesCountByMetricName"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

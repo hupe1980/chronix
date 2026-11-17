@@ -82,7 +82,11 @@ pub struct ForecastLimits {
 }
 
 /// Register all Chronix custom SQL functions on a [`SessionContext`].
-pub fn register_udfs(ctx: &SessionContext, limits: ForecastLimits) {
+pub(crate) fn register_udfs(
+    ctx: &SessionContext,
+    limits: ForecastLimits,
+    executor: crate::db::exec::ExecHandle,
+) {
     // ── Scalar ──────────────────────────────────────────────────────
     ctx.register_udf(ScalarUDF::new_from_impl(time_bucket::TimeBucketUdf::new()));
 
@@ -112,7 +116,7 @@ pub fn register_udfs(ctx: &SessionContext, limits: ForecastLimits) {
         limits,
     )));
     ctx.register_udaf(AggregateUDF::new_from_impl(
-        aggregates::AutoForecastUdaf::new(limits),
+        aggregates::AutoForecastUdaf::new(limits, executor),
     ));
     ctx.register_udaf(AggregateUDF::new_from_impl(
         aggregates::MultivariateForecastUdaf::new(limits),

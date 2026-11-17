@@ -14,17 +14,11 @@
 //!
 //! ## Both histogram shapes become one histogram
 //!
-//! An OTLP explicit-bucket histogram used to be spread across one `bucket_<b>`
-//! field per boundary, plus `count` and `sum`. That stores the data and
-//! answers nothing: `histogram_quantile` has no bucketed series to work on,
-//! and a Grafana histogram panel over it renders as a summary. It is also the
-//! per-bucket cardinality that native histograms exist to remove.
-//!
-//! Both shapes now land in a single `value` column of type histogram:
-//! explicit bounds as schema −53 (custom buckets), exponential as the
-//! matching base-2 schema. `histogram_quantile`, `histogram_count`,
-//! `histogram_sum` and the rest read them, a rollup merges rather than drops
-//! them, and the metric keeps its own name because the field is `value`.
+//! Both shapes land in a single `value` column of type histogram: explicit
+//! bounds as schema −53 (custom buckets), exponential as the matching base-2
+//! schema. `histogram_quantile`, `histogram_count`, `histogram_sum` and the
+//! rest read them, a rollup merges them, and the metric keeps its own name
+//! because the field is `value`. No per-bucket fields are stored.
 
 use std::collections::BTreeMap;
 
@@ -87,6 +81,7 @@ pub async fn otlp_metrics_handler(
 
     crate::util::insert_batch_with_mode(
         &state.db,
+        &state.namespace_ingest_limiter,
         scope.as_deref(),
         points,
         state.write_timeout,
@@ -193,7 +188,9 @@ fn convert_metric_data(
 
                 let point = Point::new(key, fields, timestamp_ns)
                     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-                points.push(point);
+                if let Some(point) = with_otlp_start(point, dp.start_time_unix_nano) {
+                    points.push(point);
+                }
             }
         }
         Data::Histogram(histogram) => {
@@ -222,7 +219,9 @@ fn convert_metric_data(
 
                 let point = Point::new(key, fields, timestamp_ns)
                     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-                points.push(point);
+                if let Some(point) = with_otlp_start(point, dp.start_time_unix_nano) {
+                    points.push(point);
+                }
             }
         }
         Data::ExponentialHistogram(histogram) => {
@@ -264,7 +263,9 @@ fn convert_metric_data(
 
                 let point = Point::new(key, fields, timestamp_ns)
                     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-                points.push(point);
+                if let Some(point) = with_otlp_start(point, dp.start_time_unix_nano) {
+                    points.push(point);
+                }
             }
         }
         Data::Summary(summary) => {
@@ -293,12 +294,34 @@ fn convert_metric_data(
 
                 let point = Point::new(key, fields, timestamp_ns)
                     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-                points.push(point);
+                if let Some(point) = with_otlp_start(point, dp.start_time_unix_nano) {
+                    points.push(point);
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Attach an OTLP `start_time_unix_nano` to `point` (`0` is unset).
+///
+/// A gauge never reaches this: OTLP gives a gauge's start time no meaning.
+/// `None` drops the point — a start after the sample is a sender defect —
+/// and counts it.
+fn with_otlp_start(point: Point, start_unix_nano: u64) -> Option<Point> {
+    if start_unix_nano == 0 {
+        return Some(point);
+    }
+    match point.with_start_timestamp(saturating_u64_to_i64(start_unix_nano)) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            metrics::counter!("chronix_otlp_rejected_points_total", "reason" => "start_after_sample")
+                .increment(1);
+            tracing::debug!(error = %e, "OTLP data point refused");
+            None
+        }
+    }
 }
 
 /// Extract the numeric value from an OTLP `NumberDataPoint`.
@@ -532,6 +555,8 @@ struct OtlpJsonNumberDataPoint {
     #[serde(default)]
     attributes: Vec<OtlpJsonKeyValue>,
     #[serde(default, deserialize_with = "json_int::u64")]
+    start_time_unix_nano: u64,
+    #[serde(default, deserialize_with = "json_int::u64")]
     time_unix_nano: u64,
     #[serde(default)]
     as_double: Option<f64>,
@@ -551,6 +576,8 @@ struct OtlpJsonHistogram {
 struct OtlpJsonHistogramDataPoint {
     #[serde(default)]
     attributes: Vec<OtlpJsonKeyValue>,
+    #[serde(default, deserialize_with = "json_int::u64")]
+    start_time_unix_nano: u64,
     #[serde(default, deserialize_with = "json_int::u64")]
     time_unix_nano: u64,
     #[serde(default, deserialize_with = "json_int::u64")]
@@ -575,6 +602,8 @@ struct OtlpJsonExponentialHistogram {
 struct OtlpJsonExponentialHistogramDataPoint {
     #[serde(default)]
     attributes: Vec<OtlpJsonKeyValue>,
+    #[serde(default, deserialize_with = "json_int::u64")]
+    start_time_unix_nano: u64,
     #[serde(default, deserialize_with = "json_int::u64")]
     time_unix_nano: u64,
     #[serde(default, deserialize_with = "json_int::u64")]
@@ -614,6 +643,8 @@ struct OtlpJsonSummary {
 struct OtlpJsonSummaryDataPoint {
     #[serde(default)]
     attributes: Vec<OtlpJsonKeyValue>,
+    #[serde(default, deserialize_with = "json_int::u64")]
+    start_time_unix_nano: u64,
     #[serde(default, deserialize_with = "json_int::u64")]
     time_unix_nano: u64,
     #[serde(default, deserialize_with = "json_int::u64")]
@@ -753,7 +784,7 @@ fn json_kv_to_proto(kv: OtlpJsonKeyValue) -> otlp::KeyValue {
 fn json_histogram_dp_to_proto(dp: OtlpJsonHistogramDataPoint) -> otlp::HistogramDataPoint {
     otlp::HistogramDataPoint {
         attributes: dp.attributes.into_iter().map(json_kv_to_proto).collect(),
-        start_time_unix_nano: 0,
+        start_time_unix_nano: dp.start_time_unix_nano,
         time_unix_nano: dp.time_unix_nano,
         count: dp.count,
         sum: dp.sum,
@@ -773,7 +804,7 @@ fn json_exponential_histogram_dp_to_proto(
     };
     otlp::ExponentialHistogramDataPoint {
         attributes: dp.attributes.into_iter().map(json_kv_to_proto).collect(),
-        start_time_unix_nano: 0,
+        start_time_unix_nano: dp.start_time_unix_nano,
         time_unix_nano: dp.time_unix_nano,
         count: dp.count,
         sum: dp.sum,
@@ -791,7 +822,7 @@ fn json_exponential_histogram_dp_to_proto(
 fn json_summary_dp_to_proto(dp: OtlpJsonSummaryDataPoint) -> otlp::SummaryDataPoint {
     otlp::SummaryDataPoint {
         attributes: dp.attributes.into_iter().map(json_kv_to_proto).collect(),
-        start_time_unix_nano: 0,
+        start_time_unix_nano: dp.start_time_unix_nano,
         time_unix_nano: dp.time_unix_nano,
         count: dp.count,
         sum: dp.sum,
@@ -815,7 +846,7 @@ fn json_number_dp_to_proto(dp: OtlpJsonNumberDataPoint) -> otlp::NumberDataPoint
 
     otlp::NumberDataPoint {
         attributes: dp.attributes.into_iter().map(json_kv_to_proto).collect(),
-        start_time_unix_nano: 0,
+        start_time_unix_nano: dp.start_time_unix_nano,
         time_unix_nano: dp.time_unix_nano,
         value,
     }

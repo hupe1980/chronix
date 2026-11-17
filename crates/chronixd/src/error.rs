@@ -56,16 +56,11 @@ pub enum ServerError {
     /// A write outran its deadline, and the server does not know whether it
     /// landed.
     ///
-    /// The deadline is a `tokio::time::timeout` around a `spawn_blocking`
-    /// task, and dropping a `JoinHandle` cancels nothing — a blocking task
-    /// cannot be cancelled, and a durable write must not be. So the write is
-    /// still running, will very likely complete, and the only honest answer
-    /// is that the outcome is **unknown**. Saying "the write did not
-    /// complete" is the same lie pass 42 found one level down, where a record
-    /// the caller was told had failed reached the disk anyway.
-    ///
-    /// A retry is safe: a point is identified by its series and its
-    /// timestamp, so writing it twice stores it once.
+    /// The deadline is a timeout around a `spawn_blocking` task, which cannot be
+    /// cancelled — and a durable write must not be — so the write is still
+    /// running and the only honest answer is "unknown". A retry is safe: a point
+    /// is identified by its series and timestamp, so writing it twice stores it
+    /// once.
     #[error(
         "the write did not complete within {0:?}; it may still be applied, \
          so its outcome is unknown — retrying is safe because a point is \
@@ -89,6 +84,18 @@ pub enum ServerError {
         setting: &'static str,
     },
 
+    /// Every query slot stayed busy for the query's whole timeout.
+    #[error(
+        "every query slot was busy for {waited:?} (server.max_concurrent_queries = {capacity}); \
+         retry, or raise the setting"
+    )]
+    QuerySlotsBusy {
+        /// How long the query waited.
+        waited: std::time::Duration,
+        /// The configured number of slots.
+        capacity: usize,
+    },
+
     /// Duplicate write detected via idempotency key.
     #[error("conflict: {0}")]
     Conflict(String),
@@ -107,15 +114,98 @@ pub enum ServerError {
     /// 1.0 without operator involvement.
     #[error("unsupported media type: {0}")]
     UnsupportedMediaType(String),
+
+    /// A namespace is over its ingestion rate, and this batch fits once the
+    /// bucket refills. `429` with `Retry-After`; on gRPC,
+    /// `RESOURCE_EXHAUSTED` with a `grpc-retry-pushback-ms` trailer.
+    #[error(
+        "namespace {namespace:?} is over its ingestion rate ({rate} points/s); retry after {} s",
+        retry_after_ms.div_ceil(1000).max(1)
+    )]
+    NamespaceRateLimited {
+        /// The namespace.
+        namespace: String,
+        /// Its configured rate, points per second.
+        rate: u64,
+        /// How long until the batch would be admitted.
+        retry_after_ms: u64,
+    },
+
+    /// A batch larger than one second of its namespace's ingestion rate. It
+    /// can never be admitted as it is, so it is a `400`: retrying it
+    /// unchanged would be refused for ever.
+    #[error(
+        "a batch of {points} points exceeds namespace {namespace:?}'s ingestion rate of \
+         {rate} points/s and can never be admitted; split it"
+    )]
+    BatchExceedsNamespaceRate {
+        /// The namespace.
+        namespace: String,
+        /// Points in the refused batch.
+        points: u64,
+        /// The configured rate, points per second.
+        rate: u64,
+    },
+
+    /// A namespace quota the request sets is not one this release has.
+    #[error("{0}")]
+    InvalidQuota(String),
+
+    /// A query error, with what the query got wrong and what it probably
+    /// meant. Classified exactly as `inner`; the body gains `hint` and `span`.
+    #[error("{message}")]
+    Diagnosed {
+        /// The error being explained; it decides status and `code`.
+        inner: Box<ServerError>,
+        /// One sentence, with the hint in it.
+        message: String,
+        /// What the query probably meant: `did you mean "cpu_usage"?`.
+        hint: Option<String>,
+        /// The bytes of the query the error is about.
+        span: Option<chronix::diagnostics::Span>,
+    },
+}
+
+impl ServerError {
+    /// Attach a diagnosis to `inner`; `inner` unchanged when there is none.
+    ///
+    /// The message always carries the hint, so a client that reads only
+    /// `error` — a Grafana banner, a log line — loses nothing.
+    #[must_use]
+    pub fn diagnosed(inner: Self, d: chronix::diagnostics::Diagnosis) -> Self {
+        if d.is_empty() {
+            return inner;
+        }
+        let mut message = d.message.unwrap_or_else(|| inner.to_string());
+        if let Some(hint) = &d.hint
+            && !message.contains(hint.as_str())
+        {
+            message = format!("{message} — {hint}");
+        }
+        Self::Diagnosed {
+            inner: Box::new(inner),
+            message,
+            hint: d.hint,
+            span: d.span,
+        }
+    }
 }
 
 /// Standard JSON error response body.
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
-    /// Human-readable error message.
+    /// Human-readable error message: one sentence, complete on its own.
     pub error: String,
     /// Machine-readable error code.
     pub code: &'static str,
+    /// What the request probably meant, e.g. `did you mean "cpu_usage"?`.
+    /// Absent when there is nothing to suggest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// The bytes of the query the error is about, as half-open byte offsets
+    /// into the query as sent. Absent when the error has no position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<chronix::diagnostics::Span>,
 }
 
 /// Give every error response the same JSON envelope, whoever produced it.
@@ -188,6 +278,8 @@ pub async fn error_envelope_layer(
         axum::Json(ErrorResponse {
             error: message,
             code,
+            hint: None,
+            span: None,
         }),
     )
         .into_response();
@@ -221,13 +313,8 @@ fn is_storage_full(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// What a client is told about an error, on every protocol.
-///
-/// **One classifier, two renderings.** The HTTP and gRPC mappings used to be
-/// two independent `match` statements over the same enum, each with its own
-/// `_ =>` arm, so they could — and did — disagree about the same condition
-/// while both passing their own tests. They now differ only in how they spell
-/// an [`Outcome`].
+/// What a client is told about an error, on every protocol: one
+/// classifier, rendered as HTTP and as gRPC, so the two cannot disagree.
 #[derive(Debug)]
 struct Outcome {
     /// HTTP status.
@@ -238,14 +325,17 @@ struct Outcome {
     grpc: tonic::Code,
     /// `true` when the error's own text may be shown to the client.
     ///
-    /// The rule, unchanged since pass 42's `507`: a condition that describes
-    /// the *deployment* — a full disk, a full memtable, a query that ran out
-    /// of time, a schema mistake — is safe and useful to show. A condition
-    /// that describes chronix's own machinery is a redacted 500 with the
-    /// detail in the log, because its text carries paths and internal shapes.
+    /// A condition that describes the deployment — a full disk, a full memtable,
+    /// a query that ran out of time, a schema mistake — is safe and useful to
+    /// show. A condition that describes chronix's own machinery is a redacted 500
+    /// with the detail in the log, because its text carries paths and internal
+    /// shapes.
     public: bool,
     /// Seconds for a `Retry-After` header, when the wait is knowable.
     retry_after_secs: Option<u64>,
+    /// The same wait in milliseconds, for gRPC's `grpc-retry-pushback-ms`
+    /// trailer, when it is known that precisely.
+    retry_after_ms: Option<u64>,
 }
 
 impl Outcome {
@@ -256,6 +346,7 @@ impl Outcome {
             grpc,
             public: true,
             retry_after_secs: None,
+            retry_after_ms: None,
         }
     }
 
@@ -267,11 +358,22 @@ impl Outcome {
             grpc: tonic::Code::Internal,
             public: false,
             retry_after_secs: None,
+            retry_after_ms: None,
         }
     }
 
     const fn retry_after(mut self, secs: u64) -> Self {
         self.retry_after_secs = Some(secs);
+        self
+    }
+
+    /// A wait known to the millisecond: `Retry-After` rounds it up to whole
+    /// seconds (never zero, which a client reads as "now"), and gRPC carries
+    /// it exactly.
+    const fn retry_after_ms(mut self, ms: u64) -> Self {
+        let secs = ms.div_ceil(1000);
+        self.retry_after_secs = Some(if secs == 0 { 1 } else { secs });
+        self.retry_after_ms = Some(ms);
         self
     }
 }
@@ -300,7 +402,7 @@ fn classify_db(err: &chronix::DbError) -> Outcome {
             "INVALID_POINT",
             tonic::Code::InvalidArgument,
         ),
-        E::PromQl(_) => Outcome::new(
+        E::PromQl { .. } => Outcome::new(
             StatusCode::BAD_REQUEST,
             "PROMQL_ERROR",
             tonic::Code::InvalidArgument,
@@ -317,6 +419,16 @@ fn classify_db(err: &chronix::DbError) -> Outcome {
             Outcome::new(
                 StatusCode::BAD_REQUEST,
                 "CARDINALITY_EXCEEDED",
+                tonic::Code::ResourceExhausted,
+            )
+        }
+        E::NamespaceQuotaExceeded { .. } => {
+            // Permanent for the same reason as the database budget: the
+            // namespace's usage does not fall on its own, so a `429` would be
+            // retried by remote write, OTLP and Influx clients for ever.
+            Outcome::new(
+                StatusCode::BAD_REQUEST,
+                "NAMESPACE_QUOTA_EXCEEDED",
                 tonic::Code::ResourceExhausted,
             )
         }
@@ -358,6 +470,18 @@ fn classify_db(err: &chronix::DbError) -> Outcome {
             StatusCode::SERVICE_UNAVAILABLE,
             "DATABASE_CLOSED",
             tonic::Code::Unavailable,
+        ),
+        // A server never opens its own directory read-only; these reach a
+        // client only through a stdio MCP session, and both are permanent.
+        E::ReadOnly { .. } => Outcome::new(
+            StatusCode::FORBIDDEN,
+            "READ_ONLY",
+            tonic::Code::FailedPrecondition,
+        ),
+        E::DirectoryLive { .. } => Outcome::new(
+            StatusCode::CONFLICT,
+            "DIRECTORY_LIVE",
+            tonic::Code::FailedPrecondition,
         ),
 
         // ── chronix's own machinery ────────────────────────────────────
@@ -425,6 +549,7 @@ fn classify(err: &ServerError) -> Outcome {
     }
 
     match err {
+        ServerError::Diagnosed { inner, .. } => classify(inner),
         ServerError::Db(e) => classify_db(e),
         ServerError::BadRequest(_) => Outcome::new(
             StatusCode::BAD_REQUEST,
@@ -449,6 +574,12 @@ fn classify(err: &ServerError) -> Outcome {
             "QUERY_TIMEOUT",
             tonic::Code::DeadlineExceeded,
         ),
+        ServerError::QuerySlotsBusy { .. } => Outcome::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "QUERY_SLOTS_BUSY",
+            tonic::Code::ResourceExhausted,
+        )
+        .retry_after(1),
         ServerError::Conflict(_) => {
             Outcome::new(StatusCode::CONFLICT, "CONFLICT", tonic::Code::AlreadyExists)
         }
@@ -462,10 +593,49 @@ fn classify(err: &ServerError) -> Outcome {
             "UNSUPPORTED_MEDIA_TYPE",
             tonic::Code::InvalidArgument,
         ),
+        ServerError::NamespaceRateLimited { retry_after_ms, .. } => Outcome::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "NAMESPACE_RATE_LIMITED",
+            tonic::Code::ResourceExhausted,
+        )
+        .retry_after_ms(*retry_after_ms),
+        ServerError::BatchExceedsNamespaceRate { .. } => Outcome::new(
+            StatusCode::BAD_REQUEST,
+            "BATCH_EXCEEDS_NAMESPACE_RATE",
+            tonic::Code::ResourceExhausted,
+        ),
+        ServerError::InvalidQuota(_) => Outcome::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_QUOTA",
+            tonic::Code::InvalidArgument,
+        ),
         ServerError::Config(_) => Outcome::internal("CONFIG_ERROR"),
         ServerError::Tls(_) => Outcome::internal("TLS_ERROR"),
         ServerError::Io(_) => Outcome::internal("IO_ERROR"),
         ServerError::Internal(_) => Outcome::internal("INTERNAL_ERROR"),
+    }
+}
+
+impl ServerError {
+    /// What a client is told — the message, redacted unless the condition is
+    /// one the engine can name, and the hint — without building a response.
+    /// For a protocol that is not HTTP (the MCP tools) to say exactly what
+    /// the matching route would.
+    #[must_use]
+    pub fn client_view(&self) -> (String, Option<String>) {
+        let outcome = classify(self);
+        if !outcome.public {
+            tracing::error!(code = outcome.code, error = %self, "server error");
+            return (
+                format!("{}: an internal error occurred", outcome.code),
+                None,
+            );
+        }
+        let hint = match self {
+            Self::Diagnosed { hint, .. } => hint.clone(),
+            _ => None,
+        };
+        (self.to_string(), hint)
     }
 }
 
@@ -492,9 +662,15 @@ impl IntoResponse for ServerError {
             format!("{}: an internal error occurred", outcome.code)
         };
 
+        let (hint, span) = match &self {
+            Self::Diagnosed { hint, span, .. } if outcome.public => (hint.clone(), *span),
+            _ => (None, None),
+        };
         let body = ErrorResponse {
             error: error_msg,
             code: outcome.code,
+            hint,
+            span,
         };
 
         let mut response = (outcome.status, axum::Json(body)).into_response();
@@ -518,7 +694,13 @@ impl ServerError {
     pub fn to_grpc_status(&self) -> tonic::Status {
         let outcome = classify(self);
         if outcome.public {
-            tonic::Status::new(outcome.grpc, self.to_string())
+            let mut status = tonic::Status::new(outcome.grpc, self.to_string());
+            // gRPC's retry policy reads the pushback from this trailer
+            // (gRFC A6); without it a client backs off on its own schedule.
+            if let Some(ms) = outcome.retry_after_ms {
+                pushback(&mut status, ms);
+            }
+            status
         } else {
             tracing::error!(code = outcome.code, error = %self, "server error (gRPC)");
             tonic::Status::new(
@@ -529,6 +711,15 @@ impl ServerError {
     }
 }
 
+/// Attach a `grpc-retry-pushback-ms` trailer to a refusal.
+pub fn pushback(status: &mut tonic::Status, ms: u64) {
+    if let Ok(value) = ms.to_string().parse() {
+        status
+            .metadata_mut()
+            .insert("grpc-retry-pushback-ms", value);
+    }
+}
+
 /// Convenience alias for handler results.
 pub type Result<T> = std::result::Result<T, ServerError>;
 
@@ -536,11 +727,8 @@ pub type Result<T> = std::result::Result<T, ServerError>;
 mod tests {
     use super::*;
 
-    /// A full disk is `507`, unredacted, on every shape the error arrives in.
-    ///
-    /// It used to be `500 DATABASE_ERROR: an internal error occurred` — the
-    /// reason only in the server's log, so a Telegraf agent retried against a
-    /// full volume for ever and nothing in its output said why. Verified
+    /// A full disk is `507`, unredacted, on every shape the error arrives in, so
+    /// a client stops retrying against a full volume and says why. Verified
     /// against a real 24 MiB volume filled by writing to it.
     #[test]
     fn a_full_disk_is_insufficient_storage_and_says_so() {
@@ -591,13 +779,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// A missing encryption key reaches the client with its reason intact.
-    ///
-    /// It used to be a `SegmentError::CorruptFile`, which classifies as a
-    /// redacted `DATABASE_ERROR` — so an operator who restored an encrypted
-    /// backup onto a machine without the key was told "an internal error
-    /// occurred" and had every reason to think the backup was damaged. The
-    /// two have completely different next steps.
+    /// A missing encryption key reaches the client with its reason intact: a
+    /// backup restored without its key is not a damaged backup, and the two have
+    /// different next steps.
     #[test]
     fn a_missing_encryption_key_is_not_redacted() {
         let err = ServerError::Db(chronix::DbError::Segment(
@@ -638,15 +822,10 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
-    /// Back-pressure is `UNAVAILABLE`, not `RESOURCE_EXHAUSTED`.
-    ///
-    /// gRPC's own guidance puts a transient overload that clears on its own
-    /// under `UNAVAILABLE` — the code every client's default retry policy
-    /// retries — and reserves `RESOURCE_EXHAUSTED` for a quota the caller has
-    /// to do something about, which is where the cardinality budget belongs
-    /// and where a full disk belongs. It used to be `RESOURCE_EXHAUSTED`,
-    /// which reads as "you have used up your allowance" for a memtable that
-    /// will be flushed in a moment.
+    /// Back-pressure is `UNAVAILABLE`, not `RESOURCE_EXHAUSTED`: gRPC puts a
+    /// transient overload under `UNAVAILABLE`, which every client's default retry
+    /// policy retries, and reserves `RESOURCE_EXHAUSTED` for a quota the caller
+    /// must act on — the cardinality budget, a full disk.
     #[test]
     fn grpc_backpressure_is_unavailable_and_a_quota_is_not() {
         assert_eq!(
@@ -756,13 +935,9 @@ mod tests {
         );
     }
 
-    /// The HTTP and gRPC mappings cannot disagree, because there is one.
-    ///
-    /// They used to be two independent `match` statements over the same enum,
-    /// each with its own catch-all. This drives both renderings of the same
-    /// classification and checks they carry the same *meaning* — a `4xx` is an
-    /// argument error on gRPC too, a `503` is `Unavailable`, and a redacted
-    /// `500` says the same nothing on both.
+    /// The HTTP and gRPC renderings of one classification carry the same
+    /// meaning: a `4xx` is an argument error on gRPC too, a `503` is
+    /// `Unavailable`, and a redacted `500` says the same nothing on both.
     #[test]
     fn the_two_protocols_answer_the_same_classification() {
         let cases = [

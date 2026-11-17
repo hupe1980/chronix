@@ -33,6 +33,7 @@ impl super::Chronix {
     /// Returns an error if the database is closed, flush fails, or
     /// segment deletion encounters an I/O error.
     pub fn drop_measurement(&self, measurement: &str) -> Result<()> {
+        self.ensure_writable("dropping a measurement")?;
         self.check_open()?;
 
         // When soft_delete_ttl is configured, mark the measurement
@@ -120,6 +121,7 @@ impl super::Chronix {
             let prefix = format!("{measurement}\0");
             self.known_series
                 .retain(|canonical| !canonical.starts_with(&prefix));
+            self.recount_namespace_series();
         }
 
         // 7. Forget the measurement in the namespace index.
@@ -168,6 +170,7 @@ impl super::Chronix {
     ///
     /// Returns an error if the database is closed or the delete fails.
     pub fn delete_series(&self, measurement: &str, tags: &BTreeMap<String, String>) -> Result<()> {
+        self.ensure_writable("deleting")?;
         // Validated here rather than only inside the CDC event: a tag set the
         // canonical form cannot represent is a bad request whether or not
         // anybody is subscribed.
@@ -210,6 +213,9 @@ impl super::Chronix {
     ///
     /// Returns the number of tombstones reclaimed.
     pub fn gc_tombstones(&self) -> usize {
+        if self.config.read_only {
+            return 0;
+        }
         let removed = {
             let mut catalog = self.catalog.write();
             match catalog.reclaim_tombstones() {
@@ -274,6 +280,7 @@ impl super::Chronix {
     /// cannot be persisted.
     #[must_use = "delete errors must be handled"]
     pub fn execute_delete(&self, req: &DeleteRequest) -> Result<DeleteOutcome> {
+        self.ensure_writable("deleting")?;
         self.check_open()?;
 
         // Flush all memtables so series not yet on disk are included in the scan.
@@ -404,12 +411,9 @@ impl super::Chronix {
 
         // Resolve each match into a tombstone.
         //
-        // The upper bound is the request's when it named one, and otherwise
-        // the newest timestamp that series actually has. Resolving it is what
-        // separates "delete what is stored" from "mask this series forever":
-        // the unranged form used to produce an open-ended tombstone, so every
-        // later write to the same series was accepted, logged, and then
-        // filtered out of every read.
+        // The upper bound is the request's when it named one, and otherwise the
+        // newest timestamp the series actually has: "delete what is stored", never
+        // "mask this series forever", so later writes to it stay visible.
         let tombstones: Vec<Tombstone> = matched
             .iter()
             .map(|(canonical, (_, max_ts))| {
@@ -422,19 +426,12 @@ impl super::Chronix {
         let tombstoned_count = tombstones.len() as u64;
 
         if !tombstones.is_empty() {
-            // Persist before touching in-memory state, so a crash in the
-            // middle leaves a database that has either applied the delete or
-            // not seen it — never one that shows it and forgets it on restart.
+            // Persist before touching in-memory state, so a crash in the middle leaves
+            // a database that has either applied the delete or not seen it.
             //
-            // The catalog manifest is the **only** durable record, and it is
-            // fsynced per append. A `WalEntry::Delete` used to be written and
-            // fsynced here as well, and nothing depended on it: the WAL floor
-            // is raised by any concurrent flush and a record below the floor
-            // is never replayed, so it could not be relied on for recovery
-            // even in principle — which the comment here said, while naming
-            // point-in-time restore as the reason to keep it. That never
-            // worked and is gone, so what was left was a second `fsync` on
-            // every delete, and on flash the fsync rate is the wear rate.
+            // The catalog manifest is the only durable record, fsynced per append. No
+            // WAL record is written: every point a tombstone covers is already flushed
+            // and below the WAL floor, and on flash each extra fsync is wear.
             self.catalog
                 .write()
                 .record_tombstones(&tombstones)
@@ -460,8 +457,8 @@ impl super::Chronix {
             // read as partial, and only an absent bound proves it is not.
             let covers_whole_series = req.time_start.is_none() && req.time_end.is_none();
             for (canonical, (key, _)) in &matched {
-                if covers_whole_series {
-                    self.known_series.remove(canonical.as_str());
+                if covers_whole_series && self.known_series.remove(canonical.as_str()).is_some() {
+                    self.release_namespace_series(canonical);
                 }
                 self.lvc.evict_by_key(key);
             }

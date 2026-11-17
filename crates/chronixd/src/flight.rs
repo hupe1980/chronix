@@ -51,6 +51,12 @@ pub struct ChronixFlightSqlService {
     /// answers "was this attempted?", and an answer that depends on which
     /// port the attempt came in on is not one.
     audit: Option<std::sync::Arc<chronix_security::audit::AuditLogger>>,
+    /// Per-namespace request-rate limits — the same map the HTTP layer reads.
+    request_limiter: crate::rate_limit::NamespaceRateLimiter,
+    /// Per-namespace ingestion-rate limits, charged per point on every write.
+    ingest: crate::rate_limit::NamespaceIngestLimiter,
+    /// The slots SQL and PromQL over HTTP draw on too.
+    query_slots: crate::query_slots::QuerySlots,
 }
 
 impl ChronixFlightSqlService {
@@ -66,7 +72,31 @@ impl ChronixFlightSqlService {
             multi_tenancy: false,
             authz: None,
             audit: None,
+            request_limiter: crate::rate_limit::NamespaceRateLimiter::new(),
+            ingest: crate::rate_limit::NamespaceIngestLimiter::new(),
+            query_slots: crate::query_slots::QuerySlots::default(),
         }
+    }
+
+    /// Share the server's query slots, so a Flight SQL query counts against
+    /// `server.max_concurrent_queries` like an HTTP one.
+    #[must_use]
+    pub fn with_query_slots(mut self, slots: crate::query_slots::QuerySlots) -> Self {
+        self.query_slots = slots;
+        self
+    }
+
+    /// Share the server's per-namespace request and ingestion limiters, so a
+    /// tenant's quotas are the same on this surface as on HTTP.
+    #[must_use]
+    pub fn with_limiters(
+        mut self,
+        request: crate::rate_limit::NamespaceRateLimiter,
+        ingest: crate::rate_limit::NamespaceIngestLimiter,
+    ) -> Self {
+        self.request_limiter = request;
+        self.ingest = ingest;
+        self
     }
 
     /// Attach the Cedar policy engine.
@@ -146,6 +176,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Read,
             &request,
         )?;
@@ -200,20 +231,16 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             .map_err(|_| Status::invalid_argument("invalid statement handle"))?;
         let (handle_scope, sql) = decode_handle(&handle)?;
 
-        // **The ticket is not authoritative for scope.** A ticket is bytes
-        // the client sends, so a handle that names a namespace is a
-        // namespace the client chose — and it used to be trusted, which let
-        // any client read any tenant's data by editing the string.
-        //
-        // The scope comes from *this* request's metadata, exactly as it does
-        // on every other surface, and the handle's copy only has to agree.
-        // Disagreement is refused rather than silently resolved, so a client
-        // whose ticket outlived a namespace change gets an error instead of
-        // another tenant's rows.
+        // The ticket is not authoritative for scope: it is bytes the client sends.
+        // The scope comes from this request's metadata, as on every other surface,
+        // and the ticket's copy only has to agree. Disagreement is refused, so a
+        // ticket that outlived a namespace change gets an error, never another
+        // tenant's rows.
         let scope = crate::namespace::authorize_request(
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Read,
             &_request,
         )?;
@@ -231,6 +258,14 @@ impl FlightSqlTrait for ChronixFlightSqlService {
         let df = chronix::sql::sql_read_only(&sql_ctx, sql)
             .await
             .map_err(|e| Status::invalid_argument(format!("SQL error: {e}")))?;
+
+        // Held until the result is collected, which is when the DataFusion
+        // execution ends.
+        let _slot = self
+            .query_slots
+            .acquire(self.sql_query_timeout)
+            .await
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
 
         // Stream batches with timeout instead of full collect().
         use futures::StreamExt;
@@ -319,6 +354,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Write,
             &request,
         )?;
@@ -397,7 +433,10 @@ impl FlightSqlTrait for ChronixFlightSqlService {
                         chronix_core::ColumnRole::Tag => {
                             tag_indices.push((i, field.name().clone()));
                         }
-                        chronix_core::ColumnRole::Field => {
+                        // `_start` rides as the point's start timestamp,
+                        // which the point carries in its field set.
+                        chronix_core::ColumnRole::Field
+                        | chronix_core::ColumnRole::StartTimestamp => {
                             field_indices.push((i, field.name().clone()));
                         }
                         chronix_core::ColumnRole::Timestamp => {
@@ -458,6 +497,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             let n = points.len() as i64;
             crate::util::insert_batch_with_mode(
                 &db,
+                &self.ingest,
                 scope.as_deref(),
                 points,
                 self.write_timeout,
@@ -616,6 +656,7 @@ impl FlightSqlTrait for ChronixFlightSqlService {
             self.multi_tenancy,
             self.authz.as_deref(),
             self.audit.as_deref(),
+            &self.request_limiter,
             chronix_security::authz::ChronixAction::Read,
             &_request,
         )?;

@@ -5,21 +5,12 @@
 //! `NUMERIC`'s, so a round trip through either is lossless and needs no
 //! dependency on either.
 //!
-//! # Why a database of metrics needs one
+//! # Why
 //!
-//! Every other field type in Chronix answers *how much*, approximately: a
-//! temperature, a load average, a byte count. [`FieldValue::F64`](crate::FieldValue::F64) is the
-//! right shape for those, and the compression stack is built around the
-//! observation that most of them started life as decimals.
-//!
-//! A quarter-hour meter register is a different kind of quantity. It is a
-//! *legal* one: a German household settlement under BK 618-25-02 (MiSpeL) is
-//! computed from `Z1NB¼`, `Z2V¼` and their siblings, and a settlement that
-//! went through a `double` is a settlement nobody can reproduce. The same is
-//! true of a price, an invoice line, a tariff step and a regulatory report.
-//! For those, "close enough" is not a weaker answer — it is the wrong one.
-//!
-//! So the exactness is structural, not best-effort:
+//! A measurement such as a temperature is approximate, and
+//! [`FieldValue::F64`](crate::FieldValue::F64) fits it. A meter register, a
+//! price or an invoice line is a legal quantity that must reproduce exactly,
+//! which a `double` cannot guarantee. The exactness is structural:
 //!
 //! - **No `f64` anywhere on the path.** There is no `From<f64>`. The only
 //!   way in is [`Decimal::new`] from an integer mantissa or [`FromStr`] from

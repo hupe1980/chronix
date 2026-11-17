@@ -21,12 +21,9 @@ use datafusion::common::DataFusionError;
 /// Retype the time column from storage's `Int64` nanoseconds to SQL's
 /// `Timestamp(Nanosecond)`.
 ///
-/// A **retype**, not a rename: the column is `_time` on both sides. It used to
-/// be a rename too — storage called it `timestamp` — which is why a reader who
-/// printed the schema and then wrote `SELECT timestamp …` got a planning
-/// error. The type still differs deliberately: storage stores an `i64` because
-/// that is what it encodes, and SQL presents a `TIMESTAMP` so DataFusion's
-/// date functions and interval arithmetic work on it.
+/// The name is `_time` on both sides. Storage keeps an `i64` because that is
+/// what it encodes; SQL presents a `TIMESTAMP` so DataFusion's date
+/// functions and interval arithmetic work on it.
 pub(crate) fn convert_timestamp_column(batch: RecordBatch) -> Result<RecordBatch, DataFusionError> {
     if batch.num_rows() == 0 {
         // Return empty batch — avoid schema mismatches.

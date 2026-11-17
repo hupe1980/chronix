@@ -1,20 +1,19 @@
 {% extends "base.html" %}
+{% block title %}Page not found · {{ config.title }}{% endblock %}
 {% block content %}
-<div class="wrap band">
-  <p class="eyebrow">404</p>
-  <h1>That page moved or never existed.</h1>
-  <p class="lede">
-    The documentation was reorganised: one 3,400-line architecture page became
-    a page per subsystem, and the guide, internals and reference are now
-    separate sections. An old deep link is the most likely cause.
-  </p>
-  <div class="cards compact" style="margin-top:2rem">
-    <a class="card link" href="{{ get_url(path='@/docs/_index.md') }}">
-      <h3>Guide</h3><p>Install, API, operations, security.</p></a>
-    <a class="card link" href="{{ get_url(path='@/internals/_index.md') }}">
-      <h3>Internals</h3><p>How the engine works, and why.</p></a>
-    <a class="card link" href="{{ get_url(path='@/reference/_index.md') }}">
-      <h3>Reference</h3><p>The implementation, subsystem by subsystem.</p></a>
+<section class="band">
+  <div class="wrap">
+    <div class="band-head">
+      <p class="eyebrow">404</p>
+      <h1 style="margin:0 0 .75rem;font-size:clamp(1.8rem,4vw,2.6rem);letter-spacing:-.02em">This page isn’t here.</h1>
+      <p>It may have moved. Search for it, or start from one of the sections.</p>
+    </div>
+    <p><button class="btn btn-primary" type="button" data-search-open>Search the docs</button></p>
+    <div class="cards" style="margin-top:2rem">
+      {%- for item in config.extra.nav %}{% set s = get_section(path=item.path, metadata_only=true) %}
+      <a class="card" href="{{ s.permalink }}"><h3>{{ item.label }}</h3><p>{{ s.description }}</p></a>
+      {%- endfor %}
+    </div>
   </div>
-</div>
+</section>
 {% endblock %}

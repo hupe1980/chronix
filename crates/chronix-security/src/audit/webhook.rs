@@ -126,15 +126,9 @@ fn expand_env_vars(s: &str) -> std::result::Result<String, String> {
     expand_with(s, |name| std::env::var(name).ok())
 }
 
-/// `expand_env_vars` with the lookup supplied.
-///
-/// The split exists so the substitution can be tested without touching the
-/// process environment. `std::env::set_var` is `unsafe` in edition 2024
-/// because it mutates state shared by every thread, and `cargo test` runs
-/// tests in parallel — so the tests that used to set a variable, read it back
-/// and remove it were a data race against any concurrently running test that
-/// reads the environment. Passing the lookup in removes the hazard rather
-/// than annotating it.
+/// `expand_env_vars` with the lookup supplied, so the substitution is tested
+/// without mutating the process environment (`set_var` is `unsafe` and races
+/// with parallel tests).
 fn expand_with<F>(s: &str, lookup: F) -> std::result::Result<String, String>
 where
     F: Fn(&str) -> Option<String>,

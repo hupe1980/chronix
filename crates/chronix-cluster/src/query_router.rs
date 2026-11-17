@@ -328,16 +328,14 @@ impl QueryRouter {
                 let consistency = dq.consistency;
                 handles.push(tokio::spawn(async move {
                     // Linearizable read verification via ReadIndex
-                    if consistency.is_leader() {
-                        if let Some(ref rm) = raft_manager {
-                            if let Some(raft) = rm.get_raft(region_id) {
-                                if let Err(e) = raft.ensure_linearizable().await {
-                                    return Err(ClusterError::ReplicationFailed(format!(
-                                        "linearizable read failed for region {region_id}: {e}"
-                                    )));
-                                }
-                            }
-                        }
+                    if consistency.is_leader()
+                        && let Some(ref rm) = raft_manager
+                        && let Some(raft) = rm.get_raft(region_id)
+                        && let Err(e) = raft.ensure_linearizable().await
+                    {
+                        return Err(ClusterError::ReplicationFailed(format!(
+                            "linearizable read failed for region {region_id}: {e}"
+                        )));
                     }
 
                     let query = RegionQuery {

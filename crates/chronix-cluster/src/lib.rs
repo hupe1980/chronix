@@ -19,6 +19,10 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
+// openraft's `RPCError` is large by its own design and its network trait fixes
+// it as the error type; boxing it would only move the conversion into every
+// impl of a frozen tier.
+#![allow(clippy::result_large_err)]
 
 /// Automatic region scaling — splits and disk-aware rebalancing.
 pub mod autoscale;

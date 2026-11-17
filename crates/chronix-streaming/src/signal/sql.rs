@@ -449,13 +449,9 @@ fn parse_create(tokens: &[String]) -> Result<TriggerStatement> {
                         continue;
                     }
 
-                    // Anything else is a channel that does not exist. This
-                    // used to be `i += 1` — a silent skip — so `DELIVER slack`
-                    // parsed to *no* targets, and no targets means every
-                    // channel: asking for one place delivered everywhere. A
-                    // typo (`lag` for `log`) did the same, and `DELIVER TO
-                    // log` worked by accident, which is why this crate's own
-                    // example used a spelling the grammar does not have.
+                    // Anything else is a channel that does not exist, and is an error: no
+                    // targets means every channel, so skipping an unknown name would turn
+                    // `DELIVER slack` (or a typo) into delivery everywhere.
                     return Err(SignalError::InvalidConfig(format!(
                         "unknown delivery channel {t:?}: the channels are `log` and \
                          `webhook('https://…')`"
@@ -1297,7 +1293,7 @@ mod tests {
     fn execute_drop_nonexistent() {
         let engine = TriggerEngine::new();
         let stmt = parse_trigger_sql("DROP TRIGGER nonexistent").unwrap();
-        // Drop of nonexistent trigger is now an error
+        // Dropping a trigger that does not exist is an error
         let result = execute_trigger_sql(&engine, &stmt);
         assert!(result.is_err());
     }
@@ -1812,14 +1808,9 @@ mod persistence_tests {
         );
     }
 
-    /// A save that cannot write reports it.
-    ///
-    /// Narrower than it looks, and named for what it actually proves: this
-    /// exercises the `File::create` failure, not the parent-directory fsync
-    /// — which used to be `let _ =` and is now propagated, but which no test
-    /// here can make fail on its own without a filesystem that refuses
-    /// `fsync` on a directory it just let us open. Stated rather than
-    /// implied by a name that would claim more.
+    /// A save that cannot write reports it. This exercises the `File::create`
+    /// failure; the parent-directory fsync is propagated too, but no portable
+    /// test can make it fail on its own.
     #[test]
     fn a_save_that_cannot_write_says_so() {
         let dir = tempfile::tempdir().unwrap();

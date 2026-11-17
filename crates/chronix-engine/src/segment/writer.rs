@@ -1391,8 +1391,7 @@ fn encode_tag_column(
 fn merge_stats(dest: &mut ColumnStats, src: &ColumnStats) {
     dest.min_value = dest.min_value.min(src.min_value);
     dest.max_value = dest.max_value.max(src.max_value);
-    // Also merge u64 min/max — previously these were silently
-    // dropped, breaking predicate pushdown for u64 columns.
+    // u64 bounds too: predicate pushdown on u64 columns reads them.
     dest.min_value_u64 = dest.min_value_u64.min(src.min_value_u64);
     dest.max_value_u64 = dest.max_value_u64.max(src.max_value_u64);
     dest.null_count += src.null_count;
@@ -2165,12 +2164,9 @@ mod tests {
 
     /// Segment metadata must stay proportional to the data, not fixed.
     ///
-    /// Every column used to carry a full-precision HyperLogLog sketch
-    /// (16 KiB) plus an equi-depth histogram, unconditionally — roughly 49 KiB
-    /// of fixed overhead per segment that nothing ever read: the DataFusion
-    /// statistics provider works from the catalog's exact `distinct_count`.
-    /// On an hourly-sharded gateway that dwarfed the data and burned flash for
-    /// nothing, so the sketches were removed. This pins the result.
+    /// No per-column sketches: the statistics provider uses the catalog's
+    /// exact `distinct_count`, and fixed overhead per segment would dwarf a
+    /// gateway's small segments.
     #[test]
     fn segment_metadata_overhead_stays_proportional_to_data() {
         let dir = tempfile::tempdir().unwrap();

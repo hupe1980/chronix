@@ -1,35 +1,23 @@
 //! Which segment files a live reader may still open.
 //!
-//! # Why
-//!
 //! A scan is lazy: [`execute_iter`](super::Chronix::execute_iter) snapshots the
-//! catalog once and opens each segment on the `next()` call that first needs
-//! it, so a large export holds a list of paths for as long as the consumer
-//! takes. Every pass that *retires* a segment — retention, a measurement drop,
-//! cold-tier archiving, a compaction's inputs — used to remove the catalog
-//! entry and then unlink the file, which is crash-safe and says nothing about
-//! the reader already holding the path. A retention pass landing inside a scan
-//! made the scan fail with a bare `No such file or directory`.
+//! catalog once and opens each segment when it first needs it, so a long export
+//! holds paths for as long as its consumer takes. A pass that retires a segment
+//! — retention, a measurement drop, cold-tier archiving, compaction — must not
+//! unlink a file such a reader can still open.
 //!
-//! # The rule
+//! **A segment leaves the catalog when its rows leave the database; its file is
+//! unlinked when the last reader that could open it is gone.** This is RocksDB's
+//! per-`Version` reference count and Prometheus's `pendingReaders`, sized for
+//! this engine: a count per segment id, incremented under the catalog read lock
+//! the reader already takes to snapshot and consulted under the write lock the
+//! retirement already takes, so there is no window in which a reader holds an
+//! uncounted path.
 //!
-//! **A segment leaves the catalog when its rows leave the database; its file
-//! is unlinked when the last reader that could open it is gone.** This is the
-//! reference count RocksDB keeps per `Version` and the `pendingReaders` wait
-//! Prometheus keeps per block, at the size this engine needs: a count per
-//! segment id, incremented under the catalog *read* lock the reader already
-//! takes to snapshot, consulted under the catalog *write* lock the retirement
-//! already takes. Those two locks make the pair atomic, so there is no window
-//! where a reader has a path nobody is counting.
-//!
-//! A segment that is still leased when it is retired is marked
-//! [`SegmentState::SoftDeleted`](chronix_core::SegmentState) — invisible to
-//! every query from that moment — and its file is unlinked by the next
-//! [`gc`](super::Chronix::gc), which is a step of every maintenance pass.
-//!
-//! This replaces a five-minute grace period, which was a wall clock standing
-//! in for the question the count answers exactly: a scan shorter than the
-//! grace was safe by luck and a longer one was not safe at all.
+//! A segment still leased when it is retired is marked
+//! [`SegmentState::SoftDeleted`](chronix_core::SegmentState) — invisible to every
+//! query from then on — and its file is unlinked by the next
+//! [`gc`](super::Chronix::gc), which every maintenance pass runs.
 
 use std::collections::HashMap;
 

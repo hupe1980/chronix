@@ -209,7 +209,7 @@ fn bench_compression_ratios(c: &mut Criterion) {
     // Irregular metrics: random-ish values
     let irregular_floats: Vec<f64> = (0..100_000)
         .map(|i| {
-            let x = (i as f64) * 1.618033988749;
+            let x = (i as f64) * std::f64::consts::GOLDEN_RATIO;
             (x.sin() * 100.0 + x.cos() * 50.0).abs()
         })
         .collect();

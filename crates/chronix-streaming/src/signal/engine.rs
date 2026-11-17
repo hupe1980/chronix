@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn ma_crossover_zero_window_does_not_panic() {
-        // short_window=0 previously caused division by zero
+        // short_window = 0 must not divide by zero
         let engine = TriggerEngine::new();
         engine
             .register(
@@ -1487,7 +1487,7 @@ mod tests {
 
     #[test]
     fn ma_crossover_short_greater_than_long_does_not_panic() {
-        // short_window > long_window previously caused usize underflow
+        // short_window > long_window must not underflow
         let engine = TriggerEngine::new();
         engine
             .register(
@@ -1504,7 +1504,7 @@ mod tests {
 
     #[test]
     fn rate_of_change_window_zero_does_not_fire() {
-        // window=0 previously silently never fired with no indication
+        // A rate needs two samples, so window < 2 never fires
         let engine = TriggerEngine::new();
         engine
             .register(

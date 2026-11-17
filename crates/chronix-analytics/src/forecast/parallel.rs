@@ -1,10 +1,10 @@
-//! Parallel forecasting utilities built on rayon.
-
-use rayon::prelude::*;
+//! Forecasting many series at once, within the caller's thread budget
+//! (see [`crate::par`]).
 
 use crate::forecast::error::ForecastError;
 use crate::forecast::result::ForecastResult;
 use crate::forecast::traits::ForecastModel;
+use crate::par;
 
 /// Fit multiple series in parallel.
 ///
@@ -29,11 +29,7 @@ pub fn parallel_fit<M: ForecastModel + Send>(
             .map(|_| Err(ForecastError::InvalidInput(err_msg.clone())))
             .collect();
     }
-    let results: Vec<_> = models
-        .par_iter_mut()
-        .zip(data.par_iter())
-        .map(|(model, (ts, vals))| model.fit(ts, vals))
-        .collect();
+    let results = par::map_zip_mut(models, data, |model, (ts, vals)| model.fit(ts, vals));
     metrics::histogram!("chronix_compute_parallel_fit_duration_seconds")
         .record(_start.elapsed().as_secs_f64());
     results
@@ -47,10 +43,7 @@ pub fn parallel_predict<M: ForecastModel + Sync>(
     horizon: usize,
 ) -> Vec<Result<ForecastResult, ForecastError>> {
     let _start = std::time::Instant::now();
-    let results: Vec<_> = models
-        .par_iter()
-        .map(|model| model.predict(horizon))
-        .collect();
+    let results = par::map(models, |model| model.predict(horizon));
     metrics::histogram!("chronix_compute_parallel_predict_duration_seconds")
         .record(_start.elapsed().as_secs_f64());
     results
@@ -71,13 +64,11 @@ where
     M: ForecastModel + Send,
     F: Fn() -> M + Sync,
 {
-    data.par_iter()
-        .map(|(ts, vals)| {
-            let mut model = factory();
-            model.fit(ts, vals)?;
-            model.predict(horizon)
-        })
-        .collect()
+    par::map(data, |(ts, vals)| {
+        let mut model = factory();
+        model.fit(ts, vals)?;
+        model.predict(horizon)
+    })
 }
 
 #[cfg(test)]

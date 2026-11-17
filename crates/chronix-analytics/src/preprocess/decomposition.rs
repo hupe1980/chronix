@@ -190,18 +190,10 @@ impl StlConfig {
         next_odd_at_least(w, 3)
     }
 
-    /// Cleveland et al. (1990) §3.3: `n_s` is in units of **cycles**, not of
-    /// samples — the seasonal smoother runs along a cycle-subseries, which
-    /// holds one point per cycle, so a series of `n` points offers it only
-    /// `n / period` of them. The paper's fixed default of 7 is what R's
-    /// `stl(s.window = "periodic")` and statsmodels' `STL(seasonal = 7)`
-    /// both use.
-    ///
-    /// This used to default to `max(7, period)`, which reads the window in
-    /// the *series'* units: for hourly data with a daily cycle it asked for
-    /// a 25-point smoother over a subseries holding one point per day, so
-    /// every deployment with fewer than `period` cycles of history got a
-    /// smoother wider than its own data.
+    /// Cleveland et al. (1990) §3.3: `n_s` is in units of **cycles**, not
+    /// samples — the seasonal smoother runs along a cycle-subseries holding one
+    /// point per cycle. The paper's default of 7 is what R's
+    /// `stl(s.window = "periodic")` and statsmodels' `STL(seasonal = 7)` use.
     fn effective_seasonal_window(&self) -> usize {
         next_odd_at_least(self.seasonal_window.unwrap_or(7), 7)
     }
@@ -452,26 +444,13 @@ fn detrend(values: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// Locally weighted regression (Loess) smoother with tricube
-/// kernel (Cleveland 1990).
-///
-/// Fits a degree-1 (linear) polynomial at each point using weighted
-/// least squares.  The tricube kernel `w(u) = (1 - |u|³)³` for `|u| < 1`
-/// downweights points far from the center, producing better edge
-/// behaviour and outlier resistance than a uniform moving average.
-/// The low-pass filter of STL step 3: pad by one cycle at each end with the
-/// adjacent cycle, apply a `period`-point centred moving average (a 2×MA for
 /// The low-pass filter of STL step 3: `MA(period)`, `MA(period)`, `MA(3)`,
 /// then a degree-1 loess of width `n_l`.
 ///
 /// Every moving average runs in **valid** mode — an output point only where
-/// the whole window lies inside the input — so the three of them consume
-/// exactly `(period - 1) + (period - 1) + 2 = 2 * period` points. That is
-/// precisely what the cycle-subseries extension added, which is why the
-/// result is `n` long without any edge special-casing. A partial window at
-/// the ends, which is what `centered_moving_average` used to supply, is an
-/// average of fewer points presented as if it were an average of the whole
-/// window.
+/// the whole window lies inside the input — so together they consume exactly
+/// `2 * period` points, which is what the cycle-subseries extension added: the
+/// result is `n` long with no edge special-casing and no partial windows.
 fn low_pass_filter(cycle_ext: &[f64], period: usize, low_pass_window: usize) -> Vec<f64> {
     let a = moving_average_valid(cycle_ext, period);
     let b = moving_average_valid(&a, period);
@@ -743,17 +722,10 @@ mod tests {
 
     /// A straight line has no seasonal component, and STL has to say so.
     ///
-    /// This is the cheapest test in the file and the one that would have
-    /// caught the padding defect: the old low-pass filter padded by copying
-    /// the first and last cycle, which on a ramp butts the copy against the
-    /// original at a discontinuity, and the moving averages smeared it into
-    /// the first and last period. The seasonal component of `1000 + 37 i`
-    /// swung by 278.
-    ///
-    /// A monotonic counter is the commonest series in a metrics database, so
-    /// this is not a corner: `seasonal_strength` read that swing as 0.81
-    /// against a 0.64 threshold and auto-ARIMA seasonally differenced every
-    /// counter it was shown.
+    /// A monotonic counter is the commonest series in a metrics database, so this
+    /// is not a corner: a seasonal component leaking from the ends of a ramp would
+    /// make `seasonal_strength` call every counter seasonal and auto-ARIMA
+    /// difference it seasonally.
     #[test]
     fn a_straight_line_has_no_seasonal_component() {
         for period in [4usize, 7, 12, 24] {
@@ -775,19 +747,11 @@ mod tests {
         }
     }
 
-    /// The seasonal amplitude that comes out is the one that went in.
-    ///
-    /// Checked across the number of *cycles*, which is the axis that broke:
-    /// the seasonal smoother runs along a cycle-subseries holding one point
-    /// per cycle, and its window used to default to `max(7, period)` — read
-    /// in the series' units rather than in cycles. Seven days of hourly data
-    /// with a daily cycle therefore asked for a 25-point smoother over a
-    /// 7-point subseries, whereupon `loess_smooth` returned the subseries
-    /// mean and 22 % of the amplitude went into the trend.
-    ///
-    /// The values match statsmodels' `STL` to three decimals on every row of
-    /// this table; where a genuine edge effect remains — `period = 7` over
-    /// 10 cycles — statsmodels reports the same 11.699.
+    /// The seasonal amplitude that comes out is the one that went in, across the
+    /// number of cycles — the axis on which the seasonal smoother's window is
+    /// defined. The values match statsmodels' `STL` to three decimals on every
+    /// row; where an edge effect remains (`period = 7` over 10 cycles),
+    /// statsmodels reports the same 11.699.
     #[test]
     fn stl_recovers_the_seasonal_amplitude_from_few_cycles() {
         use std::f64::consts::TAU;

@@ -62,18 +62,15 @@ static SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 ///
 /// # Default-deny
 ///
-/// A request no policy permits is denied. An engine with no policies at all
-/// therefore denies everything, which is why `chronixd` treats "no policy
-/// directory configured" as "no policy engine" rather than as an empty one.
+/// A request no policy permits is denied, so an engine with no policies
+/// denies everything. `chronixd` therefore treats "no policy directory
+/// configured" as "no policy engine", not as an empty one.
 ///
 /// # Cross-tenant isolation is not a policy
 ///
 /// It is a property of the credential: a key or token carries the namespaces
-/// it may act in, and the gate refuses a header naming any other *before*
-/// Cedar is consulted. There used to be a built-in `forbid` policy for this
-/// which nothing loaded and which compared a `principal.namespace` attribute
-/// nothing set — an isolation guarantee that existed only as a string
-/// constant. Policies narrow what a credential may do; they are not what
+/// it may act in, and the gate refuses any other namespace before Cedar is
+/// consulted. Policies narrow what a credential may do; they are not what
 /// keeps tenants apart.
 pub struct AuthzEngine {
     /// The Cedar authorizer (stateless, thread-safe).

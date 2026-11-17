@@ -126,8 +126,9 @@ fn schema_to_arrow(ms: &MeasurementSchema, keep_namespace: bool) -> SchemaRef {
     columns.sort_by_key(|col| {
         let group = match col.role {
             ColumnRole::Timestamp => 0,
-            ColumnRole::Tag => 1,
-            ColumnRole::Field => 2,
+            ColumnRole::StartTimestamp => 1,
+            ColumnRole::Tag => 2,
+            ColumnRole::Field => 3,
         };
         (group, col.name.as_str())
     });
@@ -139,6 +140,13 @@ fn schema_to_arrow(ms: &MeasurementSchema, keep_namespace: bool) -> SchemaRef {
                 chronix_core::TIME_COLUMN,
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 false,
+            ),
+            // `_start` sits beside `_time` and reads as a `TIMESTAMP`, so
+            // `_time - _start` is an interval; null where none was sent.
+            ColumnRole::StartTimestamp => Field::new(
+                &col.name,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
             ),
             ColumnRole::Tag => Field::new(&col.name, DataType::Utf8, true),
             ColumnRole::Field => {
@@ -237,14 +245,10 @@ fn reverse_op(
 
 /// What the engine can do with one `column op literal` predicate.
 ///
-/// This is the **single** decision, and both the classifier DataFusion asks
-/// and the code that builds the scan read it. They used to decide
-/// separately, and disagreed: the classifier answered `Exact` for every
-/// operator on a time column and for every tag equality, while the builder
-/// applied only five operators and only `Utf8` literals. DataFusion
-/// *removes* an Exact filter from the plan, so `WHERE _time <> X` and
-/// `WHERE host = region` were dropped by the planner and never applied by
-/// anyone — the query returned rows its own predicate excluded.
+/// This is the single decision that both the classifier DataFusion asks and
+/// the code that builds the scan read. DataFusion removes an `Exact` filter
+/// from the plan, so the two must never disagree: a filter claimed and not
+/// applied would return rows the query's own predicate excludes.
 enum Pushdown {
     /// Fully applied by the engine; DataFusion may drop the filter.
     Exact(PushdownTerm),
