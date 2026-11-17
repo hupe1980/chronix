@@ -392,9 +392,22 @@ jobs:
           # A hostile label value renders as text: escaped in the DOM, never an element.
           curl -sf http://127.0.0.1:8086/write --data-binary \
             'xss,name=\"><img\ src\=x\ onerror\=alert(1)> v=1'
-          hostile=$($chrome "$base#q=xss_v&r=1h&t=table")
-          grep -q '&lt;img' <<<"$hostile"
-          ! grep -q '<img' <<<"$hostile"
+          # Headless Chrome's virtual time can run out before the page's
+          # fetches answer on a loaded runner, so the dump is retried; the
+          # security assertion (no live <img>) holds on every attempt.
+          rendered=no
+          for attempt in 1 2 3; do
+            hostile=$($chrome "$base#q=xss_v&r=1h&t=table")
+            if grep -q '<img' <<<"$hostile"; then
+              echo "a label value rendered as an element:"; grep -o '<img[^>]*>' <<<"$hostile"; exit 1
+            fi
+            if grep -q '&lt;img' <<<"$hostile"; then rendered=yes; break; fi
+            echo "attempt $attempt: the table had not rendered the hostile series yet"
+          done
+          if [ "$rendered" != yes ]; then
+            grep -oE '<(table|tbody)[^>]*>.{0,600}' <<<"$hostile" | head -c 2000 || true
+            exit 1
+          fi
 
   deny:
     # The single advisory gate. `cargo audit` used to run beside this and was
