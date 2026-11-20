@@ -103,10 +103,12 @@ transient. What settles is 1.6 MiB.
 
 ### A declared detector's pass
 
-`detector_pass/50_series_x_60_points` in `chronix_bench` times one
-maintenance pass at the same shape — a minute of 50 series at 1 Hz, 3 000
-points scored and written as verdicts: **15.6 ms** on an Apple M4 Pro, most
-of it the verdict write (eight fields a point, one fsync). At one pass a
+`detector_pass` in `chronix_bench` times one maintenance pass at the same
+shape — a minute of 50 series at 1 Hz, 3 000 points scored and written as
+verdicts: **15.6 ms** with one baseline per series and **15.8 ms** with a
+Europe/Berlin quarter-hour season (`seasonal_15m_1d`) on an Apple M4 Pro.
+Placing a point in its slot costs a constant few zone lookups; nearly all of
+the pass is the verdict write — nine fields a point, one fsync. At one pass a
 minute that is a quarter of a thousandth of one core.
 
 ### Server-side budgets

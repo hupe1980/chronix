@@ -11,7 +11,7 @@ generated data.
 ## Run the demo
 
 ```bash
-cargo install chronixd
+brew install hupe1980/tap/chronixd   # or: cargo install chronixd
 chronixd --demo
 ```
 

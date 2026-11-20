@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use super::Chronix;
-use super::{BackupManifest, catalog_dir_of, chrono_timestamp_ms, segments_dir_of, wal_dir_of};
+use super::{BackupManifest, catalog_dir_of, segments_dir_of, unix_ms_now, wal_dir_of};
 use crate::error::{DbError, Result};
 
 /// Name of the marker written last, and the only proof a backup finished.
@@ -202,7 +202,7 @@ impl Chronix {
         //    backup, so an interrupted checkpoint cannot be restored.
         let manifest = BackupManifest {
             version: 2,
-            created_at: chrono_timestamp_ms(),
+            created_at: unix_ms_now(),
             wal_sequence: self.wal.current_sequence(),
             segments: files.len() as u64,
             file_count,
@@ -515,7 +515,9 @@ impl Chronix {
         // Second precision, and `:` replaced: a colon is legal on the
         // filesystems this targets and is not on the one an operator will
         // eventually copy the directory to.
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let stamp = jiff::Timestamp::now()
+            .strftime("%Y%m%dT%H%M%SZ")
+            .to_string();
         let target = root.join(&stamp);
         if target.exists() {
             // Two runs inside one second, which only happens if the interval

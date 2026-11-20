@@ -1371,8 +1371,6 @@ fn eval_date_fn(
     args: &[Expr],
     params: &QueryParams,
 ) -> Result<PromQLValue, EvalError> {
-    use chrono::{DateTime, Datelike, Timelike};
-
     if args.len() > 1 {
         return Err(EvalError(format!(
             "{func}() takes at most 1 argument, got {}",
@@ -1412,25 +1410,29 @@ fn eval_date_fn(
         if !seconds.is_finite() {
             return f64::NAN;
         }
-        // `DateTime::from_timestamp` rejects anything outside roughly
-        // ±262 000 years, which is the honest boundary for a value that is
-        // being *interpreted* as a date rather than measured as one.
+        // Beyond ±262 143 years is the honest boundary for a value being
+        // *interpreted* as a date rather than measured as one.
         #[allow(clippy::cast_possible_truncation)]
         let whole = seconds.floor() as i64;
-        let Some(dt) = DateTime::from_timestamp(whole, 0) else {
+        let days = whole.div_euclid(86_400);
+        let secs = whole.rem_euclid(86_400);
+        let (year, month, day) = chronix_core::timebucket::civil_from_days(days);
+        if year.abs() > 262_143 {
             return f64::NAN;
-        };
-        let dt = dt.naive_utc();
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let f = |v: i64| v as f64;
         match func {
-            "year" => f64::from(dt.year()),
-            "month" => f64::from(dt.month()),
-            "day_of_month" => f64::from(dt.day()),
-            // Prometheus numbers the week from Sunday = 0.
-            "day_of_week" => f64::from(dt.weekday().num_days_from_sunday()),
-            "day_of_year" => f64::from(dt.ordinal()),
-            "days_in_month" => f64::from(days_in_month(dt.year(), dt.month())),
-            "hour" => f64::from(dt.hour()),
-            "minute" => f64::from(dt.minute()),
+            "year" => f(year),
+            "month" => f64::from(month),
+            "day_of_month" => f64::from(day),
+            // Prometheus numbers the week from Sunday = 0; 1970-01-01 was a
+            // Thursday.
+            "day_of_week" => f((days + 4).rem_euclid(7)),
+            "day_of_year" => f(days - chronix_core::timebucket::days_from_civil(year, 1, 1) + 1),
+            "days_in_month" => f64::from(days_in_month(year, month)),
+            "hour" => f(secs / 3_600),
+            "minute" => f(secs % 3_600 / 60),
             _ => f64::NAN,
         }
     };
@@ -1459,7 +1461,7 @@ fn eval_date_fn(
 }
 
 /// Number of days in a Gregorian calendar month.
-fn days_in_month(year: i32, month: u32) -> u32 {
+fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

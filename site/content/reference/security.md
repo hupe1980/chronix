@@ -421,7 +421,7 @@ chronix:
   "id": "3f9c1e2a-...",
   "source": "chronix:trigger/high_cpu",
   "type": "io.chronix.signal.fired",
-  "time": "2026-01-15T10:30:00.123456789+00:00",
+  "time": "2026-01-15T10:30:00.123456789Z",
   "datacontenttype": "application/json",
   "data": { "trigger_id": "high_cpu", "measurement": "cpu", "value": 92.5, "..." : "..." }
 }

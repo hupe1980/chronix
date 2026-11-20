@@ -450,6 +450,10 @@ async fn a_detector_is_declared_listed_and_dropped_over_http() {
     assert_eq!(d["where"]["site"], "roof");
     assert_eq!(d["output_measurement"], "pv_health_verdicts");
     assert_eq!(d["status"]["state"], "inactive", "no data yet: {d}");
+    assert_eq!(
+        d["warming_slots"], 0,
+        "no series admitted, nothing warming: {d}"
+    );
 
     let different = serde_json::json!({
         "name": "pv_health", "source_measurement": "pv", "field": "power", "zscore": 2.0,

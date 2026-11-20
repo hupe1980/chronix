@@ -21,7 +21,9 @@ let db = Chronix::open_small("/var/lib/chronix")?;
 ### Single-Node Server
 
 ```bash
-# Install (or download a prebuilt binary from https://github.com/hupe1980/chronix/releases)
+# Install: Homebrew (macOS, Linux), from source, or a binary from
+# https://github.com/hupe1980/chronix/releases
+brew install hupe1980/tap/chronixd
 cargo install chronixd
 
 # Try it with a generated week of data, on loopback, deleted on exit
@@ -131,7 +133,7 @@ on a directory another chronix version wrote.
 $ chronixd inspect /var/lib/chronix
 /var/lib/chronix  not closed cleanly · generation 2
 
-holder    pid 75279 on gw-0042 · chronix 0.8.0 · opened 3 h ago
+holder    pid 75279 on gw-0042 · chronix 0.9.0 · opened 3 h ago
 formats   catalog ✓  segment ✓  wal ✓  series ✓
 series    5 · budget 1 000 000 (default)
 wal       2 files · 1 912 records to replay (3.4 MiB) · seq 88 121–90 032

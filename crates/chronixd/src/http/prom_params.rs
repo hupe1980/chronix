@@ -140,8 +140,8 @@ impl PromParams {
 ///
 /// [`ServerError::BadRequest`] when the value is neither, or is not finite.
 pub fn parse_time_ns(key: &str, value: &str) -> Result<i64, ServerError> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
-        return dt.timestamp_nanos_opt().ok_or_else(|| {
+    if let Ok(t) = value.parse::<jiff::Timestamp>() {
+        return i64::try_from(t.as_nanosecond()).map_err(|_| {
             ServerError::BadRequest(format!("{key}: timestamp out of range: {value}"))
         });
     }

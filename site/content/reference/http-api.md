@@ -731,7 +731,7 @@ chronixd --export-dashboards ./grafana/
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/detectors` | List declared detectors with watermark, series, late points and status |
+| `GET` | `/api/v1/detectors` | List declared detectors with watermark, series, late points, warming slots and status |
 | `POST` | `/api/v1/detectors` | Declare a detector — `201` when created or identical; `409` if the name holds a different one |
 | `DELETE` | `/api/v1/detectors/{name}` | Drop a detector and its state; its verdicts stay |
 
@@ -752,8 +752,11 @@ curl -X POST http://localhost:8086/api/v1/detectors \
 Optional fields: `where` (a tag → value map: only matching rows are judged),
 `group_by_tags`, `min_samples`, `forgetting` (half-life in periods),
 `output_measurement` (default `<name>_verdicts`), `settle_seconds`,
-`max_points_per_pass`. Verdicts are ordinary rows: query them with SQL or
-PromQL (`pv_health_verdicts_z`). With multi-tenancy on, a detector is scoped
+`max_points_per_pass`. A season's slots are wall-clock positions in
+`timezone` (14:00 is slot 56 of a quarter-hour day on every day of the year);
+`warming_slots` in the listing counts slots that have data but not yet
+`min_samples` of it. Verdicts are ordinary rows with a `slot` field: query
+them with SQL or PromQL (`pv_health_verdicts_z`). With multi-tenancy on, a detector is scoped
 to the caller's namespace — it judges that namespace's rows only, and other
 namespaces never see it. Rollup and detector administration are the same
 Cedar actions (`Read` to list, `Write` to declare or drop).

@@ -105,21 +105,27 @@ impl ScalarUDFImpl for TimeBucketUdf {
                 ));
             }
         };
-        // The zone is the optional third argument.
-        let tz_str: Option<&str> = if args.len() >= 3 {
-            match &args[2] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(tz))) => Some(tz.as_str()),
-                _ => None,
+        // The zone is the optional third argument. Constant or NULL, never
+        // a column: a value that is not read must not become "UTC".
+        let tz_str: Option<&str> = match args.get(2) {
+            None => None,
+            Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(tz)))) => Some(tz.as_str()),
+            Some(ColumnarValue::Scalar(s)) if s.is_null() => None,
+            Some(_) => {
+                return Err(datafusion::common::DataFusionError::Plan(
+                    "time_bucket: the zone must be a constant string such as 'Europe/Berlin'"
+                        .into(),
+                ));
             }
-        } else {
-            None
         };
+        // Parsed once per call — once per batch, not per row: the zone is
+        // looked up a single time however many rows it buckets.
         let mut bucket = TimeBucket::parse(&interval_str, tz_str)
             .map_err(|e| datafusion::common::DataFusionError::Plan(format!("time_bucket: {e}")))?;
 
-        // The origin is the optional fourth argument. `TimeBucket` is
-        // `Copy`, and both forms go through the same parser the rollup API
-        // uses, so a local origin lands in the bucket's own zone.
+        // The origin is the optional fourth argument; both forms go through
+        // the parser the rollup API uses, so a local origin lands in the
+        // bucket's own zone.
         if let Some(origin) = args.get(3) {
             let plan_err = |e: chronix_core::timebucket::BucketParseError| {
                 datafusion::common::DataFusionError::Plan(format!("time_bucket: {e}"))
@@ -198,10 +204,7 @@ mod tests {
         use arrow::array::{Array, TimestampNanosecondArray};
 
         let ts = |s: &str| -> i64 {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .unwrap()
-                .timestamp_nanos_opt()
-                .unwrap()
+            i64::try_from(s.parse::<jiff::Timestamp>().unwrap().as_nanosecond()).unwrap()
         };
         // Two instants an hour apart across Berlin's autumn transition, and one
         // ordinary instant: all three land in different buckets.
@@ -230,16 +233,33 @@ mod tests {
         assert!(got.is_null(2), "a null timestamp buckets to null");
     }
 
+    /// A zone that is not a constant — a column, an expression — is refused,
+    /// never read as "no zone": that would bucket in UTC without saying so.
+    #[test]
+    fn a_non_constant_zone_is_refused_not_ignored() {
+        use arrow::array::{StringArray, TimestampNanosecondArray};
+        let input: TimestampNanosecondArray = vec![Some(0_i64)].into();
+        let zones: StringArray = vec![Some("Europe/Berlin")].into();
+        let err = super::super::helpers::invoke_udf(
+            &TimeBucketUdf::new(),
+            vec![
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("1d".into()))),
+                ColumnarValue::Array(Arc::new(input)),
+                ColumnarValue::Array(Arc::new(zones)),
+            ],
+            1,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("zone must be a constant"), "{err}");
+    }
+
     /// A calendar width reaches the UDF too — the case that could not be
     /// expressed at all before.
     #[test]
     fn the_udf_buckets_a_calendar_month() {
         use arrow::array::TimestampNanosecondArray;
         let ts = |s: &str| -> i64 {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .unwrap()
-                .timestamp_nanos_opt()
-                .unwrap()
+            i64::try_from(s.parse::<jiff::Timestamp>().unwrap().as_nanosecond()).unwrap()
         };
         let input: TimestampNanosecondArray = vec![Some(ts("2024-02-17T12:00:00Z"))].into();
         let out = super::super::helpers::invoke_udf(

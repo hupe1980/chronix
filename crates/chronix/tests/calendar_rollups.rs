@@ -39,10 +39,7 @@ fn open(dir: &std::path::Path) -> Chronix {
 }
 
 fn ts(s: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap()
+    i64::try_from(s.parse::<jiff::Timestamp>().unwrap().as_nanosecond()).unwrap()
 }
 
 /// One point per hour over `hours`, each worth 1.0, backfilled so the

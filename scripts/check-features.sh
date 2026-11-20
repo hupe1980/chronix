@@ -101,7 +101,23 @@ for manifest in crates/*/Cargo.toml; do
     done
 done
 
+# One time library. `chrono` and `chrono-tz` are unmaintained (RUSTSEC-2026-0543,
+# -0555); Arrow and DataFusion still carry them, and no chronix crate may. The
+# embedded build — what a gateway compiles — must not contain `chrono-tz` at all,
+# so its consumers' `cargo deny` needs no ignore for it.
+for dep in chrono chrono-tz; do
+    direct=$(cargo tree --workspace --all-features -e normal,build,dev -i "$dep" --depth 1 --prefix none 2>/dev/null \
+        | grep -E '^chronix' || true)
+    [ -z "$direct" ] || note "a chronix crate depends on $dep directly — use jiff: $direct"
+done
+for feats in "" "-F analytics"; do
+    # shellcheck disable=SC2086
+    if cargo tree -p chronix --no-default-features $feats -e normal -i chrono-tz >/dev/null 2>&1; then
+        note "chrono-tz is in the embedded build (chronix --no-default-features $feats)."
+    fi
+done
+
 if [ "$fail" -eq 0 ]; then
-    echo "every feature dependency is named by the code it unlocks"
+    echo "every feature dependency is named by the code it unlocks; one time library"
 fi
 exit "$fail"

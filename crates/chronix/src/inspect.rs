@@ -565,7 +565,10 @@ fn sidecar_version(path: &Path) -> Option<u64> {
 }
 
 fn rfc3339(ns: i64) -> String {
-    chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    jiff::Timestamp::from_nanosecond(i128::from(ns)).map_or_else(
+        |_| ns.to_string(),
+        |t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    )
 }
 
 /// The running process on this host that holds `data_dir`, if any.
@@ -627,7 +630,9 @@ impl LockHolder {
         Self {
             pid: std::process::id(),
             host: local_host(),
-            opened: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            opened: jiff::Timestamp::now()
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                .to_string(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }

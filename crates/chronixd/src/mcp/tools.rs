@@ -87,7 +87,7 @@ impl Ctx {
     }
 
     fn now(&self) -> i64 {
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
+        i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap_or(i64::MAX)
     }
 
     fn time(&self, key: &str, spec: Option<&TimeArg>, default: &str) -> Result<i64, ToolError> {
@@ -117,7 +117,10 @@ impl TimeArg {
 }
 
 fn rfc3339(ns: i64) -> String {
-    chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    jiff::Timestamp::from_nanosecond(i128::from(ns)).map_or_else(
+        |_| ns.to_string(),
+        |t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    )
 }
 
 /// Keep the first items of `items` that fit in `max_items` and `max_bytes`.

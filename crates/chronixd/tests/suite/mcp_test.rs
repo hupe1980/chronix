@@ -72,7 +72,7 @@ fn demo_db(dir: &Path) -> Arc<Chronix> {
             .unwrap(),
     )
     .unwrap();
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+    let now = i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap();
     demo::ingest(&db, demo::window_end(now)).unwrap();
     Arc::new(db)
 }
@@ -271,13 +271,16 @@ async fn detect_anomalies_finds_the_planted_spike() {
     )
     .await;
     let found = ok(&result, "detect_anomalies");
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+    let now = i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap();
     let planted = demo::Planted::for_window(demo::window_end(now));
     let strongest = found["anomalies"][0]["t"].as_str().unwrap();
-    let t = chrono::DateTime::parse_from_rfc3339(strongest)
-        .unwrap()
-        .timestamp_nanos_opt()
-        .unwrap();
+    let t = i64::try_from(
+        strongest
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_nanosecond(),
+    )
+    .unwrap();
     // The window ends at a 10 s step; a second's slack either side.
     let (from, to) = planted.heat_pump_spike;
     assert!(
@@ -555,7 +558,7 @@ async fn a_namespace_sees_only_its_own_series() {
     let addr = spawn(state);
     chronixd::tls::ensure_crypto_provider();
     let http = reqwest::Client::new();
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+    let now = i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap();
     for (ns, measurement) in [("tenant-a", "alpha"), ("tenant-b", "beta")] {
         for i in 0..20 {
             let resp = http

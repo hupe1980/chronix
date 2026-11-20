@@ -38,7 +38,7 @@ cargo run -p chronix --features object-store --example cold_tier
 |---------|-------------|
 | [forecast](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/forecast.rs) | All forecast models: Linear Regression, SES, Holt, Holt-Winters, ARIMA, SARIMA |
 | [anomaly_detection](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/anomaly_detection.rs) | All anomaly methods: Z-Score, Modified Z-Score, IQR, Dynamic Threshold, Forecast Residual |
-| [declared_detector](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/declared_detector.rs) | A PV plant-health monitor the store keeps: a performance ratio judged against each month's own normal, 400 simulated days, a 15 % degradation caught the day it starts |
+| [declared_detector](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/declared_detector.rs) | A PV plant-health monitor the store keeps: a quarter-hour performance ratio judged against the same quarter hour on the Berlin wall clock, a simulated year across both clock changes, a 15 % degradation caught within hours |
 | [continuous_forecast](https://github.com/hupe1980/chronix/blob/main/crates/chronix/examples/continuous_forecast.rs) | Continuous forecasting engine with accuracy tracking and automatic refit |
 
 ## Multivariate & Preprocessing

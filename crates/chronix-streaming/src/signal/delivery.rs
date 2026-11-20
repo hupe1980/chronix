@@ -175,7 +175,8 @@ impl<'a> CloudEvent<'a> {
             id: &event.event_id,
             source: format!("chronix:trigger/{}", event.trigger_id),
             ty: "io.chronix.signal.fired",
-            time: chrono::DateTime::from_timestamp_nanos(event.timestamp).to_rfc3339(),
+            time: jiff::Timestamp::from_nanosecond(i128::from(event.timestamp))
+                .map_or_else(|_| event.timestamp.to_string(), |t| t.to_string()),
             datacontenttype: "application/json",
             data: event,
         }
@@ -1322,8 +1323,8 @@ mod tests {
         assert_eq!(json["data"]["trigger_id"], "t1");
         // `time` is the data point's own timestamp, RFC 3339, round-trippable.
         let time = json["time"].as_str().unwrap();
-        let parsed = chrono::DateTime::parse_from_rfc3339(time).unwrap();
-        assert_eq!(parsed.timestamp_nanos_opt(), Some(event.timestamp));
+        let parsed: jiff::Timestamp = time.parse().unwrap();
+        assert_eq!(parsed.as_nanosecond(), i128::from(event.timestamp));
     }
 
     #[test]

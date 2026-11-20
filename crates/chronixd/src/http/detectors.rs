@@ -109,6 +109,9 @@ pub struct DetectorResponse {
     pub series: usize,
     /// Points that arrived too late to be judged.
     pub late_points: u64,
+    /// Slot baselines that have seen data but not yet `min_samples` of it,
+    /// across every series: a detector that writes nothing yet says why here.
+    pub warming_slots: Option<u64>,
     /// `{"state": "active" | "inactive" | "degraded", "reason"?: …}`.
     pub status: chronix::DetectorStatus,
 }
@@ -124,7 +127,7 @@ fn response(info: chronix::DetectorInfo, visible_name: String) -> DetectorRespon
             .into_iter()
             .filter(|(k, _)| k != crate::namespace::NAMESPACE_TAG)
             .collect(),
-        season: d.season.map(|s| {
+        season: d.season.as_ref().map(|s| {
             BTreeMap::from([
                 ("slot", s.slot().width().to_string()),
                 ("period", s.period().width().to_string()),
@@ -132,6 +135,7 @@ fn response(info: chronix::DetectorInfo, visible_name: String) -> DetectorRespon
         }),
         timezone: d
             .season
+            .as_ref()
             .and_then(|s| s.slot().timezone().map(str::to_string)),
         zscore: d.zscore,
         cusum: d.cusum.map(|(k, h)| CusumRequest { k, h }),
@@ -139,6 +143,7 @@ fn response(info: chronix::DetectorInfo, visible_name: String) -> DetectorRespon
         watermark_ns: info.watermark_ns,
         series: info.series,
         late_points: info.late_points,
+        warming_slots: info.warming_slots,
         status: info.status,
     }
 }

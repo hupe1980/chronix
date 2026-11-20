@@ -372,3 +372,71 @@ jobs:
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # Homebrew: Formula/chronixd.rb in hupe1980/homebrew-tap, for release tags.
+  # Needs the GitHub environment `homebrew` with HOMEBREW_APP_ID and
+  # HOMEBREW_APP_PRIVATE_KEY: a GitHub App installed on the tap only, with
+  # contents: write. Without them the job says so and skips. Actions are pinned
+  # by commit because this job holds that token.
+  tap:
+    name: Homebrew tap
+    needs: [github-release]
+    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    environment: homebrew
+    outputs:
+      published: ${{ steps.configured.outputs.ok }}
+    steps:
+      - id: configured
+        env:
+          APP_ID: ${{ secrets.HOMEBREW_APP_ID }}
+        run: |
+          if [ -n "$APP_ID" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::HOMEBREW_APP_ID is not set in the homebrew environment; the tap is not updated"; fi
+      - if: steps.configured.outputs.ok == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: steps.configured.outputs.ok == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { path: dist, merge-multiple: true }
+      - if: steps.configured.outputs.ok == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: hupe1980
+          repositories: homebrew-tap
+          permission-contents: write
+      - if: steps.configured.outputs.ok == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hupe1980/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+          persist-credentials: true
+      - if: steps.configured.outputs.ok == 'true'
+        name: Update the formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p tap/Formula
+          packaging/homebrew/formula.sh "$version" dist > tap/Formula/chronixd.rb
+          cd tap
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "chronix release"
+            git config user.email "chronix-release@users.noreply.github.com"
+            git add Formula/chronixd.rb
+            git commit -m "chronixd $version"
+            git push
+          fi
+
+  # The published formula installs and passes its own test.
+  brew:
+    name: Homebrew install
+    needs: [tap]
+    if: needs.tap.outputs.published == 'true'
+    runs-on: macos-latest
+    steps:
+      - run: |
+          brew install hupe1980/tap/chronixd
+          brew test chronixd
+          [ "$(chronixd --version)" = "chronixd ${GITHUB_REF_NAME#v}" ]

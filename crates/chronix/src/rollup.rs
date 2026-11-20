@@ -435,7 +435,7 @@ impl RollupRegistry {
         let affected: Vec<(String, TimeBucket)> = self
             .rollups_rooted_at(measurement)
             .into_iter()
-            .map(|c| (c.name.clone(), c.bucket))
+            .map(|c| (c.name.clone(), c.bucket.clone()))
             .collect();
         let mut changed = Vec::new();
         for (name, bucket) in affected {

@@ -1111,7 +1111,7 @@ mod tests {
         // Create a valid JWT
         let claims = serde_json::json!({
             "sub": "user@example.com",
-            "exp": chrono_expiry(),
+            "exp": expiry_in_an_hour(),
         });
         let token = encode(
             &Header::default(),
@@ -1144,7 +1144,7 @@ mod tests {
     }
 
     /// Helper to create an expiry timestamp 1 hour from now.
-    fn chrono_expiry() -> u64 {
+    fn expiry_in_an_hour() -> u64 {
         (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

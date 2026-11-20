@@ -650,7 +650,6 @@ impl Default for ChronixConfig {
 }
 
 impl ChronixConfig {
-    /// Returns a builder with sensible defaults.
     /// A configuration preset for small-footprint deployments — IoT
     /// gateways and edge devices with 512 MB–1 GB of RAM and flash (eMMC/SD)
     /// storage.

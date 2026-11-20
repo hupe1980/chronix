@@ -324,12 +324,8 @@ fn a_seasonal_baseline_tolerates_winter_and_catches_degradation() {
     let points: Vec<Point> = (0..730)
         .map(|d| {
             let ts = BASE + d * DAY + 12 * HOUR;
-            let month = chrono::DateTime::from_timestamp_nanos(ts)
-                .format("%m")
-                .to_string()
-                .parse::<usize>()
-                .unwrap()
-                - 1;
+            let month =
+                chronix_core::timebucket::civil_from_days(ts.div_euclid(DAY)).1 as usize - 1;
             let fault = if d >= fault_from { 0.85 } else { 1.0 };
             let v = level[month] * fault + 0.01 * noise(d);
             Point::new(key.clone(), fields! { "value" => v }, ts).unwrap()
@@ -445,4 +441,139 @@ fn a_where_tag_confines_the_detector_to_its_rows() {
         .unwrap();
     assert!((0..b.num_rows()).all(|i| host.value(i) == "a"));
     assert_eq!(db.detectors().unwrap()[0].series, 1);
+}
+
+fn column<'a, T: 'static>(b: &'a arrow::record_batch::RecordBatch, name: &str) -> &'a T {
+    b.column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<T>()
+        .unwrap()
+}
+
+/// A shape that follows the Berlin wall clock — 100 + the local quarter hour
+/// exactly — across the 25-hour night of 25 October 2026. Every quarter hour is
+/// judged against the same quarter hour of the days before, so nothing is
+/// flagged; slots counted by elapsed time would compare 14:00 with 13:00.
+#[test]
+fn a_wall_clock_shape_survives_the_fall_back_night() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Chronix::open(config(dir.path())).unwrap();
+    let berlin = |w| TimeBucket::parse(w, Some("Europe/Berlin")).unwrap();
+    let quarter = 15 * 60 * 1_000_000_000_i64;
+    let clock = berlin("15m");
+    let key = SeriesKey::new("load", tags! { "site" => "home" }).unwrap();
+    // 2026-10-11 00:00 CEST → 2026-10-28.
+    let from = 1_791_669_600_000_000_000_i64;
+    let points: Vec<Point> = (0..17 * 96 + 4)
+        .map(|i| {
+            let ts = from + i * quarter;
+            let q = clock.wall_clock_ns(ts).rem_euclid(DAY) / quarter;
+            let v = 100.0 + q as f64;
+            Point::new(key.clone(), fields! { "kw" => v }, ts).unwrap()
+        })
+        .collect();
+    db.backfill(&points).unwrap().into_complete().unwrap();
+    db.declare_detector(
+        DetectorDeclaration::builder("load_shape")
+            .source("load", "kw")
+            .season(Season::new(berlin("15m"), berlin("1d")).unwrap())
+            .zscore(4.0)
+            .settle(Duration::ZERO)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    db.advance_detectors().unwrap();
+    assert_eq!(anomalies(&db, "load_shape_verdicts"), Vec::new());
+
+    // 14:00 CET on 25 October is 13:00Z: slot 56, as on every other day.
+    let b = rows(&db, "load_shape_verdicts");
+    let ts = column::<arrow::array::Int64Array>(&b, chronix_core::TIME_COLUMN);
+    let slot = column::<arrow::array::Int64Array>(&b, "slot");
+    let at = (0..b.num_rows())
+        .find(|&i| ts.value(i) == 1_792_933_200_000_000_000)
+        .expect("14:00 on the 25-hour day was judged");
+    assert_eq!(slot.value(at), 56);
+}
+
+/// `.forgetting(1)` halves a slot's past once per year. January 2023 at 10,
+/// January 2024 at 20: on 1 January 2025 the baseline is
+/// (31·½·10 + 31·20) / (31·½ + 31) = 16.67. Dividing by a nominal year
+/// would make 2023 and 2024 one Berlin year and say 15.
+#[test]
+fn forgetting_halves_once_per_calendar_year() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Chronix::open(config(dir.path())).unwrap();
+    let berlin = |w| TimeBucket::parse(w, Some("Europe/Berlin")).unwrap();
+    let key = SeriesKey::new("ratio", tags! { "array" => "south" }).unwrap();
+    let noon = |days_since_2023: i64| BASE + days_since_2023 * DAY + 12 * HOUR;
+    let mut points = Vec::new();
+    for d in 0..31 {
+        points.push(Point::new(key.clone(), fields! { "pr" => 10.0 }, noon(d)).unwrap());
+        points.push(Point::new(key.clone(), fields! { "pr" => 20.0 }, noon(365 + d)).unwrap());
+    }
+    let first_of_2025 = noon(731);
+    points.push(Point::new(key.clone(), fields! { "pr" => 20.0 }, first_of_2025).unwrap());
+    db.backfill(&points).unwrap().into_complete().unwrap();
+    db.declare_detector(
+        DetectorDeclaration::builder("roof")
+            .source("ratio", "pr")
+            .season(Season::new(berlin("1mo"), berlin("1y")).unwrap())
+            .cusum(0.5, 1e9) // judge without flagging, so every point teaches
+            .forgetting(1)
+            .settle(Duration::ZERO)
+            .build()
+            .unwrap(),
+    )
+    .unwrap();
+    db.advance_detectors().unwrap();
+    let b = rows(&db, "roof_verdicts");
+    let ts = column::<arrow::array::Int64Array>(&b, chronix_core::TIME_COLUMN);
+    let baseline = column::<arrow::array::Float64Array>(&b, "baseline");
+    let at = (0..b.num_rows())
+        .find(|&i| ts.value(i) == first_of_2025)
+        .unwrap();
+    let want = (15.5 * 10.0 + 31.0 * 20.0) / 46.5;
+    assert!(
+        (baseline.value(at) - want).abs() < 1e-9,
+        "baseline {} on 2025-01-01, want {want}",
+        baseline.value(at)
+    );
+}
+
+/// An active detector that writes nothing is warming up, and the listing
+/// says so; once warm, every verdict names the slot that judged it.
+#[test]
+fn warming_slots_say_why_there_are_no_verdicts_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Chronix::open(config(dir.path())).unwrap();
+    db.declare_detector(daily("warm")).unwrap();
+    assert_eq!(
+        db.detectors().unwrap()[0].warming_slots,
+        Some(0),
+        "nothing admitted yet"
+    );
+
+    write_hours(&db, "a", 0, 2, 1.0);
+    db.advance_detectors().unwrap();
+    let info = &db.detectors().unwrap()[0];
+    assert_eq!(info.status, DetectorStatus::Active);
+    assert_eq!(
+        info.warming_slots,
+        Some(24),
+        "two samples of each hour, three needed"
+    );
+    assert_eq!(rows(&db, "warm_verdicts").num_rows(), 0);
+
+    write_hours(&db, "a", 2, 2, 1.0);
+    db.advance_detectors().unwrap();
+    assert_eq!(db.detectors().unwrap()[0].warming_slots, Some(0));
+    let b = rows(&db, "warm_verdicts");
+    assert!(b.num_rows() > 0);
+    let ts = column::<arrow::array::Int64Array>(&b, chronix_core::TIME_COLUMN);
+    let slot = column::<arrow::array::Int64Array>(&b, "slot");
+    for i in 0..b.num_rows() {
+        assert_eq!(slot.value(i), (ts.value(i) - BASE).rem_euclid(DAY) / HOUR);
+    }
 }

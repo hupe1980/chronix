@@ -1013,70 +1013,79 @@ fn bench_sql_parallel_forecast(c: &mut Criterion) {
 
 /// One maintenance pass of a declared detector at the design partner's
 /// shape: 50 series, one new minute at 1 Hz each (3 000 points), scored
-/// and written as verdicts. Only the pass is timed, not the writes it judges.
+/// and written as verdicts — once with one baseline per series, once with a
+/// Europe/Berlin quarter-hour season. Only the pass is timed, not the
+/// writes it judges.
 fn bench_detector_pass(c: &mut Criterion) {
-    use chronix::detector::DetectorDeclaration;
+    use chronix::detector::{DetectorDeclaration, Season};
     const MINUTE: i64 = 60_000_000_000;
     const BASE: i64 = 1_672_531_200_000_000_000; // 2023-01-01, settled
-    let tmp = TempDir::new().unwrap();
-    let db = Chronix::open(
-        ChronixConfig::builder()
-            .data_dir(tmp.path())
-            .maintenance_interval(std::time::Duration::ZERO)
-            .memtable_flush_threshold(64 * 1024 * 1024)
-            .build()
-            .unwrap(),
-    )
-    .unwrap();
-    db.declare_detector(
-        DetectorDeclaration::builder("bench")
+    let berlin = |w| TimeBucket::parse(w, Some("Europe/Berlin")).unwrap();
+    let mut group = c.benchmark_group("detector_pass");
+    group.throughput(Throughput::Elements(3_000));
+    for (name, season) in [
+        ("50_series_x_60_points", None),
+        (
+            "seasonal_15m_1d",
+            Some(Season::new(berlin("15m"), berlin("1d")).unwrap()),
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let db = Chronix::open(
+            ChronixConfig::builder()
+                .data_dir(tmp.path())
+                .maintenance_interval(std::time::Duration::ZERO)
+                .memtable_flush_threshold(64 * 1024 * 1024)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut decl = DetectorDeclaration::builder("bench")
             .source("pv", "power")
             .zscore(4.0)
             .cusum(0.5, 5.0)
-            .settle(std::time::Duration::ZERO)
-            .build()
-            .unwrap(),
-    )
-    .unwrap();
-    let mut minute = 0i64;
-    let write_minute = |m: i64| {
-        let points: Vec<Point> = (0..50)
-            .flat_map(|s| {
-                (0..60).map(move |sec| {
-                    let key =
-                        SeriesKey::new("pv", tags! { "inverter" => format!("inv-{s}") }).unwrap();
-                    let v = 1_000.0 + ((m * 60 + sec) % 7) as f64;
-                    Point::new(
-                        key,
-                        chronix::fields! { "power" => v },
-                        BASE + m * MINUTE + sec * 1_000_000_000,
-                    )
-                    .unwrap()
+            .min_samples(1)
+            .settle(std::time::Duration::ZERO);
+        if let Some(season) = season {
+            decl = decl.season(season);
+        }
+        db.declare_detector(decl.build().unwrap()).unwrap();
+        let write_minute = |m: i64| {
+            let points: Vec<Point> = (0..50)
+                .flat_map(|s| {
+                    (0..60).map(move |sec| {
+                        let key = SeriesKey::new("pv", tags! { "inverter" => format!("inv-{s}") })
+                            .unwrap();
+                        let v = 1_000.0 + ((m * 60 + sec) % 7) as f64;
+                        Point::new(
+                            key,
+                            chronix::fields! { "power" => v },
+                            BASE + m * MINUTE + sec * 1_000_000_000,
+                        )
+                        .unwrap()
+                    })
                 })
-            })
-            .collect();
-        db.backfill(&points).unwrap().into_complete().unwrap();
-    };
-    // Warm every baseline before measuring.
-    write_minute(minute);
-    db.advance_detectors().unwrap();
-    minute += 1;
-
-    let mut group = c.benchmark_group("detector_pass");
-    group.throughput(Throughput::Elements(3_000));
-    group.bench_function("50_series_x_60_points", |b| {
-        b.iter_custom(|iters| {
-            let mut total = std::time::Duration::ZERO;
-            for _ in 0..iters {
-                write_minute(minute);
-                minute += 1;
-                let t = std::time::Instant::now();
-                black_box(db.advance_detectors().unwrap());
-                total += t.elapsed();
-            }
-            total
+                .collect();
+            db.backfill(&points).unwrap().into_complete().unwrap();
+        };
+        // Warm every baseline before measuring.
+        write_minute(0);
+        db.advance_detectors().unwrap();
+        let mut minute = 1i64;
+        group.bench_function(name, |b| {
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    write_minute(minute);
+                    minute += 1;
+                    let t = std::time::Instant::now();
+                    black_box(db.advance_detectors().unwrap());
+                    total += t.elapsed();
+                }
+                total
+            });
         });
-    });
+    }
     group.finish();
 }
 

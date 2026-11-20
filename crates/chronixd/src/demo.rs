@@ -322,9 +322,8 @@ pub fn banner(addr: SocketAddr, planted: &Planted, console: Option<&str>) -> Str
 
 fn window_text((start, end): (i64, i64)) -> String {
     let fmt = |ns: i64, f: &str| {
-        chrono::DateTime::from_timestamp_nanos(ns)
-            .format(f)
-            .to_string()
+        jiff::Timestamp::from_nanosecond(i128::from(ns))
+            .map_or_else(|_| ns.to_string(), |t| t.strftime(f).to_string())
     };
     format!("{}–{} UTC", fmt(start, "%Y-%m-%d %H:%M"), fmt(end, "%H:%M"))
 }
@@ -458,9 +457,8 @@ pub async fn run(
         config.server.log_format = format;
     }
 
-    let now = chrono::Utc::now()
-        .timestamp_nanos_opt()
-        .ok_or_else(|| DemoError::Other("the system clock is out of range".to_owned()))?;
+    let now = i64::try_from(jiff::Timestamp::now().as_nanosecond())
+        .map_err(|_| DemoError::Other("the system clock is out of range".to_owned()))?;
     let demo = DemoExtension {
         end_ns: window_end(now),
         addr: http_addr,

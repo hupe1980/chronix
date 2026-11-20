@@ -13,10 +13,11 @@ ignore = [
   # re-check on every object_store bump.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
-  # chrono and chrono-tz — unmaintained, not vulnerable. Arrow and DataFusion
-  # expose them in their public timestamp and time-zone API, and chronix-core's
-  # calendar buckets use them; replacing our own use would leave Arrow's in
-  # place. Clears when arrow-rs moves off chrono; re-check on every Arrow bump.
+  # chrono and chrono-tz — unmaintained, not vulnerable, and Arrow's, not ours:
+  # chronix uses jiff. chrono comes with every Arrow build; chrono-tz only with
+  # DataFusion (`sql`), so an embedded build has none and needs no ignore.
+  # `bans` below and scripts/check-features.sh keep it that way. Clears when
+  # arrow-rs moves off chrono; re-check on every Arrow bump.
   "RUSTSEC-2026-0543",
   "RUSTSEC-2026-0555",
   # humantime — unmaintained, not vulnerable; object_store parses durations in
@@ -59,6 +60,8 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+# chrono-tz is Arrow's and DataFusion's time-zone support and nobody else's.
+deny = [{ crate = "chrono-tz", wrappers = ["arrow-array", "datafusion-functions"], reason = "unmaintained (RUSTSEC-2026-0555); chronix uses jiff" }]
 
 [sources]
 unknown-registry = "deny"

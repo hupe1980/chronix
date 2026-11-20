@@ -69,9 +69,9 @@ The on-disk formats are frozen from 0.8: no release changes a data directory.
 # [workspace.dependencies] — cargo publish refuses a mismatch.
 $EDITOR Cargo.toml
 cargo update --workspace
-git commit -am "Release 0.8.0"
-git tag -a v0.8.0 -m "chronix 0.8.0"
-git push origin v0.8.0
+git commit -am "Release 0.9.0"
+git tag -a v0.9.0 -m "chronix 0.9.0"
+git push origin v0.9.0
 ```
 
 `.github/workflows/release.yml` checks the tag against the manifest, waits for CI on that

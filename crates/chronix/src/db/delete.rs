@@ -46,7 +46,7 @@ impl super::Chronix {
         // operator was told was gone and forgets the deadline that was
         // supposed to reclaim its disk.
         if let Some(ttl) = self.config.soft_delete_ttl {
-            let now_ms = super::chrono_timestamp_ms();
+            let now_ms = super::unix_ms_now();
             let deadline_ms = now_ms + ttl.as_millis() as u64;
             self.catalog
                 .write()

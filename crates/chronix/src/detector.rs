@@ -5,36 +5,41 @@
 //! exactly the hard part on a box that reboots. A *declared* detector is the
 //! other shape, the one a rollup has: declared once on a source measurement,
 //! persisted in the catalog, advanced by the maintenance pass, and resumed —
-//! not relearned — after a restart.
+//! not relearned — after a restart. Declaring and advancing need the
+//! `analytics` feature (on by default; name it with `default-features =
+//! false`).
+//!
+//! The source is any measurement, including one the application writes
+//! itself — a performance ratio `actual / modelled` per quarter hour is the
+//! intended use, since raw production flags every cloudy day:
 //!
 //! ```no_run
 //! # #[cfg(feature = "analytics")] {
 //! use chronix::detector::{DetectorDeclaration, Season};
 //! use chronix_core::timebucket::TimeBucket;
 //! # fn demo(db: &chronix::Chronix) -> chronix::error::Result<()> {
+//! let berlin = |w| TimeBucket::parse(w, Some("Europe/Berlin")).unwrap();
 //! let declaration = DetectorDeclaration::builder("roof_health")
 //!     .source("pv_ratio", "value")
-//!     .season(Season::new(
-//!         TimeBucket::parse("1mo", Some("Europe/Berlin")).unwrap(),
-//!         TimeBucket::parse("1y", Some("Europe/Berlin")).unwrap(),
-//!     )?)
-//!     .zscore(3.0)
+//!     .season(Season::new(berlin("15m"), berlin("1d"))?) // 14:00 vs 14:00
+//!     .zscore(4.0)
 //!     .cusum(0.5, 5.0)
+//!     .forgetting(14) // follow the seasons: a slot's past halves every 14 days
 //!     .build()?;
 //! db.declare_detector(declaration)?; // idempotent: declare it on every start
 //! # Ok(()) }
 //! # }
 //! ```
 //!
-//! Each point after a slot's warm-up produces one **verdict** row in the
+//! Each point after its slot's warm-up produces one **verdict** row in the
 //! output measurement (`<name>_verdicts` by default), tagged with the source
 //! series' tags and `detector=<name>`, with the fields `value`, `baseline`,
-//! `stddev`, `z`, `cusum_pos`, `cusum_neg`, `anomaly` and `reason`. Verdicts
-//! are ordinary points: query them, subscribe to them, alert on them.
+//! `stddev`, `z`, `cusum_pos`, `cusum_neg`, `anomaly`, `reason` and `slot`.
+//! Verdicts are ordinary points: query them, subscribe to them, alert on them.
 
 use std::time::Duration;
 
-use chronix_core::timebucket::TimeBucket;
+use chronix_core::timebucket::{BucketWidth, TimeBucket};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DbError, Result};
@@ -42,27 +47,56 @@ use crate::error::{DbError, Result};
 /// The most slots one season may have.
 pub const MAX_SLOTS_PER_PERIOD: usize = 2_048;
 
-/// The calendar a baseline is learned against: `slot`-wide buckets within a
-/// `period`.
+const DAY_NS: i64 = 86_400_000_000_000;
+
+/// The calendar a baseline is learned against: `slot`-wide slots within a
+/// `period`, read in one time zone.
 ///
-/// Fifteen-minute slots in a Europe/Berlin day give each quarter hour its own
-/// normal; monthly slots in a year give each month its own. Both are
-/// [`TimeBucket`]s, so a 23- or 25-hour day and a 28-day February are read
-/// against the calendar rather than divided out of a nanosecond count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// **A slot is a wall-clock position.** Fifteen-minute slots in a
+/// Europe/Berlin day make 14:00 slot 56 on every day of the year — on the
+/// 23-hour day in March, the 25-hour day in October, and every other — so a
+/// quarter hour is always judged against the same quarter hour. The repeated
+/// hour of an autumn night folds into the slots of 02:00–02:59; the hour a
+/// spring night skips leaves its four slots empty for that day. Monthly slots
+/// in a year make June slot 5 in every year, and a period's index counts
+/// calendar periods, so forgetting halves exactly once per period.
+///
+/// Pick the zone for what drives the signal: the local zone for anything
+/// people and tariffs shape (consumption, charging), UTC for anything the sun
+/// shapes (shading, dawn on a PV array), since solar time does not move when
+/// the clocks do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SeasonRepr", into = "SeasonRepr")]
 pub struct Season {
+    slot: TimeBucket,
+    period: TimeBucket,
+    /// [`Season::slots`], computed once.
+    slots: usize,
+}
+
+/// The persisted form: the two buckets. Read back through [`Season::new`],
+/// so a stored season obeys the same rules as a new one.
+#[derive(Serialize, Deserialize)]
+struct SeasonRepr {
     slot: TimeBucket,
     period: TimeBucket,
 }
 
-/// Instants the slot tiling is checked at: an ordinary day, both European
-/// transition days of 2026, and midsummer — every shape a day can have.
-const TILING_PROBES: [i64; 4] = [
-    1_768_478_400_000_000_000,
-    1_774_785_600_000_000_000,
-    1_781_524_800_000_000_000,
-    1_792_929_600_000_000_000,
-];
+impl TryFrom<SeasonRepr> for Season {
+    type Error = DbError;
+    fn try_from(r: SeasonRepr) -> Result<Self> {
+        Self::new(r.slot, r.period)
+    }
+}
+
+impl From<Season> for SeasonRepr {
+    fn from(s: Season) -> Self {
+        Self {
+            slot: s.slot,
+            period: s.period,
+        }
+    }
+}
 
 impl Season {
     /// A season of `slot`-wide slots within each `period`.
@@ -70,72 +104,154 @@ impl Season {
     /// # Errors
     ///
     /// [`DbError::InvalidRequest`] when the slots do not tile the period —
-    /// a period boundary that is not a slot boundary, so a slot would
-    /// straddle two periods — or when a period holds more than
+    /// the two are read in different zones, the slot carries an origin (the
+    /// period's start places every slot), the slot does not divide the period
+    /// (15m in a 1d, 1d in a 1w or 1mo, 1mo in a 1y), or the period starts
+    /// where no slot does — or when a period holds more than
     /// [`MAX_SLOTS_PER_PERIOD`] slots.
     pub fn new(slot: TimeBucket, period: TimeBucket) -> Result<Self> {
-        let season = Self { slot, period };
-        for probe in TILING_PROBES {
-            let start = period.start_of(probe);
-            let end = period.next(start);
-            if slot.start_of(start) != start {
-                return Err(DbError::InvalidRequest(format!(
-                    "a {slot} slot does not start where a {period} period does; \
-                     choose a slot that divides the period (15m in a 1d, 1mo in a 1y) \
-                     and the same time zone for both"
-                )));
-            }
-            let mut s = start;
-            let mut n = 0usize;
-            while s < end {
-                s = slot.next(s);
-                n += 1;
-                if n > MAX_SLOTS_PER_PERIOD {
-                    return Err(DbError::InvalidRequest(format!(
-                        "a {period} period holds more than {MAX_SLOTS_PER_PERIOD} {slot} \
-                         slots; choose a wider slot"
-                    )));
-                }
-            }
-            if s != end {
-                return Err(DbError::InvalidRequest(format!(
-                    "{slot} slots do not tile a {period} period exactly; \
-                     choose a slot that divides it"
-                )));
-            }
+        let bad = |m: String| Err(DbError::InvalidRequest(m));
+        if slot.timezone() != period.timezone() {
+            return bad(format!(
+                "a season's slot and period must be read in one time zone; got {} and {}",
+                slot.timezone().unwrap_or("UTC"),
+                period.timezone().unwrap_or("UTC")
+            ));
         }
-        Ok(season)
+        if slot.origin().is_some() {
+            return bad(
+                "a season's slot cannot carry an origin: the period's start places every \
+                 slot — set the origin on the period"
+                    .into(),
+            );
+        }
+        use BucketWidth::{Days, Fixed, Months};
+        let tiles = match (slot.width(), period.width()) {
+            (Fixed(s), Fixed(p)) => s > 0 && s < p && p % s == 0,
+            (Fixed(s), Days(_) | Months(_)) => s > 0 && DAY_NS % s == 0,
+            (Days(s), Days(p)) => s < p && p % s == 0,
+            (Days(1), Months(_)) => true,
+            (Months(s), Months(p)) => s < p && p % s == 0,
+            _ => false,
+        };
+        // Calendar slots keep their own boundaries (days at midnight), so a
+        // period starting mid-slot — a month from the 15th at 06:00 — would
+        // cut its first slot in two.
+        let aligned = slot
+            .width()
+            .is_calendar()
+            .then(|| period.origin().map(|o| slot.start_of(o) == o))
+            .flatten()
+            .unwrap_or(true);
+        if !tiles || !aligned {
+            return bad(format!(
+                "{} slots do not tile a {} period; choose a slot that divides it \
+                 (15m in a 1d, 1d in a 1w or 1mo, 1mo in a 1y)",
+                slot.width(),
+                period.width()
+            ));
+        }
+        let slots = Self::count_slots(slot.width(), period.width());
+        if slots > MAX_SLOTS_PER_PERIOD {
+            return bad(format!(
+                "a {} period holds up to {slots} {} slots, more than {MAX_SLOTS_PER_PERIOD}; \
+                 choose a wider slot",
+                period.width(),
+                slot.width()
+            ));
+        }
+        Ok(Self {
+            slot,
+            period,
+            slots,
+        })
+    }
+
+    /// The most slots any one period holds on the wall clock: 96 quarter
+    /// hours in a day, 31 days in a month, 366 days in a year, 12 months.
+    fn count_slots(slot: BucketWidth, period: BucketWidth) -> usize {
+        let slot_ns = match slot {
+            BucketWidth::Fixed(s) => s,
+            BucketWidth::Days(d) => i64::from(d) * DAY_NS,
+            BucketWidth::Months(s) => {
+                let BucketWidth::Months(p) = period else {
+                    return 1;
+                };
+                return (p / s) as usize;
+            }
+        };
+        let period_ns = match period {
+            BucketWidth::Fixed(p) => p,
+            BucketWidth::Days(d) => i64::from(d) * DAY_NS,
+            BucketWidth::Months(m) => longest_months_days(m) * DAY_NS,
+        };
+        usize::try_from(period_ns / slot_ns.max(1)).unwrap_or(usize::MAX)
     }
 
     /// The slot width.
     #[must_use]
-    pub fn slot(&self) -> TimeBucket {
-        self.slot
+    pub fn slot(&self) -> &TimeBucket {
+        &self.slot
     }
 
     /// The period width.
     #[must_use]
-    pub fn period(&self) -> TimeBucket {
-        self.period
+    pub fn period(&self) -> &TimeBucket {
+        &self.period
     }
 
-    /// `(slot index, period start)` of `ts`.
+    /// The most slots one period holds on the wall clock — 96 for quarter
+    /// hours in a day. Slots that only some periods have (the 31st of a
+    /// month, 29 February) count.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    /// `(slot, period index)` of `ts`.
     ///
-    /// Counted by stepping the slot calendar from the period's start, so the
-    /// 02:00 slot of a 23-hour day is index 8 in quarter hours and the 03:00
-    /// one is index 8 too — the hour that does not exist has no slot.
+    /// The slot is the wall-clock position in the period (see [`Season`]);
+    /// the period index counts calendar periods, consecutive periods being
+    /// consecutive integers.
     #[must_use]
     pub fn slot_of(&self, ts: i64) -> (usize, i64) {
         let period_start = self.period.start_of(ts);
-        let slot_start = self.slot.start_of(ts).max(period_start);
-        let mut s = period_start;
-        let mut i = 0usize;
-        while s < slot_start && i < MAX_SLOTS_PER_PERIOD {
-            s = self.slot.next(s);
-            i += 1;
-        }
-        (i, period_start)
+        let slot = match self.slot.width() {
+            BucketWidth::Fixed(s) => {
+                // Measured from the period's *nominal* local start. A period
+                // that opens in a gap — Santiago springs forward at midnight —
+                // starts at 01:00 on the wall clock, and 14:00 must still be
+                // fourteen hours in: one nanosecond earlier the clock read
+                // just before the nominal start.
+                let start = self
+                    .slot
+                    .wall_clock_ns(period_start)
+                    .min(self.slot.wall_clock_ns(period_start - 1) + 1);
+                (self.slot.wall_clock_ns(ts) - start).div_euclid(s.max(1))
+            }
+            _ => self.slot.index_of(ts) - self.slot.index_of(period_start),
+        };
+        let slot = usize::try_from(slot.max(0)).unwrap_or(0);
+        (slot.min(self.slots - 1), self.period.index_of(ts))
     }
+}
+
+/// The most days `m` consecutive calendar months hold: 31 for one, 92 for a
+/// quarter, 366 for a year. Counted over a 400-year cycle, which holds every
+/// arrangement of leap days the calendar has.
+fn longest_months_days(m: u32) -> i64 {
+    let month = TimeBucket::utc(BucketWidth::Months(1));
+    // 2000-01-01T00:00Z.
+    let mut starts = vec![946_684_800_000_000_000_i64];
+    for _ in 0..4_800 + m {
+        starts.push(month.next(*starts.last().unwrap_or(&0)));
+    }
+    let m = m as usize;
+    starts
+        .windows(m + 1)
+        .map(|w| (w[m] - w[0]) / DAY_NS)
+        .max()
+        .unwrap_or(31)
 }
 
 /// A declared detector's definition.
@@ -421,6 +537,12 @@ pub struct DetectorInfo {
     pub series: usize,
     /// Points that arrived at or below the watermark and were not judged.
     pub late_points: u64,
+    /// Slot baselines still warming up: (series, slot) pairs that have seen
+    /// data but fewer than `min_samples` points of it, so judge nothing yet.
+    /// A slot no data falls in (night, for a PV ratio) is not counted. Zero
+    /// when every slot in use can judge; `None` in a build without
+    /// `analytics`, which cannot read a baseline.
+    pub warming_slots: Option<u64>,
     /// Whether it is running.
     pub status: DetectorStatus,
 }
@@ -477,35 +599,155 @@ mod tests {
         TimeBucket::parse(w, Some("Europe/Berlin")).unwrap()
     }
 
-    /// Every quarter hour of a local day has its own slot, including the
-    /// 23-hour day in March and the 25-hour day in October.
+    /// How many slots a period holds, on the wall clock, and what is
+    /// refused: a cap, a slot that does not divide, two zones, a slot origin.
     #[test]
-    fn quarter_hours_of_a_berlin_day_on_both_transitions() {
-        let season = Season::new(berlin("15m"), berlin("1d")).unwrap();
-        // 2026-03-29 00:00 Berlin (CET, +01:00) = 2026-03-28T23:00Z.
-        let march = 1_774_738_800_000_000_000_i64;
-        // 2026-10-25 00:00 Berlin (CEST, +02:00) = 2026-10-24T22:00Z.
-        let october = 1_792_879_200_000_000_000_i64;
-        for (day_start, quarters) in [(march, 92usize), (october, 100usize)] {
-            let mut seen = Vec::new();
-            for q in 0..quarters {
-                let ts = day_start + i64::try_from(q).unwrap() * 900_000_000_000 + 1;
-                let (slot, period) = season.slot_of(ts);
-                assert_eq!(period, day_start, "quarter {q} left its day");
-                seen.push(slot);
-            }
-            let mut sorted = seen.clone();
-            sorted.dedup();
+    fn slot_counts_and_refusals() {
+        let utc = |w| TimeBucket::parse(w, None).unwrap();
+        for (slot, period, n) in [
+            ("15m", "1d", 96),
+            ("1h", "1w", 168),
+            ("1d", "1w", 7),
+            ("1d", "1mo", 31),
+            ("1d", "3mo", 92),
+            ("1d", "1y", 366),
+            ("1mo", "1y", 12),
+            ("1h", "1mo", 744),
+            ("5m", "1h", 12),
+        ] {
             assert_eq!(
-                sorted.len(),
-                quarters,
-                "two quarters shared a slot: {seen:?}"
-            );
-            assert!(
-                seen.windows(2).all(|w| w[0] < w[1]),
-                "slots out of order: {seen:?}"
+                Season::new(utc(slot), utc(period)).unwrap().slots(),
+                n,
+                "{slot} in {period}"
             );
         }
+        assert!(Season::new(utc("1m"), utc("1w")).is_err(), "10 080 slots");
+        assert!(
+            Season::new(utc("1w"), utc("1mo")).is_err(),
+            "weeks do not tile months"
+        );
+        assert!(
+            Season::new(utc("7m"), utc("1d")).is_err(),
+            "7 minutes do not divide a day"
+        );
+        assert!(
+            Season::new(utc("1d"), utc("1d")).is_err(),
+            "one slot is not a season"
+        );
+        assert!(Season::new(utc("15m"), berlin("1d")).is_err(), "two zones");
+        let slot_origin = utc("15m").with_origin(60_000_000_000).unwrap();
+        assert!(
+            Season::new(slot_origin, utc("1d")).is_err(),
+            "a slot origin"
+        );
+        // A month period from the 15th at 06:00 cannot be tiled by days
+        // counted from midnight; one from the 15th at midnight can.
+        let p = |o: &str| utc("1mo").with_origin_str(o).unwrap();
+        assert!(Season::new(utc("1d"), p("2024-01-15 06:00:00")).is_err());
+        assert!(Season::new(utc("1d"), p("2024-01-15")).is_ok());
+    }
+
+    /// America/Santiago springs forward at midnight: the day starts at 01:00
+    /// on the wall clock, and 14:00 is still slot 56.
+    #[test]
+    fn a_day_that_starts_in_a_gap_keeps_wall_clock_slots() {
+        let santiago = |w| TimeBucket::parse(w, Some("America/Santiago")).unwrap();
+        let season = Season::new(santiago("15m"), santiago("1d")).unwrap();
+        // 2024-09-08: 00:00 -04 → 01:00 -03. 14:00 -03 = 17:00Z.
+        let two_pm = 1_725_814_800_000_000_000;
+        assert_eq!(season.slot_of(two_pm).0, 56);
+        // 01:00 -03 (04:00Z) — the first instant of the day — is slot 4.
+        assert_eq!(season.slot_of(1_725_768_000_000_000_000).0, 4);
+    }
+
+    #[test]
+    fn days_of_a_month() {
+        let season = Season::new(berlin("1d"), berlin("1mo")).unwrap();
+        // 2024-02-29 12:00 CET is the 29th: slot 28.
+        assert_eq!(season.slot_of(1_709_204_400_000_000_000).0, 28);
+    }
+
+    /// A stored season is read back through the same rules.
+    #[test]
+    fn a_season_round_trips_through_postcard() {
+        let season = Season::new(berlin("15m"), berlin("1d")).unwrap();
+        let bytes = postcard::to_stdvec(&season).unwrap();
+        let back: Season = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, season);
+        assert_eq!(back.slots(), 96);
+    }
+
+    /// 2026 Europe/Berlin, local wall-clock time → epoch nanoseconds.
+    /// CET is +01:00, CEST +02:00; the transitions are 29 March 02:00 → 03:00
+    /// and 25 October 03:00 → 02:00.
+    fn berlin_at(y: i32, mo: u32, d: u32, h: u32, mi: u32, cest: bool) -> i64 {
+        let days = {
+            // Days from 1970-01-01 (proleptic Gregorian), no library needed.
+            let (y, mo) = if mo <= 2 {
+                (y - 1, mo + 9)
+            } else {
+                (y, mo - 3)
+            };
+            let era = y.div_euclid(400);
+            let yoe = y - era * 400;
+            let doy = (153 * mo as i32 + 2) / 5 + d as i32 - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            i64::from(era * 146_097 + doe - 719_468)
+        };
+        let local = days * 86_400 + i64::from(h) * 3_600 + i64::from(mi) * 60;
+        (local - if cest { 7_200 } else { 3_600 }) * 1_000_000_000
+    }
+
+    /// The slot is the wall-clock position: 14:00 is 14:00 on every day,
+    /// including both transition days, and a day never has more than 96.
+    #[test]
+    fn a_quarter_hour_keeps_its_slot_across_both_transitions() {
+        let season = Season::new(berlin("15m"), berlin("1d")).unwrap();
+        // 14:00 on an ordinary day, on the 23-hour day, on the 25-hour day.
+        for at in [
+            berlin_at(2026, 3, 28, 14, 0, false),
+            berlin_at(2026, 3, 29, 14, 0, true),
+            berlin_at(2026, 10, 25, 14, 0, false),
+        ] {
+            assert_eq!(season.slot_of(at).0, 56, "14:00 must be slot 56");
+        }
+        // Both passes of 02:30 on 25 October are 02:30 on the wall clock.
+        let first = berlin_at(2026, 10, 25, 2, 30, true);
+        let second = berlin_at(2026, 10, 25, 2, 30, false);
+        assert_eq!(first + 3_600_000_000_000, second);
+        assert_eq!(season.slot_of(first).0, 10);
+        assert_eq!(season.slot_of(second).0, 10);
+        // 23:45 is the last slot on all three days.
+        for (d, cest) in [(28, false), (29, true)] {
+            assert_eq!(season.slot_of(berlin_at(2026, 3, d, 23, 45, cest)).0, 95);
+        }
+        assert_eq!(season.slot_of(berlin_at(2026, 10, 25, 23, 45, false)).0, 95);
+    }
+
+    /// Forgetting counts periods: consecutive years and months are
+    /// consecutive integers, whatever their length.
+    #[test]
+    fn the_period_index_steps_by_one_per_calendar_period() {
+        let yearly = Season::new(berlin("1mo"), berlin("1y")).unwrap();
+        let years: Vec<i64> = (2019..=2030)
+            .map(|y| yearly.slot_of(berlin_at(y, 1, 1, 12, 0, false)).1)
+            .collect();
+        assert!(
+            years.windows(2).all(|w| w[1] == w[0] + 1),
+            "years: {years:?}"
+        );
+        let monthly = Season::new(berlin("1d"), berlin("1mo")).unwrap();
+        let months: Vec<i64> = (1..=12)
+            .map(|m| {
+                monthly
+                    .slot_of(berlin_at(2024, m, 15, 12, 0, (4..=10).contains(&m)))
+                    .1
+            })
+            .collect();
+        assert!(
+            months.windows(2).all(|w| w[1] == w[0] + 1),
+            "months: {months:?}"
+        );
     }
 
     #[test]
@@ -515,21 +757,6 @@ mod tests {
         assert_eq!(season.slot_of(1_781_524_800_000_000_000).0, 5);
         // 2026-01-15 is January: slot 0.
         assert_eq!(season.slot_of(1_768_478_400_000_000_000).0, 0);
-    }
-
-    #[test]
-    fn too_many_slots_and_misaligned_slots_are_refused() {
-        let utc = |w| TimeBucket::parse(w, None).unwrap();
-        assert!(Season::new(utc("1s"), utc("1d")).is_err(), "86 400 slots");
-        assert!(
-            Season::new(utc("1w"), utc("1mo")).is_err(),
-            "weeks do not tile months"
-        );
-        assert!(
-            Season::new(utc("7m"), utc("1h")).is_err(),
-            "7 minutes do not divide an hour"
-        );
-        assert!(Season::new(utc("15m"), utc("1d")).is_ok());
     }
 
     #[test]

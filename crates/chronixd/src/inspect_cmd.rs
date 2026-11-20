@@ -73,7 +73,7 @@ impl InspectArgs {
                 }
             }
         } else {
-            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+            let now = i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap_or(i64::MAX);
             print!("{}", render(&report, from_config, now));
         }
         std::process::ExitCode::SUCCESS
@@ -382,16 +382,17 @@ fn ago(ts_ns: i64, now_ns: i64) -> String {
         60..3_600 => format!("{} min ago", secs / 60),
         3_600..172_800 => format!("{} h ago", secs / 3_600),
         172_800..7_776_000 => format!("{} days ago", secs / 86_400),
-        _ => chrono::DateTime::from_timestamp_nanos(ts_ns)
-            .format("%Y-%m-%d")
-            .to_string(),
+        _ => jiff::Timestamp::from_nanosecond(i128::from(ts_ns)).map_or_else(
+            |_| ts_ns.to_string(),
+            |t| t.strftime("%Y-%m-%d").to_string(),
+        ),
     }
 }
 
 fn ago_rfc3339(s: &str, now_ns: i64) -> String {
-    chrono::DateTime::parse_from_rfc3339(s)
+    s.parse::<jiff::Timestamp>()
         .ok()
-        .and_then(|t| t.timestamp_nanos_opt())
+        .and_then(|t| i64::try_from(t.as_nanosecond()).ok())
         .map_or_else(|| s.to_owned(), |ns| ago(ns, now_ns))
 }
 

@@ -31,13 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 ```sh
-cargo add chronix                          # the library
-cargo install chronixd && chronixd --demo  # the server, with a generated week of data
+cargo add chronix                                      # the library
+brew install hupe1980/tap/chronixd && chronixd --demo  # the server, with a generated week of data
 ```
 
 `chronixd --demo` serves a generated gateway week — PV, battery, grid and heat pump, with two
 planted anomalies — on `127.0.0.1:8086`, and prints queries to paste and the console's address.
-Prebuilt binaries are on the [releases page](https://github.com/hupe1980/chronix/releases).
+`cargo install chronixd` builds it from source; prebuilt binaries are on the [releases page](https://github.com/hupe1980/chronix/releases).
 
 ## Why Chronix
 

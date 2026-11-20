@@ -47,8 +47,12 @@ ORDER BY day;
 
 The **unit decides**: `'30s'`, `'5m'` and `'1h'` are a fixed span that never
 varies, while `'1d'`, `'1w'`, `'1mo'` and `'1y'` follow that zone's calendar —
-so a transition day is 23 or 25 hours and February is February. The month is
-`'mo'`; `'m'` is always the minute.
+so a transition day is 23 or 25 hours and February is February. A fixed span
+in a zone sits on that zone's standard-time grid: `'6h'` in Europe/Berlin
+starts at 00:00, 06:00, 12:00 and 18:00 CET all year. The month is `'mo'`;
+`'m'` is always the minute. The zone is a constant string, matched
+case-insensitively against the IANA database built into Chronix — never the
+host's, so a query buckets identically on every machine.
 
 A fourth argument moves the boundary, for a period that does not start at
 midnight on the 1st:

@@ -3,6 +3,34 @@
 Notable changes to Chronix, in [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 format. Before 1.0 a breaking change bumps the minor version and a fix the patch.
 
+## [0.9.0] - 2026-11-20
+
+**The calendar under a detector.** A season's slot is the wall-clock position, so a
+quarter hour is judged against the same quarter hour on both clock-change days; forgetting
+counts calendar periods; and chronix runs on one maintained time library with the IANA
+database compiled in. No on-disk format change.
+
+### Breaking changes
+
+- One time library: chronix uses `jiff` with its compiled-in IANA database; `chrono` and `chrono-tz` are gone from every chronix crate, and a `default-features = false` build has no `chrono-tz` (RUSTSEC-2026-0555).
+- `TimeBucket` and `Season` are `Clone`, not `Copy`.
+- `TimeBucket::in_zone(Tz) -> Self` → `in_zone(&str) -> Result<Self, BucketParseError>`; `timezone()` returns `Option<&str>`.
+- `Season::slot()` / `period()` return `&TimeBucket`; `Season::slot_of` returns `(slot, period index)`, not `(slot, period start)`.
+- `Season::new` refuses a slot with an origin, a slot and period in different zones, and a calendar slot the period's origin would cut.
+- `DetectorInfo` gains `warming_slots`.
+- `time_bucket()` refuses a zone that is not a constant string instead of bucketing in UTC.
+- ⚠️ Silent: a season's slot is the wall-clock position — 14:00 is slot 56 on every Europe/Berlin day, including both clock-change days, where it was 52 and 60.
+- ⚠️ Silent: forgetting counts calendar periods (`TimeBucket::index_of`); a monthly or yearly season skipped or repeated periods.
+- ⚠️ Silent: a zoned fixed-width bucket wider than its zone's offset starts at the standard-time midnight grid — `6h` in Europe/Berlin is 00:00/06:00/12:00/18:00, where it was 02:00/08:00/14:00/20:00.
+- ⚠️ Silent: CloudEvents `time` and rollup `origin` print RFC 3339 with `Z` rather than `+00:00`.
+- ⚠️ Silent: zone names are matched case-insensitively and reported in their canonical spelling; `Etc/Unknown` is refused.
+
+### Added
+
+- `brew install hupe1980/tap/chronixd` — macOS (Apple silicon) and Linux.
+- `TimeBucket::index_of` (the bucket ordinal), `TimeBucket::wall_clock_ns`, `Season::slots`.
+- Verdicts carry `slot`; `detectors()` and `/api/v1/detectors` report `warming_slots`.
+
 ## [0.8.0] - 2026-11-17
 
 **Hard cut.** The on-disk format moves to generation 2 and a 0.7 data directory

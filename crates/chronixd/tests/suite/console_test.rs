@@ -54,7 +54,7 @@ fn demo_db(dir: &Path) -> Arc<Chronix> {
             .unwrap(),
     )
     .unwrap();
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+    let now = i64::try_from(jiff::Timestamp::now().as_nanosecond()).unwrap();
     demo::ingest(&db, demo::window_end(now)).unwrap();
     Arc::new(db)
 }

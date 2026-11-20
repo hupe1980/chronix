@@ -120,15 +120,41 @@ impl super::Chronix {
                 .map_err(|e| DbError::Internal(format!("unreadable detector {name}: {e}")))?;
             let head = DetectorStateHead::decode(&state)?;
             let status = self.detector_status(&declaration, &head);
+            let warming_slots = Self::warming_slots(&declaration, &state);
             out.push(DetectorInfo {
                 watermark_ns: head.watermark_ns,
                 series: usize::try_from(head.series_count).unwrap_or(usize::MAX),
                 late_points: head.late_points,
+                warming_slots,
                 status,
                 declaration,
             });
         }
         Ok(out)
+    }
+
+    /// (series, slot) baselines that have seen data and not yet
+    /// `min_samples` of it. A slot no data falls in — night, for a PV
+    /// ratio — is unused, not warming.
+    #[cfg(feature = "analytics")]
+    fn warming_slots(declaration: &DetectorDeclaration, state: &[u8]) -> Option<u64> {
+        if state.is_empty() {
+            return Some(0);
+        }
+        let state: crate::detector::DetectorState = postcard::from_bytes(state).ok()?;
+        let min = f64::from(declaration.min_samples);
+        let warming = state
+            .series
+            .values()
+            .flat_map(|b| &b.slots)
+            .filter(|w| w.weight > 0.0 && w.weight < min)
+            .count();
+        Some(warming as u64)
+    }
+
+    #[cfg(not(feature = "analytics"))]
+    fn warming_slots(_: &DetectorDeclaration, _: &[u8]) -> Option<u64> {
+        None
     }
 
     fn detector_status(
@@ -388,7 +414,10 @@ impl super::Chronix {
                     None => {
                         // A new group costs its slots as it learns; refuse
                         // it up front when the state is near the cap.
-                        let slots = decl.season.map_or(1, |_| 96);
+                        let slots = decl
+                            .season
+                            .as_ref()
+                            .map_or(1, crate::detector::Season::slots);
                         let estimate = key.len() + 40 + slots * 32;
                         if approx_bytes + estimate > budget {
                             state.degraded = Some(format!(
@@ -401,10 +430,7 @@ impl super::Chronix {
                         state.series.entry(key.clone()).or_default()
                     }
                 };
-                let (slot, period) = decl.season.map_or((0, 0), |s| s.slot_of(ts));
-                let period_index = decl
-                    .season
-                    .map_or(0, |s| period / s.period().nominal_ns().max(1));
+                let (slot, period_index) = decl.season.as_ref().map_or((0, 0), |s| s.slot_of(ts));
                 let Some(v) = baseline.score(slot, period_index, x, &rule, decl.forgetting) else {
                     continue;
                 };
@@ -437,6 +463,12 @@ impl super::Chronix {
                 fields.insert("cusum_neg".to_string(), F::F64(v.cusum.neg));
                 fields.insert("anomaly".to_string(), F::Bool(v.is_anomaly()));
                 fields.insert("reason".to_string(), F::String(v.reason().to_string()));
+                // Which baseline judged it: a surprising verdict is traced to
+                // its slot, and `slot = 56` reads as 14:00 in a quarter-hour day.
+                fields.insert(
+                    "slot".to_string(),
+                    F::I64(i64::try_from(slot).unwrap_or(i64::MAX)),
+                );
                 let point = chronix_core::Point::new(series_key, fields, ts)
                     .map_err(|e| DbError::Internal(format!("verdict point: {e}")))?;
                 verdicts.push(point);

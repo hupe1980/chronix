@@ -472,7 +472,8 @@ pub async fn list_rollups_handler(
                 origin: r
                     .bucket
                     .origin()
-                    .map(|ns| chrono::DateTime::from_timestamp_nanos(ns).to_rfc3339()),
+                    .and_then(|ns| jiff::Timestamp::from_nanosecond(i128::from(ns)).ok())
+                    .map(|t| t.to_string()),
                 aggregations: r.aggregations.iter().map(|a| format!("{a:?}")).collect(),
                 materialised_until: state.materialised_until,
                 pending_repairs: state.pending_invalidations().to_vec(),

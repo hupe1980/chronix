@@ -257,7 +257,9 @@ impl super::Chronix {
                     })
                     .map_or("value", |f| f.name().as_str());
                 let mut ds = chronix_query::downsample::StreamingDownsampler::new(
-                    value_col, *bucket, *function,
+                    value_col,
+                    bucket.clone(),
+                    *function,
                 )?;
                 let mut results = ds.push(&first)?;
                 drop(first);

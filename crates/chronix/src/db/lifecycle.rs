@@ -1027,7 +1027,7 @@ impl super::Chronix {
         if entries.is_empty() {
             return out;
         }
-        let now_ms = super::chrono_timestamp_ms();
+        let now_ms = super::unix_ms_now();
         let segments_dir = self.segments_dir();
         let mut to_unlink: Vec<std::path::PathBuf> = Vec::with_capacity(entries.len());
 
