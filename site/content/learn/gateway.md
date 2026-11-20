@@ -1,6 +1,6 @@
 +++
 title = "Your first gateway monitor"
-description = "Build a solar-roof health monitor with Chronix: a declared detector with a quarter-hour seasonal baseline on the local wall clock, persisted by the store and resumed after a reboot."
+description = "Build a solar-roof health monitor with Chronix: a declared detector that judges each quarter hour on the wall clock and resumes after a reboot."
 weight = 30
 +++
 
