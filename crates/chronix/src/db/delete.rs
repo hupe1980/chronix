@@ -280,6 +280,12 @@ impl super::Chronix {
     /// cannot be persisted.
     #[must_use = "delete errors must be handled"]
     pub fn execute_delete(&self, req: &DeleteRequest) -> Result<DeleteOutcome> {
+        let _writer = self.rollup_pass.read();
+        self.execute_delete_in_pass(req)
+    }
+
+    /// The caller holds the rollup pass gate for a correction or a refresh.
+    pub(super) fn execute_delete_in_pass(&self, req: &DeleteRequest) -> Result<DeleteOutcome> {
         self.ensure_writable("deleting")?;
         self.check_open()?;
 
@@ -473,8 +479,7 @@ impl super::Chronix {
                     start,
                     end.saturating_add(1),
                 );
-                let states = self.snapshot_rollup_states(&changed);
-                if let Err(e) = self.persist_rollup_states(&states) {
+                if let Err(e) = self.persist_rollup_states(&changed) {
                     warn!(error = %e, "could not persist rollup invalidations after a delete");
                 }
             }

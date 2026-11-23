@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "dashmap",
  "fnv",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-encoding"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chronix-core",
  "pco",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-engine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "arrow",

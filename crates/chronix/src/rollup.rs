@@ -49,7 +49,7 @@ pub enum RollupAggFn {
     Max,
     /// Sum of all values.
     Sum,
-    /// Count of data points.
+    /// Number of contributing observations for a field, stored and returned as `UInt64`.
     Count,
     /// First (oldest) value in the bucket — with `Last`, what a meter
     /// reading needs to become consumption per bucket.
@@ -98,6 +98,40 @@ pub struct RollupConfig {
     pub group_by_tags: Vec<String>,
     /// Optional retention for the target measurement (in nanoseconds).
     pub retention_ns: Option<i64>,
+}
+
+impl RollupConfig {
+    /// Properties that change the definition under the same name.
+    pub(crate) fn differing_fields(&self, other: &Self) -> Vec<&'static str> {
+        fn same_set<T: Ord>(left: &[T], right: &[T]) -> bool {
+            use std::collections::BTreeSet;
+            left == right || left.iter().collect::<BTreeSet<_>>() == right.iter().collect()
+        }
+
+        [
+            (
+                "source_measurement",
+                self.source_measurement != other.source_measurement,
+            ),
+            (
+                "target_measurement",
+                self.target_measurement != other.target_measurement,
+            ),
+            ("bucket", self.bucket != other.bucket),
+            (
+                "aggregations",
+                !same_set(&self.aggregations, &other.aggregations),
+            ),
+            (
+                "group_by_tags",
+                !same_set(&self.group_by_tags, &other.group_by_tags),
+            ),
+            ("retention_ns", self.retention_ns != other.retention_ns),
+        ]
+        .into_iter()
+        .filter_map(|(name, differs)| differs.then_some(name))
+        .collect()
+    }
 }
 
 /// Builder for constructing [`RollupConfig`] ergonomically.
@@ -783,7 +817,7 @@ impl BucketAccumulator {
                 // aggregate of an exact column stays exact.
                 #[allow(clippy::cast_precision_loss)]
                 let value = if agg_fn == RollupAggFn::Count {
-                    AggResult::F64(stats.count as f64)
+                    AggResult::U64(stats.count)
                 } else if let Some(track) = stats.histogram.as_deref() {
                     // A distribution's aggregate is a distribution. `sum` is
                     // the merge; `avg` is the merge scaled by 1/n, which is
@@ -1148,6 +1182,7 @@ fn agg_result_to_field(value: chronix_query::AggResult) -> Option<chronix_core::
     match value {
         chronix_query::AggResult::Null => None,
         chronix_query::AggResult::F64(v) => Some(chronix_core::FieldValue::F64(v)),
+        chronix_query::AggResult::U64(v) => Some(chronix_core::FieldValue::U64(v)),
         chronix_query::AggResult::Decimal { mantissa, scale } => {
             chronix_core::Decimal::new(mantissa, scale)
                 .ok()
@@ -1209,7 +1244,9 @@ pub fn record_batch_to_points(
     batch: &arrow::record_batch::RecordBatch,
     measurement: &str,
 ) -> Vec<chronix_core::Point> {
-    use arrow::array::{Array, Decimal128Array, Float64Array, Int64Array, StringArray};
+    use arrow::array::{
+        Array, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+    };
     let schema = batch.schema();
     let Some(ts) = batch
         .column_by_name(chronix_core::TIME_COLUMN)
@@ -1234,6 +1271,7 @@ pub fn record_batch_to_points(
     // a rollup of a settlement register produced no rows at all.
     enum FieldCol<'a> {
         F64(&'a Float64Array),
+        U64(&'a UInt64Array),
         Decimal(&'a Decimal128Array, u8),
         /// A merged native histogram, still in its own encoding.
         Histogram(&'a arrow::array::BinaryArray),
@@ -1246,6 +1284,9 @@ pub fn record_batch_to_points(
             let col = batch.column(i);
             if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
                 return Some((f.name().as_str(), FieldCol::F64(a)));
+            }
+            if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+                return Some((f.name().as_str(), FieldCol::U64(a)));
             }
             if let Some(a) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() {
                 return Some((f.name().as_str(), FieldCol::Histogram(a)));
@@ -1272,6 +1313,9 @@ pub fn record_batch_to_points(
                     FieldCol::F64(a) => a
                         .is_valid(row)
                         .then(|| chronix_core::FieldValue::F64(a.value(row))),
+                    FieldCol::U64(a) => a
+                        .is_valid(row)
+                        .then(|| chronix_core::FieldValue::U64(a.value(row))),
                     FieldCol::Decimal(a, scale) => a.is_valid(row).then(|| {
                         chronix_core::Decimal::new(a.value(row), *scale)
                             .ok()
@@ -1514,11 +1558,25 @@ mod tests {
         assert!(
             (field_aggs[&RollupAggFn::Sum].clone().as_f64().unwrap() - 60.0).abs() < f64::EPSILON
         );
-        assert!(
-            (field_aggs[&RollupAggFn::Count].clone().as_f64().unwrap() - 3.0).abs() < f64::EPSILON
+        assert_eq!(
+            field_aggs[&RollupAggFn::Count],
+            chronix_query::AggResult::U64(3)
         );
         assert!(
             (field_aggs[&RollupAggFn::Last].clone().as_f64().unwrap() - 30.0).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn rollup_count_preserves_integers_beyond_float_precision() {
+        let mut acc = BucketAccumulator::new(0);
+        let mut stats = FieldStats::new();
+        stats.count = (1_u64 << 53) + 1;
+        acc.stats.insert("watts".into(), stats);
+        let result = acc.emit(&[RollupAggFn::Count]);
+        assert_eq!(
+            agg_result_to_field(result["watts"][&RollupAggFn::Count].clone()),
+            Some(chronix_core::FieldValue::U64((1_u64 << 53) + 1))
         );
     }
 
@@ -1609,6 +1667,10 @@ mod tests {
         let fields = BTreeMap::from([
             ("cpu_avg".to_string(), chronix_core::FieldValue::F64(25.0)),
             ("cpu_max".to_string(), chronix_core::FieldValue::F64(30.0)),
+            (
+                "cpu_count".to_string(),
+                chronix_core::FieldValue::U64(u64::MAX),
+            ),
         ]);
         let key = chronix_core::SeriesKey::new("cpu_5min", tags).unwrap();
         let p = chronix_core::Point::new(key, fields, 1000).unwrap();
@@ -1619,6 +1681,12 @@ mod tests {
         assert!(batch.schema().index_of("host").is_ok());
         assert!(batch.schema().index_of("cpu_avg").is_ok());
         assert!(batch.schema().index_of("cpu_max").is_ok());
+        let decoded = record_batch_to_points(&batch, "cpu_5min");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].field("cpu_count"),
+            Some(&chronix_core::FieldValue::U64(u64::MAX))
+        );
     }
 
     #[test]

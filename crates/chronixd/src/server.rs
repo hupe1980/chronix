@@ -167,6 +167,17 @@ pub async fn run_with(
 
     reject_unbuildable_sections(&config)?;
 
+    // Keep each socket open from port selection through serving.
+    let http_listener = tokio::net::TcpListener::bind(config.server.http_addr).await?;
+    let grpc_listener = tokio::net::TcpListener::bind(config.server.grpc_addr()).await?;
+    let flight_listener = tokio::net::TcpListener::bind(config.server.flight_addr()).await?;
+    let http_addr = http_listener.local_addr()?;
+    let grpc_addr = grpc_listener.local_addr()?;
+    let flight_addr = flight_listener.local_addr()?;
+    config.server.http_addr = http_addr;
+    config.server.grpc_addr = Some(grpc_addr);
+    config.server.flight_addr = Some(flight_addr);
+
     // Register configured connectors
     if let Some(ref kafka_cfg) = config.kafka {
         let consumer = crate::kafka::KafkaConsumer::new_arc(
@@ -482,7 +493,6 @@ pub async fn run_with(
         extension_routes,
     );
 
-    let http_addr = config.server.http_addr;
     let shutdown_timeout = std::time::Duration::from_secs(config.server.shutdown_timeout_secs);
     let tls_config_clone = config.tls.clone();
     // Every server drains on this one signal, and every server fires it when
@@ -522,7 +532,7 @@ pub async fn run_with(
                 drain_signal.await;
                 server_handle.graceful_shutdown(Some(http_drain_timeout));
             });
-            axum_server::bind_rustls(http_addr, rustls_config)
+            axum_server::from_tcp_rustls(http_listener.into_std()?, rustls_config)?
                 .handle(handle)
                 .serve(app.into_make_service())
                 .await
@@ -534,7 +544,6 @@ pub async fn run_with(
         let http_drain_timeout = shutdown_timeout;
         tokio::spawn(async move {
             let _shutdown_guard = shutdown_guard;
-            let listener = tokio::net::TcpListener::bind(http_addr).await?;
             info!(%http_addr, "HTTP server listening");
             // `axum::serve`'s graceful shutdown waits for every open connection
             // without a deadline, and `/api/v1/cdc/stream` and the annotations SSE
@@ -542,7 +551,7 @@ pub async fn run_with(
             // open for ever. This path carries `shutdown_timeout` like TLS, gRPC and
             // Flight SQL do.
             tokio::select! {
-                res = axum::serve(listener, app).with_graceful_shutdown(drain_signal) => res,
+                res = axum::serve(http_listener, app).with_graceful_shutdown(drain_signal) => res,
                 () = async {
                     drain_deadline.await;
                     tokio::time::sleep(http_drain_timeout).await;
@@ -558,7 +567,6 @@ pub async fn run_with(
     };
 
     // ── gRPC server (tonic) ────────────────────────────────────────────
-    let grpc_addr = config.server.grpc_addr();
     let grpc_service = ChronixGrpcService::with_streaming_config(
         db.clone(),
         start_time,
@@ -648,16 +656,13 @@ pub async fn run_with(
             // Manual TLS with hot-reloadable cert resolver.
             // TLS handshakes are spawned concurrently so a slow client
             // does not block accepting new connections.
-            let listener = tokio::net::TcpListener::bind(grpc_addr)
-                .await
-                .map_err(std::io::Error::other)?;
             let (tx, rx) = tokio::sync::mpsc::channel::<
                 Result<crate::tls::GrpcTlsStream, std::io::Error>,
             >(128);
 
             tokio::spawn(async move {
                 loop {
-                    match listener.accept().await {
+                    match grpc_listener.accept().await {
                         Ok((tcp, addr)) => {
                             let acc = acceptor.clone();
                             let tx = tx.clone();
@@ -701,9 +706,11 @@ pub async fn run_with(
                 }
             }
         } else {
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(grpc_listener).with_nodelay(Some(true));
             let drain_deadline = shutdown.wait();
             tokio::select! {
-                res = router.serve_with_shutdown(grpc_addr, shutdown.wait()) => {
+                res = router.serve_with_incoming_shutdown(incoming, shutdown.wait()) => {
                     res.map_err(std::io::Error::other)
                 }
                 _ = async {
@@ -718,7 +725,6 @@ pub async fn run_with(
     });
 
     // ── Flight SQL server ──────────────────────────────────────────────
-    let flight_addr = config.server.flight_addr();
     let flight_drain_timeout = shutdown_timeout;
     let flight_service = ChronixFlightSqlService::new(db.clone())
         .with_multi_tenancy(config.server.multi_tenancy)
@@ -766,16 +772,13 @@ pub async fn run_with(
 
         if let Some(acceptor) = grpc_tls_acceptor {
             // Manual TLS with hot-reloadable cert resolver.
-            let listener = tokio::net::TcpListener::bind(flight_addr)
-                .await
-                .map_err(std::io::Error::other)?;
             let (tx, rx) = tokio::sync::mpsc::channel::<
                 Result<crate::tls::GrpcTlsStream, std::io::Error>,
             >(128);
 
             tokio::spawn(async move {
                 loop {
-                    match listener.accept().await {
+                    match flight_listener.accept().await {
                         Ok((tcp, addr)) => {
                             let acc = acceptor.clone();
                             let tx = tx.clone();
@@ -819,9 +822,11 @@ pub async fn run_with(
                 }
             }
         } else {
+            let incoming = tonic::transport::server::TcpIncoming::from(flight_listener)
+                .with_nodelay(Some(true));
             let drain_deadline = shutdown.wait();
             tokio::select! {
-                res = router.serve_with_shutdown(flight_addr, shutdown.wait()) => {
+                res = router.serve_with_incoming_shutdown(incoming, shutdown.wait()) => {
                     res.map_err(std::io::Error::other)
                 }
                 _ = async {

@@ -99,6 +99,12 @@ impl super::Chronix {
     /// As [`insert_batch`](Self::insert_batch).
     #[must_use = "backfill errors indicate data loss"]
     pub fn backfill(&self, points: &[Point]) -> Result<InsertResult> {
+        let _writer = self.rollup_pass.read();
+        self.backfill_in_pass(points)
+    }
+
+    /// The caller holds the rollup gate for a correction or materialisation.
+    pub(super) fn backfill_in_pass(&self, points: &[Point]) -> Result<InsertResult> {
         self.write_batch(points, false)
     }
 
@@ -586,8 +592,7 @@ impl super::Chronix {
         if changed.is_empty() {
             return;
         }
-        let states = self.snapshot_rollup_states(&changed);
-        if let Err(e) = self.persist_rollup_states(&states) {
+        if let Err(e) = self.persist_rollup_states(&changed) {
             warn!(error = %e, "could not persist rollup invalidations");
         } else {
             counter!("chronix_rollup_invalidations_total").increment(changed.len() as u64);

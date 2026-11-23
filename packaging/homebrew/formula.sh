@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render the Homebrew formula for a release from the archives' .sha256 files.
 #
-#   packaging/homebrew/formula.sh 0.9.0 dist/ > Formula/chronixd.rb
+#   packaging/homebrew/formula.sh "$VERSION" dist/ > Formula/chronixd.rb
 set -euo pipefail
 version="${1:?usage: formula.sh <version> <dir with chronixd-*.tar.gz.sha256>}"
 dir="${2:?usage: formula.sh <version> <dir with chronixd-*.tar.gz.sha256>}"

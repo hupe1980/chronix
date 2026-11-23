@@ -10,8 +10,7 @@ eyebrow = "Embedded time-series database · Rust"
 tagline = "The time-series database you add with Cargo."
 lede = """
 Chronix runs **inside your binary** — on a 512 MB gateway or behind Grafana — and
-forecasts, detects anomalies and keeps exact decimals **in the engine**, not in a
-service beside it.
+stores exact decimals, forecasts demand and detects anomalies.
 """
 
 # Zola highlights Markdown, not Tera, so code lives here and the template
@@ -28,12 +27,7 @@ let key = SeriesKey::new("power", tags! { "meter" => "main" })?;
 db.insert(&Point::new(key, fields! { "watts" => 231.45 }, t)?)?;
 
 // PromQL, in-process. No server.
-let rate = db.promql("rate(power_watts[5m])", t)?;
-
-// 1 440 points ahead; the model is picked by cross-validation.
-let day = 86_400_000_000_000;
-let next = db.auto_forecast("power", "watts", &[("meter", "main")],
-                            t - 30 * day, t, 1_440, None)?;
+let power = db.promql("power_watts", t)?;
 ```
 """
 
@@ -45,7 +39,7 @@ curl localhost:8086/write \\
 
 # PromQL: what Grafana's Prometheus data source sends
 curl localhost:8086/api/v1/query \\
-  --data-urlencode 'query=rate(power_watts[5m])'
+  --data-urlencode 'query=power_watts'
 
 # SQL: forecasting is an aggregate
 curl localhost:8086/api/v1/chronix/sql \\
@@ -60,7 +54,7 @@ curl localhost:8086/api/v1/chronix/sql \\
 title = "In your binary"
 stat = "under 25 MiB"
 stat_note = "peak heap for an hour of gateway ingest and rollups"
-body = "A Cargo dependency, not a deployment: a file-locked directory, a crash-safe WAL and one maintenance thread that flushes, compacts, rolls up and enforces retention. No daemon to start."
+body = "Store readings in a local directory with a crash-safe WAL. Background maintenance builds rollups and enforces retention."
 href = "@/guides/run-on-a-gateway.md"
 more = "Run it on a gateway"
 

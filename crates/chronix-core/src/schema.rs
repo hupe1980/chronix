@@ -358,7 +358,7 @@ impl MeasurementSchema {
     /// with an existing field column.
     #[must_use]
     pub fn add_tag(&mut self, name: &str) -> bool {
-        if let Some(existing) = self.columns.iter().find(|c| c.name == name) {
+        if let Some(existing) = self.column(name) {
             if existing.role != ColumnRole::Tag {
                 // Reject writes with conflicting roles
                 // instead of silently ignoring them.
@@ -491,7 +491,7 @@ impl MeasurementSchema {
         name: &str,
         column_type: ColumnType,
     ) -> Result<bool, SchemaError> {
-        if let Some(existing) = self.columns.iter().find(|c| c.name == name) {
+        if let Some(existing) = self.column(name) {
             if existing.role != ColumnRole::for_field_name(name) {
                 return Err(SchemaError::TypeConflict {
                     measurement: self.measurement.clone(),

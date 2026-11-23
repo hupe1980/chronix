@@ -53,7 +53,7 @@ fn write_hourly(db: &Chronix, from: i64, hours: i64) {
 }
 
 /// Every `(bucket_start, count)` a materialised tier holds.
-fn buckets(db: &Chronix, measurement: &str) -> Vec<(i64, i64)> {
+fn buckets(db: &Chronix, measurement: &str) -> Vec<(i64, u64)> {
     let plan = db
         .query()
         .measurement(measurement)
@@ -75,12 +75,11 @@ fn buckets(db: &Chronix, measurement: &str) -> Vec<(i64, i64)> {
         .column_by_name("v_count")
         .expect("the count column")
         .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .expect("aggregates are Float64")
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .expect("rollup counts are UInt64")
         .clone();
-    #[allow(clippy::cast_possible_truncation)]
-    let mut out: Vec<(i64, i64)> = (0..batch.num_rows())
-        .map(|i| (times.value(i), counts.value(i) as i64))
+    let mut out: Vec<(i64, u64)> = (0..batch.num_rows())
+        .map(|i| (times.value(i), counts.value(i)))
         .collect();
     out.sort_unstable();
     out

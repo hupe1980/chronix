@@ -1101,11 +1101,7 @@ impl Default for DatabaseConfig {
 }
 
 impl ServerConfig {
-    /// Validate that HTTP, gRPC, and Flight SQL ports are distinct.
-    ///
-    /// Returns an error if any two server endpoints are configured to
-    /// bind to the same `(ip, port)` pair, which would cause a startup
-    /// failure with an opaque "address already in use" error.
+    /// Reject duplicate fixed addresses. Port zero asks the OS to assign a port.
     ///
     /// # Errors
     ///
@@ -1114,17 +1110,17 @@ impl ServerConfig {
         let http = self.server.http_addr;
         let grpc = self.server.grpc_addr();
         let flight = self.server.flight_addr();
-        if http == grpc {
+        if http.port() != 0 && http == grpc {
             return Err(ServerConfigError::Invalid(format!(
                 "HTTP and gRPC addresses must be distinct, both set to {http}",
             )));
         }
-        if http == flight {
+        if http.port() != 0 && http == flight {
             return Err(ServerConfigError::Invalid(format!(
                 "HTTP and Flight SQL addresses must be distinct, both set to {http}",
             )));
         }
-        if grpc == flight {
+        if grpc.port() != 0 && grpc == flight {
             return Err(ServerConfigError::Invalid(format!(
                 "gRPC and Flight SQL addresses must be distinct, both set to {grpc}",
             )));

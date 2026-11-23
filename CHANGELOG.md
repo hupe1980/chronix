@@ -3,6 +3,27 @@
 Notable changes to Chronix, in [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 format. Before 1.0 a breaking change bumps the minor version and a fix the patch.
 
+## [0.10.0] - 2026-11-23
+
+- **Breaking:** declared rollups store and return `<field>_count`
+  as `UInt64`. Use an unsigned integer Arrow array when reading counts. Start
+  with fresh targets for this schema. Export any history held only by an old
+  float-count tier before rebuilding from the raw observations.
+- Embedded rollup ranges select bucket starts inclusively. A read ending at
+  the bucket start includes every available observation in that bucket.
+  Empty reads expose the rollup columns when the source schema is known.
+- `Chronix::ensure_rollup` creates a missing tier and accepts an equivalent
+  declaration on restart. A conflicting definition reports the differing
+  properties and preserves the original tier and watermark.
+- Corrective backfills and deletes coordinate with materialisation so a
+  correction crossing the watermark is included in the next repair.
+  A failed catalog fsync rolls back the unacknowledged declaration.
+- Calendar buckets with a local origin inside a repeated clock hour keep
+  the same bucket start on both occurrences after the boundary. Bucket
+  arithmetic also handles the first and last representable nanoseconds.
+- HTTP, gRPC and Flight SQL accept independent port-zero binds. The
+  `chronixd started` log record includes each assigned address.
+
 ## [0.9.0] - 2026-11-20
 
 **The calendar under a detector.** A season's slot is the wall-clock position, so a

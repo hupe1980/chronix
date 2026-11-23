@@ -108,6 +108,8 @@ pub enum AggResult {
     Null,
     /// A floating-point result.
     F64(f64),
+    /// An exact unsigned integer result.
+    U64(u64),
     /// An exact decimal result: `mantissa × 10⁻ˢᶜᵃˡᵉ`.
     Decimal {
         /// The unscaled result.
@@ -127,7 +129,7 @@ pub enum AggResult {
 impl AggResult {
     /// The result as an `f64`, for the callers that only deal in floats.
     ///
-    /// Lossy for a decimal, by definition — see
+    /// Decimal values and large integers can lose precision here. See
     /// [`extract_f64`](crate::extract_f64) for where that is and is not the
     /// right thing to do.
     #[must_use]
@@ -136,6 +138,7 @@ impl AggResult {
         match self {
             Self::Null => None,
             Self::F64(v) => Some(v),
+            Self::U64(v) => Some(v as f64),
             Self::Decimal { mantissa, scale } => {
                 Some(mantissa as f64 / chronix_core::pow10(u32::from(scale)).unwrap_or(1) as f64)
             }
@@ -153,11 +156,22 @@ impl AggResult {
 /// accumulator, and two functions that must agree on an output type are one
 /// function.
 ///
-/// The Arrow type follows the results: a decimal aggregate produces a
-/// `Decimal128` column, everything else a `Float64` one. A run of results
-/// is homogeneous by construction — they come from one accumulator over one
-/// input column — so the first non-null one decides.
+/// The Arrow type follows the homogeneous aggregate results. An all-null
+/// column defaults to `Float64`.
 pub fn agg_result_column(name: &str, results: &[AggResult]) -> Result<(Field, ArrayRef)> {
+    if matches!(
+        results.iter().find(|r| !matches!(r, AggResult::Null)),
+        Some(AggResult::U64(_))
+    ) {
+        let values: UInt64Array = results
+            .iter()
+            .map(|r| match r {
+                AggResult::U64(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        return Ok((Field::new(name, DataType::UInt64, true), Arc::new(values)));
+    }
     // A histogram aggregate produces a histogram column, encoded the way the
     // storage layer encodes one — so a rollup tier's target holds the same
     // thing its source did, rather than a number derived from it.
@@ -1892,6 +1906,16 @@ mod tests {
                 scale: 8
             }
         );
+    }
+
+    #[test]
+    fn unsigned_results_keep_nulls_and_all_64_bits() {
+        let (field, column) =
+            agg_result_column("n", &[AggResult::Null, AggResult::U64(u64::MAX)]).unwrap();
+        assert_eq!(field.data_type(), &DataType::UInt64);
+        let values = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert!(values.is_null(0));
+        assert_eq!(values.value(1), u64::MAX);
     }
 
     #[test]

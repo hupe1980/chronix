@@ -24,9 +24,11 @@ The `Chronix` struct and its methods are organized into focused submodules:
 | `stream.rs`       | `execute_iter` — time-disjoint bucketing for bounded-memory scans |
 | `delete.rs`       | `drop_measurement`, tombstones, hard delete           |
 | `lifecycle.rs`    | `flush`, `close`, `compact`, GC, retention enforcement |
-| `rollup.rs`       | Rollup definitions, materialisation, the real-time view |
+| `rollup.rs`       | `ensure_rollup`, `create_rollup`, `materialise_rollups`, `rollup` and `rollup_where` |
 | `backup.rs`       | Checkpoint and restore                                 |
 | `analytics_api.rs`| Anomaly detection, forecast API surface               |
+
+For an embedded startup example and the bucket and Arrow result contracts, see [Rollups and retention](@/guides/rollups-and-retention.md#declare-a-tier-at-startup).
 
 ### Lifecycle
 

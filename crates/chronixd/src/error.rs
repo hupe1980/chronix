@@ -522,7 +522,7 @@ fn classify_db(err: &chronix::DbError) -> Outcome {
         E::NotFound { .. } => {
             Outcome::new(StatusCode::NOT_FOUND, "NOT_FOUND", tonic::Code::NotFound)
         }
-        E::Conflict { .. } => {
+        E::Conflict { .. } | E::RollupDefinitionConflict { .. } => {
             Outcome::new(StatusCode::CONFLICT, "CONFLICT", tonic::Code::AlreadyExists)
         }
         E::InvalidRequest(_) => Outcome::new(

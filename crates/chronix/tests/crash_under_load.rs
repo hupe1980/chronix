@@ -191,7 +191,7 @@ fn a_crash_under_load_loses_nothing_acknowledged_and_duplicates_nothing() {
             .column_by_name("v_count")
             .unwrap()
             .as_any()
-            .downcast_ref::<arrow::array::Float64Array>()
+            .downcast_ref::<arrow::array::UInt64Array>()
             .unwrap();
         let avg = m
             .column_by_name("v_avg")
@@ -204,7 +204,11 @@ fn a_crash_under_load_loses_nothing_acknowledged_and_duplicates_nothing() {
             let bucket = ts.value(i) / MINUTE;
             let first = bucket * 60;
             let last = ((bucket + 1) * 60).min(total) - 1;
-            assert_eq!(count.value(i) as i64, last - first + 1, "bucket {bucket}");
+            assert_eq!(
+                count.value(i),
+                u64::try_from(last - first + 1).unwrap(),
+                "bucket {bucket}"
+            );
             let expect = (first + last) as f64 / 2.0;
             assert!((avg.value(i) - expect).abs() < 1e-9, "bucket {bucket}");
         }

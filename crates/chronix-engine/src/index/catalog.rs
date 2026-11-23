@@ -326,17 +326,6 @@ thread_local! {
         std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX));
 }
 
-/// Sync on **every** manifest append, so no catalog mutation is lost to a
-/// power failure.
-///
-/// A single mutation — registering a segment, updating a schema — is
-/// infrequent enough that its fsync is free. What is not free is a mutation
-/// made of *many* appends: a compaction of four segments is six, and a delete
-/// producing a hundred tombstones is a hundred. Those are batched by
-/// [`SegmentCatalog::in_one_sync`], which is where the count belongs — a
-/// global batch size would defer the appends nobody is going to sync.
-const SYNC_BATCH_SIZE: u64 = 1;
-
 // Compile-time guarantee: SegmentCatalog is safe to share across threads.
 const _: () = {
     const fn _assert_send<T: Send + Sync>() {}
@@ -1077,8 +1066,6 @@ impl SegmentCatalog {
     /// as `WalWriter::rewind_to_durable` does, and the error the caller sees
     /// matches the bytes on disk.
     fn append_manifest(&mut self, entry: &ManifestEntry) -> Result<()> {
-        self.manifest_seq += 1;
-
         // Lazily open the WAL file handle and keep it for future appends.
         if self.manifest_wal_file.is_none() {
             let wal_path = self.manifest_dir.join("manifest.wal");
@@ -1100,36 +1087,36 @@ impl SegmentCatalog {
         let crc = crc32c::crc32c(&payload);
 
         let record_len = 4 + payload.len() as u64 + 4;
+        // A standalone transition syncs every append. Only in_one_sync
+        // can batch the appends of a single logical operation.
+        let sync_now = self.defer_sync == 0;
         let written = (|| -> std::io::Result<()> {
             file.write_all(&len.to_le_bytes())?;
             file.write_all(&payload)?;
             file.write_all(&crc.to_le_bytes())?;
             // Always flush to kernel buffers so data is ordered.
-            file.flush()
+            file.flush()?;
+            if sync_now {
+                file.sync_data()?;
+            }
+            Ok(())
         })();
 
         if let Err(e) = written {
-            // The record is not whole. Truncate back to the last one that
-            // was, so the file never holds a fragment with a valid record
-            // after it. `manifest_seq` is put back too: a sequence
-            // consumed by a record that does not exist makes the catalog's
-            // version disagree with its log.
-            self.manifest_seq -= 1;
+            // A complete record that failed fsync is as uncertain as a
+            // short write. Rewind both to the last acknowledged boundary.
             self.rewind_manifest();
             return Err(e.into());
         }
+        self.manifest_seq += 1;
         self.manifest_good_len += record_len;
 
-        // Synced here unless a caller has declared that this append is one
-        // step of a larger transition (`in_one_sync`), in which case that
-        // caller's single `sync_manifest()` covers it. Data reaches the
-        // kernel either way.
-        self.pending_sync += 1;
-        if self.defer_sync == 0 && self.pending_sync >= SYNC_BATCH_SIZE {
-            file.sync_data()?;
+        if sync_now {
             self.pending_sync = 0;
             self.manifest_syncs += 1;
             metrics::counter!("chronix_catalog_fsync_total").increment(1);
+        } else {
+            self.pending_sync += 1;
         }
 
         self.changes_since_snapshot += 1;
@@ -1793,6 +1780,58 @@ mod tests {
             "a sequence consumed by a record that does not exist makes the \
              catalog's version disagree with its log"
         );
+    }
+
+    // 052-rollup-contract/SR-003
+    #[test]
+    fn a_declaration_with_a_failed_fsync_does_not_reappear_on_replay() {
+        #[derive(Debug)]
+        struct FailedSync(std::fs::File);
+
+        impl std::io::Write for FailedSync {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.flush()
+            }
+        }
+
+        impl crate::durable::DurableFile for FailedSync {
+            fn sync_data(&self) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected manifest fsync failure"))
+            }
+
+            fn sync_all(&self) -> std::io::Result<()> {
+                self.0.sync_all()
+            }
+
+            fn set_len(&self, size: u64) -> std::io::Result<()> {
+                self.0.set_len(size)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = SegmentCatalog::new(dir.path()).unwrap();
+        cat.set_declared(DeclaredKind::Rollup, "first", vec![1])
+            .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("manifest.wal"))
+            .unwrap();
+        cat.manifest_wal_file = Some(Box::new(FailedSync(file)));
+        assert!(
+            cat.set_declared(DeclaredKind::Rollup, "refused", vec![2])
+                .is_err()
+        );
+        assert_eq!(cat.manifest_seq(), 1);
+        cat.set_declared(DeclaredKind::Rollup, "third", vec![3])
+            .unwrap();
+        drop(cat);
+        let reopened = SegmentCatalog::open(dir.path()).unwrap();
+        let names: Vec<_> = reopened.rollups().map(|(name, _)| name).collect();
+        assert_eq!(names, ["first", "third"]);
     }
 
     /// A compaction is **one** fsync, whatever it retires.

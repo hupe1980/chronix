@@ -158,8 +158,8 @@ second default is written here.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `http_addr` | `SocketAddr` | `0.0.0.0:8086` | HTTP API listen address |
-| `grpc_addr` | `SocketAddr` | unset — port `8087` on `http_addr`'s host | gRPC API listen address. Leave it unset and gRPC listens wherever HTTP does, so `--bind 127.0.0.1:8086` keeps every listener on loopback; set it to put gRPC somewhere else |
-| `flight_addr` | `SocketAddr` | unset — port `8817` on `http_addr`'s host | Arrow Flight SQL listen address, with the same rule as `grpc_addr` |
+| `grpc_addr` | `SocketAddr` | unset — port `8087` on `http_addr`'s host | gRPC API listen address |
+| `flight_addr` | `SocketAddr` | unset — port `8817` on `http_addr`'s host | Arrow Flight SQL listen address |
 | `authz_policy_dir` | `Option<PathBuf>` | `None` | Directory of Cedar `.cedar` policies; absent = open mode |
 | `backup_root` | `Option<PathBuf>` | `<data_dir>/backups` | Root every admin backup/restore path is resolved inside |
 | `multi_tenancy` | `bool` | `false` | Namespace isolation on every read and write |
@@ -493,7 +493,7 @@ Loads the file, applies the environment and the flags, runs every startup
 validation, prints what it resolved to, and exits without opening the database
 or binding a port. An unknown key, a `[tracing]` section this build cannot
 honour, an `[auth]` section that authenticates nobody and two listeners on one
-address are all refused here.
+fixed address are all refused here.
 
 ## Inspecting a data directory
 

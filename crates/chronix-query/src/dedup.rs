@@ -22,7 +22,7 @@
 //! ids, so a hash collision can never merge two series.
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -68,20 +68,23 @@ fn build_union_schema(batches: &[RecordBatch]) -> Arc<Schema> {
 /// Columns present in the target but missing from the batch are filled
 /// with typed null arrays of the batch's row count. Columns in the batch
 /// but not in the target are dropped (the target schema is the authority).
-fn align_batch(batch: &RecordBatch, target: &Arc<Schema>) -> Result<RecordBatch> {
-    let cols: Vec<ArrayRef> = target
+///
+/// # Errors
+///
+/// Returns an Arrow error when a present column has an incompatible type.
+pub fn align_batch(batch: &RecordBatch, target: &Arc<Schema>) -> Result<RecordBatch> {
+    let mut columns = HashMap::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+        columns.entry(field.name()).or_insert(column);
+    }
+    let cols = target
         .fields()
         .iter()
         .map(|field| {
-            match batch.schema().index_of(field.name()) {
-                Ok(idx) => Arc::clone(batch.column(idx)),
-                Err(_) => {
-                    // Column missing — create a typed null array matching the
-                    // target field's data type so the RecordBatch constructor
-                    // accepts it.
-                    new_null_array(field.data_type(), batch.num_rows())
-                }
-            }
+            columns.get(field.name()).map_or_else(
+                || new_null_array(field.data_type(), batch.num_rows()),
+                |column| Arc::clone(column),
+            )
         })
         .collect();
 

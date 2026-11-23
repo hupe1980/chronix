@@ -14,6 +14,8 @@ const MINUTE: i64 = 60_000_000_000;
 fn open(dir: &tempfile::TempDir) -> Arc<Chronix> {
     let config = ChronixConfig::builder()
         .data_dir(dir.path())
+        // These fixtures explicitly flush and count the segments they retire.
+        .maintenance_interval(Duration::ZERO)
         .build()
         .unwrap();
     Arc::new(Chronix::open(config).unwrap())
@@ -56,6 +58,16 @@ fn f64_col(batch: &arrow::record_batch::RecordBatch, name: &str, row: usize) -> 
         .expect("column present in the rollup batch")
         .as_any()
         .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap()
+        .value(row)
+}
+
+fn u64_col(batch: &arrow::record_batch::RecordBatch, name: &str, row: usize) -> u64 {
+    batch
+        .column_by_name(name)
+        .expect("column present in the rollup batch")
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
         .unwrap()
         .value(row)
 }
@@ -136,7 +148,7 @@ fn readable_segment_is_dropped_after_rollup() {
 
     let batch = scan(&db, "raw_1m");
     assert_eq!(batch.num_rows(), 1);
-    assert_eq!(f64_col(&batch, "v_count", 0), 50.0);
+    assert_eq!(u64_col(&batch, "v_count", 0), 50);
     assert!((f64_col(&batch, "v_avg", 0) - 24.5).abs() < 1e-9);
     db.close().unwrap();
 }
@@ -153,11 +165,13 @@ fn retention_materialises_the_whole_cascade_before_dropping_raw() {
     let key = SeriesKey::new("raw", tags! { "h" => "a" }).unwrap();
     // 30 minutes of 1 s data with value = minute index, so every tier has
     // a closed-form answer.
-    for i in 0..1800i64 {
-        let v = (i / 60) as f64;
-        db.insert(&Point::new(key.clone(), fields! { "v" => v }, i * 1_000_000_000).unwrap())
-            .unwrap();
-    }
+    let points: Vec<_> = (0..1800i64)
+        .map(|i| {
+            let v = (i / 60) as f64;
+            Point::new(key.clone(), fields! { "v" => v }, i * 1_000_000_000).unwrap()
+        })
+        .collect();
+    db.insert_batch(&points).unwrap().into_complete().unwrap();
     db.flush().unwrap();
     advance_clock(&db, 10 * HOUR);
 
@@ -184,7 +198,7 @@ fn retention_materialises_the_whole_cascade_before_dropping_raw() {
         (f64_col(&m15, "v_avg_avg", 1) - 22.0).abs() < 1e-9,
         "{m15:?}"
     );
-    assert_eq!(f64_col(&m15, "v_avg_count", 0), 15.0);
+    assert_eq!(u64_col(&m15, "v_avg_count", 0), 15);
     db.close().unwrap();
 }
 
@@ -231,8 +245,8 @@ fn retention_rolls_a_bucket_up_over_every_segment_that_feeds_it() {
     let batch = scan(&db, "raw_1m");
     assert_eq!(batch.num_rows(), 1, "one bucket: {batch:?}");
     assert_eq!(
-        f64_col(&batch, "v_count", 0),
-        60.0,
+        u64_col(&batch, "v_count", 0),
+        60,
         "every point of every segment feeds the bucket"
     );
     let avg = f64_col(&batch, "v_avg", 0);

@@ -410,6 +410,7 @@ const HANDLE_SURFACE: &[&str] = &[
     "gc_tombstones",
     // rollups
     "create_rollup",
+    "ensure_rollup",
     "delete_rollup",
     "list_rollups",
     "materialise_rollups",

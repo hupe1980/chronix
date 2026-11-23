@@ -118,7 +118,7 @@ fn child(dir: &std::path::Path) -> ! {
 }
 
 /// The rollup's `(bucket_start → (sum, count))`, read through the public API.
-fn rollup_buckets(db: &Chronix) -> BTreeMap<i64, (f64, f64)> {
+fn rollup_buckets(db: &Chronix) -> BTreeMap<i64, (f64, u64)> {
     let m = db.rollup("raw_1m", i64::MIN, i64::MAX - 1).unwrap();
     let ts = m
         .column_by_name(chronix_core::TIME_COLUMN)
@@ -136,7 +136,7 @@ fn rollup_buckets(db: &Chronix) -> BTreeMap<i64, (f64, f64)> {
         .column_by_name("v_count")
         .unwrap()
         .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
+        .downcast_ref::<arrow::array::UInt64Array>()
         .unwrap();
     let mut out = BTreeMap::new();
     for i in 0..m.num_rows() {
@@ -147,14 +147,14 @@ fn rollup_buckets(db: &Chronix) -> BTreeMap<i64, (f64, f64)> {
 }
 
 /// The truth: aggregate the raw rows the same way, straight from storage.
-fn raw_buckets(db: &Chronix) -> BTreeMap<i64, (f64, f64)> {
+fn raw_buckets(db: &Chronix) -> BTreeMap<i64, (f64, u64)> {
     let plan = db
         .query()
         .measurement("raw")
         .range(i64::MIN, i64::MAX)
         .build()
         .unwrap();
-    let mut out: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    let mut out: BTreeMap<i64, (f64, u64)> = BTreeMap::new();
     for batch in db.execute_stream(&plan).unwrap() {
         let ts = batch
             .column_by_name(chronix_core::TIME_COLUMN)
@@ -172,7 +172,7 @@ fn raw_buckets(db: &Chronix) -> BTreeMap<i64, (f64, f64)> {
             let bucket = ts.value(i).div_euclid(MINUTE) * MINUTE;
             let e = out.entry(bucket).or_default();
             e.0 += v.value(i);
-            e.1 += 1.0;
+            e.1 += 1;
         }
     }
     out
@@ -228,7 +228,7 @@ fn a_crash_inside_a_repair_leaves_the_rollup_equal_to_its_source() {
             .copied()
             .unwrap_or_else(|| panic!("rollup has bucket {bucket} the raw data does not"));
         assert!(
-            (sum - raw_sum).abs() < 1e-9 && (count - raw_count).abs() < 1e-9,
+            (sum - raw_sum).abs() < 1e-9 && *count == raw_count,
             "bucket {bucket}: rollup says (sum {sum}, count {count}), raw says \
              (sum {raw_sum}, count {raw_count})"
         );

@@ -6,6 +6,42 @@ weight = 60
 
 Keep raw data for as long as you need detail, and summaries for as long as you need history. Declare rollup tiers on calendar buckets, set retention per measurement, and Chronix keeps raw data until every tier that needs it is materialised.
 
+## Declare a tier at startup
+
+Use `ensure_rollup` each time the gateway opens its database. An equivalent
+declaration keeps the existing buckets and materialisation watermark. If a
+property differs, `DbError::RollupDefinitionConflict` names the differing
+properties. Use `create_rollup` when a duplicate name should be an error.
+
+```rust
+use chronix::{RollupAggFn, RollupBuilder};
+
+let tier = RollupBuilder::new()
+    .name("qh")
+    .source("power")
+    .target("power_15m")
+    .every("15m")
+    .group_by("point")
+    .aggregation(RollupAggFn::Avg)
+    .aggregation(RollupAggFn::Count)
+    .build()?;
+db.ensure_rollup(tier)?;
+
+// t is the start of a quarter in nanoseconds since the Unix epoch.
+let quarter = db.rollup_where("qh", t, t, &[("point", "grid")])?;
+```
+
+Both endpoints select **bucket starts, inclusively**. For a quarter starting
+at 12:00, the window [12:00, 12:00] includes readings at 12:00 and 12:07.
+Readings of 0 W and 1,000 W give `watts_avg = 500.0` and `watts_count = 2`
+on either side of the watermark. A window starting at 12:01 excludes that
+quarter. An open bucket reflects the observations available at read time.
+
+Once the source schema is known, a tag with no matching observations returns
+zero rows with the rollup's typed columns. A client can look up
+`watts_count` as Arrow `UInt64` on populated and empty results. A recorded
+zero contributes one sample.
+
 ## Retention and rollups
 
 Retention drops data older than its window, where age is measured from

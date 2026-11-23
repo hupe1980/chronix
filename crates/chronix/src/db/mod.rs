@@ -307,6 +307,10 @@ pub struct DbInner {
     pub(super) segment_leases: Arc<leases::SegmentLeases>,
     /// Rollup registry for managing rollup definitions.  Level-5 ordered lock.
     pub(super) rollup_registry: Arc<RollupRegistryLock<RollupRegistry>>,
+    /// Maintenance and declaration removal are exclusive. Historical writers
+    /// share the gate so a pass cannot clear a concurrent correction or
+    /// advance its watermark past one. Acquired before catalog or registry.
+    pub(super) rollup_pass: parking_lot::RwLock<()>,
     /// Declared detectors' watermarks by source measurement, so the write
     /// path can count a point no detector will ever judge without reading
     /// the catalog. Not an ordered lock: `DashMap` shards are never held
@@ -825,6 +829,7 @@ impl Chronix {
                 tag_index: Arc::new(tag_index),
                 segment_leases: Arc::new(leases::SegmentLeases::default()),
                 rollup_registry: Arc::new(RollupRegistryLock::new(rollup_registry)),
+                rollup_pass: parking_lot::RwLock::new(()),
                 detector_marks: DashMap::new(),
                 detector_late: DashMap::new(),
                 detector_pass: parking_lot::Mutex::new(()),

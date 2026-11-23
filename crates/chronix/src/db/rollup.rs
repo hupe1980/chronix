@@ -1,15 +1,16 @@
 //! Rollup definition, materialisation and read methods for [`Chronix`].
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use metrics::counter;
 use tracing::{info, warn};
 
 use arrow::record_batch::RecordBatch;
-use chronix_core::Point;
+use chronix_core::{ColumnRole, ColumnType, MeasurementSchema, Point};
 
 use crate::error::{DbError, Result};
-use crate::rollup::RollupConfig;
+use crate::rollup::{RollupAggFn, RollupConfig};
 
 impl super::Chronix {
     /// Materialise every rollup as far as its input is final.
@@ -48,6 +49,7 @@ impl super::Chronix {
     /// skipped; retention will not drop the raw data it needs.
     pub fn materialise_rollups(&self) -> Result<usize> {
         self.ensure_writable("materialising rollups")?;
+        let _pass = self.rollup_pass.write();
         self.check_open()?;
 
         let configs: Vec<RollupConfig> = self
@@ -178,7 +180,7 @@ impl super::Chronix {
                     .chain(downstream)
                     .collect()
             };
-            self.persist_rollup_states(&self.snapshot_rollup_states(&names))?;
+            self.persist_rollup_states(&names)?;
             progressed = true;
             info!(rollup = %config.name, from, to, points = n, "rollup range recomputed");
             counter!("chronix_rollup_ranges_recomputed_total").increment(1);
@@ -210,9 +212,7 @@ impl super::Chronix {
         self.rollup_registry
             .write()
             .set_materialised_until(&config.name, to);
-        self.persist_rollup_states(
-            &self.snapshot_rollup_states(std::slice::from_ref(&config.name)),
-        )?;
+        self.persist_rollup_states(std::slice::from_ref(&config.name))?;
         if n > 0 {
             info!(rollup = %config.name, points = n, until = to, "Rollup materialised");
             counter!("chronix_rollup_points_written_total").increment(n as u64);
@@ -226,7 +226,7 @@ impl super::Chronix {
         if self.schema(&config.target_measurement).is_none() {
             return Ok(()); // nothing materialised there yet
         }
-        let outcome = self.execute_delete(&crate::delete::DeleteRequest {
+        let outcome = self.execute_delete_in_pass(&crate::delete::DeleteRequest {
             measurement: config.target_measurement.clone(),
             tag_filters: Vec::new(),
             time_start: Some(from),
@@ -242,42 +242,31 @@ impl super::Chronix {
         Ok(())
     }
 
-    /// Persist rollup state to the catalog.
-    ///
-    /// Takes the states **by value**, never the registry lock: the catalog
-    /// is lock level 1 and the registry level 5, so holding the registry
-    /// across a catalog write inverts the order the whole engine is built
-    /// on. Callers snapshot under the registry lock, release it, then call
-    /// this.
-    pub(super) fn persist_rollup_states(
-        &self,
-        states: &[(String, crate::rollup::RollupState)],
-    ) -> Result<()> {
-        if states.is_empty() {
+    /// Serialize state persistence before taking a snapshot. A delayed writer
+    /// then sees current state, even if another writer has already committed
+    /// newer invalidations or an operator has deleted the declaration.
+    pub(super) fn persist_rollup_states(&self, names: &[String]) -> Result<()> {
+        if names.is_empty() {
             return Ok(());
         }
         let mut catalog = self.catalog.write();
-        for (name, state) in states {
-            let bytes = postcard::to_stdvec(state)
+        for name in names {
+            let state = {
+                let registry = self.rollup_registry.read();
+                if registry.get(name).is_none() {
+                    continue;
+                }
+                registry.state(name)
+            };
+            let bytes = postcard::to_stdvec(&state)
                 .map_err(|e| DbError::Internal(format!("encoding rollup state: {e}")))?;
-            catalog
-                .set_declared_state(
-                    chronix_engine::index::catalog::DeclaredKind::Rollup,
-                    name,
-                    bytes,
-                )
-                .map_err(|e| DbError::Internal(format!("persisting rollup state: {e}")))?;
+            catalog.set_declared_state(
+                chronix_engine::index::catalog::DeclaredKind::Rollup,
+                name,
+                bytes,
+            )?;
         }
         Ok(())
-    }
-
-    /// Snapshot the named rollups' state, without holding the registry.
-    pub(super) fn snapshot_rollup_states(
-        &self,
-        names: &[String],
-    ) -> Vec<(String, crate::rollup::RollupState)> {
-        let reg = self.rollup_registry.read();
-        names.iter().map(|n| (n.clone(), reg.state(n))).collect()
     }
 
     /// Recompute `[start, end]` of a rollup from its source, now.
@@ -292,6 +281,7 @@ impl super::Chronix {
     /// fails.
     pub fn refresh_rollup(&self, name: &str, start: i64, end: i64) -> Result<usize> {
         self.ensure_writable("refreshing a rollup")?;
+        let _pass = self.rollup_pass.write();
         self.check_open()?;
         let config = {
             let reg = self.rollup_registry.read();
@@ -312,7 +302,7 @@ impl super::Chronix {
             from,
             to,
         );
-        self.persist_rollup_states(&self.snapshot_rollup_states(&downstream))?;
+        self.persist_rollup_states(&downstream)?;
         Ok(written)
     }
 
@@ -359,7 +349,7 @@ impl super::Chronix {
         for batch in self.execute_iter(&plan)?.without_deadline() {
             pending.extend(acc.push(&batch?));
             if pending.len() >= CHUNK {
-                written += self.backfill(&pending)?.into_complete()?;
+                written += self.backfill_in_pass(&pending)?.into_complete()?;
                 pending.clear();
                 // A backfill opens a memtable per shard it touches, so a
                 // long backlog is flushed as it goes. Counting chunks, not
@@ -394,7 +384,7 @@ impl super::Chronix {
         }
         pending.extend(acc.finish());
         if !pending.is_empty() {
-            written += self.backfill(&pending)?.into_complete()?;
+            written += self.backfill_in_pass(&pending)?.into_complete()?;
         }
         if unordered {
             return Err(DbError::Internal(format!(
@@ -405,21 +395,14 @@ impl super::Chronix {
         Ok(written)
     }
 
-    /// Read a rollup over `[start, end]` — the materialised buckets **plus**
-    /// the buckets that are not yet final, aggregated on the fly from the
-    /// source.
+    /// Read stored buckets below the watermark and aggregate newer buckets
+    /// from source observations.
     ///
-    /// A materialised rollup lags the newest write by the out-of-order
-    /// window, which is right for a three-year tier and wrong for a
-    /// dashboard of the last hour. This is the real-time view: everything
-    /// below the watermark comes from the target measurement, everything
-    /// above it is computed from the raw data in the same pass, with the
-    /// same accumulator, so the two halves cannot disagree. The live half
-    /// is bounded by the window — at most a few shards of source data.
-    ///
-    /// Returns one row per `(bucket, tag group)`, ascending by bucket, with
-    /// the target measurement's columns (`<field>_<agg>`), or an empty batch
-    /// with that schema.
+    /// Selects bucket starts in the inclusive range and aggregates all available
+    /// observations in each selected bucket, even when `end` is its start.
+    /// Returns one row per (bucket, tag group), in ascending bucket order.
+    /// Once the source schema is known, empty and populated batches have
+    /// the same timestamp, grouping tags and aggregate fields.
     ///
     /// # Errors
     ///
@@ -431,18 +414,8 @@ impl super::Chronix {
 
     /// [`rollup`](Self::rollup) restricted to the series matching `tags`.
     ///
-    /// Every key must be one of the rollup's `group_by_tags`, and anything
-    /// else is refused by name. That is not a convenience check: a rollup's
-    /// **target** measurement carries only the tags it grouped by, so a
-    /// filter on any other key would narrow the live half — read from the
-    /// source, which still has every tag — and match nothing in the
-    /// materialised half. The answer would be silently short on one side of
-    /// the watermark and whole on the other, which is the worst shape a
-    /// time-series answer can take.
-    ///
-    /// Without this the caller reads every tag group and discards all but
-    /// one. That is bounded for a handful of measurement points and is a
-    /// whole-group-set materialisation for anyone with real cardinality.
+    /// Filters apply to both stored and live buckets. Only grouping tags are
+    /// available on the stored target.
     ///
     /// # Errors
     ///
@@ -477,6 +450,11 @@ impl super::Chronix {
             }
         }
 
+        if start > end {
+            return Err(DbError::InvalidRequest(
+                "rollup range start must be at or before end".into(),
+            ));
+        }
         let mut points: Vec<Point> = Vec::new();
 
         // Materialised half: the target measurement below the watermark.
@@ -500,12 +478,26 @@ impl super::Chronix {
         }
 
         // Live half: the source above the watermark, aggregated now.
-        if end >= watermark {
-            let live_from = config.bucket.start_of(start.max(watermark));
+        let lower = start.max(watermark);
+        let containing = config.bucket.start_of(lower);
+        let live_from = if containing < lower {
+            config.bucket.next(containing)
+        } else {
+            containing
+        };
+        let last_bucket = config.bucket.start_of(end);
+        if live_from <= last_bucket {
+            // The last representable bucket has no representable successor.
+            let next = config.bucket.next(last_bucket);
+            let live_end = if next == i64::MAX && config.bucket.start_of(i64::MAX) == last_bucket {
+                i64::MAX
+            } else {
+                next.saturating_sub(1)
+            };
             let mut q = self
                 .query()
                 .measurement(&config.source_measurement)
-                .range(live_from, end);
+                .range(live_from, live_end);
             for (k, v) in tags {
                 q = q.tag(*k, *v);
             }
@@ -515,6 +507,11 @@ impl super::Chronix {
             let mut acc = crate::rollup::RollupAccumulator::new(&config);
             for batch in self.execute_iter(&plan)? {
                 points.extend(acc.push(&batch?));
+            }
+            if acc.saw_unordered_input() {
+                return Err(DbError::Internal(format!(
+                    "rollup {name}: source scan returned rows out of timestamp order"
+                )));
             }
             points.extend(acc.finish());
         }
@@ -527,16 +524,50 @@ impl super::Chronix {
                     .cmp(b.series_key().canonical_form())
             })
         });
-        crate::rollup::points_to_record_batch(&points).map_or_else(
-            || {
-                let schema = self.schema(&config.target_measurement).map_or_else(
-                    || Arc::new(arrow::datatypes::Schema::empty()),
-                    |ms| Self::measurement_to_arrow_schema(&ms, &[]),
-                );
-                Ok(RecordBatch::new_empty(schema))
-            },
-            Ok,
-        )
+        let schema = self.rollup_read_schema(&config)?;
+        if points.is_empty() {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+        let batch = chronix_query::points_to_record_batch(&points)?;
+        if batch.schema_ref() == &schema {
+            return Ok(batch);
+        }
+        Ok(chronix_query::dedup::align_batch(&batch, &schema)?)
+    }
+
+    fn rollup_read_schema(&self, config: &RollupConfig) -> Result<Arc<arrow::datatypes::Schema>> {
+        let Some(source) = self.schema(&config.source_measurement) else {
+            return Ok(self.schema(&config.target_measurement).map_or_else(
+                || Arc::new(arrow::datatypes::Schema::empty()),
+                |target| Self::measurement_to_arrow_schema(&target, &[]),
+            ));
+        };
+
+        // Use the same column order as a point batch: time, sorted tags,
+        // sorted fields. A sparse group then only changes which cells are null.
+        let mut output = MeasurementSchema::new(&config.target_measurement);
+        let tags: BTreeSet<_> = config.group_by_tags.iter().map(String::as_str).collect();
+        for tag in &tags {
+            let _ = output.add_tag(tag);
+        }
+        let mut fields = BTreeMap::new();
+        for column in source.columns() {
+            if column.role != ColumnRole::Field
+                || column.name == "series_key_hash"
+                || tags.contains(column.name.as_str())
+            {
+                continue;
+            }
+            for &agg in &config.aggregations {
+                if let Some(ty) = aggregate_column_type(column.column_type, agg) {
+                    fields.insert(format!("{}_{agg}", column.name), ty);
+                }
+            }
+        }
+        for (name, ty) in fields {
+            output.declare_field(&name, ty)?;
+        }
+        Ok(Self::measurement_to_arrow_schema(&output, &[]))
     }
 
     /// Has every rollup fed by `measurement` — directly or through other
@@ -565,16 +596,40 @@ impl super::Chronix {
 
     // ── Rollup API ──────────────────────────────────────────────────
 
-    /// Register a rollup configuration.
+    /// Register a rollup under a new name.
+    ///
+    /// Use [`ensure_rollup`](Self::ensure_rollup) to apply a declaration on
+    /// every startup.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database is closed or validation fails.
+    /// Returns [`DbError::Conflict`] if the name already exists, or an error
+    /// if the database is closed, validation fails, or persistence fails.
     pub fn create_rollup(&self, config: RollupConfig) -> Result<()> {
+        self.register_rollup(config, false)
+    }
+
+    /// Ensure a named rollup exists with the requested definition.
+    ///
+    /// Call this on every startup, including before the first source write.
+    /// Equivalent declarations preserve the stored definition and its watermark.
+    /// Aggregations and grouping tags compare as sets. Bucket width, zone and
+    /// origin, source and target names, and retention must match.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::RollupDefinitionConflict`] lists each differing property.
+    /// Creation has the same validation and persistence errors as
+    /// [`create_rollup`](Self::create_rollup).
+    pub fn ensure_rollup(&self, config: RollupConfig) -> Result<()> {
+        self.register_rollup(config, true)
+    }
+
+    fn register_rollup(&self, config: RollupConfig, accept_equivalent: bool) -> Result<()> {
         self.ensure_writable("creating a rollup")?;
         self.check_open()?;
         if config.source_measurement == config.target_measurement {
-            return Err(DbError::Internal(
+            return Err(DbError::InvalidRequest(
                 "a rollup's source and target must differ".into(),
             ));
         }
@@ -590,39 +645,43 @@ impl super::Chronix {
             )?;
         }
 
-        let name = config.name.clone();
+        // Acquire the catalog (level 1) before the registry (level 5).
+        // Keep the name reserved until persistence succeeds so a concurrent
+        // startup cannot acknowledge a declaration that failed to reach disk.
+        let mut catalog = self.catalog.write();
+        let mut registry = self.rollup_registry.write();
+        if let Some(existing) = registry.get(&config.name) {
+            if !accept_equivalent {
+                return Err(DbError::Conflict {
+                    kind: "rollup",
+                    name: config.name,
+                });
+            }
+            let fields = existing.differing_fields(&config);
+            if fields.is_empty() {
+                return Ok(());
+            }
+            return Err(DbError::RollupDefinitionConflict {
+                name: config.name,
+                fields,
+            });
+        }
+        if registry.would_cycle(&config) {
+            return Err(DbError::InvalidRequest(format!(
+                "rollup {} would make {} feed itself",
+                config.name, config.source_measurement
+            )));
+        }
         let bytes = postcard::to_stdvec(&config)
             .map_err(|e| DbError::Internal(format!("encoding rollup: {e}")))?;
-        {
-            let mut registry = self.rollup_registry.write();
-            if registry.would_cycle(&config) {
-                return Err(DbError::Internal(format!(
-                    "rollup {name} would make {} feed itself",
-                    config.source_measurement
-                )));
-            }
-            registry
-                .add(config)
-                // `AlreadyExists` is the caller's answer, not a fault:
-                // declaring a tier on every start is idempotent by nature,
-                // because the registry is persisted and every run after the
-                // first meets its own rollup. Collapsing it into `Internal`
-                // made the common path a string match on a redacted 500.
-                .map_err(|e| match e {
-                    crate::rollup::RollupError::AlreadyExists(name) => {
-                        DbError::Conflict { kind: "rollup", name }
-                    }
-                    other => DbError::Internal(format!("rollup registration failed: {other}")),
-                })?;
-        }
-        self.catalog
-            .write()
-            .set_declared(
-                chronix_engine::index::catalog::DeclaredKind::Rollup,
-                &name,
-                bytes,
-            )
-            .map_err(|e| DbError::Internal(format!("rollup persistence failed: {e}")))?;
+        catalog.set_declared(
+            chronix_engine::index::catalog::DeclaredKind::Rollup,
+            &config.name,
+            bytes,
+        )?;
+        registry
+            .add(config)
+            .map_err(|e| DbError::Internal(format!("rollup registration failed: {e}")))?;
         Ok(())
     }
 
@@ -662,14 +721,108 @@ impl super::Chronix {
     /// doesn't exist.
     pub fn delete_rollup(&self, name: &str) -> Result<bool> {
         self.ensure_writable("deleting a rollup")?;
+        let _pass = self.rollup_pass.write();
         self.check_open()?;
-        let removed = self.rollup_registry.write().remove(name).is_some();
-        if removed {
-            self.catalog
-                .write()
-                .remove_declared(chronix_engine::index::catalog::DeclaredKind::Rollup, name)
-                .map_err(|e| DbError::Internal(format!("rollup persistence failed: {e}")))?;
+        let mut catalog = self.catalog.write();
+        let mut registry = self.rollup_registry.write();
+        if registry.get(name).is_none() {
+            return Ok(false);
         }
-        Ok(removed)
+        catalog.remove_declared(chronix_engine::index::catalog::DeclaredKind::Rollup, name)?;
+        Ok(registry.remove(name).is_some())
+    }
+}
+
+/// Type emitted by the rollup accumulator for an aggregatable source field.
+fn aggregate_column_type(source: ColumnType, agg: RollupAggFn) -> Option<ColumnType> {
+    use ColumnType::{Decimal, F64, Histogram, I64, U64};
+    use RollupAggFn::{Avg, Count, Max, Min};
+    match (source, agg) {
+        (F64 | I64 | U64 | Decimal { .. } | Histogram, Count) => Some(U64),
+        (F64 | I64 | U64, _) => Some(F64),
+        (Decimal { scale }, Avg) => Some(Decimal {
+            scale: scale
+                .saturating_add(chronix_query::aggregate::AVG_EXTRA_SCALE)
+                .min(chronix_core::MAX_DECIMAL_SCALE),
+        }),
+        (Decimal { .. }, _) => Some(source),
+        (Histogram, Min | Max)
+        | (ColumnType::Timestamp | ColumnType::String | ColumnType::Bool, _) => None,
+        (Histogram, _) => Some(Histogram),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+
+    #[test]
+    fn historical_correction_waiting_for_a_pass_invalidates_its_new_watermark() {
+        const HOUR: i64 = 3_600_000_000_000;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ChronixConfig::small(dir.path());
+        config.maintenance_interval = std::time::Duration::ZERO;
+        let db = Chronix::open(config).unwrap();
+        let declaration = RollupBuilder::new()
+            .name("qh")
+            .source("power")
+            .target("summary")
+            .every("15m")
+            .aggregation(RollupAggFn::Avg)
+            .build()
+            .unwrap();
+        db.ensure_rollup(declaration.clone()).unwrap();
+        let series = SeriesKey::new("power", Default::default()).unwrap();
+        let original = Point::new(series.clone(), crate::fields! {"watts" => 0.0}, 0).unwrap();
+        let correction = Point::new(series, crate::fields! {"watts" => 10.0}, 1).unwrap();
+        db.insert(&original).unwrap();
+        let pass = db.rollup_pass.write();
+        let ready = std::sync::Barrier::new(2);
+        // Hold the gate across the same scan + watermark transition used
+        // by maintenance while the corrective writer starts up.
+        std::thread::scope(|writers| {
+            let handle = writers.spawn(|| {
+                ready.wait();
+                db.backfill(&[correction]).unwrap().into_complete().unwrap();
+            });
+            ready.wait();
+            db.materialise_one(&declaration, Some(HOUR)).unwrap();
+            drop(pass);
+            handle.join().unwrap();
+        });
+        assert_eq!(
+            db.rollup_state("qh").unwrap().pending_invalidations(),
+            &[(0, HOUR / 4)]
+        );
+        db.materialise_rollups().unwrap();
+        let batch = db.rollup("qh", 0, 0).unwrap();
+        let avg = batch
+            .column_by_name("watts_avg")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(avg.value(0), 5.0);
+    }
+
+    #[test]
+    fn delayed_state_persistence_cannot_resurrect_a_dropped_rollup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Chronix::open(ChronixConfig::small(dir.path())).unwrap();
+        let config = RollupBuilder::new()
+            .name("qh")
+            .source("power")
+            .target("summary")
+            .every("15m")
+            .aggregation(RollupAggFn::Count)
+            .build()
+            .unwrap();
+        db.ensure_rollup(config).unwrap();
+        // A writer computed this list before being descheduled. Deletion
+        // lands before it gets the catalog lock to persist the invalidations.
+        let changed = vec!["qh".to_owned()];
+        db.delete_rollup("qh").unwrap();
+        db.persist_rollup_states(&changed).unwrap();
+        assert_eq!(db.catalog.read().rollups().count(), 0);
     }
 }

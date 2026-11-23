@@ -19,6 +19,7 @@ target
 /specs/
 /.specify/
 /.claude/
+/.agents/skills/speckit-*/
 
 # Feedback for sibling crates (bug reports / feature requests; always internal — sent to their teams)
 *_FEEDBACK.md

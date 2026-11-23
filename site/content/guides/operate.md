@@ -58,6 +58,17 @@ docker run --rm -v /etc/chronix:/etc/chronix:ro \
 It exits non-zero on a bad file, so it works as a deploy gate. See
 [Configuration](@/reference/configuration.md).
 
+### Let the OS assign listener ports
+
+```bash
+chronixd --bind 127.0.0.1:0 --grpc-bind 127.0.0.1:0 --flight-bind 127.0.0.1:0 --log-format json
+```
+
+The INFO record with
+`fields.message` equal to `chronixd started` contains the bound socket
+addresses in `fields.http`, `fields.grpc`, and `fields.flight_sql`.
+Use the HTTP address for the `/ready` probe.
+
 ## Monitoring
 
 ### Cardinality
@@ -133,7 +144,7 @@ on a directory another chronix version wrote.
 $ chronixd inspect /var/lib/chronix
 /var/lib/chronix  not closed cleanly · generation 2
 
-holder    pid 75279 on gw-0042 · chronix 0.9.0 · opened 3 h ago
+holder    pid 75279 on gw-0042 · chronix 0.10.0 · opened 3 h ago
 formats   catalog ✓  segment ✓  wal ✓  series ✓
 series    5 · budget 1 000 000 (default)
 wal       2 files · 1 912 records to replay (3.4 MiB) · seq 88 121–90 032

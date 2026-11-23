@@ -74,6 +74,16 @@ fn f64_col(batch: &arrow::record_batch::RecordBatch, name: &str, row: usize) -> 
         .value(row)
 }
 
+fn u64_col(batch: &arrow::record_batch::RecordBatch, name: &str, row: usize) -> u64 {
+    batch
+        .column_by_name(name)
+        .expect("column present in the rollup batch")
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .unwrap()
+        .value(row)
+}
+
 fn ts_col(batch: &arrow::record_batch::RecordBatch, row: usize) -> i64 {
     batch
         .column_by_name(chronix_core::TIME_COLUMN)
@@ -108,7 +118,7 @@ fn materialises_final_buckets_exactly_once() {
         assert_eq!(ts_col(&m1, row), (row as i64) * MINUTE, "bucket start");
         assert!((f64_col(&m1, "v_avg", row) - minute).abs() < 1e-9);
         assert_eq!(f64_col(&m1, "v_max", row), minute);
-        assert_eq!(f64_col(&m1, "v_count", row), 60.0);
+        assert_eq!(u64_col(&m1, "v_count", row), 60);
     }
 
     assert_eq!(db.materialise_rollups().unwrap(), 0, "nothing new is final");
@@ -144,7 +154,7 @@ fn a_cascade_stays_consistent_by_construction() {
             "{m15:?}"
         );
         assert_eq!(f64_col(&m15, "v_max_max", row), k + 14.0);
-        assert_eq!(f64_col(&m15, "v_count_count", row), 15.0);
+        assert_eq!(u64_col(&m15, "v_count_count", row), 15);
     }
     db.close().unwrap();
 }
@@ -310,7 +320,7 @@ fn the_rollup_view_covers_the_unmaterialised_tail() {
             (f64_col(&view, "v_avg", row) - minute).abs() < 1e-9,
             "row {row}"
         );
-        assert_eq!(f64_col(&view, "v_count", row), 60.0);
+        assert_eq!(u64_col(&view, "v_count", row), 60);
     }
 
     // A window entirely in the live tail, and one straddling the watermark.
@@ -360,7 +370,7 @@ fn a_backfill_below_the_watermark_repairs_its_buckets() {
 
     let before = scan(&db, "raw_1m");
     assert_eq!(before.num_rows(), 1, "one bucket for host b");
-    assert_eq!(f64_col(&before, "v_count", 0), 60.0);
+    assert_eq!(u64_col(&before, "v_count", 0), 60);
 
     // Host a's backlog arrives for the same minute, far below the window.
     let key = SeriesKey::new("raw", tags! { "h" => "a" }).unwrap();
@@ -374,11 +384,11 @@ fn a_backfill_below_the_watermark_repairs_its_buckets() {
     db.materialise_rollups().unwrap();
     let after = scan(&db, "raw_1m");
     assert_eq!(after.num_rows(), 2, "host a's bucket is now materialised");
-    let mut counts: Vec<f64> = (0..after.num_rows())
-        .map(|r| f64_col(&after, "v_count", r))
+    let mut counts: Vec<u64> = (0..after.num_rows())
+        .map(|r| u64_col(&after, "v_count", r))
         .collect();
-    counts.sort_by(f64::total_cmp);
-    assert_eq!(counts, vec![60.0, 60.0], "both buckets are complete");
+    counts.sort_unstable();
+    assert_eq!(counts, vec![60, 60], "both buckets are complete");
     let avgs: Vec<f64> = (0..after.num_rows())
         .map(|r| f64_col(&after, "v_avg", r))
         .collect();
@@ -441,7 +451,7 @@ fn refresh_rollup_recomputes_a_range_on_demand() {
     db.refresh_rollup("raw_1m", 0, 2 * MINUTE).unwrap();
     let again = scan(&db, "raw_1m");
     assert_eq!(again.num_rows(), 2, "recomputing is idempotent");
-    assert_eq!(f64_col(&again, "v_count", 0), 60.0);
+    assert_eq!(u64_col(&again, "v_count", 0), 60);
 
     assert!(db.refresh_rollup("nope", 0, 1).is_err());
     db.close().unwrap();
@@ -521,10 +531,10 @@ fn an_integer_field_is_rolled_up() {
 
     let batch = scan(&db, "raw_1m");
     let row = (0..batch.num_rows())
-        .find(|r| f64_col(&batch, "n_count", *r) > 0.0)
+        .find(|r| u64_col(&batch, "n_count", *r) > 0)
         .expect("the integer field produced a bucket");
     assert_eq!(f64_col(&batch, "n_avg", row), 5.0);
-    assert_eq!(f64_col(&batch, "n_count", row), 60.0);
+    assert_eq!(u64_col(&batch, "n_count", row), 60);
     db.close().unwrap();
 }
 

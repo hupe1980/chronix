@@ -346,7 +346,7 @@ impl TimeBucket {
     /// so such a boundary is not a monthly one.
     pub fn with_origin(mut self, origin: i64) -> Result<Self, BucketParseError> {
         if matches!(self.width, BucketWidth::Months(_)) {
-            let (_, _, day) = civil_from_days(self.wall_clock_ns(origin).div_euclid(DAY));
+            let (_, _, day) = civil_from_days(self.local_day_and_time(origin).0);
             if day > 28 {
                 return Err(BucketParseError(format!(
                     "a monthly bucket cannot start on day {day}: that day is missing from some months, so it is not a monthly boundary. Use 1 to 28."
@@ -392,13 +392,12 @@ impl TimeBucket {
                      '2024-01-15 06:00:00', or an RFC 3339 instant"
                 ))
             })?;
-        let civil = civil_ns(local).ok_or_else(out_of_range)?;
-        let ns = match &self.tz {
-            None => civil,
+        let offset = match &self.tz {
+            None => jiff::tz::Offset::UTC,
             Some(tz) => match tz.to_ambiguous_timestamp(local).offset() {
-                AmbiguousOffset::Unambiguous { offset } => civil - offset_ns(offset),
+                AmbiguousOffset::Unambiguous { offset } => offset,
                 // Happens twice: the earlier, as a bucket boundary does.
-                AmbiguousOffset::Fold { before, .. } => civil - offset_ns(before),
+                AmbiguousOffset::Fold { before, .. } => before,
                 AmbiguousOffset::Gap { .. } => {
                     return Err(BucketParseError(format!(
                         "the local time '{text}' does not exist in {} — \
@@ -408,6 +407,8 @@ impl TimeBucket {
                 }
             },
         };
+        let instant = offset.to_timestamp(local).map_err(|_| out_of_range())?;
+        let ns = i64::try_from(instant.as_nanosecond()).map_err(|_| out_of_range())?;
         self.with_origin(ns)
     }
 
@@ -465,7 +466,7 @@ impl TimeBucket {
     /// The start of the bucket containing `ts`.
     #[must_use]
     pub fn start_of(&self, ts: i64) -> i64 {
-        self.locate(ts).1
+        self.locate(ts, 0).1
     }
 
     /// The ordinal of the bucket containing `ts`, counted from this width's
@@ -479,11 +480,12 @@ impl TimeBucket {
     /// year.
     #[must_use]
     pub fn index_of(&self, ts: i64) -> i64 {
-        self.locate(ts).0
+        self.locate(ts, 0).0
     }
 
-    /// `(ordinal, start)` of the bucket containing `ts`.
-    fn locate(&self, ts: i64) -> (i64, i64) {
+    /// Locate a bucket relative to the one containing `ts`. Advance the
+    /// ordinal before clipping the boundary to the representable timeline.
+    fn locate(&self, ts: i64, ahead: i64) -> (i64, i64) {
         match self.width {
             BucketWidth::Fixed(n) => {
                 let n = i128::from(n.max(1));
@@ -496,34 +498,37 @@ impl TimeBucket {
                 // land at half past UTC — the local clock's hour.
                 let anchor = self.origin.unwrap_or_else(|| -self.standard_offset_ns(ts));
                 let since = i128::from(ts) - i128::from(anchor);
-                let start = i128::from(ts) - since.rem_euclid(n);
-                (clamp_i64(since.div_euclid(n)), clamp_i64(start))
+                let ordinal = since.div_euclid(n) + i128::from(ahead);
+                (
+                    clamp_i64(ordinal),
+                    clamp_i64(i128::from(anchor) + ordinal * n),
+                )
             }
             BucketWidth::Days(n) => {
                 let n = i64::from(n.max(1));
                 let (anchor_day, tod) = self.day_phase();
                 // An instant earlier in the day than the boundary belongs to
                 // the bucket that opened the previous day.
-                let day = self.wall_clock_ns(ts).saturating_sub(tod).div_euclid(DAY);
-                let ordinal = (day - anchor_day).div_euclid(n);
+                let (day, time) = self.local_day_and_time(ts);
+                // A repeated 02:15 can follow the first 02:30. A boundary
+                // is the earlier instant when the local clock repeats.
+                let day = day - i64::from(time < tod && ts < self.instant_at(day, tod));
+                let ordinal = (day - anchor_day).div_euclid(n) + ahead;
                 let start_day = ordinal * n + anchor_day;
-                (
-                    ordinal,
-                    self.instant_at(start_day.saturating_mul(DAY).saturating_add(tod)),
-                )
+                (ordinal, self.instant_at(start_day, tod))
             }
             BucketWidth::Months(n) => {
                 let n = i64::from(n.max(1));
                 let (anchor_month, dom, tod) = self.month_phase();
-                let local = self.wall_clock_ns(ts);
-                let (y, m, d) = civil_from_days(local.div_euclid(DAY));
+                let (day, time) = self.local_day_and_time(ts);
+                let (y, m, d) = civil_from_days(day);
                 let mut months = (y - 1970) * 12 + i64::from(m - 1);
                 // Before this month's boundary day (or at it but earlier in
                 // the day) is still the previous month's bucket.
-                if d < dom || (d == dom && local.rem_euclid(DAY) < tod) {
+                if d < dom || (d == dom && time < tod && ts < self.instant_at(day, tod)) {
                     months -= 1;
                 }
-                let ordinal = (months - anchor_month).div_euclid(n);
+                let ordinal = (months - anchor_month).div_euclid(n) + ahead;
                 let start = self.month_boundary(ordinal * n + anchor_month, dom, tod);
                 (ordinal, start)
             }
@@ -538,24 +543,12 @@ impl TimeBucket {
     /// that has assumed the calendar away.
     #[must_use]
     pub fn next(&self, bucket_start: i64) -> i64 {
-        match self.width {
-            BucketWidth::Fixed(n) => bucket_start.saturating_add(n.max(1)),
-            BucketWidth::Days(n) => {
-                let (_, tod) = self.day_phase();
-                let day = self
-                    .wall_clock_ns(bucket_start)
-                    .saturating_sub(tod)
-                    .div_euclid(DAY);
-                let next = day.saturating_add(i64::from(n.max(1)));
-                self.instant_at(next.saturating_mul(DAY).saturating_add(tod))
-            }
-            BucketWidth::Months(n) => {
-                let (_, dom, tod) = self.month_phase();
-                let (y, m, _) = civil_from_days(self.wall_clock_ns(bucket_start).div_euclid(DAY));
-                let months = (y - 1970) * 12 + i64::from(m - 1);
-                self.month_boundary(months.saturating_add(i64::from(n.max(1))), dom, tod)
-            }
+        if let BucketWidth::Fixed(n) = self.width
+            && bucket_start != i64::MIN
+        {
+            return bucket_start.saturating_add(n.max(1));
         }
+        self.locate(bucket_start, 1).1
     }
 
     /// The wall clock at `ts` in this bucket's zone, as nanoseconds since
@@ -566,30 +559,47 @@ impl TimeBucket {
     /// slot is measured in.
     #[must_use]
     pub fn wall_clock_ns(&self, ts: i64) -> i64 {
-        match &self.tz {
-            None => ts,
-            Some(tz) => ts.saturating_add(offset_ns(tz.to_offset(timestamp(ts)))),
-        }
+        ts.saturating_add(self.local_offset_ns(ts))
     }
 
-    /// The instant the wall clock reads `civil`.
+    fn local_offset_ns(&self, ts: i64) -> i64 {
+        self.tz
+            .as_ref()
+            .map_or(0, |tz| offset_ns(tz.to_offset(timestamp(ts))))
+    }
+
+    // Apply the offset to the time of day so a local civil time just outside
+    // the timestamp range can still resolve to its correct UTC boundary.
+    fn local_day_and_time(&self, ts: i64) -> (i64, i64) {
+        let time = ts.rem_euclid(DAY) + self.local_offset_ns(ts);
+        (
+            ts.div_euclid(DAY) + time.div_euclid(DAY),
+            time.rem_euclid(DAY),
+        )
+    }
+
+    /// The instant the wall clock reaches `tod` on `day`.
     ///
     /// A time that happens twice (autumn fall-back) is its earlier instant,
     /// which is what a boundary means. A time that does not happen (spring
     /// forward — at midnight in America/Santiago and Asia/Beirut) is the
     /// instant the clock resumed.
-    fn instant_at(&self, civil: i64) -> i64 {
-        let Some(tz) = &self.tz else { return civil };
-        let Some(dt) = civil_datetime(civil) else {
-            return civil;
+    fn instant_at(&self, day: i64, tod: i64) -> i64 {
+        let civil = i128::from(day) * i128::from(DAY) + i128::from(tod);
+        let Some(tz) = &self.tz else {
+            return clamp_i64(civil);
         };
+        let Some(dt) = civil_datetime(day, tod) else {
+            return clamp_i64(civil);
+        };
+        let instant = |offset| clamp_i64(civil - i128::from(offset_ns(offset)));
         match tz.to_ambiguous_timestamp(dt).offset() {
-            AmbiguousOffset::Unambiguous { offset } => civil - offset_ns(offset),
-            AmbiguousOffset::Fold { before, .. } => civil - offset_ns(before),
+            AmbiguousOffset::Unambiguous { offset } => instant(offset),
+            AmbiguousOffset::Fold { before, .. } => instant(before),
             AmbiguousOffset::Gap { before, .. } => {
                 // `civil - before` lies inside the gap's instants, so the
                 // transition just before it is the instant the clock resumed.
-                let inside = civil - offset_ns(before);
+                let inside = instant(before);
                 tz.preceding(timestamp(inside.saturating_add(1)))
                     .next()
                     .map_or(inside, |t| clamp_i64(t.timestamp().as_nanosecond()))
@@ -605,7 +615,7 @@ impl TimeBucket {
             months.rem_euclid(12) as u32 + 1,
             dom,
         );
-        self.instant_at(day.saturating_mul(DAY).saturating_add(tod))
+        self.instant_at(day, tod)
     }
 
     /// The day anchor and the local time of day boundaries fall on.
@@ -615,10 +625,7 @@ impl TimeBucket {
     /// be.
     fn day_phase(&self) -> (i64, i64) {
         match self.origin {
-            Some(o) => {
-                let local = self.wall_clock_ns(o);
-                (local.div_euclid(DAY), local.rem_euclid(DAY))
-            }
+            Some(o) => self.local_day_and_time(o),
             None => (DAY_ANCHOR, 0),
         }
     }
@@ -632,13 +639,9 @@ impl TimeBucket {
     fn month_phase(&self) -> (i64, u32, i64) {
         match self.origin {
             Some(o) => {
-                let local = self.wall_clock_ns(o);
-                let (y, m, d) = civil_from_days(local.div_euclid(DAY));
-                (
-                    (y - 1970) * 12 + i64::from(m - 1),
-                    d.min(28),
-                    local.rem_euclid(DAY),
-                )
+                let (day, time) = self.local_day_and_time(o);
+                let (y, m, d) = civil_from_days(day);
+                ((y - 1970) * 12 + i64::from(m - 1), d.min(28), time)
             }
             None => (0, 1, 0),
         }
@@ -684,10 +687,9 @@ fn clamp_i64(v: i128) -> i64 {
     i64::try_from(v).unwrap_or(if v < 0 { i64::MIN } else { i64::MAX })
 }
 
-/// Civil nanoseconds → a jiff civil date-time, for the zone lookups.
-fn civil_datetime(civil: i64) -> Option<jiff::civil::DateTime> {
-    let (y, m, d) = civil_from_days(civil.div_euclid(DAY));
-    let tod = civil.rem_euclid(DAY);
+/// Civil day and time of day → a jiff civil date-time, for zone lookups.
+fn civil_datetime(day: i64, tod: i64) -> Option<jiff::civil::DateTime> {
+    let (y, m, d) = civil_from_days(day);
     jiff::civil::DateTime::new(
         i16::try_from(y).ok()?,
         i8::try_from(m).ok()?,
@@ -698,21 +700,6 @@ fn civil_datetime(civil: i64) -> Option<jiff::civil::DateTime> {
         i32::try_from(tod % SEC).ok()?,
     )
     .ok()
-}
-
-/// A jiff civil date-time → civil nanoseconds; `None` outside `i64`.
-fn civil_ns(dt: jiff::civil::DateTime) -> Option<i64> {
-    let days = days_from_civil(
-        i64::from(dt.year()),
-        u32::try_from(dt.month()).ok()?,
-        u32::try_from(dt.day()).ok()?,
-    );
-    let t = dt.time();
-    let tod = i64::from(t.hour()) * HOUR
-        + i64::from(t.minute()) * MIN
-        + i64::from(t.second()) * SEC
-        + i64::from(t.subsec_nanosecond());
-    days.checked_mul(DAY)?.checked_add(tod)
 }
 
 /// Days from 1970-01-01 to the proleptic Gregorian date `y-m-d`.
@@ -1177,6 +1164,46 @@ mod tests {
         let start = b.start_of(ts("2024-03-15T12:00:00Z"));
         assert_eq!(start, ts("2024-03-11T00:00:00Z"));
         assert_eq!(weekday(start), jiff::civil::Weekday::Monday);
+    }
+
+    #[test]
+    fn an_anchored_calendar_bucket_stays_open_when_the_clock_repeats() {
+        for width in ["1d", "1mo"] {
+            let bucket = TimeBucket::parse(width, Some("Europe/Berlin"))
+                .unwrap()
+                .with_origin_str("2020-01-25T02:30:00")
+                .unwrap();
+            let first_0230 = ts("2026-10-25T00:30:00Z");
+            assert_eq!(bucket.start_of(first_0230), first_0230);
+            assert_eq!(bucket.start_of(ts("2026-10-25T01:15:00Z")), first_0230);
+        }
+    }
+
+    #[test]
+    fn buckets_tile_the_first_and_last_representable_instants() {
+        for width in ["15m", "1w", "3mo"] {
+            for zone in [None, Some("Europe/Berlin"), Some("America/New_York")] {
+                let bucket = TimeBucket::parse(width, zone).unwrap();
+                let first = bucket.start_of(i64::MIN);
+                assert_eq!(first, i64::MIN, "{width} {zone:?}");
+                let second = bucket.next(first);
+                assert_eq!(bucket.start_of(second - 1), first, "{width} {zone:?}");
+                assert_eq!(bucket.start_of(second), second, "{width} {zone:?}");
+                assert_eq!(
+                    bucket.next(bucket.start_of(i64::MAX)),
+                    i64::MAX,
+                    "{width} {zone:?}"
+                );
+            }
+        }
+        // MAX is 2262-04-11 23:47 UTC, already April 12 in Berlin.
+        let day = TimeBucket::parse("1d", Some("Europe/Berlin")).unwrap();
+        assert_eq!(day.start_of(i64::MAX), ts("2262-04-11T22:00:00Z"));
+        assert!(day.clone().with_origin_str("1677-09-21T00:13:00").is_err());
+        assert_eq!(
+            day.with_origin_str("2262-04-12T00:00:00").unwrap().origin(),
+            Some(ts("2262-04-11T22:00:00Z"))
+        );
     }
 
     /// Every bucket is half-open and they tile the line with no gap and no

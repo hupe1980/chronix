@@ -59,19 +59,25 @@ and give every page a one-sentence `description`. Pages describe current behavio
 |---|---|
 | `chronix` and its seven library crates | crates.io |
 | `chronixd` | crates.io, and prebuilt binaries on GitHub Releases |
+| `chronix-client` Python SDK | PyPI |
+| `chronixd` Homebrew formula | `hupe1980/tap` |
 | `chronix-meta`, `chronix-cluster`, `chronix-dsim`, `chronixd-cluster` | not published (frozen cluster tier) |
 
 All crates share one version. Before 1.0 a breaking change bumps the minor and a fix the patch.
-The on-disk formats are frozen from 0.8: no release changes a data directory.
+The catalog, WAL and segment formats are frozen from 0.8. Document changes to
+public or persisted measurement schemas in the changelog.
 
 ```bash
 # [workspace.package] version, and the version of every chronix* entry in
 # [workspace.dependencies] — cargo publish refuses a mismatch.
 $EDITOR Cargo.toml
 cargo update --workspace
-git commit -am "Release 0.9.0"
-git tag -a v0.9.0 -m "chronix 0.9.0"
-git push origin v0.9.0
+version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "chronix") | .version')
+git commit -am "Release $version"
+git push origin main
+# Once CI passes for this commit:
+git tag -a "v$version" -m "chronix $version"
+git push origin "v$version"
 ```
 
 `.github/workflows/release.yml` checks the tag against the manifest, waits for CI on that

@@ -44,6 +44,10 @@ planted anomalies — on `127.0.0.1:8086`, and prints queries to paste and the c
 - **It runs inside your binary.** A file-locked directory, a crash-safe WAL and one
   maintenance thread that flushes, compacts, rolls up and enforces retention. The gateway
   preset peaks **under 25 MiB** of heap for an hour of ingest and rollups.
+- **Read a whole quarter with one timestamp.** Declare a tier at startup with
+  `ensure_rollup`, then read a bucket by its start. Live and stored buckets have
+  the same boundaries, typed empty results and integer sample counts.
+  [Rollups and retention](https://hupe1980.github.io/chronix/guides/rollups-and-retention/).
 - **Analytics are in the engine.** Forecasting with the model picked by cross-validation,
   anomaly detection, and detectors you declare once and the store keeps — callable from Rust,
   SQL and the server. Estimates are checked against statsmodels and scipy.

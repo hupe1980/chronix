@@ -32,7 +32,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 authors = ["hupe1980"]
 license = "MIT OR Apache-2.0"
@@ -44,17 +44,17 @@ rust-version = "1.94"
 [workspace.dependencies]
 # Internal crates. `cargo publish` needs the `version`; members inherit these with
 # `chronix-core.workspace = true`.
-chronix = { path = "crates/chronix", version = "0.9.0" }
-chronix-core = { path = "crates/chronix-core", version = "0.9.0" }
-chronix-engine = { path = "crates/chronix-engine", version = "0.9.0" }
-chronix-security = { path = "crates/chronix-security", version = "0.9.0" }
-chronix-streaming = { path = "crates/chronix-streaming", version = "0.9.0" }
-chronix-encoding = { path = "crates/chronix-encoding", version = "0.9.0" }
-chronix-query = { path = "crates/chronix-query", version = "0.9.0" }
-chronix-analytics = { path = "crates/chronix-analytics", version = "0.9.0" }
+chronix = { path = "crates/chronix", version = "0.10.0" }
+chronix-core = { path = "crates/chronix-core", version = "0.10.0" }
+chronix-engine = { path = "crates/chronix-engine", version = "0.10.0" }
+chronix-security = { path = "crates/chronix-security", version = "0.10.0" }
+chronix-streaming = { path = "crates/chronix-streaming", version = "0.10.0" }
+chronix-encoding = { path = "crates/chronix-encoding", version = "0.10.0" }
+chronix-query = { path = "crates/chronix-query", version = "0.10.0" }
+chronix-analytics = { path = "crates/chronix-analytics", version = "0.10.0" }
 # Frozen and not published, so a path-only dependency is enough.
 chronix-meta = { path = "crates/chronix-meta" }
-chronixd = { path = "crates/chronixd", version = "0.9.0" }
+chronixd = { path = "crates/chronixd", version = "0.10.0" }
 chronix-cluster = { path = "crates/chronix-cluster" }
 
 # Optional, off by default: the `rust_decimal` interop feature on

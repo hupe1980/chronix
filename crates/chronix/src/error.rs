@@ -158,6 +158,16 @@ pub enum DbError {
         name: String,
     },
 
+    /// An existing rollup differs from the definition passed to
+    /// [`ensure_rollup`](crate::Chronix::ensure_rollup).
+    #[error("rollup {name:?} has a different definition ({})", fields.join(", "))]
+    RollupDefinitionConflict {
+        /// The rollup whose definition was compared.
+        name: String,
+        /// All differing [`RollupConfig`](crate::RollupConfig) property names.
+        fields: Vec<&'static str>,
+    },
+
     /// Series cardinality limit exceeded.
     #[error(
         "Series cardinality limit exceeded: {current} unique series \
