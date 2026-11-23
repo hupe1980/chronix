@@ -61,7 +61,7 @@ It exits non-zero on a bad file, so it works as a deploy gate. See
 ### Let the OS assign listener ports
 
 ```bash
-chronixd --bind 127.0.0.1:0 --grpc-bind 127.0.0.1:0 --flight-bind 127.0.0.1:0 --log-format json
+RUST_LOG=info chronixd --bind 127.0.0.1:0 --grpc-bind 127.0.0.1:0 --flight-bind 127.0.0.1:0 --log-format json
 ```
 
 The INFO record with

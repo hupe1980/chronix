@@ -1,10 +1,4 @@
-# Zola configuration for the Chronix documentation site.
-#
-# Replaces an mdBook setup whose chapters were stubs `{{#include}}`-ing the
-# repository's Markdown, so the site and the repo could not drift apart. Zola
-# gives per-page metadata — titles, descriptions, canonical URLs, structured
-# data — which is what a documentation site needs to be findable, and mdBook
-# has no place to put.
+# Chronix documentation site.
 
 base_url = "https://hupe1980.github.io/chronix"
 title = "Chronix"

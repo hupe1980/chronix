@@ -1477,15 +1477,8 @@ pub fn setup_prometheus() -> Result<metrics_exporter_prometheus::PrometheusHandl
         .map_err(|e| ServerError::Internal(format!("failed to install Prometheus recorder: {e}")))
 }
 
-/// The one shutdown signal, shared by every server task.
-///
-/// - **A server that stops on its own stops the others.** The exit of any
-///   server — clean, failed or panicking — triggers this, so the others drain
-///   and the shutdown sequence is the one a `SIGTERM` takes; a gRPC listener
-///   that cannot bind never leaves an HTTP-only server running.
-/// - **Nothing closes the database before the last server has drained.** That
-///   is the caller's job (`join!` on all three handles), and it is sound
-///   because every server is reachable by this signal.
+/// Shared shutdown signal. When any server task exits, the others drain
+/// before the caller closes the database.
 #[derive(Clone, Debug)]
 pub struct Shutdown(tokio::sync::watch::Sender<bool>);
 
@@ -1871,12 +1864,7 @@ mod shutdown_tests {
         tokio::join!(a, b);
     }
 
-    /// A server that stops on its own stops the others.
-    ///
-    /// The guard is what turns "the gRPC listener could not bind" into a
-    /// clean shutdown of the whole process instead of an HTTP-only server
-    /// with an error in the log — and it fires on a panicking task too,
-    /// because a panic unwinds through the guard's `Drop`.
+    /// Dropping a server task's guard wakes its peers, including during unwinding.
     #[tokio::test]
     async fn a_dropped_guard_triggers_the_shutdown() {
         let shutdown = Shutdown::new();

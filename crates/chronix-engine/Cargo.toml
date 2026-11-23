@@ -75,7 +75,7 @@ aes-gcm = { workspace = true, optional = true }
 # Object storage (feature-gated)
 object_store = { workspace = true, optional = true }
 # Scratch space for the cold-tier re-encode (the segment reader mmaps).
-url = { version = "2", optional = true }
+url = { version = "2.5.9", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

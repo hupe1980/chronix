@@ -92,7 +92,7 @@ regex.workspace = true
 
 # Cold tier (feature-gated)
 object_store = { workspace = true, optional = true }
-url = { version = "2", optional = true }
+url = { version = "2.5.9", optional = true }
 jiff.workspace = true
 
 [target.'cfg(unix)'.dependencies]

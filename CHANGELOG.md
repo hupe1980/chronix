@@ -23,6 +23,7 @@ format. Before 1.0 a breaking change bumps the minor version and a fix the patch
   arithmetic also handles the first and last representable nanoseconds.
 - HTTP, gRPC and Flight SQL accept independent port-zero binds. The
   `chronixd started` log record includes each assigned address.
+- Updated `url` for [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html).
 
 ## [0.9.0] - 2026-11-20
 
