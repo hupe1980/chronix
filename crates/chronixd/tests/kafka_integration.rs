@@ -499,10 +499,11 @@ async fn kafka_retries_a_refused_batch() {
     let topic = "test-write-retry";
     create_topics(&bootstrap, &[topic]).await;
     let producer = make_producer(&bootstrap).await;
-    producer
+    let sent = producer
         .send(Record::new(topic, "cpu watts=1i 1000\ncpu watts=2i 2000"))
         .await
         .expect("produce batch");
+    assert_eq!(sent.offset, 0);
 
     let (db, _tmp) = open_test_db();
     let config = make_kafka_config(
