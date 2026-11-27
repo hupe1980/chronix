@@ -144,7 +144,7 @@ on a directory another chronix version wrote.
 $ chronixd inspect /var/lib/chronix
 /var/lib/chronix  not closed cleanly · generation 2
 
-holder    pid 75279 on gw-0042 · chronix 0.10.0 · opened 3 h ago
+holder    pid 75279 on gw-0042 · chronix 0.11.0 · opened 3 h ago
 formats   catalog ✓  segment ✓  wal ✓  series ✓
 series    5 · budget 1 000 000 (default)
 wal       2 files · 1 912 records to replay (3.4 MiB) · seq 88 121–90 032

@@ -356,24 +356,22 @@ client_id = "chronix-1"
 topics = ["sensors/#"]
 qos = 1
 format = "json"
-username = "chronix"                       # or credential_file, which rotates
+username = "chronix"                       # or credential_file
 password = "$CHRONIX_MQTT_PASSWORD"
 ```
 
-A connector carries no request, so its `namespace` comes from its own
-configuration. Under `multi_tenancy = true` its points are tagged with that
-namespace, `default` included.
+With `multi_tenancy = true`, each connector writes to its configured
+`namespace` (default `default`).
 
-`credential_file` holds `{"username": "...", "password": "..."}` and takes
-precedence over the inline pair, so credentials rotate without a config
-change.
+Kafka accepts `PLAINTEXT` (default), `SSL`, `SASL_PLAINTEXT` or `SASL_SSL`
+as `security_protocol`. For SASL, set `sasl_mechanism` to `PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`. Supply `sasl_username` and `sasl_password`
+or a `credential_file`. Set `ca_cert` for a private broker CA.
 
-**MQTT TLS is not available in this build** — `rumqttc`'s rustls feature
-pulls in an advisory-capped `rustls-webpki` and an unmaintained
-`rustls-pemfile`. Setting `ca_cert`, `client_cert` or `client_key` is
-refused at startup rather than ignored, so a connector never sends its
-password over a link the operator believes is encrypted. Terminate TLS in
-front of the broker.
+Both connectors read `credential_file` at startup. The file holds
+`{"username": "...", "password": "..."}` and takes precedence over inline
+credentials. MQTT uses plaintext. Terminate TLS in front of the broker if
+the connection needs encryption.
 
 ### Cold archiving
 

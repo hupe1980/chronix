@@ -572,47 +572,15 @@ reason. The server never falls back to plaintext.
 
 ### Connector Credential Rotation
 
-Kafka and MQTT connectors support hot-reload credential rotation via an
-external JSON credential file. This avoids embedding secrets in the main
-configuration and allows credential updates without restarting the service.
-
-**Kafka SASL authentication:**
-
-```toml
-[kafka]
-sasl_mechanism = "PLAIN"        # or "SCRAM-SHA-256", "SCRAM-SHA-512"
-sasl_username = "kafka-user"    # inline fallback
-sasl_password = "kafka-pass"
-credential_file = "/run/secrets/kafka-creds.json"
-```
-
-**MQTT authentication:**
-
-```toml
-[mqtt]
-username = "mqtt-user"          # inline fallback
-password = "mqtt-pass"
-credential_file = "/run/secrets/mqtt-creds.json"
-```
-
-**Credential file format:**
+Set `credential_file` in `[kafka]` or `[mqtt]` to the path of a JSON file:
 
 ```json
-{"username": "rotated-user", "password": "rotated-pass"}
+{"username": "connector", "password": "..."}
 ```
 
-**Resolution order:**
+The connector reads the file at startup. Replace the file and restart the
+connector to rotate credentials. An unreadable or invalid file fails startup.
 
-1. If `credential_file` is set and readable, its `username`/`password` are used.
-2. Otherwise, inline `sasl_username`/`sasl_password` (Kafka) or
-   `username`/`password` (MQTT) are used as fallback.
-3. If neither is configured, the connector runs without authentication.
-
-When the credential file is updated on disk, the connector picks up the new
-credentials on the next reconnect cycle — no restart required. This
-integrates naturally with secret managers (Vault, AWS Secrets Manager,
-Kubernetes projected secrets) that write rotated secrets to the filesystem.
-
-For maximum security, combine short-lived certificates with an allowed-CN
-list. This eliminates the window between revocation and CRL propagation
-entirely.
+For Kafka, set `security_protocol = "SASL_SSL"` and choose a SASL mechanism.
+TLS uses the bundled WebPKI roots by default. An explicit `ca_cert` PEM bundle
+replaces those roots. See the [connector settings](@/reference/configuration.md#connectors).

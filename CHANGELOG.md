@@ -3,6 +3,12 @@
 Notable changes to Chronix, in [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 format. Before 1.0 a breaking change bumps the minor version and a fix the patch.
 
+## [0.11.0] - 2026-11-27
+
+- **Breaking:** building Chronix requires Rust 1.95 or newer.
+- The Kafka connector uses Krafka 0.32.1 and retries failed writes from the
+  first offset in each affected partition.
+
 ## [0.10.0] - 2026-11-23
 
 - **Breaking:** declared rollups store and return `<field>_count`

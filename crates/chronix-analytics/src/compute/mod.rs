@@ -47,8 +47,6 @@ mod error;
 // unsafe_code deny: every unsafe block is a runtime-feature-gated
 // std::arch intrinsic call with a // SAFETY: justification.
 #[allow(unsafe_code)]
-// chunks_exact(N) with SIMD lane constants reads clearer than as_chunks::<N>() here.
-#[allow(clippy::chunks_exact_to_as_chunks)]
 mod simd;
 
 pub use buffer_pool::BufferPool;

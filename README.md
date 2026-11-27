@@ -37,7 +37,7 @@ brew install hupe1980/tap/chronixd && chronixd --demo  # the server, with a gene
 
 `chronixd --demo` serves a generated gateway week — PV, battery, grid and heat pump, with two
 planted anomalies — on `127.0.0.1:8086`, and prints queries to paste and the console's address.
-`cargo install chronixd` builds it from source; prebuilt binaries are on the [releases page](https://github.com/hupe1980/chronix/releases).
+Building from source requires Rust 1.95 or newer. Install the server with `cargo install chronixd --locked` or download a [prebuilt binary](https://github.com/hupe1980/chronix/releases).
 
 ## Why Chronix
 

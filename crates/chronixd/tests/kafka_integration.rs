@@ -3,22 +3,10 @@
 // `krafka`'s builder futures are large by construction and these run one at a
 // time in a test, where stack size is not a constraint.
 #![allow(clippy::large_futures)]
-//! Kafka integration tests using testcontainers.
-//!
-//! These tests spin up a real Apache Kafka broker via Docker and verify
-//! the end-to-end path: produce messages → `KafkaConsumer` ingests →
-//! data appears in the Chronix database.
-//!
-//! # Requirements
-//!
-//! - Docker daemon running
-//! - `--features kafka` (or `all-connectors`)
-//!
-//! All tests are `#[ignore]` by default so `cargo test` doesn't require
-//! Docker. Run them explicitly:
+//! End-to-end Kafka ingestion tests. Run with Docker available:
 //!
 //! ```sh
-//! cargo test -p chronixd --features kafka --test kafka_integration -- --ignored
+//! cargo test -p chronixd --features kafka --test kafka_integration -- --ignored --test-threads=1
 //! ```
 
 #![cfg(feature = "kafka")]
@@ -26,8 +14,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use krafka::admin::{AdminClient, NewTopic};
-use krafka::producer::Producer;
+use krafka::Kafka as KafkaClient;
+use krafka::admin::{CreateTopicsOptions, NewTopic};
+use krafka::producer::{Producer, Record};
 use tempfile::TempDir;
 
 use testcontainers_modules::kafka::apache::{self, Kafka};
@@ -50,12 +39,7 @@ fn open_test_db() -> (Arc<Chronix>, TempDir) {
     (db, tmp)
 }
 
-/// Send the connector's own `tracing` output to the test's stdout.
-///
-/// The consumer loop reports every unrecoverable failure — a broker it
-/// cannot reach, a `subscribe` the broker refuses — with `error!` and then
-/// returns, so without a subscriber a broken consumer is indistinguishable
-/// from an idle one: `metrics()` reads zero either way.
+/// Include connector logs in test failures.
 fn capture_logs() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -70,26 +54,14 @@ fn capture_logs() {
     });
 }
 
-/// Create the topics a test produces to, and wait until they exist.
-///
-/// **Auto-creation is not something to rely on.** Every test here produced
-/// to a topic nothing had created, on the assumption that the broker would
-/// make it: four of the five then failed with `unknown topic`, because a
-/// KRaft broker resolves the metadata request that triggers auto-creation
-/// *after* answering the produce. Nobody saw it, because all five are
-/// `#[ignore]`d and CI ran them with no `--ignored` — the job reported
-/// "ok. 0 passed; 5 ignored" for years.
-///
-/// One partition and one replica: these assert ingestion, and more than one
-/// partition would make the order the consumer sees non-deterministic for
-/// no gain.
+/// Create single-partition topics before producing records.
 async fn create_topics(bootstrap_servers: &str, topics: &[&str]) {
     capture_logs();
-    let admin = AdminClient::builder()
-        .bootstrap_servers(bootstrap_servers)
-        .build()
+    let admin = KafkaClient::builder(bootstrap_servers)
+        .connect()
         .await
-        .expect("Failed to create Kafka admin client");
+        .expect("Failed to connect to Kafka")
+        .admin();
 
     let specs: Vec<NewTopic> = topics
         .iter()
@@ -97,25 +69,26 @@ async fn create_topics(bootstrap_servers: &str, topics: &[&str]) {
         .collect();
 
     let results = admin
-        .create_topics(specs, Duration::from_secs(20), false)
+        .create_topics(
+            specs,
+            CreateTopicsOptions::default().timeout(Duration::from_secs(20)),
+        )
         .await
         .expect("CreateTopics request failed");
 
-    for result in results {
-        assert!(
-            result.error.is_none(),
-            "could not create topic {}: {}",
-            result.name,
-            result.error.unwrap_or_default()
-        );
+    for (topic, result) in results {
+        assert!(result.is_ok(), "could not create topic {topic}: {result:?}");
     }
 }
 
 /// Create a `krafka` producer pointing at the given bootstrap server.
 async fn make_producer(bootstrap_servers: &str) -> Producer {
-    Producer::builder()
-        .bootstrap_servers(bootstrap_servers)
+    KafkaClient::builder(bootstrap_servers)
         .request_timeout(Duration::from_secs(10))
+        .connect()
+        .await
+        .expect("Failed to connect to Kafka")
+        .producer()
         .build()
         .await
         .expect("Failed to create Kafka producer")
@@ -175,9 +148,9 @@ async fn kafka_line_protocol_end_to_end() {
         "cpu,host=srv1 usage=91.3 3000000000",
     ];
 
-    for line in &lines {
+    for line in lines {
         let _ = producer
-            .send(topic, Some(b"k"), Some(line.as_bytes()))
+            .send(Record::new(topic, line).key("k"))
             .await
             .expect("Kafka produce failed");
     }
@@ -256,9 +229,9 @@ async fn kafka_json_end_to_end() {
         r#"{"tags":{"host":"srv2"},"fields":{"temp":18.3},"timestamp":2000}"#,
     ];
 
-    for msg in &messages {
+    for msg in messages {
         let _ = producer
-            .send(topic, Some(b"k"), Some(msg.as_bytes()))
+            .send(Record::new(topic, msg).key("k"))
             .await
             .expect("Kafka produce failed");
     }
@@ -325,21 +298,13 @@ async fn kafka_multi_topic_mapping() {
 
     // Produce to topic-a (line protocol)
     let _ = producer
-        .send(
-            "topic-a",
-            Some(b"k"),
-            Some(b"mem,host=srv1 used=1024 1000000000" as &[u8]),
-        )
+        .send(Record::new("topic-a", "mem,host=srv1 used=1024 1000000000").key("k"))
         .await
         .expect("produce topic-a");
 
     // Produce to topic-b
     let _ = producer
-        .send(
-            "topic-b",
-            Some(b"k"),
-            Some(b"disk,host=srv1 free=50000 2000000000" as &[u8]),
-        )
+        .send(Record::new("topic-b", "disk,host=srv1 free=50000 2000000000").key("k"))
         .await
         .expect("produce topic-b");
 
@@ -411,31 +376,19 @@ async fn kafka_decode_error_resilience() {
 
     // First: valid message
     let _ = producer
-        .send(
-            topic,
-            Some(b"k"),
-            Some(b"cpu,host=srv1 usage=50.0 1000000000" as &[u8]),
-        )
+        .send(Record::new(topic, "cpu,host=srv1 usage=50.0 1000000000").key("k"))
         .await
         .expect("produce valid");
 
     // Second: malformed line protocol
     let _ = producer
-        .send(
-            topic,
-            Some(b"k"),
-            Some(b"this is not valid line protocol!!!" as &[u8]),
-        )
+        .send(Record::new(topic, "this is not valid line protocol!!!").key("k"))
         .await
         .expect("produce invalid");
 
     // Third: another valid message
     let _ = producer
-        .send(
-            topic,
-            Some(b"k"),
-            Some(b"cpu,host=srv2 usage=75.0 2000000000" as &[u8]),
-        )
+        .send(Record::new(topic, "cpu,host=srv2 usage=75.0 2000000000").key("k"))
         .await
         .expect("produce valid 2");
 
@@ -449,13 +402,7 @@ async fn kafka_decode_error_resilience() {
 
     consumer.start().await.expect("consumer start");
 
-    // Wait until all 3 messages are consumed (2 valid + 1 error)
-    // **Wait for what is asserted, not for a proxy.** `messages_total` counts
-    // a record when the loop *sees* it; `points_total` counts it when the
-    // batch insert has returned. Breaking on the first and asserting the
-    // second stops the consumer in the window between them — which is how
-    // this failed in CI with `points_total == 0` after the decode error had
-    // already been logged.
+    // Wait for both the decode error and the completed write.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let m = consumer.metrics().await;
@@ -515,12 +462,7 @@ async fn kafka_connector_lifecycle_live() {
 
     consumer.start().await.expect("start");
 
-    // **`start()` returning is not "connected".** This assertion used to be
-    // `assert_eq!(status(), Running)` on the line after `start()`, and it
-    // passed because `status()` was computed from the flag `start()` had
-    // just set — it would have passed with no broker at all, and with the
-    // consumer task already dead. It now reports what the task is doing, so
-    // the connected state is something to wait for.
+    // The consumer joins its group in the background.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let status = consumer.status().await;
@@ -542,4 +484,54 @@ async fn kafka_connector_lifecycle_live() {
     consumer.stop().await.expect("stop");
     assert_eq!(consumer.status().await, ConnectorStatus::Stopped);
     assert!(!consumer.is_healthy().await);
+}
+
+/// A later poll must retry a refused batch before committing past it.
+#[tokio::test]
+#[ignore]
+async fn kafka_retries_a_refused_batch() {
+    let kafka_node = Kafka::default().start().await.expect("start Kafka");
+    let port = kafka_node
+        .get_host_port_ipv4(apache::KAFKA_PORT)
+        .await
+        .expect("Kafka port");
+    let bootstrap = format!("127.0.0.1:{port}");
+    let topic = "test-write-retry";
+    create_topics(&bootstrap, &[topic]).await;
+    let producer = make_producer(&bootstrap).await;
+    producer
+        .send(Record::new(topic, "cpu watts=1i 1000\ncpu watts=2i 2000"))
+        .await
+        .expect("produce batch");
+
+    let (db, _tmp) = open_test_db();
+    let config = make_kafka_config(
+        &bootstrap,
+        vec![topic.into()],
+        ConnectorFormat::LineProtocol,
+    );
+    let limiter = chronixd::rate_limit::NamespaceIngestLimiter::new();
+    limiter.set_limit("default", 1);
+    let consumer =
+        KafkaConsumer::new_arc("retry", config, db, true).with_ingest_limiter(limiter.clone());
+    consumer.start().await.expect("start consumer");
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while consumer.metrics().await.messages_total < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("refused record was not polled again");
+    assert_eq!(consumer.metrics().await.points_total, 0);
+
+    limiter.remove("default");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while consumer.metrics().await.points_total < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("batch was not written after lifting the quota");
+    consumer.stop().await.expect("stop consumer");
 }

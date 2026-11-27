@@ -174,8 +174,7 @@ unsafe fn hmax_512(v: std::arch::x86_64::__m512d) -> f64 {
 #[inline]
 #[allow(dead_code)]
 fn scalar_sum(data: &[f64]) -> f64 {
-    let chunks = data.chunks_exact(4);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = data.as_chunks::<4>();
     let (mut a0, mut a1, mut a2, mut a3) = (0.0_f64, 0.0, 0.0, 0.0);
     let (mut c0, mut c1, mut c2, mut c3) = (0.0_f64, 0.0, 0.0, 0.0);
     for c in chunks {
@@ -218,8 +217,7 @@ fn scalar_sum(data: &[f64]) -> f64 {
 #[inline]
 #[allow(dead_code)]
 fn scalar_variance(data: &[f64], mean: f64) -> f64 {
-    let chunks = data.chunks_exact(4);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = data.as_chunks::<4>();
     let (mut a0, mut a1, mut a2, mut a3) = (0.0_f64, 0.0, 0.0, 0.0);
     // Kahan compensation terms for each accumulator lane.
     let (mut c0, mut c1, mut c2, mut c3) = (0.0_f64, 0.0, 0.0, 0.0);
@@ -1286,8 +1284,7 @@ pub fn simd_mean_variance(data: &[f64]) -> (f64, f64) {
 pub fn simd_range_filter_i64(timestamps: &[i64], min: i64, max: i64) -> Vec<u32> {
     let mut result = Vec::with_capacity(timestamps.len());
     // 4-wide scalar unroll for ILP on all platforms.
-    let chunks = timestamps.chunks_exact(4);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = timestamps.as_chunks::<4>();
     let mut base_idx: u32 = 0;
     for chunk in chunks {
         if chunk[0] >= min && chunk[0] <= max {

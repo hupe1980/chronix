@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "chronix"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "async-stream",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-analytics"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1155,7 +1155,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-cluster"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "chronix-analytics",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "dashmap",
  "fnv",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-dsim"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chronix-meta",
  "openraft",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-encoding"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "chronix-core",
  "criterion",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-engine"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-meta"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "futures",
  "metrics",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-query"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "chronix-core",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "chronix-security"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1318,7 +1318,7 @@ dependencies = [
  "cedar-policy",
  "chronix-core",
  "dashmap",
- "hmac 0.13.0",
+ "hmac",
  "jsonwebtoken",
  "metrics",
  "parking_lot",
@@ -1329,7 +1329,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2",
  "subtle",
  "tempfile",
  "thiserror 2.0.21",
@@ -1341,14 +1341,14 @@ dependencies = [
 
 [[package]]
 name = "chronix-streaming"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "base64 0.23.1",
  "chronix-core",
  "dashmap",
  "fnv",
- "hmac 0.13.0",
+ "hmac",
  "jiff 1.0.1",
  "metrics",
  "parking_lot",
@@ -1357,7 +1357,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "chronixd"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "chronixd-cluster"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2298,7 +2298,7 @@ dependencies = [
  "num-traits",
  "rand 0.9.5",
  "regex",
- "sha2 0.11.1",
+ "sha2",
  "uuid",
 ]
 
@@ -3171,15 +3171,6 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest 0.10.7",
-]
-
-[[package]]
-name = "hmac"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
@@ -3764,9 +3755,9 @@ dependencies = [
 
 [[package]]
 name = "krafka"
-version = "0.21.0"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a9458835cc8ac00ac2d4f5ec1c13de0e9c207fafb309cf98db45ee5ba437dc6"
+checksum = "339c656f3bddd0dcd21664a03eaae5d8eee4d7596ba27296c4d014a4d64156c9"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -3776,19 +3767,22 @@ dependencies = [
  "flate2",
  "futures",
  "futures-core",
- "hmac 0.12.1",
+ "hmac",
  "lz4_flex 0.11.7",
  "parking_lot",
  "pbkdf2",
  "rand 0.9.5",
+ "regex-lite",
  "rustls",
- "sha2 0.10.9",
+ "ruzstd",
+ "sha2",
  "snap",
  "socket2 0.5.10",
  "subtle",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tokio-socks",
  "tokio-util",
  "tracing",
  "webpki-roots",
@@ -4653,12 +4647,12 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pbkdf2"
-version = "0.12.2"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
- "digest 0.10.7",
- "hmac 0.12.1",
+ "digest 0.11.3",
+ "hmac",
 ]
 
 [[package]]
@@ -5413,6 +5407,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5539,7 +5539,7 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2",
  "sse-stream",
  "thiserror 2.0.21",
  "tokio",
@@ -5720,6 +5720,15 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -5961,17 +5970,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
-]
-
-[[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
 ]
 
 [[package]]
@@ -6497,6 +6495,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-socks"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7e2948f60dbe26b35f2c7fb74ac2854c1fddded0fe9d7548fcc674a246f7615"
+dependencies = [
+ "either",
+ "futures-util",
+ "thiserror 1.0.69",
  "tokio",
 ]
 

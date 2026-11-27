@@ -430,24 +430,17 @@ pub struct KafkaConfig {
     /// SASL username.
     #[serde(default)]
     pub sasl_username: Option<String>,
-    /// SASL password. Prefer `credential_file` for rotation support.
+    /// SASL password.
     #[serde(default)]
     pub sasl_password: Option<String>,
     /// Security protocol: "PLAINTEXT", "SSL", "SASL_PLAINTEXT", or "SASL_SSL".
     #[serde(default)]
     pub security_protocol: Option<String>,
     /// PEM CA bundle used to verify the broker under `SSL` / `SASL_SSL`.
-    ///
-    /// Without it the platform trust store is used, which is right for a
-    /// managed broker and wrong for the private CA most self-hosted clusters
-    /// run.
+    /// Defaults to the bundled WebPKI roots. An explicit bundle replaces them.
     #[serde(default)]
     pub ca_cert: Option<String>,
-    /// Path to a JSON credential file for hot-reload rotation.
-    ///
-    /// The file must contain `{"username": "...", "password": "..."}`.
-    /// When the file changes on disk, the connector reloads credentials
-    /// on the next reconnect cycle without requiring a full restart.
+    /// JSON file with `username` and `password`, read at connector startup.
     #[serde(default)]
     pub credential_file: Option<String>,
 }
@@ -490,14 +483,10 @@ pub struct MqttConfig {
     /// MQTT username for broker authentication.
     #[serde(default)]
     pub username: Option<String>,
-    /// MQTT password for broker authentication. Prefer `credential_file` for rotation.
+    /// MQTT password for broker authentication.
     #[serde(default)]
     pub password: Option<String>,
-    /// Path to a JSON credential file for hot-reload rotation.
-    ///
-    /// The file must contain `{"username": "...", "password": "..."}`.
-    /// When the file changes on disk, credentials are reloaded on the
-    /// next reconnect cycle without requiring a full restart.
+    /// JSON file with `username` and `password`, read at connector startup.
     #[serde(default)]
     pub credential_file: Option<String>,
     /// Explicit topic → measurement name mapping.
@@ -537,7 +526,6 @@ fn default_mqtt_format() -> ConnectorFormat {
 
 /// Credentials loaded from a JSON credential file.
 ///
-/// Used by Kafka and MQTT connectors for hot-reload credential rotation.
 /// The credential file must contain `{"username": "...", "password": "..."}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorCredentials {
@@ -565,7 +553,7 @@ impl ConnectorCredentials {
 
 impl KafkaConfig {
     /// Returns the effective SASL credentials, preferring `credential_file`
-    /// over inline `sasl_username`/`sasl_password` for rotation support.
+    /// over inline `sasl_username`/`sasl_password`.
     pub fn effective_credentials(&self) -> Result<Option<(String, String)>, ServerError> {
         if let Some(ref path) = self.credential_file {
             let creds = ConnectorCredentials::load_from_file(path)?;
@@ -580,7 +568,7 @@ impl KafkaConfig {
 
 impl MqttConfig {
     /// Returns the effective credentials, preferring `credential_file`
-    /// over inline `username`/`password` for rotation support.
+    /// over inline `username`/`password`.
     pub fn effective_credentials(&self) -> Result<Option<(String, String)>, ServerError> {
         if let Some(ref path) = self.credential_file {
             let creds = ConnectorCredentials::load_from_file(path)?;

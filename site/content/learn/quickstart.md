@@ -11,6 +11,8 @@ reads it back with the query builder, SQL, PromQL and a forecast.
 
 ## Add the crate
 
+Use Rust 1.95 or newer.
+
 ```bash
 cargo add chronix
 ```

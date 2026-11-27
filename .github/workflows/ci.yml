@@ -476,13 +476,13 @@ jobs:
       - run: cargo +nightly miri test -p chronix-core
 
   msrv:
-    name: MSRV (1.94)
+    name: MSRV (1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-protoc
-      - run: cargo check --all-targets
+      - run: cargo check --locked --all-targets --features chronixd/kafka

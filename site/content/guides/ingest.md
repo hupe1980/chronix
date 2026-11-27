@@ -4,7 +4,7 @@ description = "Point Prometheus remote write, Telegraf, the OpenTelemetry Collec
 weight = 10
 +++
 
-Chronix speaks the protocols your agents already send. Point Prometheus remote write, Telegraf, the OpenTelemetry Collector, Kafka or MQTT at it; no client changes beyond the URL.
+Prometheus, Telegraf and the OpenTelemetry Collector send writes to Chronix over HTTP. For Kafka and MQTT, Chronix connects to the broker and subscribes to topics.
 
 ## Wire Protocol Endpoints
 
@@ -184,21 +184,20 @@ counts, not `204`. Both rejections are deterministic, so `400` is correct:
 Prometheus treats it as permanent and drops the batch, where a `503` would
 have it retry the same doomed batch for ever.
 
-## Connector Management
+## Kafka and MQTT
 
-### Startup Retry
+Install the server with the connector you need, then set the broker and topics
+in the [connector configuration](@/reference/configuration.md#connectors).
 
-Ingestion connectors are started at boot. By default a connector that cannot
-reach its broker stops the server, rather than leaving it running with a
-silently dead ingestion path.
+```sh
+cargo install chronixd --locked --features kafka  # or mqtt, or all-connectors
+chronixd --config /etc/chronixd.toml
+```
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `connector_start_retries` | `0` | Start attempts per connector; `0` is fail-fast |
-| `connector_start_retry_backoff_ms` | `1000` | Initial backoff; doubles each retry |
-
-Raise the retry count when connectors and brokers start concurrently, as in a
-container stack.
+Kafka joins its consumer group in the background and retries with backoff if
+the broker is unavailable. Check `GET /api/v1/connectors` for its status.
+`connector_start_retries` controls retries for errors returned by connector
+startup. The default is zero.
 
 ## Protocol-Level Compatibility
 

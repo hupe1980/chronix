@@ -66,7 +66,7 @@
   <div class="wrap">
     <div class="band-head">
       <h2 id="why">One engine, from the gateway to Grafana</h2>
-      <p>Embedded databases do not speak observability protocols, and time-series servers do not fit in a binary. Chronix is both — and the analytics come with it.</p>
+      <p>Use the Rust library for local queries and forecasts, or run the same database behind Grafana.</p>
     </div>
     <div class="cards">
     {% for c in section.extra.cards %}
@@ -108,7 +108,7 @@
 
 <section class="band" aria-label="Project status">
   <div class="wrap">
-    <p class="limits"><strong>Honest about what it is.</strong> Pre-1.0 and single-node; the clustered tier is frozen on purpose. Every performance and compression number in these docs names the test or benchmark that measures it.</p>
+    <p class="limits">Chronix runs on a single node. See the <a href="{{ get_url(path='@/reference/cluster.md') }}">cluster reference</a> for the frozen distributed tier.</p>
   </div>
 </section>
 </div>

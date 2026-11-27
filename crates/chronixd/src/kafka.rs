@@ -1,21 +1,6 @@
-//! Kafka consumer ingestion connector.
+//! Ingest Kafka records as InfluxDB line protocol or JSON.
 //!
-//! Consumes messages from Kafka topics and writes time-series data into
-//! the Chronix database. Supports InfluxDB Line Protocol and JSON
-//! deserialization formats.
-//!
-//! # Feature gate
-//!
-//! The consumer loop requires the `kafka` feature, which brings in
-//! `krafka` — a pure-Rust, async-native client. Without the feature the
-//! connector still constructs and its parsing logic is still testable, and
-//! `start()` logs a notice rather than connecting to a broker.
-//!
-//! `krafka` rather than `rdkafka`: `rdkafka` compiles librdkafka from C
-//! through cmake, so enabling Kafka ingestion imposed a C toolchain on every
-//! build — including the aarch64 cross-compile the embedded wedge depends on
-//! — and put an unaudited FFI surface inside a tree whose policy is
-//! `deny(unsafe_code)`. `krafka` is pure Rust with the same policy.
+//! Build `chronixd` with the `kafka` feature to enable the Krafka consumer.
 //!
 //! # Configuration
 //!
@@ -27,10 +12,7 @@
 //! format = "line_protocol"        # or "json"
 //! auto_offset_reset = "latest"    # or "earliest"
 //!
-//! # Optional transport security. Before this was wired up the four fields
-//! # below parsed and were then dropped on the floor: a broker configured
-//! # for SASL_SSL was connected to in plaintext with no credentials, and the
-//! # only symptom was a connection failure that named nothing.
+//! # Optional SASL over TLS with a private CA.
 //! security_protocol = "SASL_SSL"  # PLAINTEXT | SSL | SASL_PLAINTEXT | SASL_SSL
 //! sasl_mechanism = "SCRAM-SHA-512"
 //! credential_file = "/run/secrets/kafka.json"
@@ -67,7 +49,7 @@ pub struct KafkaConsumer {
     #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     db: Arc<Chronix>,
     /// Weak self-reference for safe background task spawning.
-    /// Populated by [`new_arc`] — avoids `unsafe` Arc reconstruction.
+    /// Set by [`Self::new_arc`].
     #[cfg_attr(not(feature = "kafka"), allow(dead_code))]
     self_ref: OnceLock<Weak<Self>>,
     /// The server's per-namespace ingestion limiter; unlimited until the
@@ -123,18 +105,7 @@ impl KafkaConsumer {
         *self.state.lock() = next;
     }
 
-    /// Namespace this connector writes to.
-    ///
-    /// A connector carries no request, so its namespace comes from its own
-    /// configuration rather than a header.
-    ///
-    /// The decision is **whether the server is multi-tenant**, not whether
-    /// the namespace happens to be `default`. Skipping the tag for the
-    /// default namespace left a multi-tenant deployment's connector data
-    /// untagged, and every scoped read filters on the tag — so the points
-    /// were stored and unreachable through the database's own query API.
-    /// A single-tenant server's points stay untagged, so a series does not
-    /// depend on which route wrote it.
+    /// Scope writes to the configured namespace on multi-tenant servers.
     #[cfg(feature = "kafka")]
     fn namespace_scope(&self) -> Option<&str> {
         self.multi_tenancy.then_some(self.config.namespace.as_str())
@@ -232,22 +203,15 @@ mod consumer_impl {
     use super::*;
     use std::time::Duration;
 
+    use krafka::Kafka;
     use krafka::auth::{AuthConfig, TlsConfig};
-    use krafka::consumer::{AutoOffsetReset, Consumer};
+    use krafka::consumer::{AutoOffsetReset, Consumer, TopicPartition};
     use tracing::{debug, error, warn};
 
-    /// How long one `poll` waits for records before yielding to the
-    /// cancellation branch.
-    /// How long to wait before the first retry of a failed setup.
     const SETUP_BACKOFF_MIN: Duration = Duration::from_millis(250);
     /// The ceiling the retry backoff doubles up to.
     const SETUP_BACKOFF_MAX: Duration = Duration::from_secs(30);
-    /// Consecutive setup failures after which the status names the error
-    /// rather than saying "reconnecting". Retrying continues either way.
-    ///
-    /// Eight is about thirty seconds of continuous failure, given the
-    /// backoff below. Five was under eight, which a broker still
-    /// electing a coordinator can spend without anything being wrong.
+    /// Report the setup error after repeated failures while continuing to retry.
     const SETUP_ATTEMPTS_BEFORE_FAILED: u32 = 8;
     /// Consecutive empty polls after which a connected consumer reports
     /// `Idle` rather than `Running`: connected, and nothing arriving.
@@ -271,13 +235,7 @@ mod consumer_impl {
             }
         }
 
-        /// Build the TLS material for an `SSL` / `SASL_SSL` deployment.
-        ///
-        /// The default trust anchors are the bundled WebPKI roots, which
-        /// cover every managed broker; `ca_cert` adds the private CA that
-        /// self-hosted clusters issue from. The platform trust store is
-        /// deliberately not consulted — it is one more dependency and one
-        /// more thing that differs between the build host and the gateway.
+        /// Use the configured CA bundle or the default WebPKI roots.
         fn tls_config(&self) -> TlsConfig {
             match self.config.ca_cert {
                 Some(ref path) => TlsConfig::new().with_ca_cert(path.clone()),
@@ -285,12 +243,7 @@ mod consumer_impl {
             }
         }
 
-        /// Resolve `security_protocol` + `sasl_mechanism` + credentials into
-        /// one authentication configuration.
-        ///
-        /// Every combination is either understood or rejected by name. The
-        /// alternative — ignoring what is not understood — is how these four
-        /// fields came to be parsed, documented and unused.
+        /// Build the client authentication settings and validate credentials.
         fn auth_config(&self) -> Result<Option<AuthConfig>, ServerError> {
             let protocol = self
                 .config
@@ -332,8 +285,15 @@ mod consumer_impl {
                 .unwrap_or("PLAIN")
                 .to_ascii_uppercase();
             let auth = match mechanism.as_str() {
-                "PLAIN" => AuthConfig::sasl_plain(username, password)
-                    .map_err(|e| ServerError::BadRequest(format!("kafka SASL/PLAIN: {e}")))?,
+                "PLAIN" => {
+                    // Krafka validates on connect. Reject malformed credentials at start().
+                    if username.is_empty() || username.contains('\0') || password.contains('\0') {
+                        return Err(ServerError::BadRequest(
+                            "kafka SASL/PLAIN requires a username and NUL-free credentials".into(),
+                        ));
+                    }
+                    AuthConfig::sasl_plain(username, password)
+                }
                 "SCRAM-SHA-256" => AuthConfig::sasl_scram_sha256(username, password),
                 "SCRAM-SHA-512" => AuthConfig::sasl_scram_sha512(username, password),
                 other => {
@@ -351,6 +311,26 @@ mod consumer_impl {
             }))
         }
 
+        async fn connect_consumer(
+            &self,
+            auth: Option<AuthConfig>,
+            offset_reset: AutoOffsetReset,
+        ) -> krafka::Result<Consumer> {
+            let mut builder =
+                Kafka::builder(&self.config.brokers).client_id(format!("chronixd-{}", self.name));
+            if let Some(auth) = auth {
+                builder = builder.security(auth);
+            }
+            let kafka = builder.connect().await?;
+            kafka
+                .consumer(&self.config.group_id)
+                .auto_offset_reset(offset_reset)
+                .enable_auto_commit(false)
+                .metrics_push(false)
+                .build()
+                .await
+        }
+
         /// Spawn the Kafka consumer loop as a background task.
         ///
         /// Each poll batch is parsed, written in one insert, and only then
@@ -362,171 +342,169 @@ mod consumer_impl {
             let this = Arc::clone(self);
 
             tokio::spawn(async move {
-                // Connecting is retried, not attempted once: a broker that
-                // has just started has no `__consumer_offsets` topic yet, so
-                // a first `subscribe` legitimately gets
-                // `CoordinatorNotAvailable`.
+                // A newly started broker can return CoordinatorNotAvailable
+                // until it creates the __consumer_offsets topic.
                 let mut backoff = SETUP_BACKOFF_MIN;
                 let mut attempts: u32 = 0;
 
-                let consumer = loop {
-                    if this.stopped.load(Ordering::SeqCst) {
-                        return;
-                    }
-
-                    let mut builder = Consumer::builder()
-                        .bootstrap_servers(this.config.brokers.clone())
-                        .group_id(this.config.group_id.clone())
-                        .client_id(format!("chronixd-{}", this.name))
-                        .auto_offset_reset(offset_reset)
-                        .enable_auto_commit(false);
-                    if let Some(auth) = auth.clone() {
-                        builder = builder.auth(auth);
-                    }
-
-                    let topics: Vec<&str> = this.config.topics.iter().map(String::as_str).collect();
-
-                    let outcome = match builder.build().await {
-                        Ok(c) => match c.subscribe(&topics).await {
-                            Ok(()) => Ok(c),
-                            Err(e) => Err(format!("subscribe failed: {e}")),
-                        },
-                        Err(e) => Err(format!("consumer creation failed: {e}")),
+                while !this.stopped.load(Ordering::SeqCst) {
+                    let connected = tokio::select! {
+                        () = this.cancel.notified() => return,
+                        result = this.connect_consumer(auth.clone(), offset_reset) => result,
                     };
-
-                    match outcome {
-                        Ok(c) => break c,
-                        Err(reason) => {
-                            attempts += 1;
-                            // Past the threshold the status names the error
-                            // instead of saying "reconnecting". Retrying
-                            // continues either way.
-                            if attempts >= SETUP_ATTEMPTS_BEFORE_FAILED {
-                                error!(
-                                    name = %this.name, attempts, %reason,
-                                    "Kafka consumer still cannot start"
-                                );
-                                this.set_state(ConnectorStatus::Failed(reason));
-                            } else {
-                                warn!(
-                                    name = %this.name, attempts, %reason,
-                                    "Kafka consumer setup failed, retrying"
-                                );
-                                this.set_state(ConnectorStatus::Reconnecting);
+                    let result = match connected {
+                        Ok(consumer) => {
+                            let result = this.consume(&consumer).await;
+                            if let Err(e) = consumer.close().await {
+                                warn!(name = %this.name, %e, "Kafka consumer close failed");
                             }
-
-                            tokio::select! {
-                                () = this.cancel.notified() => return,
-                                () = tokio::time::sleep(backoff) => {}
-                            }
-                            backoff = (backoff * 2).min(SETUP_BACKOFF_MAX);
+                            result
                         }
-                    }
-                };
-
-                info!(
-                    name = %this.name,
-                    brokers = %this.config.brokers,
-                    topics = ?this.config.topics,
-                    "Kafka consumer polling started"
-                );
-                this.set_state(ConnectorStatus::Running);
-                let mut empty_polls: u32 = 0;
-
-                loop {
-                    let records = tokio::select! {
-                        () = this.cancel.notified() => {
-                            info!(name = %this.name, "Kafka consumer loop cancelled");
-                            break;
-                        }
-                        polled = consumer.poll(POLL_TIMEOUT) => match polled {
-                            Ok(r) => r,
-                            Err(e) => {
-                                warn!(name = %this.name, %e, "Kafka poll error");
-                                continue;
-                            }
-                        }
+                        Err(e) => Err(e),
                     };
-                    if records.is_empty() {
-                        empty_polls = empty_polls.saturating_add(1);
-                        if empty_polls == EMPTY_POLLS_BEFORE_IDLE {
-                            this.set_state(ConnectorStatus::Idle);
-                        }
-                        continue;
-                    }
-                    if empty_polls >= EMPTY_POLLS_BEFORE_IDLE {
-                        this.set_state(ConnectorStatus::Running);
-                    }
-                    empty_polls = 0;
-
-                    // One insert per poll batch: a WAL group commit per
-                    // record is what makes a Kafka-fed gateway fsync-bound.
-                    let mut points = Vec::new();
-                    for record in &records {
-                        this.messages_total.fetch_add(1, Ordering::Relaxed);
-                        let Some(payload) = record.value.as_ref() else {
-                            continue; // tombstone
-                        };
-                        match this.parse_payload(&record.topic, payload) {
-                            Ok(parsed) => points.extend(parsed),
-                            Err(e) => {
-                                this.decode_errors.fetch_add(1, Ordering::Relaxed);
-                                debug!(name = %this.name, %e, "Kafka decode error");
-                            }
-                        }
-                    }
-
-                    if !points.is_empty() {
-                        match crate::util::insert_from_connector(
-                            &this.db,
-                            this.ingest_limiter(),
-                            this.namespace_scope(),
-                            points,
-                            INSERT_TIMEOUT,
-                            &this.name,
-                        )
-                        .await
-                        {
-                            Ok(n) => this.points_total.fetch_add(n, Ordering::Relaxed),
-                            Err(e) => {
-                                // Not committing is the whole retry mechanism:
-                                // the batch is redelivered instead of dropped.
-                                // A *partial* write is not routed here — it
-                                // would be redelivered for ever, since its
-                                // rejections are deterministic.
-                                error!(name = %this.name, %e, "failed to write Kafka points");
-                                continue;
-                            }
-                        };
-                    }
-
-                    if let Err(e) = consumer.commit().await {
-                        warn!(name = %this.name, %e, "Kafka offset commit failed");
-                    }
-
-                    // How far behind the broker we are, from the watermarks the last fetch
-                    // response already carried — no extra round trip.
-                    let lag = consumer.lag().await;
-                    let total: u64 = lag.lag.values().sum();
-                    this.lag
-                        .store(i64::try_from(total).unwrap_or(i64::MAX), Ordering::Relaxed);
-                    metrics::gauge!("chronix_kafka_consumer_lag", "connector" => this.name.clone())
-                        .set(total as f64);
-                    if !lag.stale_partitions.is_empty() {
-                        debug!(
-                            name = %this.name,
-                            stale = lag.stale_partitions.len(),
-                            "some partitions' lag is from a stale watermark"
+                    let Err(reason) = result else { return };
+                    attempts += 1;
+                    if attempts >= SETUP_ATTEMPTS_BEFORE_FAILED {
+                        error!(
+                            name = %this.name, attempts, %reason,
+                            "Kafka consumer still cannot start"
                         );
+                        this.set_state(ConnectorStatus::Failed(reason.to_string()));
+                    } else {
+                        warn!(
+                            name = %this.name, attempts, %reason,
+                            "Kafka consumer setup failed, retrying"
+                        );
+                        this.set_state(ConnectorStatus::Reconnecting);
                     }
-                }
 
-                if let Err(e) = consumer.close().await {
-                    warn!(name = %this.name, %e, "Kafka consumer close failed");
+                    tokio::select! {
+                        () = this.cancel.notified() => return,
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(SETUP_BACKOFF_MAX);
                 }
             });
 
             Ok(())
+        }
+
+        async fn consume(&self, consumer: &Consumer) -> krafka::Result<()> {
+            consumer.subscribe(&self.config.topics).await?;
+            let mut joined = false;
+            let mut empty_polls: u32 = 0;
+
+            loop {
+                let records = tokio::select! {
+                    () = self.cancel.notified() => return Ok(()),
+                    polled = consumer.poll(POLL_TIMEOUT) => match polled {
+                        Ok(records) => records,
+                        Err(e) if !joined => return Err(e),
+                        Err(e) => {
+                            warn!(name = %self.name, %e, "Kafka poll error");
+                            continue;
+                        }
+                    }
+                };
+                if !joined {
+                    // subscribe() registers interest. Polling completes the group join.
+                    if records.is_empty()
+                        && consumer
+                            .group_metadata()
+                            .await
+                            .is_none_or(|m| m.generation_id() < 0)
+                    {
+                        continue;
+                    }
+                    joined = true;
+                    info!(
+                        name = %self.name,
+                        brokers = %self.config.brokers,
+                        topics = ?self.config.topics,
+                        "Kafka consumer joined group"
+                    );
+                    self.set_state(ConnectorStatus::Running);
+                }
+                if records.is_empty() {
+                    empty_polls = empty_polls.saturating_add(1);
+                    if empty_polls == EMPTY_POLLS_BEFORE_IDLE {
+                        self.set_state(ConnectorStatus::Idle);
+                    }
+                    continue;
+                }
+                if empty_polls >= EMPTY_POLLS_BEFORE_IDLE {
+                    self.set_state(ConnectorStatus::Running);
+                }
+                empty_polls = 0;
+
+                let mut points = Vec::new();
+                for record in &records {
+                    self.messages_total.fetch_add(1, Ordering::Relaxed);
+                    let Some(payload) = record.value.as_ref() else {
+                        continue; // tombstone
+                    };
+                    match self.parse_payload(&record.topic, payload) {
+                        Ok(parsed) => points.extend(parsed),
+                        Err(e) => {
+                            self.decode_errors.fetch_add(1, Ordering::Relaxed);
+                            debug!(name = %self.name, %e, "Kafka decode error");
+                        }
+                    }
+                }
+
+                if !points.is_empty() {
+                    match crate::util::insert_from_connector(
+                        &self.db,
+                        self.ingest_limiter(),
+                        self.namespace_scope(),
+                        points,
+                        INSERT_TIMEOUT,
+                        &self.name,
+                    )
+                    .await
+                    {
+                        Ok(n) => self.points_total.fetch_add(n, Ordering::Relaxed),
+                        Err(e) => {
+                            // Poll advances local positions even when offsets are uncommitted.
+                            // Rewind every partition before another batch can be committed.
+                            let mut offsets = std::collections::HashMap::new();
+                            for record in &records {
+                                let partition =
+                                    TopicPartition::new(&*record.topic, record.partition);
+                                offsets.entry(partition).or_insert(record.offset);
+                            }
+                            consumer.seek_many(offsets).await?;
+                            error!(name = %self.name, %e, "Kafka batch write failed, retrying");
+                            tokio::select! {
+                                () = self.cancel.notified() => return Ok(()),
+                                () = tokio::time::sleep(SETUP_BACKOFF_MIN) => {}
+                            }
+                            continue;
+                        }
+                    };
+                }
+
+                if let Err(e) = consumer.commit().await {
+                    warn!(name = %self.name, %e, "Kafka offset commit failed");
+                }
+
+                // How far behind the broker we are, from the watermarks the last fetch
+                // response already carried — no extra round trip.
+                let lag = consumer.lag().await;
+                let total: u64 = lag.values().filter_map(|partition| partition.lag).sum();
+                self.lag
+                    .store(i64::try_from(total).unwrap_or(i64::MAX), Ordering::Relaxed);
+                metrics::gauge!("chronix_kafka_consumer_lag", "connector" => self.name.clone())
+                    .set(total as f64);
+                let stale = lag.values().filter(|p| p.lag.is_some() && p.stale).count();
+                if stale > 0 {
+                    debug!(
+                        name = %self.name,
+                        stale,
+                        "some partitions' lag is from a stale watermark"
+                    );
+                }
+            }
         }
     }
 }
@@ -549,7 +527,7 @@ impl IngestionConnector for KafkaConsumer {
         self.running.store(true, Ordering::SeqCst);
         self.stopped.store(false, Ordering::SeqCst);
         // Nothing has reached the broker yet; the task promotes this once
-        // its subscribe succeeds.
+        // it joins the consumer group.
         self.set_state(ConnectorStatus::Reconnecting);
 
         #[cfg(feature = "kafka")]
@@ -569,11 +547,7 @@ impl IngestionConnector for KafkaConsumer {
             }
         }
 
-        // Without the feature there is no task and this connector can never
-        // ingest. `Idle` would read as healthy and publish
-        // `chronix_connector_up 1`; naming the missing flag is the honest
-        // answer. `run()` refuses a `[kafka]` section in such a build, so
-        // this is reachable only by constructing the connector directly.
+        // Direct construction is possible even in a build without the connector.
         #[cfg(not(feature = "kafka"))]
         self.set_state(ConnectorStatus::Failed(
             "built without the `kafka` feature".into(),

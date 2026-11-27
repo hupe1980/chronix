@@ -2,7 +2,7 @@
 
 ## Setup
 
-Rust 1.94 or newer (`rust-version` in `Cargo.toml`), via [rustup](https://rustup.rs/).
+Rust 1.95 or newer (`rust-version` in `Cargo.toml`), via [rustup](https://rustup.rs/).
 
 ```bash
 git clone https://github.com/hupe1980/chronix.git
